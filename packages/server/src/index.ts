@@ -80,6 +80,7 @@ import { PgNotifyListener } from './adapters/web/pg-notify-listener';
 import { registerApiRoutes } from './routes/api';
 import { withOutboundMirror } from './adapters/mirror';
 import { persistTelegramFiles } from './adapters/telegram-uploads';
+import { LINK_TOKEN_TTL_MS, linkTokens } from './auth/link-tokens';
 import { rm, unlink } from 'fs/promises';
 import { registerGithubWebhookRoute } from './routes/webhooks';
 import {
@@ -954,12 +955,39 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     // A tapped button on the persistent keyboard arrives as ordinary text, and
     // the lists it opens are edited in place rather than re-sent.
-    telegramAdapter.onCallback(async ({ data, chatId }) => {
+    telegramAdapter.onCallback(async ({ data, chatId, userId: telegramUserId }) => {
       const store = createTelegramChatStore();
       return handleTelegramCallback({
         data,
         chatId,
         store,
+        // The link is a one-time token for THIS Telegram sender, spent in the
+        // browser by whoever is signed in there. The bot never learns which
+        // account it ends up on until the console confirms back.
+        issueAccountLink: async () => {
+          if (telegramUserId === undefined) {
+            return 'I could not tell who you are on Telegram — try again from the menu.';
+          }
+          const issued = linkTokens.issue({
+            platformUserId: String(telegramUserId),
+            chatId,
+          });
+          const minutes = Math.round(LINK_TOKEN_TTL_MS / 60000);
+          // BETTER_AUTH_URL is the install's public origin when there is one
+          // (a proxy in front); otherwise the loopback address the operator
+          // opens the console on. Never a guess at a hostname.
+          const origin = (
+            process.env.BETTER_AUTH_URL ?? `http://127.0.0.1:${process.env.PORT ?? '3090'}`
+          ).replace(/\/+$/, '');
+          const url = `${origin}/console/link/${issued.token}`;
+          return [
+            'Open this once in the browser where you are signed in to the console:',
+            '',
+            url,
+            '',
+            `It works once and expires in ${String(minutes)} minutes.`,
+          ].join('\n');
+        },
         bindProject: async projectName => {
           const conversationId = await resolveActiveTelegramConversationId(chatId);
           return setProjectForConversation(conversationId, projectName);

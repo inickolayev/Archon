@@ -120,6 +120,14 @@ export function isArchonOwnedAuthPath(path: string): boolean {
     path === '/api/auth/providers' ||
     path.startsWith('/api/auth/providers/') ||
     path === '/api/auth/me/ai-prefs' ||
-    path.startsWith('/api/auth/me/ai-prefs/')
+    path.startsWith('/api/auth/me/ai-prefs/') ||
+    // The account layer: who am I, what is linked to me, and the one-time
+    // Telegram link handshake. All Archon's own — Better Auth knows nothing
+    // about platform identities.
+    path === '/api/auth/me' ||
+    path === '/api/auth/me/sign-out' ||
+    path === '/api/auth/me/identities' ||
+    path.startsWith('/api/auth/me/identities/') ||
+    path.startsWith('/api/auth/telegram/link/')
   );
 }

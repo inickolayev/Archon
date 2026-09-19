@@ -279,6 +279,8 @@ import {
 } from '@archon/core/operations/workflow-operations';
 import { getAuth, isWebAuthEnabled, getSignupMode, isApiGateEnabled } from '../auth';
 import { artifactHeaders } from './artifact-content-type';
+import { linkTokens } from '../auth/link-tokens';
+import * as accountLinks from '@archon/core/db/account-links';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -1853,6 +1855,176 @@ export function registerApiRoutes(
   // (see isArchonOwnedAuthPath in index.ts).
   registerOpenApiRoute(authStatusRoute, c => {
     return c.json({ enabled: isWebAuthEnabled(), signup: getSignupMode() });
+  });
+
+  // ---- The account layer: who am I, what is linked, and the Telegram handshake ----
+  //
+  // Registered with app.get/post/delete rather than OpenAPI routes: they are
+  // browser-facing session endpoints rather than part of the documented API
+  // surface (same exception the artifact route takes). Every path here is
+  // listed in isArchonOwnedAuthPath, or Better Auth would swallow it.
+
+  /** GET /api/auth/me — the signed-in account, as Profile shows it. */
+  app.get('/api/auth/me', async c => {
+    const web = await requireWebUser(c);
+    if ('error' in web) return web.error;
+    try {
+      const [account, identities] = await Promise.all([
+        accountLinks.findWebAccountForUser(web.userId),
+        accountLinks.listIdentitiesForUser(web.userId),
+      ]);
+      return c.json({
+        userId: web.userId,
+        role: web.role,
+        name: account?.name ?? null,
+        email: account?.email ?? null,
+        identities: identities.map(identity => ({
+          platform: identity.platform,
+          platformUserId: identity.platformUserId,
+          displayName: identity.displayName,
+          linkedAt:
+            identity.linkedAt instanceof Date ? identity.linkedAt.toISOString() : identity.linkedAt,
+        })),
+      });
+    } catch (err) {
+      getLog().error({ err, userId: web.userId }, 'account.me_failed');
+      return apiError(c, 503, 'Could not read the account');
+    }
+  });
+
+  /**
+   * POST /api/auth/me/sign-out — end the session server-side.
+   *
+   * Archon's own, so that signing out also drops every pending link token: a
+   * one-time link left open in another window must not survive the session it
+   * was meant for.
+   */
+  app.post('/api/auth/me/sign-out', async c => {
+    linkTokens.clear();
+    const auth = getAuth();
+    if (auth === null) return c.json({ ok: true });
+    try {
+      const response = await auth.api.signOut({ headers: c.req.raw.headers, asResponse: true });
+      // Forward Better Auth's cookie clearing verbatim.
+      const headers = new Headers(response.headers);
+      headers.set('Content-Type', 'application/json');
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+    } catch (err) {
+      getLog().warn({ err }, 'account.sign_out_failed');
+      return apiError(c, 503, 'Could not sign out');
+    }
+  });
+
+  /** GET /api/auth/me/identities — linked external sources. */
+  app.get('/api/auth/me/identities', async c => {
+    const web = await requireWebUser(c);
+    if ('error' in web) return web.error;
+    const identities = await accountLinks.listIdentitiesForUser(web.userId);
+    return c.json({ identities });
+  });
+
+  /**
+   * DELETE /api/auth/me/identities/:platform — stop a platform from resolving
+   * to this account. History stays with the account (see db/account-links).
+   */
+  app.delete('/api/auth/me/identities/:platform', async c => {
+    const web = await requireWebUser(c);
+    if ('error' in web) return web.error;
+    const platform = c.req.param('platform');
+    if (platform !== 'telegram') {
+      return apiError(c, 400, 'Only the telegram link can be removed here');
+    }
+    try {
+      const { removed } = await accountLinks.unlinkIdentity('telegram', web.userId);
+      return c.json({ removed });
+    } catch (err) {
+      getLog().error({ err, userId: web.userId }, 'account.unlink_failed');
+      return apiError(c, 503, 'Could not unlink');
+    }
+  });
+
+  /**
+   * GET /api/auth/telegram/link/:token — what this link would connect.
+   *
+   * Requires a session: the confirmation screen is only meaningful to someone
+   * already signed in, and an anonymous visitor learns nothing from the link.
+   */
+  app.get('/api/auth/telegram/link/:token', async c => {
+    const web = await requireWebUser(c, 'Sign in first, then open the link again');
+    if ('error' in web) return web.error;
+    const claim = linkTokens.peek(c.req.param('token') ?? '');
+    if (claim === null) {
+      return apiError(c, 404, 'This link has expired or was already used');
+    }
+    const account = await accountLinks.findWebAccountForUser(web.userId);
+    const current = await accountLinks.findUserByIdentity('telegram', claim.platformUserId);
+    return c.json({
+      telegram: { displayName: claim.displayName ?? null },
+      account: { name: account?.name ?? null, email: account?.email ?? null },
+      // Honest about what confirming will do to history.
+      alreadyLinkedToThisAccount: current?.id === web.userId,
+      expiresAt: new Date(claim.expiresAt).toISOString(),
+    });
+  });
+
+  /** POST /api/auth/telegram/link/:token — confirm, link, and tell the chat. */
+  app.post('/api/auth/telegram/link/:token', async c => {
+    const web = await requireWebUser(c, 'Sign in first, then open the link again');
+    if ('error' in web) return web.error;
+    // Spending the token here is what makes it single-use — even if the link
+    // is confirmed twice, the second attempt finds nothing.
+    const claim = linkTokens.consume(c.req.param('token') ?? '');
+    if (claim === null) {
+      return apiError(c, 404, 'This link has expired or was already used');
+    }
+    try {
+      const outcome = await accountLinks.linkIdentityToUser(
+        'telegram',
+        claim.platformUserId,
+        web.userId
+      );
+      const account = await accountLinks.findWebAccountForUser(web.userId);
+      const moved = Object.values(outcome.moved).reduce((sum, n) => sum + n, 0);
+
+      // Confirm in the chat too: the operator started this on the phone.
+      const telegram = getTelegramAdapter?.() ?? null;
+      if (telegram !== null) {
+        const who = account?.email ?? account?.name ?? 'your account';
+        await telegram
+          .sendMessage(claim.chatId, `This chat is now linked to ${who}.`)
+          .catch((err: unknown) => {
+            getLog().warn({ err }, 'account.link_chat_confirm_failed');
+          });
+      }
+
+      return c.json({
+        linked: true,
+        alreadyLinked: outcome.alreadyLinked,
+        movedRows: moved,
+        email: account?.email ?? null,
+      });
+    } catch (err) {
+      getLog().error({ err, userId: web.userId }, 'account.link_failed');
+      return apiError(c, 503, 'Could not link the account');
+    }
+  });
+
+  /**
+   * GET /api/users/directory — who wrote what, for authorship labels.
+   *
+   * Everyone who can open the console administers this install, so the email
+   * is not a leak here; the day that changes, this is the surface to gate.
+   */
+  app.get('/api/users/directory', async c => {
+    const web = await requireWebUser(c);
+    if ('error' in web) return web.error;
+    try {
+      const users = await accountLinks.listDirectoryUsers();
+      return c.json({ me: web.userId, users });
+    } catch (err) {
+      getLog().error({ err }, 'account.directory_failed');
+      return apiError(c, 503, 'Could not read the user directory');
+    }
   });
 
   // ---- GitHub device-flow connect endpoints ----

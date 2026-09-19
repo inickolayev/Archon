@@ -35,5 +35,8 @@ export const K = {
   githubConnection: 'github-connection' as const,
   providerConnections: 'provider-connections' as const,
   userAiPrefs: 'user-ai-prefs' as const,
+  /** The signed-in account (Profile) and who-wrote-what (authorship labels). */
+  account: 'account' as const,
+  directory: 'directory' as const,
   piModels: 'pi-models' as const,
 } as const;

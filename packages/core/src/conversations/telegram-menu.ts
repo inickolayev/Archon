@@ -91,7 +91,8 @@ export type CallbackAction =
   | { readonly kind: 'menu' }
   | { readonly kind: 'switch'; readonly index: number }
   | { readonly kind: 'new' }
-  | { readonly kind: 'project'; readonly name: string };
+  | { readonly kind: 'project'; readonly name: string }
+  | { readonly kind: 'link' };
 
 export function encodeAction(action: CallbackAction): string {
   switch (action.kind) {
@@ -107,6 +108,8 @@ export function encodeAction(action: CallbackAction): string {
       return `s:${String(action.index)}`;
     case 'project':
       return `p:${action.name.slice(0, MAX_PROJECT_TOKEN)}`;
+    case 'link':
+      return 'lk';
   }
 }
 
@@ -121,6 +124,7 @@ export function parseAction(data: string): CallbackAction | null {
   }
   if (data === 'm') return { kind: 'menu' };
   if (data === 'n') return { kind: 'new' };
+  if (data === 'lk') return { kind: 'link' };
   const switchMatch = /^s:(\d{1,4})$/.exec(data);
   if (switchMatch) {
     const index = Number(switchMatch[1]);
@@ -229,6 +233,7 @@ export function buildMainMenu(): { text: string; keyboard: MenuKeyboard } {
           { label: 'Chats', action: encodeAction({ kind: 'chats' }) },
           { label: 'Projects', action: encodeAction({ kind: 'projects' }) },
         ],
+        [{ label: 'Link this chat to my account', action: encodeAction({ kind: 'link' }) }],
       ],
       persistent: MAIN_KEYBOARD.persistent,
     },
@@ -251,6 +256,12 @@ export interface TelegramCallbackInput {
   readonly store: TelegramChatStore;
   /** Binds the chat's active conversation to a project; returns what to show. */
   readonly bindProject?: (projectName: string) => Promise<string>;
+  /**
+   * Issues the one-time link that connects this Telegram sender to a web
+   * account, and returns what to show. Injected because the token lives in the
+   * server, and because a build without it should simply not offer the button.
+   */
+  readonly issueAccountLink?: () => Promise<string>;
   readonly now?: number;
 }
 
@@ -278,6 +289,16 @@ export async function handleTelegramCallback(
   if (action.kind === 'menu') {
     const menu = buildMainMenu();
     return { text: menu.text, keyboard: menu.keyboard };
+  }
+
+  if (action.kind === 'link') {
+    if (input.issueAccountLink === undefined) {
+      return { text: 'Account linking is not available on this install.' };
+    }
+    // The link itself is issued by the server — this only asks for it and
+    // shows it. Nothing about the account is decided here.
+    const text = await input.issueAccountLink();
+    return { text, toast: 'Link ready' };
   }
 
   if (action.kind === 'projects' || action.kind === 'project') {

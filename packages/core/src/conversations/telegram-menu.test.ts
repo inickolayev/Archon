@@ -155,7 +155,7 @@ describe('keyboards', () => {
 
   test('the main menu offers both lists and keeps the persistent keyboard', () => {
     const menu = buildMainMenu();
-    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual(['l:c', 'l:p']);
+    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual(['l:c', 'l:p', 'lk']);
     expect(menu.keyboard.persistent?.flat()).toContain('Status');
   });
 });
@@ -442,7 +442,53 @@ describe('the menu is one tap away', () => {
       store,
       runChatCommand: async () => 'unused',
     });
-    expect(reply?.keyboard?.inline?.flat().map(b => b.label)).toEqual(['Chats', 'Projects']);
+    expect(reply?.keyboard?.inline?.flat().map(b => b.label)).toEqual([
+      'Chats',
+      'Projects',
+      'Link this chat to my account',
+    ]);
     expect(reply?.keyboard?.persistent?.flat()).toContain('☰ Menu');
+  });
+});
+
+describe('linking this chat to a web account', () => {
+  test('the menu offers it as a button, not a command to remember', () => {
+    const labels =
+      buildMainMenu()
+        .keyboard.inline?.flat()
+        .map(b => b.label) ?? [];
+    expect(labels).toContain('Link this chat to my account');
+  });
+
+  test('tapping it asks the server for a one-time link and shows it', async () => {
+    const store = fakeStore([row({ platform_conversation_id: CHAT })]);
+    let asked = 0;
+    const reply = await handleTelegramCallback({
+      data: 'lk',
+      chatId: CHAT,
+      store,
+      issueAccountLink: async () => {
+        asked += 1;
+        return 'Open this once while signed in: http://127.0.0.1:3090/console/link/TOKEN';
+      },
+    });
+
+    expect(asked).toBe(1);
+    expect(reply?.text).toContain('/console/link/');
+    expect(reply?.toast).toBe('Link ready');
+  });
+
+  test('a build without linking says so instead of failing', async () => {
+    const store = fakeStore([row({ platform_conversation_id: CHAT })]);
+    const reply = await handleTelegramCallback({ data: 'lk', chatId: CHAT, store });
+    expect(reply?.text).toContain('not available');
+  });
+
+  test('the token is never part of the callback payload', () => {
+    // The button asks for a link; it does not carry one. A callback payload is
+    // client-supplied on the way back and must not be able to name a secret.
+    expect(encodeAction({ kind: 'link' })).toBe('lk');
+    expect(parseAction('lk')).toEqual({ kind: 'link' });
+    expect(parseAction('lk:some-token')).toBeNull();
   });
 });
