@@ -151,6 +151,9 @@ mock.module('../db/conversations', () => ({
   // back to getOrCreate); the mock keeps returning the same row either way.
   getOrAdoptConversation: mockGetOrCreateConversation,
   getOrCreateConversation: mockGetOrCreateConversation,
+  // An unowned row is claimed by the first sender we can name; the fixture
+  // rows already have an owner, so this answers "nothing to claim".
+  claimConversationOwner: mock(() => Promise.resolve(false)),
   getConversationByPlatformId: mock(() => Promise.resolve(null)),
   updateConversation: mockUpdateConversation,
   touchConversation: mock(() => Promise.resolve()),

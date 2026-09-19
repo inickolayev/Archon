@@ -18,6 +18,7 @@ mock.module('./connection', () => ({
 import {
   formatSqliteTimestamp,
   getOrAdoptConversation,
+  claimConversationOwner,
   getOrCreateConversation,
   listConversationsForChat,
   markConversationActive,
@@ -251,6 +252,67 @@ describe('conversations', () => {
       );
       // Parent inheritance short-circuits the config chain.
       expect(loadConfigSpy).not.toHaveBeenCalled();
+    });
+
+    test('inherits the owner, so a chat started from a button belongs to someone', async () => {
+      // The bug this covers: `+ New chat` in Telegram created a row with
+      // codebase_id AND user_id NULL. It then appeared in nobody's console
+      // (the chat list is per project) and read as written by a stranger.
+      const parentConversation: Conversation = {
+        ...existingConversation,
+        id: 'parent-conv',
+        platform_conversation_id: '352328891',
+        codebase_id: 'codebase-123',
+        cwd: '/workspace/project',
+        user_id: 'user-operator',
+      };
+      const newConversation: Conversation = {
+        ...existingConversation,
+        id: 'second-chat',
+        platform_conversation_id: '352328891:2',
+      };
+
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([parentConversation]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([newConversation]));
+
+      await getOrCreateConversation('telegram', '352328891:2', undefined, '352328891');
+
+      expect(mockQuery).toHaveBeenNthCalledWith(
+        3,
+        'INSERT INTO remote_agent_conversations (platform_type, platform_conversation_id, ai_assistant_type, codebase_id, cwd, user_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+        [
+          'telegram',
+          '352328891:2',
+          existingConversation.ai_assistant_type,
+          'codebase-123',
+          '/workspace/project',
+          'user-operator',
+        ]
+      );
+    });
+
+    test('an explicit sender wins over the inherited owner', async () => {
+      const parentConversation: Conversation = {
+        ...existingConversation,
+        id: 'parent-conv',
+        platform_conversation_id: 'parent-channel',
+        user_id: 'user-parent',
+      };
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([parentConversation]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([existingConversation]));
+
+      await getOrCreateConversation(
+        'discord',
+        'thread-123',
+        undefined,
+        'parent-channel',
+        'user-sender'
+      );
+
+      const insert = mockQuery.mock.calls[2] as unknown[];
+      expect((insert[1] as unknown[])[5]).toBe('user-sender');
     });
 
     test('does not inherit when parent has no context', async () => {
@@ -553,5 +615,26 @@ describe('formatSqliteTimestamp', () => {
     const precise = formatSqliteTimestamp(Date.parse('2026-09-19T18:27:45.030Z'));
     expect(precise > second).toBe(true);
     expect(precise < '2026-09-19 18:27:46').toBe(true);
+  });
+});
+
+describe('claimConversationOwner', () => {
+  test('claims an unowned row, and says so', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+    await expect(claimConversationOwner('conv-1', 'user-operator')).resolves.toBe(true);
+
+    // The guard is in the SQL, not in a read-then-write: two turns racing
+    // cannot take the row from one another, and an owned row is never
+    // overwritten.
+    expect(mockQuery).toHaveBeenCalledWith(
+      'UPDATE remote_agent_conversations SET user_id = $1 WHERE id = $2 AND user_id IS NULL',
+      ['user-operator', 'conv-1']
+    );
+  });
+
+  test('a row that already belongs to someone is left alone', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+    await expect(claimConversationOwner('conv-1', 'user-someone-else')).resolves.toBe(false);
   });
 });

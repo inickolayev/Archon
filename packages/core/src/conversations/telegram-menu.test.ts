@@ -29,15 +29,19 @@ const row = (
 function fakeStore(initial: TelegramChatRow[]): TelegramChatStore & {
   touched: string[];
   created: string[];
+  /** What each created conversation was told to inherit from. */
+  inherited: (string | undefined)[];
   rows: TelegramChatRow[];
 } {
   const state = {
     rows: [...initial],
     touched: [] as string[],
     created: [] as string[],
+    inherited: [] as (string | undefined)[],
     list: async (): Promise<readonly TelegramChatRow[]> => state.rows,
-    create: async (id: string): Promise<void> => {
+    create: async (id: string, inheritFrom?: string): Promise<void> => {
       state.created.push(id);
+      state.inherited.push(inheritFrom);
       if (!state.rows.some(r => r.platform_conversation_id === id)) {
         state.rows.push(row({ platform_conversation_id: id }));
       }
@@ -144,19 +148,40 @@ describe('keyboards', () => {
   test('one button per chat, the active one marked, then new chat', () => {
     const keyboard = buildChatsKeyboard(conversations);
     const labels = keyboard.inline?.flat().map(b => b.label) ?? [];
-    expect(labels).toEqual(['1. Deploy checklist', '● 2. Bot calibration', '+ New chat']);
-    expect(keyboard.inline?.flat().map(b => b.action)).toEqual(['s:1', 's:2', 'n']);
+    expect(labels).toEqual([
+      '1. Deploy checklist',
+      '● 2. Bot calibration',
+      '+ New chat',
+      // Every list carries a way back: in clients that fold the reply keyboard
+      // behind an icon, this is the only one-tap route to the menu.
+      '☰ Menu',
+    ]);
+    expect(keyboard.inline?.flat().map(b => b.action)).toEqual(['s:1', 's:2', 'n', 'm']);
   });
 
   test('one button per project, the bound one marked', () => {
     const keyboard = buildProjectsKeyboard([{ name: 'chesswin' }, { name: 'notes' }], 'notes');
-    expect(keyboard.inline?.flat().map(b => b.label)).toEqual(['chesswin', '● notes']);
+    expect(keyboard.inline?.flat().map(b => b.label)).toEqual(['chesswin', '● notes', '☰ Menu']);
   });
 
   test('the main menu offers both lists and keeps the persistent keyboard', () => {
     const menu = buildMainMenu();
-    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual(['l:c', 'l:p', 'lk']);
-    expect(menu.keyboard.persistent?.flat()).toContain('Status');
+    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual(['l:c', 'l:p', 'n', 'lk']);
+    expect(menu.keyboard.persistent?.flat()).toEqual(['☰ Menu']);
+  });
+
+  test('the persistent keyboard is one button — the rest would pile up messages', () => {
+    // A keyboard label is sent as a MESSAGE: each tap adds a new list under the
+    // last one. Inline buttons edit the message they belong to, so everything
+    // except the single entry point lives inline.
+    expect(MAIN_KEYBOARD.persistent).toEqual([['☰ Menu']]);
+  });
+
+  test('a client still showing the older keyboard keeps working', () => {
+    // Its labels must not fall through to the agent as questions.
+    for (const label of ['Chats', 'New chat', 'Project', 'Status']) {
+      expect(commandForLabel(label)).not.toBeNull();
+    }
   });
 });
 
@@ -184,6 +209,7 @@ describe('handleTelegramCallback', () => {
       '● 1. First',
       '2. Second',
       '+ New chat',
+      '☰ Menu',
     ]);
     expect(reply?.toast).toBe('Chat 1');
   });
@@ -275,7 +301,11 @@ describe('handleTelegramMenuCommand', () => {
       runChatCommand,
     });
     expect(reply?.text).toContain('Factory console');
-    expect(reply?.keyboard?.persistent?.flat()).toContain('New chat');
+    // Only the persistent keyboard: Telegram allows one markup per message and
+    // an inline keyboard would win, so a /start carrying both would never
+    // install the keyboard it exists to install.
+    expect(reply?.keyboard?.persistent?.flat()).toEqual(['☰ Menu']);
+    expect(reply?.keyboard?.inline).toBeUndefined();
   });
 
   test('/chats keeps its text and gains the chat buttons', async () => {
@@ -288,7 +318,7 @@ describe('handleTelegramMenuCommand', () => {
       runChatCommand,
     });
     expect(reply?.text).toBe('list text');
-    expect(reply?.keyboard?.inline?.flat().map(b => b.action)).toEqual(['s:1', 'n']);
+    expect(reply?.keyboard?.inline?.flat().map(b => b.action)).toEqual(['s:1', 'n', 'm']);
   });
 
   test('/projects gains a button per project', async () => {
@@ -300,7 +330,11 @@ describe('handleTelegramMenuCommand', () => {
       store,
       runChatCommand,
     });
-    expect(reply?.keyboard?.inline?.flat().map(b => b.label)).toEqual(['chesswin', 'notes']);
+    expect(reply?.keyboard?.inline?.flat().map(b => b.label)).toEqual([
+      'chesswin',
+      'notes',
+      '☰ Menu',
+    ]);
   });
 
   test('a command this module does not own is left to the others', async () => {
@@ -445,6 +479,7 @@ describe('the menu is one tap away', () => {
     expect(reply?.keyboard?.inline?.flat().map(b => b.label)).toEqual([
       'Chats',
       'Projects',
+      '+ New chat',
       'Link this chat to my account',
     ]);
     expect(reply?.keyboard?.persistent?.flat()).toContain('☰ Menu');
@@ -490,5 +525,38 @@ describe('linking this chat to a web account', () => {
     expect(encodeAction({ kind: 'link' })).toBe('lk');
     expect(parseAction('lk')).toEqual({ kind: 'link' });
     expect(parseAction('lk:some-token')).toBeNull();
+  });
+});
+
+describe('a new chat is a new chat, not a new context', () => {
+  test("the button starts it from the chat's current conversation", async () => {
+    const store = fakeStore([
+      row({
+        platform_conversation_id: CHAT,
+        title: 'First',
+        last_activity_at: '2026-09-20 10:00:00',
+      }),
+      row({
+        platform_conversation_id: `${CHAT}:2`,
+        title: 'Second',
+        last_activity_at: '2026-09-20 11:00:00',
+      }),
+    ]);
+
+    await handleTelegramCallback({ data: 'n', chatId: CHAT, store });
+
+    expect(store.created).toEqual([`${CHAT}:3`]);
+    // The ACTIVE one (newest activity), not the first, not the newest number:
+    // that is the conversation whose project and owner the operator means.
+    expect(store.inherited).toEqual([`${CHAT}:2`]);
+  });
+
+  test('the very first chat of a Telegram chat has nothing to inherit', async () => {
+    const store = fakeStore([]);
+    await handleTelegramCallback({ data: 'n', chatId: CHAT, store });
+    expect(store.created).toEqual([CHAT]);
+    // Points at itself — there is no earlier conversation, and the DB layer
+    // finds nothing to copy rather than inventing a parent.
+    expect(store.inherited).toEqual([CHAT]);
   });
 });

@@ -13,6 +13,7 @@
  */
 
 import {
+  activeConversationId,
   isTelegramChatCommand,
   numberConversations,
   type NumberedConversation,
@@ -35,19 +36,30 @@ export interface MenuKeyboard {
   readonly persistent?: readonly (readonly string[])[];
 }
 
-/** The labels of the persistent keyboard, in the order they are shown. */
+/**
+ * The persistent keyboard: one button.
+ *
+ * It used to carry shortcuts too (Chats / New chat / Project / Status). They
+ * were removed because a keyboard label is sent as an ordinary MESSAGE, so
+ * each tap produced a fresh list underneath the last one — tap Chats five
+ * times and there are five lists in the chat. Inline buttons edit the message
+ * they are attached to, so the list the operator is looking at is the one that
+ * changes.
+ *
+ * So there is exactly one entry point, always within reach, and everything
+ * behind it is inline and edits in place. Telegram's own menu button cannot
+ * fire a command (only a command list or a web app), which is why the
+ * keyboard, not that button, is what makes the menu reachable at all.
+ */
 export const MAIN_KEYBOARD: MenuKeyboard = {
-  persistent: [
-    // Menu first and alone: it is the one entry that is always in reach, and
-    // the only genuinely one-tap route to everything else. Telegram's own menu
-    // button can open a command list or a web app — it cannot fire a command —
-    // so the keyboard is what makes "one tap" true.
-    ['☰ Menu'],
-    ['Chats', 'New chat'],
-    ['Project', 'Status'],
-  ],
+  persistent: [['☰ Menu']],
 };
 
+/**
+ * Labels the bot answers to. Wider than what MAIN_KEYBOARD shows on purpose: a
+ * client that still has the older, larger keyboard cached must keep working
+ * rather than sending the bot the word "Status" as a question for the agent.
+ */
 const LABEL_COMMANDS: ReadonlyMap<string, string> = new Map([
   ['☰ Menu', '/menu'],
   ['Menu', '/menu'],
@@ -195,7 +207,7 @@ export function buildChatsKeyboard(
     inline: [
       ...rows,
       ...(nav.length > 0 ? [nav] : []),
-      [{ label: '+ New chat', action: encodeAction({ kind: 'new' }) }],
+      [{ label: '+ New chat', action: encodeAction({ kind: 'new' }) }, MENU_BUTTON],
     ],
   };
 }
@@ -215,13 +227,23 @@ export function buildProjectsKeyboard(
     },
   ]);
   const nav = navRow('projects', current, projects.length);
-  return { inline: [...rows, ...(nav.length > 0 ? [nav] : [])] };
+  return { inline: [...rows, ...(nav.length > 0 ? [nav] : []), [MENU_BUTTON]] };
 }
 
 /** The page a 1-based position falls on. */
 export function pageOf(index: number): number {
   return Math.max(1, Math.ceil(index / PAGE_SIZE));
 }
+
+/**
+ * Back to the menu, as an inline button.
+ *
+ * Every list carries one. In Telegram Web the reply keyboard is folded behind
+ * an icon next to the input, so `☰ Menu` down there is two taps, not one; an
+ * inline button on the message the operator is already looking at is one tap
+ * in every client.
+ */
+const MENU_BUTTON: MenuButton = { label: '☰ Menu', action: 'm' };
 
 /** The menu shown by /menu and by the Menu button. */
 export function buildMainMenu(): { text: string; keyboard: MenuKeyboard } {
@@ -233,6 +255,7 @@ export function buildMainMenu(): { text: string; keyboard: MenuKeyboard } {
           { label: 'Chats', action: encodeAction({ kind: 'chats' }) },
           { label: 'Projects', action: encodeAction({ kind: 'projects' }) },
         ],
+        [{ label: '+ New chat', action: encodeAction({ kind: 'new' }) }],
         [{ label: 'Link this chat to my account', action: encodeAction({ kind: 'link' }) }],
       ],
       persistent: MAIN_KEYBOARD.persistent,
@@ -353,7 +376,9 @@ export async function handleTelegramCallback(
         Math.max(max, c.lastActivityAt === null ? 0 : Date.parse(String(c.lastActivityAt))),
       0
     );
-    await store.create(id);
+    // Inherits the project, the cwd and the owner from the chat's current
+    // conversation — a new chat, not a new context.
+    await store.create(id, activeConversationId(rows, chatId));
     await store.touch(id, Number.isNaN(newest) ? undefined : newest);
     const refreshed = numberConversations(await store.list(chatId), chatId);
     return {
@@ -407,9 +432,8 @@ export interface TelegramCommandReply {
 const GREETING = [
   'This is the Factory console in Telegram.',
   '',
-  'Use the buttons below: Chats switches between the conversations of this',
-  'chat, New chat starts an empty one, Project binds a registered project,',
-  'Status shows where you are.',
+  'Tap ☰ Menu under the input to switch chats, start a new one, pick a project',
+  'or link this chat to your web account.',
   '',
   'Anything else you type goes to the agent. /help lists what the buttons do.',
 ].join('\n');
@@ -433,7 +457,12 @@ export async function handleTelegramMenuCommand(input: {
   const { command, args, chatId, store } = input;
 
   if (command === 'start') {
-    return { text: GREETING, keyboard: { ...buildMainMenu().keyboard } };
+    // Deliberately the PERSISTENT keyboard alone, with no inline buttons.
+    // Telegram allows one reply_markup per message and an inline keyboard wins
+    // when both are offered — so a /start that carried both would never
+    // actually install the keyboard under the input, which is the one thing
+    // /start exists to do. The menu itself is one tap away from it.
+    return { text: GREETING, keyboard: MAIN_KEYBOARD };
   }
   if (command === 'menu') {
     const menu = buildMainMenu();

@@ -2002,6 +2002,15 @@ export async function handleMessage(
       parentConversationId,
       userId
     );
+    // A row that exists but belongs to nobody gets its owner from the first
+    // sender we can name: conversations created eagerly (Telegram's `+ New
+    // chat` when the chat has no history to inherit from) and every row
+    // written before accounts existed. Never an overwrite — see
+    // claimConversationOwner.
+    if (conversation.user_id === null && userId !== undefined) {
+      const claimed = await db.claimConversationOwner(conversation.id, userId);
+      if (claimed) conversation = { ...conversation, user_id: userId };
+    }
     conversation = await inheritThreadContext(
       platform,
       conversation,

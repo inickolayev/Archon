@@ -34,6 +34,18 @@ function getLog(): ReturnType<typeof createLogger> {
 
 const MAX_LENGTH = 4096;
 /**
+ * Categories the web console renders as structure rather than as something
+ * somebody reads — a tool call row, the isolation banner. Telegram has no
+ * structure to put them in, so they would arrive as chat messages full of
+ * absolute host paths. The same set the browser→Telegram mirror refuses.
+ */
+const STRUCTURAL_CATEGORIES = new Set(['tool_call_formatted', 'isolation_context']);
+
+/** True for a message that belongs to the console's structure, not to a chat. */
+export function isStructuralCategory(category: string | undefined): boolean {
+  return category !== undefined && STRUCTURAL_CATEGORIES.has(category);
+}
+/**
  * How long an album's parts are collected before the whole set is dispatched
  * as one message. Telegram sends them milliseconds apart; this only ever
  * delays a multi-file send.
@@ -143,6 +155,17 @@ export class TelegramAdapter implements IPlatformAdapter {
     message: string,
     metadata?: MessageMetadata
   ): Promise<void> {
+    if (isStructuralCategory(metadata?.category)) {
+      // Not this window's business. The web UI draws these as structure — a
+      // tool row that folds away — and the mirror already refuses to forward
+      // them. On a phone the same thing is a wall of `✏️READ Reading:
+      // /Users/…/artifacts/uploads/…jpg`: noise, and host paths in a chat.
+      getLog().debug(
+        { conversationId, category: metadata?.category },
+        'telegram.structural_message_skipped'
+      );
+      return;
+    }
     // A conversation id is `<chat id>[:<n>]` — many Archon conversations share
     // one Telegram chat. Parse the chat id out explicitly rather than leaning on
     // `parseInt` stopping at the colon by accident.

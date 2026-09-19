@@ -56,8 +56,16 @@ export interface NumberedConversation {
 export interface TelegramChatStore {
   /** Every conversation of the chat, any order. */
   list(chatId: string): Promise<readonly TelegramChatRow[]>;
-  /** Create the conversation row for this platform id (idempotent). */
-  create(platformConversationId: string): Promise<void>;
+  /**
+   * Create the conversation row for this platform id (idempotent).
+   *
+   * `inheritFrom` is the conversation the new one is being started from — the
+   * chat's current one. A new chat inside a Telegram chat is a new chat, not a
+   * new *context*: it keeps the project, the working directory and the owner,
+   * or the operator has to bind the project again every time and the chat
+   * belongs to nobody (so it appears in nobody's console).
+   */
+  create(platformConversationId: string, inheritFrom?: string): Promise<void>;
   /**
    * Bump `last_activity_at` — this is what makes a conversation the active one.
    * `notBeforeMs` is the newest activity among the chat's other conversations,
@@ -233,7 +241,9 @@ export async function handleTelegramChatCommand(input: TelegramChatCommandInput)
     const index = parseTelegramConversationId(id)?.index ?? rows.length + 1;
     // Created eagerly (unlike the web's lazy creation): on a phone the operator
     // needs an immediate confirmation that the next message lands somewhere new.
-    await store.create(id);
+    // It inherits from the chat's current conversation — same project, same
+    // owner.
+    await store.create(id, activeConversationId(rows, chatId));
     await store.touch(id, newestActivityMs(numberConversations(rows, chatId)));
     return `Chat ${String(index)} created and active. /chats to list.`;
   }

@@ -74,9 +74,12 @@ export async function getOrCreateConversation(
     return existing.rows[0];
   }
 
-  // Check if we should inherit from a parent conversation (e.g., Discord thread inheriting from parent channel)
+  // Check if we should inherit from a parent conversation (e.g., Discord thread
+  // inheriting from parent channel, or a second chat inside one Telegram chat
+  // inheriting from the one it was started from).
   let inheritedCodebaseId: string | null = null;
   let inheritedCwd: string | null = null;
+  let inheritedUserId: string | null = null;
   let assistantType: string | undefined;
 
   if (parentConversationId) {
@@ -87,9 +90,13 @@ export async function getOrCreateConversation(
     if (parent.rows[0]) {
       inheritedCodebaseId = parent.rows[0].codebase_id;
       inheritedCwd = parent.rows[0].cwd;
+      // The owner comes across too. Without it a chat started from a button is
+      // unattributed: it belongs to nobody, so it shows up in nobody's console
+      // and reads as written by a stranger.
+      inheritedUserId = parent.rows[0].user_id;
       assistantType = parent.rows[0].ai_assistant_type;
       getLog().debug(
-        { inheritedCodebaseId, inheritedCwd },
+        { inheritedCodebaseId, inheritedCwd, inheritedUserId },
         'db.conversation_parent_context_inherited'
       );
     }
@@ -135,7 +142,14 @@ export async function getOrCreateConversation(
 
   const created = await pool.query<Conversation>(
     'INSERT INTO remote_agent_conversations (platform_type, platform_conversation_id, ai_assistant_type, codebase_id, cwd, user_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-    [platformType, platformId, assistantType, finalCodebaseId, inheritedCwd, userId ?? null]
+    [
+      platformType,
+      platformId,
+      assistantType,
+      finalCodebaseId,
+      inheritedCwd,
+      userId ?? inheritedUserId,
+    ]
   );
 
   return created.rows[0];
@@ -186,6 +200,29 @@ export async function getOrAdoptConversation(
     parentConversationId,
     userId
   );
+}
+
+/**
+ * Give an unowned conversation its owner, once.
+ *
+ * Rows can exist before anyone is known to have written in them: Telegram
+ * creates a conversation eagerly when `+ New chat` is tapped, and every row
+ * written before accounts existed has `user_id` NULL. `WHERE user_id IS NULL`
+ * makes this a claim rather than an overwrite — first-user-wins still holds,
+ * and two turns racing cannot take the row from each other.
+ *
+ * Returns true when this call is the one that claimed it.
+ */
+export async function claimConversationOwner(id: string, userId: string): Promise<boolean> {
+  const result = await pool.query(
+    'UPDATE remote_agent_conversations SET user_id = $1 WHERE id = $2 AND user_id IS NULL',
+    [userId, id]
+  );
+  const claimed = (result.rowCount ?? 0) > 0;
+  if (claimed) {
+    getLog().debug({ conversationId: id, userId }, 'db.conversation_owner_claimed');
+  }
+  return claimed;
 }
 
 export async function updateConversation(

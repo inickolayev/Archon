@@ -176,6 +176,8 @@ describe('formatChatList', () => {
 // A fake store: no database, records what the commands asked it to do.
 function fakeStore(initial: TelegramChatRow[]): TelegramChatStore & {
   created: string[];
+  /** What each created conversation was told to inherit from. */
+  inherited: (string | undefined)[];
   touched: string[];
   floors: (number | undefined)[];
   rows: TelegramChatRow[];
@@ -183,11 +185,13 @@ function fakeStore(initial: TelegramChatRow[]): TelegramChatStore & {
   const state = {
     rows: [...initial],
     created: [] as string[],
+    inherited: [] as (string | undefined)[],
     touched: [] as string[],
     floors: [] as (number | undefined)[],
     list: async (): Promise<readonly TelegramChatRow[]> => state.rows,
-    create: async (id: string): Promise<void> => {
+    create: async (id: string, inheritFrom?: string): Promise<void> => {
       state.created.push(id);
+      state.inherited.push(inheritFrom);
       if (!state.rows.some(r => r.platform_conversation_id === id)) {
         state.rows.push(row({ platform_conversation_id: id }));
       }
@@ -402,5 +406,19 @@ describe('a switch must not tie with the turn before it', () => {
     });
 
     expect(store.floors).toEqual([Date.parse('2026-09-19T11:59:00.000Z')]);
+  });
+});
+
+describe('/new inherits the chat it was started from', () => {
+  test('the project, the working directory and the owner come across', async () => {
+    const store = fakeStore([
+      row({ platform_conversation_id: CHAT, last_activity_at: '2026-09-20 10:00:00' }),
+      row({ platform_conversation_id: `${CHAT}:2`, last_activity_at: '2026-09-20 11:30:00' }),
+    ]);
+
+    await handleTelegramChatCommand({ command: 'new', args: [], chatId: CHAT, store });
+
+    // Started from the ACTIVE conversation — the one the operator is in.
+    expect(store.inherited).toEqual([`${CHAT}:2`]);
   });
 });

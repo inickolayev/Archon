@@ -19,11 +19,21 @@ export function createTelegramChatStore(): TelegramChatStore {
     list: (chatId: string): Promise<readonly TelegramChatRow[]> =>
       conversationDb.listConversationsForChat(TELEGRAM, chatId),
 
-    create: async (platformConversationId: string): Promise<void> => {
+    create: async (platformConversationId: string, inheritFrom?: string): Promise<void> => {
       // Eager creation (unlike the web's lazy first-send): on a phone the
       // operator needs an immediate "chat N created" to trust where the next
       // message goes. getOrCreate keeps it idempotent.
-      await conversationDb.getOrCreateConversation(TELEGRAM, platformConversationId);
+      //
+      // `inheritFrom` is the chat's current conversation: the new row takes its
+      // project, working directory, assistant and owner. Without it a chat
+      // started from the button had codebase_id and user_id NULL — invisible in
+      // the console (which lists per project) and attributed to nobody.
+      await conversationDb.getOrCreateConversation(
+        TELEGRAM,
+        platformConversationId,
+        undefined,
+        inheritFrom
+      );
     },
 
     touch: async (platformConversationId: string, notBeforeMs?: number): Promise<void> => {

@@ -28,7 +28,7 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
-import { TelegramAdapter } from './adapter';
+import { TelegramAdapter, isStructuralCategory } from './adapter';
 
 type SendMessage = Api['sendMessage'];
 
@@ -735,5 +735,43 @@ describe('TelegramAdapter', () => {
         is_persistent: true,
       });
     });
+  });
+});
+
+describe('what does not belong in a chat', () => {
+  test('a tool call is console structure, not a message to a person', () => {
+    // It arrived in Telegram as
+    //   ✏️READ  Reading: /Users/…/artifacts/uploads/…_photo-….jpg
+    // — noise on a phone, and absolute host paths posted into a chat.
+    expect(isStructuralCategory('tool_call_formatted')).toBe(true);
+    expect(isStructuralCategory('isolation_context')).toBe(true);
+  });
+
+  test('anything the agent actually says still goes through', () => {
+    expect(isStructuralCategory(undefined)).toBe(false);
+    expect(isStructuralCategory('workflow_status')).toBe(false);
+    expect(isStructuralCategory('')).toBe(false);
+  });
+
+  test('sendMessage drops them instead of posting them', async () => {
+    const adapter = new TelegramAdapter('fake-token-for-testing');
+    const sent: unknown[] = [];
+    adapter.getBot().api.sendMessage = mock(async (chatId: unknown, text: unknown) => {
+      sent.push(text);
+      return {
+        message_id: 1,
+        date: 0,
+        chat: { id: Number(chatId), type: 'private', first_name: 'Test' },
+        text: String(text),
+      };
+    }) as unknown as Api['sendMessage'];
+
+    await adapter.sendMessage('352328891', '✏️READ  Reading: /Users/someone/secret/path.jpg', {
+      category: 'tool_call_formatted',
+    });
+    expect(sent).toEqual([]);
+
+    await adapter.sendMessage('352328891', 'I read the screenshot: it shows the lobby.');
+    expect(sent).toHaveLength(1);
   });
 });
