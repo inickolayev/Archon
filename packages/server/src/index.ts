@@ -78,6 +78,7 @@ import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { DashboardEventPoller } from './adapters/web/dashboard-event-poller';
 import { PgNotifyListener } from './adapters/web/pg-notify-listener';
 import { registerApiRoutes } from './routes/api';
+import { withOutboundMirror } from './adapters/mirror';
 import { registerGithubWebhookRoute } from './routes/webhooks';
 import {
   startWorkflowContinuationScheduler,
@@ -396,6 +397,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const activePlatforms: string[] = ['Web'];
 
   // Platform adapters (skipped in CLI serve mode or when not configured)
+  // Telegram is declared here, far above where it is constructed, because the
+  // API routes need a LIVE reference to it: they are registered before the HTTP
+  // listener starts and Telegram starts after it, so a value captured at
+  // registration would always be null (same reason `activePlatforms` is a live
+  // array).
+  let telegram: TelegramAdapter | null = null;
   let github: GitHubAdapter | null = null;
   let githubAppAuthProvider: IGitHubAppAuthProvider | null = null;
   let gitea: GiteaAdapter | null = null;
@@ -733,7 +740,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }
 
   // Register Web UI API routes
-  registerApiRoutes(app, webAdapter, lockManager, activePlatforms);
+  registerApiRoutes(app, webAdapter, lockManager, activePlatforms, () => telegram);
 
   // GitHub webhook endpoint
   if (github) {
@@ -934,7 +941,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   getLog().info({ port: server.port, hostname }, 'server_listening');
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)
-  let telegram: TelegramAdapter | null = null;
   if (!opts.skipPlatformAdapters && process.env.TELEGRAM_BOT_TOKEN) {
     const streamingMode = (process.env.TELEGRAM_STREAMING_MODE ?? 'stream') as 'stream' | 'batch';
     telegram = new TelegramAdapter(process.env.TELEGRAM_BOT_TOKEN, streamingMode);
@@ -957,10 +963,31 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           getLog().error({ err, chatId }, 'telegram.active_conversation_lookup_failed');
         }
 
+        // The same conversation may be open in the browser. Mirror each reply
+        // onto its web stream so the console updates live instead of waiting
+        // for a refetch; the message rows themselves are persisted by the
+        // orchestrator, as they are for every non-web platform.
+        const deliverTo = withOutboundMirror(telegramAdapter, (text, metadata) => {
+          void webAdapter
+            .emitSSE(
+              conversationId,
+              JSON.stringify({
+                type: 'text',
+                content: text,
+                isComplete: true,
+                timestamp: Date.now(),
+                ...(metadata?.category ? { category: metadata.category } : {}),
+              })
+            )
+            .catch((err: unknown) => {
+              getLog().warn({ err, conversationId }, 'telegram.web_mirror_failed');
+            });
+        });
+
         // Fire-and-forget: handler returns immediately, processing happens async
         lockManager
           .acquireLock(conversationId, async () => {
-            await handleMessage(telegramAdapter, conversationId, message, {
+            await handleMessage(deliverTo, conversationId, message, {
               isolationHints: { workflowType: 'thread', workflowId: conversationId },
               userId,
             });

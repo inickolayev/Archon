@@ -6,6 +6,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
+import { MirrorBuffer, withOutboundMirror } from '../adapters/mirror';
 import { boundMetadataToolOutputs } from '../adapters/web/truncate';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
@@ -62,6 +63,8 @@ import {
   setUserDefault,
 } from '@archon/core';
 import type { UserTiersPatch, UserAliasesPatch, AliasesPatch } from '@archon/core';
+import { isTelegramConversationId } from '@archon/core';
+import type { IPlatformAdapter } from '@archon/core';
 import { parseWorkflowRunConfig } from '@archon/core/config';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import type { EffortLevel } from '@archon/workflows/schemas/effort';
@@ -1589,7 +1592,14 @@ export function registerApiRoutes(
   app: OpenAPIHono,
   webAdapter: WebAdapter,
   lockManager: ConversationLockManager,
-  activePlatforms?: readonly string[]
+  activePlatforms?: readonly string[],
+  /**
+   * The Telegram adapter, read at delivery time rather than captured here:
+   * routes are registered before the HTTP listener starts and Telegram starts
+   * after it, so a value taken now would always be null (same reason
+   * `activePlatforms` is a live array).
+   */
+  getTelegramAdapter?: () => IPlatformAdapter | null
 ): void {
   app.openAPIRegistry.register('DagNodeSseEvent', dagNodeSseEventSchema);
 
@@ -2316,7 +2326,11 @@ export function registerApiRoutes(
     }
 
     const archonHome = getArchonHome();
-    const uploadDir = join(archonHome, 'artifacts', 'uploads', conversationId);
+    // A Telegram conversation id carries a colon, which is not a legal path
+    // character everywhere (Windows reads it as a drive separator). The
+    // directory only has to be unique per conversation, so flatten it.
+    const uploadDirName = conversationId.replace(/[^\w.-]/g, '_');
+    const uploadDir = join(archonHome, 'artifacts', 'uploads', uploadDirName);
     if (!uploadDir.startsWith(archonHome + sep)) {
       return { ok: false, status: 400, error: 'Invalid conversation ID' };
     }
@@ -2376,18 +2390,49 @@ export function registerApiRoutes(
     return { ok: true, savedFiles, uploadDir };
   }
 
+  /**
+   * The Telegram adapter to mirror this conversation's replies to, or null when
+   * the conversation is not Telegram-born (or the bot is not running).
+   */
+  async function resolveTelegramMirror(
+    conversationId: string
+  ): Promise<{ adapter: IPlatformAdapter; buffer: MirrorBuffer } | null> {
+    const adapter = getTelegramAdapter?.() ?? null;
+    if (adapter === null || !isTelegramConversationId(conversationId)) return null;
+    try {
+      const conversation = await conversationDb.findConversationByPlatformId(conversationId);
+      if (conversation?.platform_type !== 'telegram') return null;
+    } catch (error) {
+      getLog().warn({ err: error, conversationId }, 'telegram_mirror.lookup_failed');
+      return null;
+    }
+    return { adapter, buffer: new MirrorBuffer() };
+  }
+
   async function dispatchToOrchestrator(
     conversationId: string,
     message: string,
     extraContext?: Omit<HandleMessageContext, 'isolationHints'>,
     filesToCleanup?: { files: AttachedFile[]; uploadDir: string }
   ): Promise<{ accepted: boolean; status: string }> {
+    // A conversation born in Telegram is answered in Telegram too, even when
+    // the question was typed in the browser — the person on the phone must not
+    // be left staring at their own unanswered message. The web delivery is
+    // unconditional; the mirror is best effort and only ever logged.
+    const telegramMirror = await resolveTelegramMirror(conversationId);
+
     const result = await lockManager.acquireLock(conversationId, async () => {
       // Emit lock:true at handler start so the UI knows processing has begun.
       // Fire-and-forget — if no SSE stream is connected yet, the event is buffered.
       webAdapter.emitLockEvent(conversationId, true);
       try {
-        await handleMessage(webAdapter, conversationId, message, {
+        const deliverTo =
+          telegramMirror === null
+            ? webAdapter
+            : withOutboundMirror(webAdapter, (text, metadata) => {
+                telegramMirror.buffer.capture(text, metadata);
+              });
+        await handleMessage(deliverTo, conversationId, message, {
           isolationHints: { workflowType: 'thread', workflowId: conversationId },
           ...extraContext,
         });
@@ -2407,6 +2452,21 @@ export function registerApiRoutes(
           getLog().error({ err: sseError, conversationId }, 'sse_error_emit_failed');
         }
       } finally {
+        // Flush after the turn, not per chunk: streaming sends the answer one
+        // delta at a time and a phone should get one message, not fifty.
+        if (telegramMirror !== null) {
+          for (const mirrored of telegramMirror.buffer.take()) {
+            try {
+              await telegramMirror.adapter.sendMessage(conversationId, mirrored.text);
+            } catch (mirrorError) {
+              // Never fails the web answer — it is already delivered.
+              getLog().error(
+                { err: mirrorError, conversationId },
+                'telegram_mirror.delivery_failed'
+              );
+            }
+          }
+        }
         await webAdapter.emitLockEvent(conversationId, false);
         // Clean up uploaded files AFTER handleMessage completes so the AI subprocess
         // has had a chance to read them. Doing this in the HTTP handler's finally block
@@ -2856,8 +2916,10 @@ export function registerApiRoutes(
     const userId = await resolveWebUserId(c);
 
     // Reject conversation IDs that could be used for path traversal when building
-    // the upload directory. Web conversation IDs are alphanumeric with hyphens only.
-    if (!/^[\w-]+$/.test(conversationId)) {
+    // the upload directory. Web ids are alphanumeric with hyphens; a Telegram
+    // conversation is `<chat id>:<n>`, so the colon is allowed too — no dots,
+    // no slashes, so `..` still cannot appear.
+    if (!/^[\w:-]+$/.test(conversationId)) {
       return c.json({ error: 'Invalid conversation ID' }, 400);
     }
 

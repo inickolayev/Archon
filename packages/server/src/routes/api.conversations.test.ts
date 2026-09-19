@@ -26,8 +26,23 @@ const mockResolveTitleRequest = mock(async () => ({
   provider: 'claude',
   options: {} as Record<string, unknown>,
 }));
+/**
+ * `handleMessage` is what the orchestrator would be: tests point it at a fake
+ * turn so the fan-out can be observed (it is the platform adapter handed to it
+ * that the reply travels through).
+ */
+const mockHandleMessage = mock(
+  async (
+    _platform: { sendMessage: (id: string, text: string, meta?: unknown) => Promise<void> },
+    _conversationId: string,
+    _message: string,
+    _context?: unknown
+  ) => {}
+);
 mock.module('@archon/core', () => ({
-  handleMessage: mock(async () => {}),
+  handleMessage: mockHandleMessage,
+  // Real behaviour, not a stub: the fan-out decision depends on it.
+  isTelegramConversationId: (id: string) => /^-?\d+(?::\d+)?$/.test(id),
   getDatabaseType: () => 'sqlite',
   loadConfig: mock(async () => ({})),
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
@@ -658,5 +673,168 @@ describe('PATCH /api/conversations/:id — forge platform IDs with encoded slash
       body: JSON.stringify({ title: 'New Title' }),
     });
     expect(response.status).toBe(404);
+  });
+});
+
+describe('POST /api/conversations/:id/message — fan-out to Telegram', () => {
+  const mockLockManager = {
+    acquireLock: mock(async (_convId: string, fn: () => Promise<void>) => {
+      await fn();
+      return { status: 'started' as const };
+    }),
+  } as unknown as ConversationLockManager;
+
+  const webDeliveries: string[] = [];
+  const mockWebAdapter = {
+    setConversationDbId: mock((_platformId: string, _dbId: string) => {}),
+    emitLockEvent: mock((_convId: string, _locked: boolean) => {}),
+    emitSSE: mock(async (_convId: string, _data: string) => {}),
+    sendMessage: mock(async (_convId: string, text: string) => {
+      webDeliveries.push(text);
+    }),
+  } as unknown as WebAdapter;
+
+  const telegramConv = {
+    ...MOCK_CONV,
+    platform_type: 'telegram',
+    platform_conversation_id: '123456789:2',
+  };
+
+  function makeTelegram(): {
+    adapter: { sendMessage: ReturnType<typeof mock> };
+    sent: { conversationId: string; text: string }[];
+  } {
+    const sent: { conversationId: string; text: string }[] = [];
+    const adapter = {
+      sendMessage: mock(async (conversationId: string, text: string) => {
+        sent.push({ conversationId, text });
+      }),
+      ensureThread: mock(async (id: string) => id),
+      getStreamingMode: mock(() => 'stream' as const),
+      getPlatformType: mock(() => 'telegram'),
+      start: mock(async () => {}),
+      stop: mock(() => {}),
+    };
+    return { adapter, sent };
+  }
+
+  test('a Telegram-born conversation answered from the browser also reaches the phone', async () => {
+    webDeliveries.length = 0;
+    mockFindConversationByPlatformId.mockImplementation(async () => telegramConv);
+    // A streamed answer: many chunks, one message on the phone.
+    mockHandleMessage.mockImplementationOnce(async (platform, conversationId) => {
+      await platform.sendMessage(conversationId, 'The ');
+      await platform.sendMessage(conversationId, 'answer ');
+      await platform.sendMessage(conversationId, 'is 42.');
+    });
+    const telegram = makeTelegram();
+
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(
+      app,
+      mockWebAdapter,
+      mockLockManager,
+      undefined,
+      () => telegram.adapter as never
+    );
+
+    const response = await app.request('/api/conversations/123456789:2/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'what is it?' }),
+    });
+
+    expect(response.status).toBe(200);
+    // The web got every chunk, as before.
+    expect(webDeliveries).toEqual(['The ', 'answer ', 'is 42.']);
+    // Telegram got one joined message, addressed by the conversation id.
+    expect(telegram.sent).toEqual([{ conversationId: '123456789:2', text: 'The answer is 42.' }]);
+    mockFindConversationByPlatformId.mockReset();
+  });
+
+  test('a web-born conversation is not mirrored anywhere', async () => {
+    webDeliveries.length = 0;
+    mockFindConversationByPlatformId.mockImplementation(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async (platform, conversationId) => {
+      await platform.sendMessage(conversationId, 'browser-only answer');
+    });
+    const telegram = makeTelegram();
+
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(
+      app,
+      mockWebAdapter,
+      mockLockManager,
+      undefined,
+      () => telegram.adapter as never
+    );
+
+    await app.request('/api/conversations/web-test-abc/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hello' }),
+    });
+
+    expect(webDeliveries).toEqual(['browser-only answer']);
+    expect(telegram.sent).toEqual([]);
+    mockFindConversationByPlatformId.mockReset();
+  });
+
+  test('a failing Telegram delivery still leaves the browser answered', async () => {
+    webDeliveries.length = 0;
+    mockFindConversationByPlatformId.mockImplementation(async () => telegramConv);
+    mockHandleMessage.mockImplementationOnce(async (platform, conversationId) => {
+      await platform.sendMessage(conversationId, 'answer');
+    });
+    const telegram = makeTelegram();
+    telegram.adapter.sendMessage = mock(async () => {
+      throw new Error('Telegram is down');
+    });
+
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(
+      app,
+      mockWebAdapter,
+      mockLockManager,
+      undefined,
+      () => telegram.adapter as never
+    );
+
+    const response = await app.request('/api/conversations/123456789:2/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'what is it?' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(webDeliveries).toEqual(['answer']);
+    mockFindConversationByPlatformId.mockReset();
+  });
+
+  test('accepts a Telegram conversation id (the colon used to be rejected)', async () => {
+    mockFindConversationByPlatformId.mockImplementation(async () => telegramConv);
+    mockHandleMessage.mockImplementationOnce(async () => {});
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(app, mockWebAdapter, mockLockManager);
+
+    const response = await app.request('/api/conversations/123456789:2/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hi' }),
+    });
+    expect(response.status).toBe(200);
+    mockFindConversationByPlatformId.mockReset();
+  });
+
+  test('still rejects an id that could escape the upload directory', async () => {
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(app, mockWebAdapter, mockLockManager);
+
+    const response = await app.request('/api/conversations/..%2Fetc/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hi' }),
+    });
+    expect(response.status).toBe(400);
   });
 });
