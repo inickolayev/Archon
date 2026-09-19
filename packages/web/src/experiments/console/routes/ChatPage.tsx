@@ -126,19 +126,40 @@ export function ChatPage(): ReactElement {
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settleSigRef = useRef('');
 
-  // SSE accelerator: invalidates the message cache on text/tool events, and via
-  // onLockChange clears `busy` the instant the server releases the conversation
-  // lock (conversation_lock:false) instead of waiting out SETTLE_MS. Must be
-  // useCallback-stable — the hook's effect depends on it, so an inline lambda
-  // would reconnect the EventSource on every render.
-  const onLockChange = useCallback((locked: boolean): void => {
-    if (locked) return;
+  // Read inside callbacks that must not re-subscribe the SSE stream on every
+  // conversation switch (see onLockChange below).
+  const activeConvIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeConvIdRef.current = activeConvId;
+  }, [activeConvId]);
+
+  // End of a turn, from either detector. The refetch matters: the recovery poll
+  // stops the moment `busy` clears, and the lock can be released a beat after
+  // the reply row is written — a poll that raced ahead of that write would
+  // otherwise leave the answer invisible until a reload (seen on the first turn
+  // of a freshly created chat).
+  const finishTurn = useCallback((): void => {
     if (settleTimerRef.current !== null) {
       clearTimeout(settleTimerRef.current);
       settleTimerRef.current = null;
     }
     setBusy(false);
+    const id = activeConvIdRef.current;
+    if (id !== null) invalidate(K.messages(id));
   }, []);
+
+  // SSE accelerator: invalidates the message cache on text/tool events, and via
+  // onLockChange ends the turn the instant the server releases the conversation
+  // lock (conversation_lock:false) instead of waiting out SETTLE_MS. Must be
+  // useCallback-stable — the hook's effect depends on it, so an inline lambda
+  // would reconnect the EventSource on every render.
+  const onLockChange = useCallback(
+    (locked: boolean): void => {
+      if (locked) return;
+      finishTurn();
+    },
+    [finishTurn]
+  );
   useConversationSSE(activeConvId, onLockChange);
 
   // Derive turn state from the trailing message: a user message means a reply
@@ -165,9 +186,9 @@ export function ChatPage(): ReactElement {
     settleSigRef.current = sig;
     if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
     settleTimerRef.current = setTimeout(() => {
-      setBusy(false);
+      finishTurn();
     }, SETTLE_MS);
-  }, [messages]);
+  }, [messages, finishTurn]);
   useEffect(
     () => (): void => {
       if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
