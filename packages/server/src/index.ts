@@ -107,6 +107,7 @@ import {
   getDecryptedAccessToken,
   type GitHubAuth,
   type IGitHubAppAuthProvider,
+  resolveActiveTelegramConversationId,
 } from '@archon/core';
 import type { IPlatformAdapter } from '@archon/core';
 import type { IdentityPlatform } from '@archon/core';
@@ -941,9 +942,20 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     // Register message handler (auth is handled internally by adapter)
     telegramAdapter.onMessage(
-      async ({ conversationId, message, userId: telegramUserId, displayName }) => {
+      async ({ conversationId: chatId, message, userId: telegramUserId, displayName }) => {
         // Resolve Telegram user id (numeric) → Archon user UUID.
         const userId = await resolveUserId('telegram', telegramUserId, displayName);
+
+        // A Telegram chat holds many conversations (`<chat id>:<n>`); the
+        // message belongs to the most recently active one. A lookup failure
+        // falls back to the chat's first, legacy-shaped conversation rather
+        // than dropping the message.
+        let conversationId = chatId;
+        try {
+          conversationId = await resolveActiveTelegramConversationId(chatId);
+        } catch (err) {
+          getLog().error({ err, chatId }, 'telegram.active_conversation_lookup_failed');
+        }
 
         // Fire-and-forget: handler returns immediately, processing happens async
         lockManager

@@ -102,6 +102,35 @@ export {
 } from './orchestrator/prompt-builder';
 
 // =============================================================================
+// Conversations (Telegram: many conversations per chat)
+// =============================================================================
+export {
+  isTelegramConversationId,
+  parseTelegramConversationId,
+  telegramChatIdOf,
+  telegramConversationId,
+  type TelegramConversationId,
+} from './conversations/telegram-conversation-id';
+export {
+  TELEGRAM_CHAT_COMMANDS,
+  activeConversationId,
+  formatAgo,
+  formatChatList,
+  handleTelegramChatCommand,
+  isTelegramChatCommand,
+  nextConversationId,
+  numberConversations,
+  type NumberedConversation,
+  type TelegramChatCommand,
+  type TelegramChatRow,
+  type TelegramChatStore,
+} from './conversations/telegram-chats';
+export {
+  createTelegramChatStore,
+  resolveActiveTelegramConversationId,
+} from './conversations/telegram-chat-store';
+
+// =============================================================================
 // Handlers
 // =============================================================================
 export { handleCommand, parseCommand } from './handlers/command-handler';

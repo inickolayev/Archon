@@ -22,6 +22,9 @@ import * as db from '../db/conversations';
 import * as codebaseDb from '../db/codebases';
 import * as sessionDb from '../db/sessions';
 import * as commandHandler from '../handlers/command-handler';
+import { handleTelegramChatCommand, isTelegramChatCommand } from '../conversations/telegram-chats';
+import { createTelegramChatStore } from '../conversations/telegram-chat-store';
+import { parseTelegramConversationId } from '../conversations/telegram-conversation-id';
 import { formatToolCall } from '@archon/workflows/utils/tool-formatter';
 import { classifyAndFormatError } from '../utils/error-formatter';
 import { toError } from '../utils/error';
@@ -2004,7 +2007,26 @@ export async function handleMessage(
 
     // 2. Check for deterministic commands
     if (trimmedMessage.startsWith('/')) {
-      const { command } = commandHandler.parseCommand(message);
+      const { command, args } = commandHandler.parseCommand(message);
+
+      // Telegram-only chat management: a Telegram chat holds many conversations
+      // (`<chat id>:<n>`), and these are how the operator moves between them
+      // from a phone. The web console has its own UI for the same thing.
+      if (platform.getPlatformType() === 'telegram' && isTelegramChatCommand(command)) {
+        const parsed = parseTelegramConversationId(conversationId);
+        if (parsed !== null) {
+          getLog().debug({ command, conversationId }, 'telegram_chat_command');
+          const reply = await handleTelegramChatCommand({
+            command,
+            args,
+            chatId: String(parsed.chatId),
+            store: createTelegramChatStore(),
+          });
+          await platform.sendMessage(conversationId, reply);
+          return;
+        }
+      }
+
       const deterministicCommands = [
         'help',
         'status',

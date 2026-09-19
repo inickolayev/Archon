@@ -3,7 +3,7 @@
  * Handles message sending with 4096 character limit splitting
  */
 import { Bot, Context } from 'grammy';
-import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
+import { telegramChatIdOf, type IPlatformAdapter, type MessageMetadata } from '@archon/core';
 import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
 import { convertToTelegramMarkdown, stripMarkdown } from './markdown';
@@ -55,9 +55,19 @@ export class TelegramAdapter implements IPlatformAdapter {
    * - Long messages: Split by paragraphs, format each chunk independently
    *   (paragraphs rarely have formatting that spans across them)
    */
-  async sendMessage(chatId: string, message: string, _metadata?: MessageMetadata): Promise<void> {
-    const id = parseInt(chatId);
-    getLog().debug({ chatId, messageLength: message.length }, 'telegram.send_message');
+  async sendMessage(
+    conversationId: string,
+    message: string,
+    _metadata?: MessageMetadata
+  ): Promise<void> {
+    // A conversation id is `<chat id>[:<n>]` — many Archon conversations share
+    // one Telegram chat. Parse the chat id out explicitly rather than leaning on
+    // `parseInt` stopping at the colon by accident.
+    const id = telegramChatIdOf(conversationId);
+    getLog().debug(
+      { conversationId, chatId: id, messageLength: message.length },
+      'telegram.send_message'
+    );
 
     if (message.length <= MAX_LENGTH) {
       // Short message: try MarkdownV2 formatting

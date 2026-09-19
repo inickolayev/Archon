@@ -1240,7 +1240,19 @@ export async function handleCommand(
   const { command, args } = parseCommand(message);
 
   switch (command) {
-    case 'help':
+    case 'help': {
+      // Telegram holds many conversations per chat; those commands only exist
+      // there, so only that platform's help mentions them.
+      const telegramSection =
+        conversation.platform_type === 'telegram'
+          ? `
+
+**Chats in this Telegram chat**
+- \`/chats\` — List this chat's conversations
+- \`/new\` — Start a new conversation here
+- \`/switch <n>\` — Continue conversation <n>
+- \`/projects\` — List registered projects`
+          : '';
       return {
         success: true,
         message: `## Archon Orchestrator
@@ -1274,13 +1286,14 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
 **Session**
 - \`/status\` — Show current session and project info
 - \`/reset\` — Clear conversation and start fresh
-- \`/help\` — Show this help message
+- \`/help\` — Show this help message${telegramSection}
 
 ### Tips
 - You don't need to select a project first — just describe what you want
 - The orchestrator knows all your registered projects and available workflows
 - For project setup, ask the orchestrator: "How do I add a new project?"`,
       };
+    }
 
     case 'status': {
       let msg = `## Orchestrator Status\n\n**Platform**: ${conversation.platform_type}\n**AI Assistant**: ${conversation.ai_assistant_type}`;

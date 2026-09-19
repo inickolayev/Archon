@@ -259,6 +259,47 @@ export async function listConversations(
 }
 
 /**
+ * Every conversation of one chat of a platform — the rows addressed as
+ * `<chat id>` (legacy) or `<chat id>:<n>`. Used by the Telegram front end,
+ * where a chat holds many conversations and the most recently active one is
+ * the one a new message belongs to.
+ *
+ * The chat id is matched exactly or as a `<chat id>:` prefix, so chat 123 can
+ * never pick up chat 1234's rows.
+ */
+export async function listConversationsForChat(
+  platformType: string,
+  chatId: string
+): Promise<readonly Conversation[]> {
+  const result = await pool.query<Conversation>(
+    `SELECT * FROM remote_agent_conversations
+      WHERE platform_type = $1
+        AND (platform_conversation_id = $2 OR platform_conversation_id LIKE $3)
+        AND deleted_at IS NULL
+      ORDER BY last_activity_at DESC NULLS LAST`,
+    [platformType, chatId, `${chatId}:%`]
+  );
+  return result.rows;
+}
+
+/**
+ * Make a conversation the most recently active one of its chat — this is what
+ * a Telegram `/switch` does, and there is no "active" column to set.
+ *
+ * `updated_at` is bumped alongside `last_activity_at` on purpose: SQLite's
+ * `datetime('now')` has one-second granularity, so a switch made in the same
+ * second as the previous turn would tie with it; `updated_at` breaks that tie
+ * in favour of the switch, which is the newer intent.
+ */
+export async function markConversationActive(id: string): Promise<void> {
+  const dialect = getDialect();
+  await pool.query(
+    `UPDATE remote_agent_conversations SET last_activity_at = ${dialect.now()}, updated_at = ${dialect.now()} WHERE id = $1`,
+    [id]
+  );
+}
+
+/**
  * Update last_activity_at for staleness tracking
  */
 export async function touchConversation(id: string): Promise<void> {
