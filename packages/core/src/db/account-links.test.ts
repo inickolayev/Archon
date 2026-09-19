@@ -151,6 +151,13 @@ describe('listIdentitiesForUser', () => {
 });
 
 describe('listDirectoryUsers', () => {
+  test('asks the web account for the name, so a profile edit is what shows', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+    await listDirectoryUsers();
+    const sql = statements()[0] ?? '';
+    expect(sql).toContain("COALESCE(NULLIF(TRIM(a.name), ''), u.display_name)");
+  });
+
   test('carries the email of the web account behind a user, and null when there is none', async () => {
     mockQuery.mockResolvedValueOnce(
       createQueryResult([

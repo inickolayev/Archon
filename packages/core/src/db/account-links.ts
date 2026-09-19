@@ -174,8 +174,12 @@ export async function listDirectoryUsers(): Promise<DirectoryUser[]> {
     display_name: string | null;
     email: string | null;
   }>(
+    // The web account's own name wins when there is one: Profile edits that
+    // name (Better Auth owns it), and a label that kept showing the display
+    // name captured at sign-up would quietly disagree with the profile the
+    // operator just changed.
     `SELECT u.id,
-            u.display_name,
+            COALESCE(NULLIF(TRIM(a.name), ''), u.display_name) AS display_name,
             a.email
        FROM remote_agent_users u
        LEFT JOIN remote_agent_user_identities i
