@@ -145,7 +145,22 @@
   }
 }
 
-/* Base body styling */
+/* Base body styling.
+ *
+ * `html` is painted as well as `body`: anything the body does not cover — the
+ * rubber-band area of an overscroll, the canvas below a short page, a
+ * full-page screenshot — otherwise falls back to the browser's default canvas
+ * colour and shows up as lighter bands above and below the content.
+ *
+ * `color-scheme: dark` tells the browser the page is dark, so the canvas it
+ * paints, the scrollbars and native form controls agree with the theme instead
+ * of being drawn light. Scrolling itself is left alone — only the colour is
+ * fixed here, not the behaviour. */
+html {
+  background-color: var(--background);
+  color-scheme: dark;
+}
+
 body {
   background-color: var(--background);
   color: var(--text-primary);
