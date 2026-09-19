@@ -369,4 +369,74 @@ describe('TelegramAdapter', () => {
       expect(mockStart).toHaveBeenCalledTimes(1);
     });
   });
+  describe('inbound handler (fake grammY context)', () => {
+    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
+    afterAll(() => {
+      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
+    });
+
+    /** Start the adapter with polling stubbed out and capture its message handler. */
+    async function handlerOf(adapter: TelegramAdapter): Promise<(ctx: unknown) => void> {
+      let captured: ((ctx: unknown) => void) | null = null;
+      const bot = adapter.getBot() as unknown as {
+        on: (event: string, fn: (ctx: unknown) => void) => void;
+        start: (opts?: { onStart?: () => void }) => Promise<void>;
+      };
+      bot.on = (_event, fn) => {
+        captured = fn;
+      };
+      bot.start = async opts => {
+        opts?.onStart?.();
+        await new Promise(() => undefined);
+      };
+      await adapter.start({ retryDelayMs: 0 });
+      if (captured === null) throw new Error('handler was never registered');
+      return captured;
+    }
+
+    const ctxFrom = (chatId: number, userId: number, text: string): unknown => ({
+      chat: { id: chatId },
+      from: { id: userId, first_name: 'Ada', last_name: 'Lovelace' },
+      message: { text },
+    });
+
+    test('passes the chat id and sender on to the message handler', async () => {
+      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const received: { conversationId: string; message: string; displayName?: string }[] = [];
+      adapter.onMessage(async ctx => {
+        received.push({
+          conversationId: ctx.conversationId,
+          message: ctx.message,
+          displayName: ctx.displayName,
+        });
+      });
+
+      const handler = await handlerOf(adapter);
+      handler(ctxFrom(-1001234567890, 4242, '/chats'));
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      // The adapter hands over the CHAT id; the server resolves which of that
+      // chat's conversations the message belongs to.
+      expect(received).toEqual([
+        { conversationId: '-1001234567890', message: '/chats', displayName: 'Ada Lovelace' },
+      ]);
+    });
+
+    test('a sender outside the whitelist is dropped silently', async () => {
+      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const received: string[] = [];
+      adapter.onMessage(async ctx => {
+        received.push(ctx.message);
+      });
+
+      const handler = await handlerOf(adapter);
+      handler(ctxFrom(999, 777_000_111, 'let me in'));
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(received).toEqual([]);
+    });
+  });
 });
