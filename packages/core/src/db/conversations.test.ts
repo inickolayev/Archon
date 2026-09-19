@@ -16,6 +16,7 @@ mock.module('./connection', () => ({
 }));
 
 import {
+  formatSqliteTimestamp,
   getOrAdoptConversation,
   getOrCreateConversation,
   listConversationsForChat,
@@ -518,6 +519,39 @@ describe('markConversationActive', () => {
     const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain('last_activity_at =');
     expect(sql).toContain('updated_at =');
-    expect(params).toEqual(['conv-1']);
+    expect(params[0]).toBe('conv-1');
+  });
+
+  test('lands strictly after the newest sibling, even inside one millisecond', async () => {
+    // Whole-second timestamps (SQLite's datetime('now')) made a switch tie with
+    // the turn that preceded it; the floor is what makes the switch win.
+    const future = Date.now() + 60_000;
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+    await markConversationActive('conv-1', future);
+
+    const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    const written = params[1];
+    if (typeof written !== 'string') {
+      // Postgres path: now() has microseconds, no floor parameter is needed.
+      expect(params).toEqual(['conv-1']);
+      return;
+    }
+    expect(Date.parse(`${written.replace(' ', 'T')}Z`)).toBeGreaterThan(future);
+  });
+});
+
+describe('formatSqliteTimestamp', () => {
+  test("keeps SQLite's own shape, with milliseconds", () => {
+    expect(formatSqliteTimestamp(Date.parse('2026-09-19T18:27:45.030Z'))).toBe(
+      '2026-09-19 18:27:45.030'
+    );
+  });
+
+  test('sorts correctly against a whole-second value of the same second', () => {
+    const second = '2026-09-19 18:27:45';
+    const precise = formatSqliteTimestamp(Date.parse('2026-09-19T18:27:45.030Z'));
+    expect(precise > second).toBe(true);
+    expect(precise < '2026-09-19 18:27:46').toBe(true);
   });
 });

@@ -58,8 +58,12 @@ export interface TelegramChatStore {
   list(chatId: string): Promise<readonly TelegramChatRow[]>;
   /** Create the conversation row for this platform id (idempotent). */
   create(platformConversationId: string): Promise<void>;
-  /** Bump `last_activity_at` — this is what makes a conversation the active one. */
-  touch(platformConversationId: string): Promise<void>;
+  /**
+   * Bump `last_activity_at` — this is what makes a conversation the active one.
+   * `notBeforeMs` is the newest activity among the chat's other conversations,
+   * so the write can land strictly after it instead of tying with it.
+   */
+  touch(platformConversationId: string, notBeforeMs?: number): Promise<void>;
   /** Registered projects, for `/projects`. */
   listProjects(): Promise<readonly { name: string; default_cwd: string | null }[]>;
 }
@@ -179,6 +183,11 @@ export function formatChatList(
   return [...lines, '', '/switch <n> to change, /new for a new chat'].join('\n');
 }
 
+/** The newest activity in a chat, as epoch ms (0 when nothing has any). */
+function newestActivityMs(conversations: readonly NumberedConversation[]): number {
+  return conversations.reduce((max, c) => Math.max(max, toMs(c.lastActivityAt)), 0);
+}
+
 /** The commands this module owns. Telegram only — the web has its own UI. */
 export const TELEGRAM_CHAT_COMMANDS = ['new', 'chats', 'switch', 'projects'] as const;
 export type TelegramChatCommand = (typeof TELEGRAM_CHAT_COMMANDS)[number];
@@ -225,7 +234,7 @@ export async function handleTelegramChatCommand(input: TelegramChatCommandInput)
     // Created eagerly (unlike the web's lazy creation): on a phone the operator
     // needs an immediate confirmation that the next message lands somewhere new.
     await store.create(id);
-    await store.touch(id);
+    await store.touch(id, newestActivityMs(numberConversations(rows, chatId)));
     return `Chat ${String(index)} created and active. /chats to list.`;
   }
 
@@ -245,7 +254,8 @@ export async function handleTelegramChatCommand(input: TelegramChatCommandInput)
   if (target.active) {
     return `Already on chat ${String(target.index)} (${label(target)}).`;
   }
-  // Touching is the switch: the active conversation is the most recently active one.
-  await store.touch(target.id);
+  // Touching is the switch: the active conversation is the most recently active
+  // one, so the write has to land strictly after every sibling.
+  await store.touch(target.id, newestActivityMs(conversations));
   return `Switched to chat ${String(target.index)}: ${label(target)}.`;
 }

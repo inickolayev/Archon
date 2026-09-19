@@ -26,13 +26,13 @@ export function createTelegramChatStore(): TelegramChatStore {
       await conversationDb.getOrCreateConversation(TELEGRAM, platformConversationId);
     },
 
-    touch: async (platformConversationId: string): Promise<void> => {
+    touch: async (platformConversationId: string, notBeforeMs?: number): Promise<void> => {
       const conversation = await conversationDb.getConversationByPlatformId(
         TELEGRAM,
         platformConversationId
       );
       if (conversation === null) return;
-      await conversationDb.markConversationActive(conversation.id);
+      await conversationDb.markConversationActive(conversation.id, notBeforeMs);
     },
 
     listProjects: async (): Promise<readonly { name: string; default_cwd: string | null }[]> => {

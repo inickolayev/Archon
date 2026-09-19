@@ -177,12 +177,14 @@ describe('formatChatList', () => {
 function fakeStore(initial: TelegramChatRow[]): TelegramChatStore & {
   created: string[];
   touched: string[];
+  floors: (number | undefined)[];
   rows: TelegramChatRow[];
 } {
   const state = {
     rows: [...initial],
     created: [] as string[],
     touched: [] as string[],
+    floors: [] as (number | undefined)[],
     list: async (): Promise<readonly TelegramChatRow[]> => state.rows,
     create: async (id: string): Promise<void> => {
       state.created.push(id);
@@ -190,8 +192,9 @@ function fakeStore(initial: TelegramChatRow[]): TelegramChatStore & {
         state.rows.push(row({ platform_conversation_id: id }));
       }
     },
-    touch: async (id: string): Promise<void> => {
+    touch: async (id: string, notBeforeMs?: number): Promise<void> => {
       state.touched.push(id);
+      state.floors.push(notBeforeMs);
       state.rows = state.rows.map(r =>
         r.platform_conversation_id === id
           ? { ...r, last_activity_at: '2026-09-19 12:00:00', updated_at: '2026-09-19 12:00:00' }
@@ -354,5 +357,50 @@ describe('handleTelegramChatCommand', () => {
     });
     expect(reply).toContain('No projects registered');
     expect(reply).toContain('/register-project');
+  });
+});
+
+describe('a switch must not tie with the turn before it', () => {
+  test('/switch tells the store to land strictly after the newest sibling', async () => {
+    const store = fakeStore([
+      row({
+        platform_conversation_id: CHAT,
+        title: 'First',
+        last_activity_at: '2026-09-19 11:00:00',
+      }),
+      row({
+        platform_conversation_id: `${CHAT}:2`,
+        title: 'Second',
+        last_activity_at: '2026-09-19 11:59:00',
+      }),
+    ]);
+
+    await handleTelegramChatCommand({
+      command: 'switch',
+      args: ['1'],
+      chatId: CHAT,
+      store,
+      now: NOW,
+    });
+
+    // The floor is the newest activity in the chat — the row being switched
+    // away from — so a whole-second clock cannot produce a tie.
+    expect(store.floors).toEqual([Date.parse('2026-09-19T11:59:00.000Z')]);
+  });
+
+  test('/new does the same for the conversation it creates', async () => {
+    const store = fakeStore([
+      row({ platform_conversation_id: CHAT, last_activity_at: '2026-09-19 11:59:00' }),
+    ]);
+
+    await handleTelegramChatCommand({
+      command: 'new',
+      args: [],
+      chatId: CHAT,
+      store,
+      now: NOW,
+    });
+
+    expect(store.floors).toEqual([Date.parse('2026-09-19T11:59:00.000Z')]);
   });
 });

@@ -1,7 +1,7 @@
 /**
  * Database operations for conversations
  */
-import { pool, getDialect } from './connection';
+import { pool, getDatabaseType, getDialect } from './connection';
 import type { Conversation } from '../types';
 import { ConversationNotFoundError } from '../types';
 import { createLogger } from '@archon/paths';
@@ -330,15 +330,37 @@ export async function listConversationsForChat(
 }
 
 /**
+ * `YYYY-MM-DD HH:MM:SS.mmm` in UTC — the shape SQLite's `datetime('now')`
+ * writes, plus milliseconds, so the two compare correctly both in SQL and
+ * after parsing.
+ */
+export function formatSqliteTimestamp(ms: number): string {
+  return new Date(ms).toISOString().replace('T', ' ').replace('Z', '');
+}
+
+/**
  * Make a conversation the most recently active one of its chat — this is what
  * a Telegram `/switch` does, and there is no "active" column to set.
  *
- * `updated_at` is bumped alongside `last_activity_at` on purpose: SQLite's
- * `datetime('now')` has one-second granularity, so a switch made in the same
- * second as the previous turn would tie with it; `updated_at` breaks that tie
- * in favour of the switch, which is the newer intent.
+ * `notBeforeMs` is the newest activity among the chat's other conversations:
+ * the write lands strictly after it, so a switch is never a tie it could lose.
+ * That matters because SQLite's `datetime('now')` resolves to whole seconds —
+ * a switch made in the same second as the previous turn silently did nothing —
+ * and two writes can share a millisecond anyway. Postgres keeps using `now()`
+ * (microseconds, and a foreign timestamp string would carry timezone risk).
+ *
+ * `updated_at` moves with `last_activity_at`: the pair is what breaks a tie for
+ * readers that only see whole seconds.
  */
-export async function markConversationActive(id: string): Promise<void> {
+export async function markConversationActive(id: string, notBeforeMs?: number): Promise<void> {
+  if (getDatabaseType() === 'sqlite') {
+    const at = formatSqliteTimestamp(Math.max(Date.now(), (notBeforeMs ?? 0) + 1));
+    await pool.query(
+      'UPDATE remote_agent_conversations SET last_activity_at = $2, updated_at = $2 WHERE id = $1',
+      [id, at]
+    );
+    return;
+  }
   const dialect = getDialect();
   await pool.query(
     `UPDATE remote_agent_conversations SET last_activity_at = ${dialect.now()}, updated_at = ${dialect.now()} WHERE id = $1`,
