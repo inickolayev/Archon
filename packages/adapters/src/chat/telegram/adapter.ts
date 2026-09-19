@@ -38,7 +38,9 @@ export class TelegramAdapter implements IPlatformAdapter {
     if (this.allowedUserIds.length > 0) {
       getLog().info({ userCount: this.allowedUserIds.length }, 'telegram.whitelist_enabled');
     } else {
-      getLog().info('telegram.whitelist_disabled');
+      // Not fatal here — `start()` is what refuses, so constructing an adapter
+      // (tests, tooling) stays possible.
+      getLog().warn('telegram.whitelist_missing');
     }
 
     getLog().info({ mode }, 'telegram.adapter_initialized');
@@ -167,6 +169,20 @@ export class TelegramAdapter implements IPlatformAdapter {
    * Makes up to 3 attempts on 409 Conflict (stale getUpdates connection).
    */
   async start(options?: { retryDelayMs?: number }): Promise<void> {
+    // An unconfigured whitelist is refused, not treated as open access: this bot
+    // reaches an agent that can write to a real checkout, so "anyone who finds
+    // the bot" is never an acceptable audience. Upstream's default is the
+    // opposite; see docs/adr/0001-telegram-as-second-front-end.md in the Factory.
+    if (this.allowedUserIds.length === 0) {
+      getLog().error(
+        { envVar: 'TELEGRAM_ALLOWED_USER_IDS' },
+        'telegram.refusing_to_start_open_bot'
+      );
+      throw new Error(
+        'Refusing to start the Telegram bot: TELEGRAM_ALLOWED_USER_IDS is empty, which would let any Telegram user drive an agent with write access. Set it to the comma-separated numeric ids allowed to use this bot.'
+      );
+    }
+
     // Register message handler before launch
     this.bot.on('message:text', ctx => {
       const message = ctx.message.text;

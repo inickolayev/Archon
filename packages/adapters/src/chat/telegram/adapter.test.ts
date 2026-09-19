@@ -5,7 +5,7 @@
  * Mocking internal modules with mock.module() causes test isolation issues
  * since the mock persists across test files.
  */
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 import type { Mock } from 'bun:test';
 import type { Api } from 'grammy';
 
@@ -242,6 +242,17 @@ describe('TelegramAdapter', () => {
   });
 
   describe('start()', () => {
+    // Every start() case needs a whitelist: this fork refuses to launch an open
+    // bot (see the 'refuses an open bot' block at the end).
+    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
+    beforeEach(() => {
+      process.env.TELEGRAM_ALLOWED_USER_IDS = '111';
+    });
+    afterAll(() => {
+      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
+    });
+
     beforeEach(() => {
       mockLogger.warn.mockClear();
       mockLogger.info.mockClear();
@@ -314,6 +325,48 @@ describe('TelegramAdapter', () => {
 
       await expect(adapter.start({ retryDelayMs: 0 })).rejects.toThrow('409');
       expect(mockStart).toHaveBeenCalledTimes(3);
+    });
+  });
+  describe('refuses an open bot', () => {
+    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
+    afterAll(() => {
+      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
+    });
+
+    test('start() refuses when the whitelist is empty, and never polls', async () => {
+      delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+      delete process.env.TELEGRAM_ALLOWED_USERS;
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const mockStart = mock<
+        (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
+      >(async () => undefined);
+      (adapter.getBot() as unknown as { start: typeof mockStart }).start = mockStart;
+
+      await expect(adapter.start({ retryDelayMs: 0 })).rejects.toThrow(
+        /TELEGRAM_ALLOWED_USER_IDS is empty/
+      );
+      // The reason is logged, and no polling was attempted.
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ envVar: 'TELEGRAM_ALLOWED_USER_IDS' }),
+        'telegram.refusing_to_start_open_bot'
+      );
+      expect(mockStart).not.toHaveBeenCalled();
+    });
+
+    test('start() proceeds when the whitelist names someone', async () => {
+      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const mockStart = mock<
+        (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
+      >().mockImplementationOnce(opts => {
+        opts?.onStart?.();
+        return new Promise(() => {});
+      });
+      (adapter.getBot() as unknown as { start: typeof mockStart }).start = mockStart;
+
+      await adapter.start({ retryDelayMs: 0 });
+      expect(mockStart).toHaveBeenCalledTimes(1);
     });
   });
 });

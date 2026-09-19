@@ -49,13 +49,16 @@ describe('telegram-auth', () => {
   });
 
   describe('isUserAuthorized', () => {
-    describe('open access mode (empty allowedIds)', () => {
-      test('should allow any user ID when no whitelist', () => {
-        expect(isUserAuthorized(123456, [])).toBe(true);
+    // This fork inverts upstream's "empty list = open access": the bot reaches an
+    // agent with write access to a real checkout, so an unconfigured whitelist
+    // must authorize nobody.
+    describe('no whitelist configured (empty allowedIds)', () => {
+      test('should reject any user ID when no whitelist', () => {
+        expect(isUserAuthorized(123456, [])).toBe(false);
       });
 
-      test('should allow undefined user ID when no whitelist', () => {
-        expect(isUserAuthorized(undefined, [])).toBe(true);
+      test('should reject undefined user ID when no whitelist', () => {
+        expect(isUserAuthorized(undefined, [])).toBe(false);
       });
     });
 
