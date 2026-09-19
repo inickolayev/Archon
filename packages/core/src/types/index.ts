@@ -108,6 +108,11 @@ export interface CommandResult {
  * Allows supporting multiple platforms (Telegram, Slack, GitHub, etc.)
  */
 export interface MessageMetadata {
+  /**
+   * Buttons the platform may render with this message. Telegram turns them
+   * into inline/reply keyboards; adapters without buttons ignore the field.
+   */
+  keyboard?: import('../conversations/telegram-menu').MenuKeyboard;
   category?:
     | 'tool_call_formatted'
     | 'workflow_status'

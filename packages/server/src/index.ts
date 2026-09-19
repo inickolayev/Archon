@@ -111,6 +111,10 @@ import {
   type GitHubAuth,
   type IGitHubAppAuthProvider,
   resolveActiveTelegramConversationId,
+  commandForLabel,
+  createTelegramChatStore,
+  handleTelegramCallback,
+  setProjectForConversation,
 } from '@archon/core';
 import type { AttachedFile, IPlatformAdapter } from '@archon/core';
 import type { IdentityPlatform } from '@archon/core';
@@ -948,9 +952,33 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     telegram = new TelegramAdapter(process.env.TELEGRAM_BOT_TOKEN, streamingMode);
     const telegramAdapter = telegram; // Capture for use in callback
 
+    // A tapped button on the persistent keyboard arrives as ordinary text, and
+    // the lists it opens are edited in place rather than re-sent.
+    telegramAdapter.onCallback(async ({ data, chatId }) => {
+      const store = createTelegramChatStore();
+      return handleTelegramCallback({
+        data,
+        chatId,
+        store,
+        bindProject: async projectName => {
+          const conversationId = await resolveActiveTelegramConversationId(chatId);
+          return setProjectForConversation(conversationId, projectName);
+        },
+      });
+    });
+
     // Register message handler (auth is handled internally by adapter)
     telegramAdapter.onMessage(
-      async ({ conversationId: chatId, message, userId: telegramUserId, displayName, files }) => {
+      async ({
+        conversationId: chatId,
+        message: rawMessage,
+        userId: telegramUserId,
+        displayName,
+        files,
+      }) => {
+        // A tap on the persistent keyboard is a plain message carrying the
+        // button's label; translate it back into the command it stands for.
+        const message = commandForLabel(rawMessage) ?? rawMessage;
         // Resolve Telegram user id (numeric) → Archon user UUID.
         const userId = await resolveUserId('telegram', telegramUserId, displayName);
 

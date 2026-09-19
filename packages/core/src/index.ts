@@ -93,7 +93,11 @@ export * as isolationOperations from './operations/isolation-operations';
 // =============================================================================
 // Orchestrator
 // =============================================================================
-export { handleMessage, resolveTitleRequest } from './orchestrator/orchestrator-agent';
+export {
+  handleMessage,
+  resolveTitleRequest,
+  setProjectForConversation,
+} from './orchestrator/orchestrator-agent';
 export type { TitleRequest } from './orchestrator/orchestrator-agent';
 export {
   buildOrchestratorPrompt,
@@ -129,6 +133,28 @@ export {
   createTelegramChatStore,
   resolveActiveTelegramConversationId,
 } from './conversations/telegram-chat-store';
+export {
+  ADVERTISED_COMMANDS,
+  MAIN_KEYBOARD,
+  PAGE_SIZE,
+  buildChatsKeyboard,
+  buildMainMenu,
+  buildProjectsKeyboard,
+  clampPage,
+  commandForLabel,
+  pageCount,
+  pageOf,
+  encodeAction,
+  handleTelegramCallback,
+  handleTelegramMenuCommand,
+  isMenuCommand,
+  parseAction,
+  type CallbackAction,
+  type MenuButton,
+  type MenuKeyboard,
+  type TelegramCallbackReply,
+  type TelegramCommandReply,
+} from './conversations/telegram-menu';
 
 // =============================================================================
 // Handlers

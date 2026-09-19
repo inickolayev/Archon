@@ -23,6 +23,7 @@ import * as codebaseDb from '../db/codebases';
 import * as sessionDb from '../db/sessions';
 import * as commandHandler from '../handlers/command-handler';
 import { handleTelegramChatCommand, isTelegramChatCommand } from '../conversations/telegram-chats';
+import { handleTelegramMenuCommand, isMenuCommand } from '../conversations/telegram-menu';
 import { createTelegramChatStore } from '../conversations/telegram-chat-store';
 import { parseTelegramConversationId } from '../conversations/telegram-conversation-id';
 import { formatToolCall } from '@archon/workflows/utils/tool-formatter';
@@ -2014,19 +2015,34 @@ export async function handleMessage(
 
       // Telegram-only chat management: a Telegram chat holds many conversations
       // (`<chat id>:<n>`), and these are how the operator moves between them
-      // from a phone. The web console has its own UI for the same thing.
-      if (platform.getPlatformType() === 'telegram' && isTelegramChatCommand(command)) {
+      // from a phone. The answers carry the buttons that belong with them —
+      // typing the command still works, it is simply no longer the only way.
+      // The web console has its own UI for the same thing.
+      if (
+        platform.getPlatformType() === 'telegram' &&
+        (isTelegramChatCommand(command) || isMenuCommand(command))
+      ) {
         const parsed = parseTelegramConversationId(conversationId);
         if (parsed !== null) {
           getLog().debug({ command, conversationId }, 'telegram_chat_command');
-          const reply = await handleTelegramChatCommand({
+          const store = createTelegramChatStore();
+          const chatId = String(parsed.chatId);
+          const reply = await handleTelegramMenuCommand({
             command,
             args,
-            chatId: String(parsed.chatId),
-            store: createTelegramChatStore(),
+            chatId,
+            store,
+            runChatCommand: (chatCommand, chatArgs) =>
+              handleTelegramChatCommand({ command: chatCommand, args: chatArgs, chatId, store }),
           });
-          await platform.sendMessage(conversationId, reply);
-          return;
+          if (reply !== null) {
+            await platform.sendMessage(
+              conversationId,
+              reply.text,
+              reply.keyboard ? { keyboard: reply.keyboard } : undefined
+            );
+            return;
+          }
         }
       }
 
@@ -3560,6 +3576,20 @@ async function handleRemoveProject(message: string): Promise<string> {
  * substring) via resolveCodebaseName. Updates by the DB primary key
  * (conversation.id), never the platform conversation id.
  */
+/**
+ * Bind a conversation to a registered project from outside a message turn —
+ * what the Telegram project buttons tap into. Reuses `/setproject` itself so
+ * the session and worktree handling cannot drift between the two entry points.
+ */
+export async function setProjectForConversation(
+  platformConversationId: string,
+  projectName: string
+): Promise<string> {
+  const conversation = await db.findConversationByPlatformId(platformConversationId);
+  if (conversation === null) return 'This chat has no conversation yet — send a message first.';
+  return handleSetProject(`/setproject ${projectName}`, conversation);
+}
+
 async function handleSetProject(message: string, conversation: Conversation): Promise<string> {
   const { args } = commandHandler.parseCommand(message);
   if (args.length < 1) {

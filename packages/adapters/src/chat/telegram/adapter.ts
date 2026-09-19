@@ -3,7 +3,13 @@
  * Handles message sending with 4096 character limit splitting
  */
 import { Bot, Context } from 'grammy';
-import { telegramChatIdOf, type IPlatformAdapter, type MessageMetadata } from '@archon/core';
+import {
+  ADVERTISED_COMMANDS,
+  telegramChatIdOf,
+  type IPlatformAdapter,
+  type MenuKeyboard,
+  type MessageMetadata,
+} from '@archon/core';
 import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
 import {
@@ -36,11 +42,50 @@ const MEDIA_GROUP_WAIT_MS = 1200;
 /** The Bot API refuses to hand over a file larger than this via getFile. */
 const TELEGRAM_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
 
+/** What a tapped button asks the server to do, and what it answers with. */
+export interface TelegramCallbackRequest {
+  /** Raw `callback_data` — untrusted, validated by the handler. */
+  readonly data: string;
+  /** The chat the tap came from (from the update, never from the data). */
+  readonly chatId: string;
+  readonly userId: number | undefined;
+}
+
+export interface TelegramCallbackResponse {
+  readonly text: string;
+  readonly keyboard?: MenuKeyboard;
+  /** Short confirmation shown on the button itself. */
+  readonly toast?: string;
+}
+
+/** Telegram's markup for a keyboard, or nothing when there are no buttons. */
+function toReplyMarkup(keyboard: MenuKeyboard | undefined): Record<string, unknown> | undefined {
+  if (keyboard === undefined) return undefined;
+  if (keyboard.inline !== undefined && keyboard.inline.length > 0) {
+    return {
+      inline_keyboard: keyboard.inline.map(row =>
+        row.map(button => ({ text: button.label, callback_data: button.action }))
+      ),
+    };
+  }
+  if (keyboard.persistent !== undefined && keyboard.persistent.length > 0) {
+    return {
+      keyboard: keyboard.persistent.map(row => row.map(label => ({ text: label }))),
+      resize_keyboard: true,
+      is_persistent: true,
+    };
+  }
+  return undefined;
+}
+
 export class TelegramAdapter implements IPlatformAdapter {
   private bot: Bot;
   private streamingMode: 'stream' | 'batch';
   private allowedUserIds: number[];
   private messageHandler: ((ctx: TelegramMessageContext) => Promise<void>) | null = null;
+  private callbackHandler:
+    | ((request: TelegramCallbackRequest) => Promise<TelegramCallbackResponse | null>)
+    | null = null;
   /** Kept only to build the file-download URL; never logged, never sent. */
   readonly #token: string;
   readonly #mediaGroups: MediaGroupCollector<TelegramIncomingFile>;
@@ -96,7 +141,7 @@ export class TelegramAdapter implements IPlatformAdapter {
   async sendMessage(
     conversationId: string,
     message: string,
-    _metadata?: MessageMetadata
+    metadata?: MessageMetadata
   ): Promise<void> {
     // A conversation id is `<chat id>[:<n>]` — many Archon conversations share
     // one Telegram chat. Parse the chat id out explicitly rather than leaning on
@@ -107,16 +152,20 @@ export class TelegramAdapter implements IPlatformAdapter {
       'telegram.send_message'
     );
 
+    // Buttons ride on the LAST chunk: a keyboard belongs under the end of what
+    // it refers to, not in the middle of a split answer.
+    const markup = toReplyMarkup(metadata?.keyboard);
+
     if (message.length <= MAX_LENGTH) {
       // Short message: try MarkdownV2 formatting
-      await this.sendFormattedChunk(id, message);
+      await this.sendFormattedChunk(id, message, markup);
     } else {
       // Long message: split by paragraphs, format each chunk
       getLog().debug({ messageLength: message.length }, 'telegram.message_splitting');
       const chunks = splitIntoParagraphChunks(message, MAX_LENGTH - 200);
 
-      for (const chunk of chunks) {
-        await this.sendFormattedChunk(id, chunk);
+      for (const [index, chunk] of chunks.entries()) {
+        await this.sendFormattedChunk(id, chunk, index === chunks.length - 1 ? markup : undefined);
       }
     }
   }
@@ -124,7 +173,11 @@ export class TelegramAdapter implements IPlatformAdapter {
   /**
    * Send a single chunk with MarkdownV2 formatting, with fallback to plain text
    */
-  private async sendFormattedChunk(id: number, chunk: string): Promise<void> {
+  private async sendFormattedChunk(
+    id: number,
+    chunk: string,
+    markup?: Record<string, unknown>
+  ): Promise<void> {
     // If chunk is still too long after paragraph splitting, fall back to plain text
     if (chunk.length > MAX_LENGTH) {
       getLog().debug({ chunkLength: chunk.length }, 'telegram.chunk_too_long_plain_text');
@@ -147,7 +200,10 @@ export class TelegramAdapter implements IPlatformAdapter {
     // Try MarkdownV2 formatting
     const formatted = convertToTelegramMarkdown(chunk);
     try {
-      await this.bot.api.sendMessage(id, formatted, { parse_mode: 'MarkdownV2' });
+      await this.bot.api.sendMessage(id, formatted, {
+        parse_mode: 'MarkdownV2',
+        ...(markup ? { reply_markup: markup as never } : {}),
+      });
       getLog().debug({ chunkLength: chunk.length }, 'telegram.markdownv2_chunk_sent');
     } catch (error) {
       // Fallback to stripped plain text for this chunk
@@ -160,7 +216,15 @@ export class TelegramAdapter implements IPlatformAdapter {
         },
         'telegram.markdownv2_failed'
       );
-      await this.bot.api.sendMessage(id, stripMarkdown(chunk));
+      // Keep the call shape identical when there are no buttons — a bare
+      // (id, text) plain-text fallback, exactly as before.
+      if (markup) {
+        await this.bot.api.sendMessage(id, stripMarkdown(chunk), {
+          reply_markup: markup as never,
+        });
+      } else {
+        await this.bot.api.sendMessage(id, stripMarkdown(chunk));
+      }
     }
   }
 
@@ -281,6 +345,15 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
+   * Register the handler for tapped buttons. Must be called before start().
+   */
+  onCallback(
+    handler: (request: TelegramCallbackRequest) => Promise<TelegramCallbackResponse | null>
+  ): void {
+    this.callbackHandler = handler;
+  }
+
+  /**
    * Start the bot (begins polling).
    * Makes up to 3 attempts on 409 Conflict (stale getUpdates connection).
    */
@@ -357,6 +430,58 @@ export class TelegramAdapter implements IPlatformAdapter {
       }
     );
 
+    // Tapped buttons. The whitelist applies here exactly as it does to
+    // messages — otherwise the keyboards would be a way straight past it — and
+    // the query is ALWAYS answered, or the client spins forever.
+    this.bot.on('callback_query:data', ctx => {
+      const userId = ctx.from.id;
+      const data = ctx.callbackQuery.data;
+      const chatId = ctx.chat?.id;
+
+      void (async (): Promise<void> => {
+        try {
+          if (!isUserAuthorized(userId, this.allowedUserIds)) {
+            const maskedId = `${String(userId).slice(0, 4)}***`;
+            getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_callback');
+            await ctx.answerCallbackQuery();
+            return;
+          }
+          if (this.callbackHandler === null || chatId === undefined) {
+            await ctx.answerCallbackQuery();
+            return;
+          }
+
+          const reply = await this.callbackHandler({
+            data,
+            chatId: String(chatId),
+            userId,
+          });
+          if (reply === null) {
+            // Unknown or stale token — say so on the button, change nothing.
+            await ctx.answerCallbackQuery({ text: 'That button is no longer valid' });
+            return;
+          }
+
+          // Edit in place: the list the operator is looking at is the one that
+          // should change, instead of a new message every tap.
+          await ctx
+            .editMessageText(reply.text, {
+              ...(toReplyMarkup(reply.keyboard)
+                ? { reply_markup: toReplyMarkup(reply.keyboard) as never }
+                : {}),
+            })
+            .catch((err: unknown) => {
+              // 'message is not modified' is normal when nothing changed.
+              getLog().debug({ err }, 'telegram.callback_edit_skipped');
+            });
+          await ctx.answerCallbackQuery(reply.toast ? { text: reply.toast } : undefined);
+        } catch (err) {
+          getLog().warn({ err }, 'telegram.callback_failed');
+          await ctx.answerCallbackQuery({ text: 'Something went wrong' }).catch(() => undefined);
+        }
+      })();
+    });
+
     // Retry on 409 Conflict — another getUpdates is still active (Telegram's long-poll timeout is 50s).
     // Wait 60s between attempts to outlast the stale connection. Do NOT recreate the bot instance
     // on each retry — that adds more stale connections rather than fewer.
@@ -385,6 +510,11 @@ export class TelegramAdapter implements IPlatformAdapter {
             });
         });
         getLog().info('telegram.bot_started');
+        // Advertise only the few commands worth typing; everything else is a
+        // button. Failing to publish them must not fail the bot.
+        await this.bot.api.setMyCommands([...ADVERTISED_COMMANDS]).catch((err: unknown) => {
+          getLog().warn({ err }, 'telegram.set_my_commands_failed');
+        });
         return;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

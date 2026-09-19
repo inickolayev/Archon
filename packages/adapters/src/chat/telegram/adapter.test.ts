@@ -309,7 +309,12 @@ describe('TelegramAdapter', () => {
       await adapter.start({ retryDelayMs: 0 });
 
       expect(mockStart).toHaveBeenCalledTimes(3);
-      expect(mockLogger.warn).toHaveBeenCalledTimes(2);
+      // Count the retry warnings specifically: publishing the command list runs
+      // in the background after a successful start and may warn on its own.
+      const retryWarnings = (mockLogger.warn.mock.calls as unknown[][]).filter(
+        call => call[1] === 'telegram.start_conflict_retrying'
+      );
+      expect(retryWarnings).toHaveLength(2);
     });
 
     test('should throw after exhausting all 409 retry attempts', async () => {
@@ -563,6 +568,172 @@ describe('TelegramAdapter', () => {
       await new Promise(resolve => setTimeout(resolve, 5));
 
       expect(received).toEqual([]);
+    });
+  });
+  describe('buttons', () => {
+    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
+    afterAll(() => {
+      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
+    });
+
+    interface Captured {
+      handlers: Map<string, (ctx: never) => void>;
+      commandsPublished: unknown[];
+      adapter: TelegramAdapter;
+    }
+
+    async function startCapturing(): Promise<Captured> {
+      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const handlers = new Map<string, (ctx: never) => void>();
+      const commandsPublished: unknown[] = [];
+      const bot = adapter.getBot() as unknown as {
+        on: (event: string | string[], fn: (ctx: never) => void) => void;
+        start: (opts?: { onStart?: () => void }) => Promise<void>;
+        api: { setMyCommands: (commands: unknown) => Promise<void> };
+      };
+      bot.on = (event, fn) => {
+        for (const name of Array.isArray(event) ? event : [event]) handlers.set(name, fn);
+      };
+      bot.start = async opts => {
+        opts?.onStart?.();
+        await new Promise(() => undefined);
+      };
+      bot.api.setMyCommands = async commands => {
+        commandsPublished.push(commands);
+      };
+      await adapter.start({ retryDelayMs: 0 });
+      return { handlers, commandsPublished, adapter };
+    }
+
+    interface CallbackCalls {
+      edits: { text: string; markup?: unknown }[];
+      answers: (unknown | undefined)[];
+    }
+
+    const callbackCtx = (data: string, calls: CallbackCalls, userId = 4242): never =>
+      ({
+        chat: { id: 555 },
+        from: { id: userId, first_name: 'Ada' },
+        callbackQuery: { data },
+        editMessageText: async (text: string, options?: { reply_markup?: unknown }) => {
+          calls.edits.push({ text, markup: options?.reply_markup });
+        },
+        answerCallbackQuery: async (options?: unknown) => {
+          calls.answers.push(options);
+        },
+      }) as never;
+
+    test('only /start, /help and /menu are published to Telegram', async () => {
+      const { commandsPublished } = await startCapturing();
+      await new Promise(resolve => setTimeout(resolve, 5));
+      const published = commandsPublished[0] as { command: string }[] | undefined;
+      expect(published?.map(c => c.command)).toEqual(['start', 'help', 'menu']);
+    });
+
+    test('a tap edits the message in place and answers the query', async () => {
+      const { handlers, adapter } = await startCapturing();
+      adapter.onCallback(async request => ({
+        text: `handled ${request.data} in chat ${request.chatId}`,
+        keyboard: { inline: [[{ label: 'Chats', action: 'l:c' }]] },
+        toast: 'done',
+      }));
+      const calls: CallbackCalls = { edits: [], answers: [] };
+
+      handlers.get('callback_query:data')?.(callbackCtx('s:2', calls));
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      // Edited, not re-sent — a phone screen fills up fast.
+      expect(calls.edits).toHaveLength(1);
+      expect(calls.edits[0]?.text).toBe('handled s:2 in chat 555');
+      expect(calls.edits[0]?.markup).toEqual({
+        inline_keyboard: [[{ text: 'Chats', callback_data: 'l:c' }]],
+      });
+      expect(calls.answers).toEqual([{ text: 'done' }]);
+    });
+
+    test('the chat id comes from the update, never from the button payload', async () => {
+      const { handlers, adapter } = await startCapturing();
+      const seen: { data: string; chatId: string }[] = [];
+      adapter.onCallback(async request => {
+        seen.push({ data: request.data, chatId: request.chatId });
+        return { text: 'ok' };
+      });
+      const calls: CallbackCalls = { edits: [], answers: [] };
+
+      // A forged payload naming another chat changes nothing.
+      handlers.get('callback_query:data')?.(callbackCtx('s:1:999999', calls));
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(seen[0]?.chatId).toBe('555');
+    });
+
+    test('a tap from outside the whitelist does nothing but is still answered', async () => {
+      const { handlers, adapter } = await startCapturing();
+      let handled = false;
+      adapter.onCallback(async () => {
+        handled = true;
+        return { text: 'should not happen' };
+      });
+      const calls: CallbackCalls = { edits: [], answers: [] };
+
+      handlers.get('callback_query:data')?.(callbackCtx('s:1', calls, 777_000_111));
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(handled).toBe(false);
+      expect(calls.edits).toEqual([]);
+      // Always answered — otherwise the client spins forever.
+      expect(calls.answers).toHaveLength(1);
+    });
+
+    test('an unknown token is answered with a note and edits nothing', async () => {
+      const { handlers, adapter } = await startCapturing();
+      adapter.onCallback(async () => null);
+      const calls: CallbackCalls = { edits: [], answers: [] };
+
+      handlers.get('callback_query:data')?.(callbackCtx('nonsense', calls));
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(calls.edits).toEqual([]);
+      expect(calls.answers).toEqual([{ text: 'That button is no longer valid' }]);
+    });
+
+    test('a handler that throws still answers the query', async () => {
+      const { handlers, adapter } = await startCapturing();
+      adapter.onCallback(async () => {
+        throw new Error('boom');
+      });
+      const calls: CallbackCalls = { edits: [], answers: [] };
+
+      handlers.get('callback_query:data')?.(callbackCtx('s:1', calls));
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(calls.answers).toEqual([{ text: 'Something went wrong' }]);
+    });
+
+    test('a message with a keyboard sends it as Telegram markup', async () => {
+      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const sent: { options?: { reply_markup?: unknown } }[] = [];
+      (adapter.getBot() as unknown as { api: { sendMessage: unknown } }).api.sendMessage = (async (
+        _chatId: number,
+        _text: string,
+        options?: { reply_markup?: unknown }
+      ) => {
+        sent.push({ options });
+        return { message_id: 1 };
+      }) as never;
+
+      await adapter.sendMessage('555', 'pick one', {
+        keyboard: { persistent: [['Chats', 'New chat']] },
+      });
+
+      expect(sent[0]?.options?.reply_markup).toEqual({
+        keyboard: [[{ text: 'Chats' }, { text: 'New chat' }]],
+        resize_keyboard: true,
+        is_persistent: true,
+      });
     });
   });
 });

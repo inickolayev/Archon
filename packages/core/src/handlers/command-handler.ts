@@ -1247,11 +1247,15 @@ export async function handleCommand(
         conversation.platform_type === 'telegram'
           ? `
 
-**Chats in this Telegram chat**
-- \`/chats\` — List this chat's conversations
-- \`/new\` — Start a new conversation here
-- \`/switch <n>\` — Continue conversation <n>
-- \`/projects\` — List registered projects`
+**Buttons (no typing needed)**
+- **Chats** — this chat's conversations; tap one to continue it
+- **New chat** — start an empty conversation here
+- **Project** — bind a registered project to this chat
+- **Status** — where you are right now
+- \`/menu\` brings the buttons back if they disappear
+
+**The same by typing**
+- \`/chats\`, \`/new\`, \`/switch <n>\`, \`/projects\`, \`/setproject <name>\``
           : '';
       return {
         success: true,
