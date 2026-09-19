@@ -1,6 +1,7 @@
 import type { ReactElement } from 'react';
 import { relativeTime } from '../lib/format';
 import { conversationLabel, type ConversationSummary } from '../primitives/conversation';
+import { authorLabel, EMPTY_DIRECTORY, type Directory } from '../primitives/author';
 import { PlatformBadge } from './PlatformBadge';
 
 interface ChatListProps {
@@ -8,6 +9,8 @@ interface ChatListProps {
   /** The chat on screen, or null while an unsent new chat is open. */
   activeId: string | null;
   onSelect: (conversationId: string) => void;
+  /** Who is who — a chat says whose it is when the answer is not obvious. */
+  directory?: Directory;
 }
 
 /**
@@ -22,7 +25,12 @@ interface ChatListProps {
  * a conversation is born on one platform but is not owned by it. The badge
  * says which one it came from.
  */
-export function ChatList({ conversations, activeId, onSelect }: ChatListProps): ReactElement {
+export function ChatList({
+  conversations,
+  activeId,
+  onSelect,
+  directory = EMPTY_DIRECTORY,
+}: ChatListProps): ReactElement {
   if (conversations.length === 0) {
     return (
       <p className="px-3 py-4 text-center text-[11px] text-text-tertiary">
@@ -63,6 +71,14 @@ export function ChatList({ conversations, activeId, onSelect }: ChatListProps): 
                     ? relativeTime(conversation.lastActivityAt)
                     : 'not started'}
                 </span>
+                {authorLabel(directory, conversation.userId) !== null ? (
+                  <span
+                    className="truncate"
+                    title={authorLabel(directory, conversation.userId) ?? ''}
+                  >
+                    · {authorLabel(directory, conversation.userId)}
+                  </span>
+                ) : null}
               </span>
             </button>
           </li>

@@ -2,10 +2,17 @@ import type { ReactElement } from 'react';
 import { AgentAvatar } from './AgentAvatar';
 import { MessageMarkdown } from './MessageMarkdown';
 import { formatClock } from '../lib/format';
+import { authorLabel, EMPTY_DIRECTORY, type Directory } from '../primitives/author';
 import type { Message } from '../primitives/message';
 
 interface MessageItemProps {
   message: Message;
+  /**
+   * Who is who. A chat can be written from the browser by one account and
+   * from Telegram by another, so a message says which — `you (name)` for the
+   * signed-in account, the other person's name (or email) otherwise.
+   */
+  directory?: Directory;
   /**
    * `chat` (default) — Direction-B chat card. `log` — run-log styling
    * (design v3 .log-agent-card): violet left accent + mono body, no avatar.
@@ -30,8 +37,13 @@ const ERROR_BLOCK = (msg: string): ReactElement => (
  * border-utility colors otherwise (see `theme.css`, mirrored in
  * `StreamCard.tsx`).
  */
-export function MessageItem({ message, variant = 'chat' }: MessageItemProps): ReactElement {
+export function MessageItem({
+  message,
+  variant = 'chat',
+  directory = EMPTY_DIRECTORY,
+}: MessageItemProps): ReactElement {
   const kind = message.role;
+  const author = authorLabel(directory, message.userId);
   const content = message.content.trim();
   const clock = formatClock(message.timestamp);
   const log = variant === 'log';
@@ -41,13 +53,14 @@ export function MessageItem({ message, variant = 'chat' }: MessageItemProps): Re
       <div className="flex flex-col items-end">
         <header className="mb-2 flex flex-row-reverse items-center gap-[9px] font-mono">
           <span
-            className="rounded px-[7px] py-[2px] text-[10px] font-bold uppercase tracking-[0.14em]"
+            className="max-w-[260px] truncate rounded px-[7px] py-[2px] text-[10px] font-bold uppercase tracking-[0.14em]"
+            title={author ?? undefined}
             style={{
               color: 'var(--brand-magenta)',
               background: 'color-mix(in oklch, var(--brand-magenta), transparent 88%)',
             }}
           >
-            You
+            {author ?? 'You'}
           </span>
           <time
             dateTime={message.timestamp}

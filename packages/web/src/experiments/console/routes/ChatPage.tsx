@@ -16,6 +16,7 @@ import { ensureUtc } from '../lib/format';
 import type { Project } from '../primitives/project';
 import type { Message } from '../primitives/message';
 import type { ConversationSummary } from '../primitives/conversation';
+import { EMPTY_DIRECTORY, type Directory } from '../primitives/author';
 
 // While a turn is active, refetch messages on this cadence so streamed replies
 // still surface if a per-conversation SSE event is dropped (cross-origin
@@ -70,6 +71,12 @@ export function ChatPage(): ReactElement {
     projectId !== undefined ? K.project(projectId) : 'noop:no-project',
     () => (projectId !== undefined ? skill.getProject(projectId) : Promise.resolve(null))
   );
+
+  // Who wrote what. Shared by the chat list and the message headers so the
+  // same person reads the same way in both. A failure here is cosmetic: the
+  // labels fall back to the plain role names.
+  const { data: directoryData } = useEntity<Directory>(K.directory, () => skill.getDirectory());
+  const directory = directoryData ?? EMPTY_DIRECTORY;
 
   const { data: conversations, error: conversationsError } = useEntity<ConversationSummary[]>(
     projectId !== undefined ? K.conversations(projectId) : 'noop:no-project-convs',
@@ -340,6 +347,7 @@ export function ChatPage(): ReactElement {
           <ChatPicker
             conversations={projectConversations}
             activeId={activeConvId}
+            directory={directory}
             onSelect={id => {
               navigate(chatPath(id));
             }}
@@ -373,7 +381,7 @@ export function ChatPage(): ReactElement {
               )
             ) : (
               <StreamContextProvider value={{ runStartedAt: null }}>
-                <ChatStream messages={messageList} showTools={showTools} />
+                <ChatStream messages={messageList} showTools={showTools} directory={directory} />
                 {busy ? (
                   <WorkingIndicator
                     activity={currentActivity}

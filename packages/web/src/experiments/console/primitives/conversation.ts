@@ -10,6 +10,8 @@ export interface ConversationSummary {
   title: string | null;
   platformType: string;
   lastActivityAt: string | null;
+  /** Archon user that owns it — who the chat belongs to. */
+  userId: string | null;
 }
 
 interface RawConversation {
@@ -18,6 +20,7 @@ interface RawConversation {
   platform_type: string;
   title: string | null;
   last_activity_at: string | null;
+  user_id?: string | null;
 }
 
 export function toConversationSummary(raw: RawConversation): ConversationSummary {
@@ -26,6 +29,7 @@ export function toConversationSummary(raw: RawConversation): ConversationSummary
     title: raw.title,
     platformType: raw.platform_type,
     lastActivityAt: raw.last_activity_at,
+    userId: raw.user_id ?? null,
   };
 }
 

@@ -8,6 +8,7 @@ const conv = (over: Partial<ConversationSummary> = {}): ConversationSummary => (
   title: 'Status of the open PRs',
   platformType: 'web',
   lastActivityAt: '2026-09-19T10:00:00.000Z',
+  userId: null,
   ...over,
 });
 
@@ -123,5 +124,79 @@ describe('ChatList platform markers', () => {
     expect(html).toContain('Phone thread');
     expect(html).toContain('CLI run');
     expect(html).toContain('cli');
+  });
+});
+
+describe('ChatList — whose chat is this', () => {
+  const directory = {
+    me: 'user-me',
+    users: [
+      { id: 'user-me', displayName: 'Igor Nikolaev', email: 'igorabcpps@gmail.com' },
+      { id: 'user-other', displayName: 'Ada Lovelace', email: 'ada@example.com' },
+      { id: 'user-nameless', displayName: null, email: 'someone@example.com' },
+    ],
+  };
+
+  test('my own chat reads "you", and says which account that is', () => {
+    const html = renderToStaticMarkup(
+      <ChatList
+        conversations={[conv({ userId: 'user-me' })]}
+        activeId={null}
+        onSelect={() => undefined}
+        directory={directory}
+      />
+    );
+    expect(html).toContain('you (Igor Nikolaev)');
+  });
+
+  test("someone else's chat reads as them, with no email when a name exists", () => {
+    const html = renderToStaticMarkup(
+      <ChatList
+        conversations={[conv({ userId: 'user-other' })]}
+        activeId={null}
+        onSelect={() => undefined}
+        directory={directory}
+      />
+    );
+    expect(html).toContain('Ada Lovelace');
+    expect(html).not.toContain('ada@example.com');
+    expect(html).not.toContain('you (');
+  });
+
+  test('a nameless author falls back to their email', () => {
+    const html = renderToStaticMarkup(
+      <ChatList
+        conversations={[conv({ userId: 'user-nameless' })]}
+        activeId={null}
+        onSelect={() => undefined}
+        directory={directory}
+      />
+    );
+    expect(html).toContain('someone@example.com');
+  });
+
+  test('with no directory loaded the rows stay as they were — no invented author', () => {
+    const html = renderToStaticMarkup(
+      <ChatList
+        conversations={[conv({ userId: 'user-me' })]}
+        activeId={null}
+        onSelect={() => undefined}
+      />
+    );
+    expect(html).toContain('Status of the open PRs');
+    expect(html).not.toContain('you (');
+  });
+
+  test('an unowned chat gets no author at all, rather than a guess', () => {
+    const html = renderToStaticMarkup(
+      <ChatList
+        conversations={[conv({ userId: null })]}
+        activeId={null}
+        onSelect={() => undefined}
+        directory={directory}
+      />
+    );
+    expect(html).not.toContain('you');
+    expect(html).not.toContain('Igor Nikolaev');
   });
 });

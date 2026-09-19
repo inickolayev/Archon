@@ -49,6 +49,8 @@ export interface Message {
   role: MessageRole;
   content: string;
   timestamp: string;
+  /** Archon user that wrote it; null for the agent and for pre-account rows. */
+  userId: string | null;
   toolCalls: InlineToolCall[];
   error: InlineError | null;
   /** Framework category from metadata (e.g. workflow_dispatch_status, workflow_result). */
@@ -65,6 +67,7 @@ interface RawMessage {
   content: string;
   metadata: string;
   created_at: string;
+  user_id?: string | null;
 }
 
 interface ParsedMetadata {
@@ -147,6 +150,7 @@ export function toMessage(raw: RawMessage): Message {
     role: toMessageRole(raw.role),
     content: raw.content,
     timestamp: raw.created_at,
+    userId: raw.user_id ?? null,
     toolCalls,
     error,
     category: meta.category ?? null,

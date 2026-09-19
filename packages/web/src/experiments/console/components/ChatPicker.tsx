@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { ChatList } from './ChatList';
 import { PlatformBadge } from './PlatformBadge';
 import { conversationLabel, type ConversationSummary } from '../primitives/conversation';
+import type { Directory } from '../primitives/author';
 
 interface ChatPickerProps {
   conversations: ConversationSummary[];
@@ -9,6 +10,8 @@ interface ChatPickerProps {
   activeId: string | null;
   onSelect: (conversationId: string) => void;
   onNewChat: () => void;
+  /** Who is who — the list says whose chat each row is. */
+  directory?: Directory;
 }
 
 /**
@@ -27,6 +30,7 @@ export function ChatPicker({
   activeId,
   onSelect,
   onNewChat,
+  directory,
 }: ChatPickerProps): ReactElement {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -92,6 +96,7 @@ export function ChatPicker({
           <ChatList
             conversations={conversations}
             activeId={activeId}
+            directory={directory}
             onSelect={id => {
               setOpen(false);
               onSelect(id);
