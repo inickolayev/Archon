@@ -6,6 +6,15 @@ import { Bot, Context } from 'grammy';
 import { telegramChatIdOf, type IPlatformAdapter, type MessageMetadata } from '@archon/core';
 import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
+import {
+  defaultCaption,
+  filesOf,
+  unsupportedKindOf,
+  unsupportedMessage,
+  type TelegramIncomingFile,
+  type TelegramMessageLike,
+} from './attachments';
+import { MediaGroupCollector } from './media-group';
 import { convertToTelegramMarkdown, stripMarkdown } from './markdown';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
 import type { TelegramMessageContext } from './types';
@@ -18,14 +27,43 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 const MAX_LENGTH = 4096;
+/**
+ * How long an album's parts are collected before the whole set is dispatched
+ * as one message. Telegram sends them milliseconds apart; this only ever
+ * delays a multi-file send.
+ */
+const MEDIA_GROUP_WAIT_MS = 1200;
+/** The Bot API refuses to hand over a file larger than this via getFile. */
+const TELEGRAM_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
 
 export class TelegramAdapter implements IPlatformAdapter {
   private bot: Bot;
   private streamingMode: 'stream' | 'batch';
   private allowedUserIds: number[];
   private messageHandler: ((ctx: TelegramMessageContext) => Promise<void>) | null = null;
+  /** Kept only to build the file-download URL; never logged, never sent. */
+  readonly #token: string;
+  readonly #mediaGroups: MediaGroupCollector<TelegramIncomingFile>;
+  /** Album parts carry no chat/sender of their own once collected. */
+  readonly #mediaGroupOrigins = new Map<string, TelegramMessageContext>();
 
-  constructor(token: string, mode: 'stream' | 'batch' = 'stream') {
+  constructor(token: string, mode: 'stream' | 'batch' = 'stream', mediaGroupWaitMs?: number) {
+    this.#token = token;
+    this.#mediaGroups = new MediaGroupCollector<TelegramIncomingFile>(
+      mediaGroupWaitMs ?? MEDIA_GROUP_WAIT_MS,
+      (groupId, group) => {
+        // The chat and sender were stashed when the group's first part arrived.
+        const origin = this.#mediaGroupOrigins.get(groupId);
+        this.#mediaGroupOrigins.delete(groupId);
+        if (origin === undefined || group.items.length === 0) return;
+        const caption = group.caption?.trim();
+        this.#dispatch({
+          ...origin,
+          message: caption && caption.length > 0 ? caption : defaultCaption(group.items),
+          files: [...group.items],
+        });
+      }
+    );
     // grammY does not impose a handler timeout by default (unlike Telegraf's 90s limit)
     this.bot = new Bot(token);
     this.streamingMode = mode;
@@ -167,6 +205,74 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
+   * The authorized chat + sender behind an update, or null when the sender is
+   * not on the whitelist (rejected silently, as before).
+   */
+  #originOf(ctx: Context): Omit<TelegramMessageContext, 'message'> | null {
+    const userId = ctx.from?.id;
+    if (!isUserAuthorized(userId, this.allowedUserIds)) {
+      // Log unauthorized attempt (mask user ID for privacy)
+      const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
+      getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_message');
+      return null;
+    }
+    // Derive a Telegram display name from inbound payload — no extra API call needed.
+    const from = ctx.from;
+    const fullName =
+      from?.first_name || from?.last_name
+        ? [from.first_name, from.last_name].filter(Boolean).join(' ')
+        : undefined;
+    return {
+      conversationId: this.getConversationId(ctx),
+      userId,
+      displayName: fullName ?? from?.username ?? undefined,
+    };
+  }
+
+  /** Hand one inbound message to the server, if it has registered a handler. */
+  #dispatch(context: TelegramMessageContext): void {
+    if (!this.messageHandler) {
+      // Intentional: message dropped silently if handler not registered yet.
+      // In production the server always calls onMessage() before start(); this
+      // path only surfaces during development or misconfiguration.
+      getLog().debug(
+        { conversationId: context.conversationId },
+        'telegram.message_dropped_no_handler'
+      );
+      return;
+    }
+    // Fire-and-forget - errors handled by caller
+    void this.messageHandler(context);
+  }
+
+  /**
+   * Download one file's bytes. The URL carries the bot token, so failures are
+   * re-thrown without it: nothing here may reach a log or a chat message.
+   */
+  async downloadFile(file: TelegramIncomingFile): Promise<Uint8Array> {
+    if (file.size !== undefined && file.size > TELEGRAM_DOWNLOAD_LIMIT_BYTES) {
+      throw new Error('That file is larger than the 20 MB the Telegram Bot API can hand over.');
+    }
+    let path: string | undefined;
+    try {
+      const described = await this.bot.api.getFile(file.fileId);
+      path = described.file_path;
+    } catch {
+      throw new Error('Telegram would not hand over that file.');
+    }
+    if (path === undefined || path === '') {
+      throw new Error('Telegram returned no download path for that file.');
+    }
+    const response = await fetch(`https://api.telegram.org/file/bot${this.#token}/${path}`).catch(
+      () => null
+    );
+    if (!response?.ok) {
+      throw new Error('Downloading that file from Telegram failed.');
+    }
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  /**
    * Register a message handler for incoming messages
    * Must be called before start()
    */
@@ -197,34 +303,59 @@ export class TelegramAdapter implements IPlatformAdapter {
     this.bot.on('message:text', ctx => {
       const message = ctx.message.text;
       if (!message) return;
-
-      // Authorization check - verify sender is in whitelist
-      const userId = ctx.from?.id;
-      if (!isUserAuthorized(userId, this.allowedUserIds)) {
-        // Log unauthorized attempt (mask user ID for privacy)
-        const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
-        getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_message');
-        return; // Silent rejection
-      }
-
-      if (this.messageHandler) {
-        const conversationId = this.getConversationId(ctx);
-        // Derive a Telegram display name from inbound payload — no extra API call needed.
-        const from = ctx.from;
-        const fullName =
-          from?.first_name || from?.last_name
-            ? [from.first_name, from.last_name].filter(Boolean).join(' ')
-            : undefined;
-        const displayName = fullName ?? from?.username ?? undefined;
-        // Fire-and-forget - errors handled by caller
-        void this.messageHandler({ conversationId, message, userId, displayName });
-      } else {
-        // Intentional: message dropped silently if handler not registered yet.
-        // In production the server always calls onMessage() before start(); this
-        // path only surfaces during development or misconfiguration.
-        getLog().debug({ chatId: ctx.chat?.id }, 'telegram.message_dropped_no_handler');
-      }
+      const origin = this.#originOf(ctx);
+      if (origin === null) return;
+      this.#dispatch({ ...origin, message });
     });
+
+    // Photos and documents. Everything the agent can actually read goes through
+    // the same path as a browser upload: the server downloads, validates and
+    // persists them; this only says what and where.
+    this.bot.on(['message:photo', 'message:document'], ctx => {
+      const origin = this.#originOf(ctx);
+      if (origin === null) return;
+      const message = ctx.message as unknown as TelegramMessageLike;
+      const files = filesOf(message);
+      if (files.length === 0) return;
+      const caption = message.caption?.trim();
+
+      const groupId = message.media_group_id;
+      if (groupId !== undefined && groupId !== '') {
+        // An album arrives as several updates; collect them into one message
+        // instead of starting a turn per photo.
+        this.#mediaGroupOrigins.set(groupId, { ...origin, message: '' });
+        this.#mediaGroups.add(groupId, { caption, items: files });
+        return;
+      }
+
+      this.#dispatch({
+        ...origin,
+        message: caption && caption.length > 0 ? caption : defaultCaption(files),
+        files,
+      });
+    });
+
+    // Media the agent cannot read. Silence was the old behaviour and it looked
+    // like the bot was broken — say so in one line instead.
+    this.bot.on(
+      [
+        'message:voice',
+        'message:video_note',
+        'message:sticker',
+        'message:audio',
+        'message:video',
+        'message:animation',
+      ],
+      ctx => {
+        const userId = ctx.from?.id;
+        if (!isUserAuthorized(userId, this.allowedUserIds)) return;
+        const kind = unsupportedKindOf(ctx.message as unknown as TelegramMessageLike);
+        if (kind === null) return;
+        void ctx.reply(unsupportedMessage(kind)).catch((err: unknown) => {
+          getLog().warn({ err }, 'telegram.unsupported_media_reply_failed');
+        });
+      }
+    );
 
     // Retry on 409 Conflict — another getUpdates is still active (Telegram's long-poll timeout is 50s).
     // Wait 60s between attempts to outlast the stale connection. Do NOT recreate the bot instance

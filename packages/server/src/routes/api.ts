@@ -7,11 +7,11 @@ import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
 import { MirrorBuffer, withOutboundMirror } from '../adapters/mirror';
+import { persistUploadedFiles, uploadEntryFromFile } from '../uploads/attachments';
 import { boundMetadataToolOutputs } from '../adapters/web/truncate';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { normalize, join, sep, basename, dirname, resolve } from 'path';
-import { randomUUID } from 'crypto';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -2218,177 +2218,6 @@ export function registerApiRoutes(
   });
 
   // Shared lock/dispatch/error handling for message and workflow endpoints
-  /** Maximum allowed upload size per file (10 MB) */
-  const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-  /** Maximum number of files per message (enforced server-side) */
-  const MAX_FILES_PER_MESSAGE = 5;
-  /**
-   * Binary (non-text) MIME types explicitly allowed for upload.
-   * All text/* types are accepted separately via isAllowedUploadType().
-   */
-  const ALLOWED_UPLOAD_BINARY_MIME_TYPES = new Set([
-    'image/png',
-    'image/jpeg',
-    'image/gif',
-    'image/webp',
-    'application/pdf',
-    // application/json is a structured text type browsers may report for .json files
-    'application/json',
-  ]);
-
-  /** Extensions accepted when browser reports an empty MIME type (code/config files). */
-  const ALLOWED_UPLOAD_EXTENSIONS = new Set([
-    '.md',
-    '.txt',
-    '.csv',
-    '.xml',
-    '.html',
-    '.htm',
-    '.json',
-    '.yaml',
-    '.yml',
-    '.toml',
-    '.ini',
-    '.cfg',
-    '.conf',
-    '.env',
-    '.log',
-    '.css',
-    '.js',
-    '.jsx',
-    '.ts',
-    '.tsx',
-    '.mjs',
-    '.cjs',
-    '.py',
-    '.rb',
-    '.go',
-    '.java',
-    '.c',
-    '.cpp',
-    '.cc',
-    '.cxx',
-    '.h',
-    '.hpp',
-    '.cs',
-    '.php',
-    '.sh',
-    '.bash',
-    '.zsh',
-    '.fish',
-    '.rs',
-    '.swift',
-    '.kt',
-    '.scala',
-    '.r',
-    '.sql',
-  ]);
-
-  /** Returns true if the MIME type is allowed for upload. */
-  function isAllowedUploadType(mimeType: string, fileName: string): boolean {
-    // All text/* types are acceptable (covers .md, .py, .rs, .go, .sh, .yaml, etc.)
-    if (mimeType.startsWith('text/')) return true;
-    if (ALLOWED_UPLOAD_BINARY_MIME_TYPES.has(mimeType)) return true;
-    // Browsers assign empty MIME types to many code/config extensions — fall back to extension
-    if (!mimeType) {
-      const dotIndex = fileName.lastIndexOf('.');
-      if (dotIndex !== -1) {
-        return ALLOWED_UPLOAD_EXTENSIONS.has(fileName.slice(dotIndex).toLowerCase());
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Persist multipart-uploaded files to the conversation's upload directory.
-   * Called from /api/workflows/:name/run; /api/conversations/:id/message still
-   * inlines the same validate-write-rollback logic and could migrate to this
-   * helper as a separate hygiene pass.
-   *
-   * Returns either { ok: true, savedFiles, uploadDir } or a structured error
-   * the caller forwards via apiError; on the success path the caller passes
-   * savedFiles + uploadDir to dispatchToOrchestrator so cleanup happens
-   * inside the lock handler.
-   */
-  async function persistUploadedFiles(
-    conversationId: string,
-    fileEntries: File[]
-  ): Promise<
-    | { ok: true; savedFiles: AttachedFile[]; uploadDir: string }
-    | { ok: false; status: 400 | 500; error: string }
-  > {
-    if (fileEntries.length > MAX_FILES_PER_MESSAGE) {
-      return {
-        ok: false,
-        status: 400,
-        error: `Maximum ${MAX_FILES_PER_MESSAGE.toString()} files per message`,
-      };
-    }
-
-    const archonHome = getArchonHome();
-    // A Telegram conversation id carries a colon, which is not a legal path
-    // character everywhere (Windows reads it as a drive separator). The
-    // directory only has to be unique per conversation, so flatten it.
-    const uploadDirName = conversationId.replace(/[^\w.-]/g, '_');
-    const uploadDir = join(archonHome, 'artifacts', 'uploads', uploadDirName);
-    if (!uploadDir.startsWith(archonHome + sep)) {
-      return { ok: false, status: 400, error: 'Invalid conversation ID' };
-    }
-
-    // Validate all files before writing any to disk.
-    for (const entry of fileEntries) {
-      const displayName = basename(entry.name).replace(/[^a-zA-Z0-9._-]/g, '_');
-      if (!isAllowedUploadType(entry.type, entry.name)) {
-        return {
-          ok: false,
-          status: 400,
-          error: `File "${displayName}" has an unsupported type: ${entry.type}`,
-        };
-      }
-      if (entry.size > MAX_UPLOAD_BYTES) {
-        return {
-          ok: false,
-          status: 400,
-          error: `File "${displayName}" exceeds the 10 MB size limit`,
-        };
-      }
-    }
-
-    const savedFiles: AttachedFile[] = [];
-    try {
-      await mkdir(uploadDir, { recursive: true });
-      for (const entry of fileEntries) {
-        const fileId = randomUUID();
-        const safeName = basename(entry.name).replace(/[^a-zA-Z0-9._-]/g, '_');
-        const filePath = join(uploadDir, `${fileId}_${safeName}`);
-        await writeFile(filePath, Buffer.from(await entry.arrayBuffer()));
-        const normalizedMime =
-          entry.type.split(';')[0].trim().toLowerCase() || 'application/octet-stream';
-        savedFiles.push({
-          path: filePath,
-          name: safeName || fileId,
-          mimeType: normalizedMime,
-          size: entry.size,
-        });
-      }
-    } catch (writeErr: unknown) {
-      for (const f of savedFiles) {
-        await unlink(f.path).catch((err: NodeJS.ErrnoException) => {
-          if (err.code !== 'ENOENT') {
-            getLog().warn({ err, filePath: f.path, conversationId }, 'upload.rollback_failed');
-          }
-        });
-      }
-      getLog().error({ err: writeErr, conversationId }, 'upload.write_failed');
-      return {
-        ok: false,
-        status: 500,
-        error: 'Failed to save uploaded file. Check available disk space.',
-      };
-    }
-
-    return { ok: true, savedFiles, uploadDir };
-  }
 
   /**
    * The Telegram adapter to mirror this conversation's replies to, or null when
@@ -2956,7 +2785,10 @@ export function registerApiRoutes(
 
       const fileEntries = fileList.filter((e): e is File => e instanceof File);
       if (fileEntries.length > 0) {
-        const result = await persistUploadedFiles(conversationId, fileEntries);
+        const result = await persistUploadedFiles(
+          conversationId,
+          fileEntries.map(uploadEntryFromFile)
+        );
         if (!result.ok) {
           return c.json({ error: result.error }, result.status);
         }
@@ -3536,7 +3368,10 @@ export function registerApiRoutes(
       const fileEntries = fileList.filter((e): e is File => e instanceof File);
 
       if (fileEntries.length > 0) {
-        const result = await persistUploadedFiles(conversationId, fileEntries);
+        const result = await persistUploadedFiles(
+          conversationId,
+          fileEntries.map(uploadEntryFromFile)
+        );
         if (!result.ok) {
           return apiError(c, result.status, result.error);
         }

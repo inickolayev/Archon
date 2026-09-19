@@ -79,6 +79,8 @@ import { DashboardEventPoller } from './adapters/web/dashboard-event-poller';
 import { PgNotifyListener } from './adapters/web/pg-notify-listener';
 import { registerApiRoutes } from './routes/api';
 import { withOutboundMirror } from './adapters/mirror';
+import { persistTelegramFiles } from './adapters/telegram-uploads';
+import { rm, unlink } from 'fs/promises';
 import { registerGithubWebhookRoute } from './routes/webhooks';
 import {
   startWorkflowContinuationScheduler,
@@ -110,7 +112,7 @@ import {
   type IGitHubAppAuthProvider,
   resolveActiveTelegramConversationId,
 } from '@archon/core';
-import type { IPlatformAdapter } from '@archon/core';
+import type { AttachedFile, IPlatformAdapter } from '@archon/core';
 import type { IdentityPlatform } from '@archon/core';
 import * as userDb from '@archon/core/db/users';
 import * as conversationDb from '@archon/core/db/conversations';
@@ -948,7 +950,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     // Register message handler (auth is handled internally by adapter)
     telegramAdapter.onMessage(
-      async ({ conversationId: chatId, message, userId: telegramUserId, displayName }) => {
+      async ({ conversationId: chatId, message, userId: telegramUserId, displayName, files }) => {
         // Resolve Telegram user id (numeric) → Archon user UUID.
         const userId = await resolveUserId('telegram', telegramUserId, displayName);
 
@@ -984,13 +986,57 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             });
         });
 
+        // Photos and documents take the same road as a browser upload:
+        // validated and written by the shared helper, handed to the agent as
+        // `attachedFiles`, and visible in the web console's history afterwards.
+        let attachedFiles: AttachedFile[] | undefined;
+        let uploadDir: string | undefined;
+        if (files !== undefined && files.length > 0) {
+          const stored = await persistTelegramFiles(conversationId, files, file =>
+            telegramAdapter.downloadFile(file)
+          );
+          if (!stored.ok) {
+            // A refused file is answered, never swallowed.
+            await telegramAdapter
+              .sendMessage(conversationId, stored.error)
+              .catch((err: unknown) => {
+                getLog().warn({ err, conversationId }, 'telegram.upload_refusal_send_failed');
+              });
+            return;
+          }
+          attachedFiles = stored.savedFiles;
+          uploadDir = stored.uploadDir;
+        }
+
         // Fire-and-forget: handler returns immediately, processing happens async
         lockManager
           .acquireLock(conversationId, async () => {
-            await handleMessage(deliverTo, conversationId, message, {
-              isolationHints: { workflowType: 'thread', workflowId: conversationId },
-              userId,
-            });
+            try {
+              await handleMessage(deliverTo, conversationId, message, {
+                isolationHints: { workflowType: 'thread', workflowId: conversationId },
+                userId,
+                ...(attachedFiles !== undefined ? { attachedFiles } : {}),
+              });
+            } finally {
+              // Clean up inside the lock, after the agent has read them —
+              // mirrors what the web message route does.
+              if (attachedFiles !== undefined && uploadDir !== undefined) {
+                for (const file of attachedFiles) {
+                  await unlink(file.path).catch((err: NodeJS.ErrnoException) => {
+                    if (err.code !== 'ENOENT') {
+                      getLog().warn({ err, filePath: file.path }, 'telegram.upload_cleanup_failed');
+                    }
+                  });
+                }
+                await rm(uploadDir, { recursive: true, force: true }).catch(
+                  (err: NodeJS.ErrnoException) => {
+                    if (err.code !== 'ENOENT') {
+                      getLog().warn({ err, uploadDir }, 'telegram.upload_dir_cleanup_failed');
+                    }
+                  }
+                );
+              }
+            }
           })
           .catch(createMessageErrorHandler('Telegram', telegramAdapter, conversationId));
       }

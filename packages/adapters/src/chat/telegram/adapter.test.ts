@@ -377,22 +377,29 @@ describe('TelegramAdapter', () => {
     });
 
     /** Start the adapter with polling stubbed out and capture its message handler. */
-    async function handlerOf(adapter: TelegramAdapter): Promise<(ctx: unknown) => void> {
-      let captured: ((ctx: unknown) => void) | null = null;
+    /** Start with polling stubbed out and capture the handler of one update type. */
+    async function handlerOf(
+      adapter: TelegramAdapter,
+      event = 'message:text'
+    ): Promise<(ctx: unknown) => void> {
+      const captured = new Map<string, (ctx: unknown) => void>();
       const bot = adapter.getBot() as unknown as {
-        on: (event: string, fn: (ctx: unknown) => void) => void;
+        on: (event: string | string[], fn: (ctx: unknown) => void) => void;
         start: (opts?: { onStart?: () => void }) => Promise<void>;
       };
-      bot.on = (_event, fn) => {
-        captured = fn;
+      bot.on = (registered, fn) => {
+        for (const name of Array.isArray(registered) ? registered : [registered]) {
+          captured.set(name, fn);
+        }
       };
       bot.start = async opts => {
         opts?.onStart?.();
         await new Promise(() => undefined);
       };
       await adapter.start({ retryDelayMs: 0 });
-      if (captured === null) throw new Error('handler was never registered');
-      return captured;
+      const handler = captured.get(event);
+      if (handler === undefined) throw new Error(`no handler registered for ${event}`);
+      return handler;
     }
 
     const ctxFrom = (chatId: number, userId: number, text: string): unknown => ({
@@ -435,6 +442,125 @@ describe('TelegramAdapter', () => {
       const handler = await handlerOf(adapter);
       handler(ctxFrom(999, 777_000_111, 'let me in'));
       await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(received).toEqual([]);
+    });
+  });
+  describe('photos and documents', () => {
+    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
+    afterAll(() => {
+      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
+    });
+
+    /** Start with polling stubbed out; return the handlers and what was dispatched. */
+    async function startCapturing(waitMs = 20): Promise<{
+      handlers: Map<string, (ctx: never) => void>;
+      received: { message: string; files?: { fileName?: string }[] }[];
+    }> {
+      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+      const adapter = new TelegramAdapter('fake-token-for-testing', 'stream', waitMs);
+      const received: { message: string; files?: { fileName?: string }[] }[] = [];
+      adapter.onMessage(async ctx => {
+        received.push({ message: ctx.message, files: ctx.files });
+      });
+      const handlers = new Map<string, (ctx: never) => void>();
+      const bot = adapter.getBot() as unknown as {
+        on: (event: string | string[], fn: (ctx: never) => void) => void;
+        start: (opts?: { onStart?: () => void }) => Promise<void>;
+      };
+      bot.on = (event, fn) => {
+        for (const name of Array.isArray(event) ? event : [event]) handlers.set(name, fn);
+      };
+      bot.start = async opts => {
+        opts?.onStart?.();
+        await new Promise(() => undefined);
+      };
+      await adapter.start({ retryDelayMs: 0 });
+      return { handlers, received };
+    }
+
+    const ctxWith = (message: Record<string, unknown>, replies?: string[]): never =>
+      ({
+        chat: { id: 555 },
+        from: { id: 4242, first_name: 'Ada' },
+        message,
+        reply: async (text: string) => {
+          replies?.push(text);
+        },
+      }) as never;
+
+    test('a document arrives as a file, with its caption as the message', async () => {
+      const { handlers, received } = await startCapturing();
+      handlers.get('message:document')?.(
+        ctxWith({
+          caption: 'look at this log',
+          document: {
+            file_id: 'doc-1',
+            file_name: 'run.log',
+            mime_type: 'text/plain',
+            file_size: 12,
+          },
+        })
+      );
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(received).toHaveLength(1);
+      expect(received[0]?.message).toBe('look at this log');
+      expect(received[0]?.files?.[0]?.fileName).toBe('run.log');
+    });
+
+    test('a photo with no caption still says something the agent can act on', async () => {
+      const { handlers, received } = await startCapturing();
+      handlers.get('message:photo')?.(
+        ctxWith({
+          photo: [
+            { file_id: 'small', width: 90 },
+            { file_id: 'big', width: 1280 },
+          ],
+        })
+      );
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(received).toHaveLength(1);
+      expect(received[0]?.message.length).toBeGreaterThan(0);
+      expect(received[0]?.files).toHaveLength(1);
+    });
+
+    test('an album of three photos becomes ONE message with three files', async () => {
+      const { handlers, received } = await startCapturing(20);
+      const photo = handlers.get('message:photo');
+      photo?.(ctxWith({ media_group_id: 'g1', caption: 'three shots', photo: [{ file_id: 'a' }] }));
+      photo?.(ctxWith({ media_group_id: 'g1', photo: [{ file_id: 'b' }] }));
+      photo?.(ctxWith({ media_group_id: 'g1', photo: [{ file_id: 'c' }] }));
+      await new Promise(resolve => setTimeout(resolve, 80));
+
+      expect(received).toHaveLength(1);
+      expect(received[0]?.message).toBe('three shots');
+      expect(received[0]?.files).toHaveLength(3);
+    });
+
+    test('voice, video notes and stickers get one line back instead of silence', async () => {
+      const { handlers } = await startCapturing();
+      const replies: string[] = [];
+      handlers.get('message:voice')?.(ctxWith({ voice: { file_id: 'v' } }, replies));
+      handlers.get('message:sticker')?.(ctxWith({ sticker: { file_id: 's' } }, replies));
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(replies).toHaveLength(2);
+      expect(replies[0]).toContain('voice');
+      expect(replies[1]).toContain('sticker');
+    });
+
+    test('a file from a sender outside the whitelist is dropped', async () => {
+      const { handlers, received } = await startCapturing();
+      handlers.get('message:document')?.({
+        chat: { id: 555 },
+        from: { id: 111_222_333, first_name: 'Nobody' },
+        message: { document: { file_id: 'd', file_name: 'x.txt' } },
+        reply: async () => undefined,
+      } as never);
+      await new Promise(resolve => setTimeout(resolve, 5));
 
       expect(received).toEqual([]);
     });
