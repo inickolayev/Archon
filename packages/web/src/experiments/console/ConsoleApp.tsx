@@ -10,6 +10,7 @@ import { RunDetailPage } from './routes/RunDetailPage';
 import { ChatPage } from './routes/ChatPage';
 import { PreviewPage } from './routes/PreviewPage';
 import { SettingsPage } from './routes/SettingsPage';
+import { ProfilePage } from './routes/ProfilePage';
 import { LinkTelegramPage } from './routes/LinkTelegramPage';
 import { invalidate } from './store/cache';
 import { K } from './store/keys';
@@ -75,6 +76,7 @@ export function ConsoleApp(): ReactElement {
           <Routes>
             <Route index element={<RunsPage />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="profile" element={<ProfilePage />} />
             {/* One-time Telegram link handshake (the bot sends this URL). */}
             <Route path="link/:token" element={<LinkTelegramPage />} />
             <Route path="builder" element={<BuilderConnected />} />

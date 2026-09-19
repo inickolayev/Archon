@@ -153,6 +153,27 @@ export function invalidate(keyPrefix: string): void {
   }
 }
 
+/**
+ * Drop every cached entity and re-load whatever is still on screen.
+ *
+ * Signing out is the reason this exists: the cache is deliberately retained
+ * across unmounts (a remount reads warm), which would hand the next account
+ * the previous one's projects and chats. Errors and in-flight loads go with
+ * it; subscribers reload through their own loaders.
+ */
+export function clearAll(): void {
+  const subscribed = [...listeners.keys()];
+  cache.clear();
+  errors.clear();
+  inflight.clear();
+  loadSeq.clear();
+  for (const key of subscribed) {
+    versions.set(key, versionOf(key) + 1);
+    for (const listener of listeners.get(key) ?? []) listener();
+    ensureLoad(key);
+  }
+}
+
 export function keysStartingWith(prefix: string): string[] {
   const out: string[] = [];
   for (const k of cache.keys()) {

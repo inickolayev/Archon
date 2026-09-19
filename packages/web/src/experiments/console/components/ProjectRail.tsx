@@ -1,12 +1,21 @@
 import { useCallback, useMemo, useRef, useState, type ReactElement } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router';
-import { Settings, Workflow, ArrowLeft, PenTool, type LucideIcon } from 'lucide-react';
+import {
+  Settings,
+  Workflow,
+  ArrowLeft,
+  PenTool,
+  UserRound,
+  LogOut,
+  type LucideIcon,
+} from 'lucide-react';
 import { ProjectRow } from './ProjectRow';
 import { EnvVarsDialog } from './EnvVarsDialog';
-import { useEntity, invalidate } from '../store/cache';
+import { useEntity, invalidate, clearAll } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
 import type { Project } from '../primitives/project';
+import { performSignOut } from '../lib/session';
 
 interface ProjectRailProps {
   onAddProject: () => void;
@@ -79,6 +88,48 @@ function RailNavLink({
         </span>
       ) : null}
     </Link>
+  );
+}
+
+/**
+ * Sign out without leaving the page you are on — the same three steps as the
+ * Profile card (server, cache, sign-in page), reachable in one click from
+ * wherever the operator happens to be. A failure stays visible in the title
+ * attribute instead of throwing away the session silently.
+ */
+function RailSignOut(): ReactElement {
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      title={failure ?? 'Sign out of the console'}
+      aria-label="Sign out"
+      onClick={() => {
+        setBusy(true);
+        setFailure(null);
+        void performSignOut({
+          signOut: skill.signOut,
+          clearAll,
+          redirect: () => {
+            navigate('/login', { replace: true });
+          },
+        }).catch((err: unknown) => {
+          setBusy(false);
+          setFailure(err instanceof Error ? err.message : 'Could not sign out');
+        });
+      }}
+      className={`${RAIL_NAV_LINK_CLASS} disabled:opacity-50`}
+    >
+      <LogOut aria-hidden className="h-3.5 w-3.5 shrink-0" />
+      <span className="truncate">{busy ? 'Signing out…' : 'Sign out'}</span>
+      {failure !== null ? (
+        <span className="shrink-0 font-mono text-[10px] text-error">failed</span>
+      ) : null}
+    </button>
   );
 }
 
@@ -312,6 +363,13 @@ export function ProjectRail({ onAddProject }: ProjectRailProps): ReactElement {
           title="Visual workflow builder (beta)"
           badge="beta"
         />
+        <RailNavLink
+          to="/console/profile"
+          icon={UserRound}
+          label="Profile"
+          title="Your account, linked sources and sign out"
+        />
+        <RailSignOut />
         <RailNavLink
           to="/console/settings"
           icon={Settings}
