@@ -70,3 +70,20 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${String(Math.round(bytes / 1024))} KB`;
   return `${String(Math.round(bytes / (1024 * 1024)))} MB`;
 }
+
+/**
+ * The files carried by a paste or a drop, in order. A `DataTransferItemList`
+ * mixes strings and files — a screenshot pasted from the clipboard arrives as
+ * one `file` item next to `text/html` string items — so keep only the files.
+ * Items whose `getAsFile()` returns null (a dragged link, an empty entry) are
+ * skipped rather than reported: there is no file to attach.
+ */
+export function transferredFiles(items: DataTransferItemList): File[] {
+  const found: File[] = [];
+  for (const item of Array.from(items)) {
+    if (item.kind !== 'file') continue;
+    const file = item.getAsFile();
+    if (file !== null) found.push(file);
+  }
+  return found;
+}

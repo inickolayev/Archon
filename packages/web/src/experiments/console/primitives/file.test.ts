@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { isAcceptedFileType, formatBytes } from './file';
+import { isAcceptedFileType, formatBytes, transferredFiles } from './file';
 
 const file = (name: string, type = ''): File => new File(['x'], name, { type });
 
@@ -33,5 +33,42 @@ describe('formatBytes', () => {
     expect(formatBytes(512)).toBe('512 B');
     expect(formatBytes(2048)).toBe('2 KB');
     expect(formatBytes(5 * 1024 * 1024)).toBe('5 MB');
+  });
+});
+
+const items = (list: { kind: string; getAsFile: () => File | null }[]): DataTransferItemList =>
+  list as unknown as DataTransferItemList;
+
+describe('transferredFiles', () => {
+  test('keeps the file items of a paste and drops the string items', () => {
+    const png = file('image.png', 'image/png');
+    const result = transferredFiles(
+      items([
+        { kind: 'string', getAsFile: () => null },
+        { kind: 'file', getAsFile: () => png },
+      ])
+    );
+    expect(result).toEqual([png]);
+  });
+
+  test('keeps every file of a multi-file drop, in order', () => {
+    const a = file('a.png', 'image/png');
+    const b = file('b.png', 'image/png');
+    expect(
+      transferredFiles(
+        items([
+          { kind: 'file', getAsFile: () => a },
+          { kind: 'file', getAsFile: () => b },
+        ])
+      )
+    ).toEqual([a, b]);
+  });
+
+  test('skips a file item that carries no file', () => {
+    expect(transferredFiles(items([{ kind: 'file', getAsFile: () => null }]))).toEqual([]);
+  });
+
+  test('returns nothing for a plain-text paste', () => {
+    expect(transferredFiles(items([{ kind: 'string', getAsFile: () => null }]))).toEqual([]);
   });
 });

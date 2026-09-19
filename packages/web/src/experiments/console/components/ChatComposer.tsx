@@ -1,5 +1,12 @@
 import { Paperclip } from 'lucide-react';
-import { useRef, useState, type KeyboardEvent, type ReactElement } from 'react';
+import {
+  useRef,
+  useState,
+  type ClipboardEvent as ReactClipboardEvent,
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent,
+  type ReactElement,
+} from 'react';
 import {
   ACCEPTED_EXTENSIONS,
   MAX_FILES,
@@ -7,6 +14,7 @@ import {
   MAX_FILE_MB,
   formatBytes,
   isAcceptedFileType,
+  transferredFiles,
 } from '../primitives/file';
 
 interface ChatComposerProps {
@@ -24,8 +32,9 @@ interface PickedFile {
 
 /**
  * Console-native chat composer. Auto-growing textarea, Enter sends,
- * Shift+Enter newline, Escape blurs. Click-to-attach files via the paperclip
- * icon (the send skill builds the multipart upload).
+ * Shift+Enter newline, Escape blurs. Attach files with the paperclip icon, by
+ * pasting them into the textarea (Cmd/Ctrl+V of a screenshot) or by dropping
+ * them anywhere on the composer (the send skill builds the multipart upload).
  *
  * Reimplemented (not imported) from the old chat's MessageInput because the
  * console may not import production `@/components/**` (ESLint isolation rule).
@@ -43,6 +52,7 @@ export function ChatComposer({
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<PickedFile[]>([]);
   const [fileError, setFileError] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const idRef = useRef(0);
@@ -115,11 +125,55 @@ export function ChatComposer({
     }
   };
 
+  // Paste of a screenshot or a copied file. A text paste carries only string
+  // items, so the textarea keeps its default behaviour.
+  const onPaste = (e: ReactClipboardEvent<HTMLTextAreaElement>): void => {
+    if (disabled) return;
+    const pasted = transferredFiles(e.clipboardData.items);
+    if (pasted.length === 0) return;
+    e.preventDefault();
+    addFiles(pasted);
+  };
+
+  const onDragOver = (e: ReactDragEvent<HTMLDivElement>): void => {
+    if (disabled || !e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    if (!dragOver) setDragOver(true);
+  };
+
+  const onDragLeave = (e: ReactDragEvent<HTMLDivElement>): void => {
+    // Only un-flag when leaving the bounding rect, not on each child crossover.
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setDragOver(false);
+  };
+
+  const onDrop = (e: ReactDragEvent<HTMLDivElement>): void => {
+    if (disabled) return;
+    e.preventDefault();
+    setDragOver(false);
+    const dropped = Array.from(e.dataTransfer.files);
+    if (dropped.length > 0) addFiles(dropped);
+  };
+
   return (
     <div
-      className="shrink-0 border-t border-border bg-surface px-[30px] py-[14px]"
+      className="relative shrink-0 border-t border-border bg-surface px-[30px] py-[14px]"
       title={disabledReason}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
     >
+      {dragOver ? (
+        <div
+          aria-hidden
+          className="brand-bar-soft pointer-events-none absolute inset-0 z-10 flex items-center justify-center"
+        >
+          <span className="rounded border border-[color:var(--brand-magenta)] bg-surface px-3 py-1.5 font-mono text-[11px] text-[color:var(--brand-magenta)]">
+            drop files to attach
+          </span>
+        </div>
+      ) : null}
       <div className="mx-auto max-w-[940px]">
         {files.length > 0 ? (
           <div className="mb-[10px] flex flex-wrap gap-[6px]">
@@ -198,6 +252,7 @@ export function ChatComposer({
               grow(e.target);
             }}
             onKeyDown={onKeyDown}
+            onPaste={onPaste}
             rows={1}
             placeholder={disabled ? (disabledReason ?? 'Waiting…') : 'Message the agent…'}
             className="min-h-0 flex-1 resize-none bg-transparent py-[7px] text-[14.5px] leading-[1.5] text-text-primary placeholder:text-text-tertiary focus:outline-none disabled:opacity-50"
