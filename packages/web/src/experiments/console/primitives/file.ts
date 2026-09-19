@@ -65,6 +65,11 @@ export function isAcceptedFileType(file: File): boolean {
   return ACCEPTED_SET.has(file.name.slice(dot).toLowerCase());
 }
 
+/** True for a file the browser can show as an image preview. */
+export function isImageFile(file: File): boolean {
+  return file.type.split(';')[0]?.trim().startsWith('image/') ?? false;
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${String(bytes)} B`;
   if (bytes < 1024 * 1024) return `${String(Math.round(bytes / 1024))} KB`;
@@ -86,4 +91,15 @@ export function transferredFiles(items: DataTransferItemList): File[] {
     if (file !== null) found.push(file);
   }
   return found;
+}
+
+/**
+ * One file picked for the next message. `previewUrl` is an object URL for
+ * images (revoked by the owner when the attachment goes away) and null for
+ * everything else — a PDF or a `.ts` file has no thumbnail.
+ */
+export interface Attachment {
+  readonly id: string;
+  readonly file: File;
+  readonly previewUrl: string | null;
 }

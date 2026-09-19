@@ -1,5 +1,6 @@
 import { Paperclip } from 'lucide-react';
 import {
+  useEffect,
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
@@ -12,10 +13,14 @@ import {
   MAX_FILES,
   MAX_FILE_BYTES,
   MAX_FILE_MB,
-  formatBytes,
   isAcceptedFileType,
+  isImageFile,
   transferredFiles,
+  type Attachment,
 } from '../primitives/file';
+import { moveItem } from '../primitives/reorder';
+import { ChatAttachments } from './ChatAttachments';
+import { ImageLightbox } from './ImageLightbox';
 
 interface ChatComposerProps {
   onSend: (message: string, files?: File[]) => void;
@@ -25,16 +30,13 @@ interface ChatComposerProps {
 
 const MAX_HEIGHT = 200;
 
-interface PickedFile {
-  file: File;
-  id: string;
-}
-
 /**
  * Console-native chat composer. Auto-growing textarea, Enter sends,
  * Shift+Enter newline, Escape blurs. Attach files with the paperclip icon, by
  * pasting them into the textarea (Cmd/Ctrl+V of a screenshot) or by dropping
  * them anywhere on the composer (the send skill builds the multipart upload).
+ * Attachments show as chips with an image thumbnail, open full screen on a
+ * click and can be dragged into the order they should be sent in.
  *
  * Reimplemented (not imported) from the old chat's MessageInput because the
  * console may not import production `@/components/**` (ESLint isolation rule).
@@ -50,12 +52,26 @@ export function ChatComposer({
   disabledReason,
 }: ChatComposerProps): ReactElement {
   const [value, setValue] = useState('');
-  const [files, setFiles] = useState<PickedFile[]>([]);
+  const [files, setFiles] = useState<Attachment[]>([]);
   const [fileError, setFileError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [previewId, setPreviewId] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const idRef = useRef(0);
+  // Thumbnails are object URLs: the browser keeps the blob alive until each one
+  // is revoked, so every path that drops an attachment revokes it, and unmount
+  // sweeps whatever is left.
+  const filesRef = useRef<Attachment[]>([]);
+  filesRef.current = files;
+
+  useEffect(
+    () => (): void => {
+      for (const f of filesRef.current)
+        if (f.previewUrl !== null) URL.revokeObjectURL(f.previewUrl);
+    },
+    []
+  );
 
   const grow = (el: HTMLTextAreaElement): void => {
     el.style.height = 'auto';
@@ -82,7 +98,11 @@ export function ChatComposer({
         skipped.push(`${file.name}: unsupported type`);
         continue;
       }
-      next.push({ file, id: String(idRef.current++) });
+      next.push({
+        file,
+        id: String(idRef.current++),
+        previewUrl: isImageFile(file) ? URL.createObjectURL(file) : null,
+      });
     }
     setFiles(next);
     setFileError(
@@ -93,8 +113,23 @@ export function ChatComposer({
   };
 
   const removeFile = (id: string): void => {
-    setFiles(prev => prev.filter(f => f.id !== id));
+    setFiles(prev => {
+      const gone = prev.find(f => f.id === id);
+      if (gone?.previewUrl != null) URL.revokeObjectURL(gone.previewUrl);
+      return prev.filter(f => f.id !== id);
+    });
+    setPreviewId(current => (current === id ? null : current));
     setFileError(null);
+  };
+
+  const reorderFiles = (from: number, to: number): void => {
+    setFiles(prev => moveItem(prev, from, to));
+  };
+
+  const clearFiles = (): void => {
+    for (const f of filesRef.current) if (f.previewUrl !== null) URL.revokeObjectURL(f.previewUrl);
+    setFiles([]);
+    setPreviewId(null);
   };
 
   const submit = (): void => {
@@ -102,7 +137,7 @@ export function ChatComposer({
     if (trimmed.length === 0 || disabled) return;
     onSend(trimmed, files.length > 0 ? files.map(f => f.file) : undefined);
     setValue('');
-    setFiles([]);
+    clearFiles();
     setFileError(null);
     if (fileInputRef.current !== null) fileInputRef.current.value = '';
     if (textareaRef.current !== null) {
@@ -156,6 +191,11 @@ export function ChatComposer({
     if (dropped.length > 0) addFiles(dropped);
   };
 
+  // The lightbox steps through the attached images only, in chip order.
+  const images = files.filter(f => f.previewUrl !== null);
+  const previewIndex = images.findIndex(f => f.id === previewId);
+  const preview = previewIndex === -1 ? null : previewIndex;
+
   return (
     <div
       className="relative shrink-0 border-t border-border bg-surface px-[30px] py-[14px]"
@@ -176,32 +216,12 @@ export function ChatComposer({
       ) : null}
       <div className="mx-auto max-w-[940px]">
         {files.length > 0 ? (
-          <div className="mb-[10px] flex flex-wrap gap-[6px]">
-            {files.map(f => (
-              <span
-                key={f.id}
-                className="flex items-center gap-[6px] rounded-[8px] border bg-[color:var(--surface-elevated)] py-[4px] pl-[9px] pr-[5px] text-[11.5px]"
-                style={{ borderColor: 'var(--border-bright)' }}
-              >
-                <span className="max-w-[180px] truncate text-text-primary">{f.file.name}</span>
-                <span className="font-mono text-[10px] text-text-tertiary">
-                  {formatBytes(f.file.size)}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    removeFile(f.id);
-                  }}
-                  aria-label={`Remove ${f.file.name}`}
-                  className="rounded p-[1px] text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
-                >
-                  <span aria-hidden className="text-[11px] leading-none">
-                    ✕
-                  </span>
-                </button>
-              </span>
-            ))}
-          </div>
+          <ChatAttachments
+            files={files}
+            onRemove={removeFile}
+            onReorder={reorderFiles}
+            onOpen={setPreviewId}
+          />
         ) : null}
         {fileError !== null ? (
           <div className="mb-[8px] font-mono text-[11px] text-error">{fileError}</div>
@@ -291,6 +311,18 @@ export function ChatComposer({
           </span>
         </div>
       </div>
+      {preview !== null ? (
+        <ImageLightbox
+          images={images}
+          index={preview}
+          onIndex={i => {
+            setPreviewId(images[i]?.id ?? null);
+          }}
+          onClose={() => {
+            setPreviewId(null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
