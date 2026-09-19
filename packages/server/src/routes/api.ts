@@ -275,6 +275,7 @@ import {
   resetWorkflowNodeSessions,
 } from '@archon/core/operations/workflow-operations';
 import { getAuth, isWebAuthEnabled, getSignupMode, isApiGateEnabled } from '../auth';
+import { artifactHeaders } from './artifact-content-type';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -4812,9 +4813,12 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid filename');
     }
 
-    let content: string;
+    // Read the bytes, never a decoded string: `readFile(path, 'utf-8')`
+    // replaced every invalid byte of a PNG or a zip with U+FFFD, so binary
+    // artifacts arrived corrupted (and larger than the file on disk).
+    let content: Buffer;
     try {
-      content = await readFile(filePath, 'utf-8');
+      content = await readFile(filePath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         return apiError(c, 404, 'Artifact file not found');
@@ -4823,12 +4827,12 @@ export function registerApiRoutes(
       return apiError(c, 500, 'Failed to read artifact file');
     }
 
-    const contentType = filename.endsWith('.md')
-      ? 'text/markdown; charset=utf-8'
-      : 'text/plain; charset=utf-8';
-    return new Response(content, {
+    // Type from the extension, with document-executable types (SVG, HTML, XML)
+    // downgraded to text — artifacts are agent output, and this origin serves
+    // the console. See artifact-content-type.ts.
+    return new Response(new Uint8Array(content), {
       status: 200,
-      headers: { 'Content-Type': contentType },
+      headers: artifactHeaders(filename),
     });
   });
 

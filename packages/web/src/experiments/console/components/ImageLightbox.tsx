@@ -1,17 +1,27 @@
 import { useEffect, type ReactElement } from 'react';
-import type { Attachment } from '../primitives/file';
+
+/**
+ * One image the viewer can show. Deliberately not tied to chat attachments:
+ * run artifacts step through the same viewer, so callers map whatever they
+ * hold (an object URL, an `/api/artifacts/...` URL) onto this shape.
+ */
+export interface LightboxImage {
+  readonly id: string;
+  readonly name: string;
+  readonly url: string;
+}
 
 interface ImageLightboxProps {
-  images: Attachment[];
+  images: LightboxImage[];
   index: number;
   onIndex: (index: number) => void;
   onClose: () => void;
 }
 
 /**
- * Full-screen viewer for an attached image. Escape closes, ← / → step through
- * the other attached images, a click on the backdrop closes. Rendered by the
- * composer, so it lives above the chat without a portal.
+ * Full-screen viewer for one image. Escape closes, ← / → step through the
+ * other images of the same set, a click on the backdrop closes. Rendered by
+ * its owner (the composer, the artifact panel), so it needs no portal.
  */
 export function ImageLightbox({
   images,
@@ -38,7 +48,7 @@ export function ImageLightbox({
     };
   }, [images.length, index, onIndex, onClose]);
 
-  if (current?.previewUrl == null) return null;
+  if (current === undefined) return null;
 
   const step = (delta: number): void => {
     onIndex((index + delta + images.length) % images.length);
@@ -48,13 +58,13 @@ export function ImageLightbox({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label={current.file.name}
+      aria-label={current.name}
       onClick={onClose}
       className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-[14px] bg-[rgba(0,0,0,0.82)] p-[24px] backdrop-blur-[2px]"
     >
       <img
-        src={current.previewUrl}
-        alt={current.file.name}
+        src={current.url}
+        alt={current.name}
         onClick={e => {
           e.stopPropagation();
         }}
@@ -78,7 +88,7 @@ export function ImageLightbox({
             ←
           </button>
         ) : null}
-        <span className="max-w-[60vw] truncate">{current.file.name}</span>
+        <span className="max-w-[60vw] truncate">{current.name}</span>
         {images.length > 1 ? (
           <>
             <span className="text-text-tertiary">

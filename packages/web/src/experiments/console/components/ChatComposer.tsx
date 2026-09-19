@@ -19,7 +19,7 @@ import {
 } from '../primitives/file';
 import { moveItem } from '../primitives/reorder';
 import { ChatAttachments } from './ChatAttachments';
-import { ImageLightbox } from './ImageLightbox';
+import { ImageLightbox, type LightboxImage } from './ImageLightbox';
 
 interface ChatComposerProps {
   onSend: (message: string, files?: File[]) => void;
@@ -185,7 +185,9 @@ export function ChatComposer({
   };
 
   // The lightbox steps through the attached images only, in chip order.
-  const images = files.filter(f => f.previewUrl !== null);
+  const images: LightboxImage[] = files.flatMap(f =>
+    f.previewUrl === null ? [] : [{ id: f.id, name: f.file.name, url: f.previewUrl }]
+  );
   const previewIndex = images.findIndex(f => f.id === previewId);
   const preview = previewIndex === -1 ? null : previewIndex;
 

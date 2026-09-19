@@ -3615,4 +3615,115 @@ describe('GET /api/artifacts/:runId/* storage-key resolution', () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe('# the full report');
   });
+
+  test('serves a binary artifact byte-identical, with an image content type', async () => {
+    // The route used to read every artifact with `utf-8`, which replaced each
+    // invalid byte with U+FFFD — a PNG arrived corrupted and bigger than the
+    // file on disk. These bytes are deliberately not valid UTF-8.
+    const runId = 'run-serve-binary';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    const bytes = new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00, 0x80, 0xc3, 0x28,
+    ]);
+    await writeFile(join(dir, 'shot.png'), bytes);
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-local',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${runId}/shot.png`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('image/png');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    const served = new Uint8Array(await response.arrayBuffer());
+    expect(served.length).toBe(bytes.length);
+    expect([...served]).toEqual([...bytes]);
+  });
+
+  test('never serves an .svg as image/svg+xml (it would script this origin)', async () => {
+    // Artifacts are agent output and the console is served from the same
+    // origin, so a document-executable type is downgraded to text.
+    const runId = 'run-serve-svg';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+    await writeFile(join(dir, 'diagram.svg'), svg);
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-local',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${runId}/diagram.svg`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).not.toContain('svg');
+    expect(response.headers.get('content-type')).toBe('text/plain; charset=utf-8');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    // Still readable — the downgrade is about the type, not the content.
+    expect(await response.text()).toBe(svg);
+  });
+
+  test('offers an unknown binary type as a download', async () => {
+    const runId = 'run-serve-zip';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'trace.zip'), new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xff]));
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-local',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${runId}/trace.zip`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('application/zip');
+    expect(response.headers.get('content-disposition')).toBe('attachment; filename="trace.zip"');
+  });
+
+  test('keeps markdown typed as markdown for the artifact viewer', async () => {
+    const runId = 'run-serve-md-type';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'report.md'), '# report');
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-local',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${runId}/report.md`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/markdown; charset=utf-8');
+    expect(await response.text()).toBe('# report');
+  });
 });

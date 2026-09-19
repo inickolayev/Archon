@@ -1,13 +1,17 @@
 import { useEffect, useState, type ReactElement } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkBreaks from 'remark-breaks';
-import rehypeHighlight from 'rehype-highlight';
 import { useEntity } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
 import { HttpError } from '../lib/http';
+import {
+  artifactBasename,
+  artifactKind,
+  artifactUrl,
+  formatArtifactSize,
+} from '../primitives/artifact';
 import type { ArtifactFile } from '../skills/runs';
+import { ArtifactViewer } from './ArtifactViewer';
+import { ImageLightbox, type LightboxImage } from './ImageLightbox';
 
 interface ArtifactPanelProps {
   runId: string;
@@ -19,8 +23,10 @@ interface ArtifactPanelProps {
  * artifact dir) rather than `workflow_artifact` events — bash/script nodes
  * typically write straight to $ARTIFACTS_DIR without emitting an event.
  *
- * Markdown gets the same react-markdown + GFM + highlight stack the old UI
- * used; everything else renders as monospace plain text.
+ * Rendering is picked per file by `artifactKind` (see ArtifactViewer): a run
+ * that wrote 40 screenshots is browsed by thumbnail, and clicking one opens
+ * the full-screen viewer, which steps through this run's images in sidebar
+ * order.
  */
 export function ArtifactPanel({ runId }: ArtifactPanelProps): ReactElement {
   const {
@@ -30,6 +36,7 @@ export function ArtifactPanel({ runId }: ArtifactPanelProps): ReactElement {
   } = useEntity<ArtifactFile[]>(K.artifacts(runId), () => skill.listRunArtifacts(runId));
 
   const [selected, setSelected] = useState<string | null>(null);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
 
   // Auto-select the first file once the list arrives (or when the run changes).
   useEffect(() => {
@@ -83,29 +90,51 @@ export function ArtifactPanel({ runId }: ArtifactPanelProps): ReactElement {
     );
   }
 
+  // The lightbox walks this run's images in the order the sidebar lists them.
+  const images: LightboxImage[] = files.flatMap(f =>
+    artifactKind(f.path) === 'image'
+      ? [{ id: f.path, name: artifactBasename(f.path), url: artifactUrl(runId, f.path) }]
+      : []
+  );
+  const previewIndex = images.findIndex(i => i.id === previewPath);
+  const selectedFile = files.find(f => f.path === selected) ?? null;
+
   return (
     <div className="flex h-full min-h-0 w-full">
-      <ArtifactSidebar files={files} selected={selected} onSelect={setSelected} />
+      <ArtifactSidebar runId={runId} files={files} selected={selected} onSelect={setSelected} />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {selected !== null ? (
-          <ArtifactViewer runId={runId} path={selected} />
+        {selectedFile !== null ? (
+          <ArtifactViewer runId={runId} file={selectedFile} onOpenImage={setPreviewPath} />
         ) : (
           <div className="flex h-full items-center justify-center text-[12px] text-text-tertiary">
             Pick a file from the left.
           </div>
         )}
       </div>
+      {previewIndex !== -1 ? (
+        <ImageLightbox
+          images={images}
+          index={previewIndex}
+          onIndex={i => {
+            setPreviewPath(images[i]?.id ?? null);
+          }}
+          onClose={() => {
+            setPreviewPath(null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
 
 interface SidebarProps {
+  runId: string;
   files: ArtifactFile[];
   selected: string | null;
   onSelect: (path: string) => void;
 }
 
-function ArtifactSidebar({ files, selected, onSelect }: SidebarProps): ReactElement {
+function ArtifactSidebar({ runId, files, selected, onSelect }: SidebarProps): ReactElement {
   return (
     <nav
       aria-label="Artifacts"
@@ -117,7 +146,7 @@ function ArtifactSidebar({ files, selected, onSelect }: SidebarProps): ReactElem
       <ul className="flex flex-col gap-px p-2">
         {files.map(f => {
           const isSelected = selected === f.path;
-          const basename = f.path.split('/').pop() ?? f.path;
+          const basename = artifactBasename(f.path);
           const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : null;
           return (
             <li key={f.path}>
@@ -127,20 +156,25 @@ function ArtifactSidebar({ files, selected, onSelect }: SidebarProps): ReactElem
                   onSelect(f.path);
                 }}
                 aria-pressed={isSelected}
-                className={`group flex w-full flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left transition-colors ${
+                className={`group flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left transition-colors ${
                   isSelected ? 'bg-surface-elevated' : 'hover:bg-surface-hover'
                 }`}
               >
-                <span
-                  className={`truncate font-mono text-[12px] ${
-                    isSelected ? 'text-text-primary' : 'text-text-secondary'
-                  }`}
-                >
-                  {basename}
-                </span>
-                <span className="flex items-center justify-between gap-2 font-mono text-[10px] text-text-tertiary">
-                  <span className="truncate">{dir ?? '·'}</span>
-                  <span className="shrink-0 tabular-nums">{formatSize(f.size)}</span>
+                {artifactKind(f.path) === 'image' ? (
+                  <SidebarThumb url={artifactUrl(runId, f.path)} name={basename} />
+                ) : null}
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span
+                    className={`truncate font-mono text-[12px] ${
+                      isSelected ? 'text-text-primary' : 'text-text-secondary'
+                    }`}
+                  >
+                    {basename}
+                  </span>
+                  <span className="flex items-center justify-between gap-2 font-mono text-[10px] text-text-tertiary">
+                    <span className="truncate">{dir ?? '·'}</span>
+                    <span className="shrink-0 tabular-nums">{formatArtifactSize(f.size)}</span>
+                  </span>
                 </span>
               </button>
             </li>
@@ -151,78 +185,40 @@ function ArtifactSidebar({ files, selected, onSelect }: SidebarProps): ReactElem
   );
 }
 
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes.toString()} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+interface SidebarThumbProps {
+  url: string;
+  name: string;
 }
 
-interface ViewerProps {
-  runId: string;
-  path: string;
-}
+/**
+ * 28px preview in the file list — a run with 40 screenshots is unreadable as
+ * a column of names. Falls back to a neutral glyph if the image will not
+ * decode, so the row never shows a broken-image icon.
+ */
+function SidebarThumb({ url, name }: SidebarThumbProps): ReactElement {
+  const [failed, setFailed] = useState(false);
 
-const REMARK_PLUGINS = [remarkGfm, remarkBreaks];
-const REHYPE_PLUGINS = [rehypeHighlight];
-
-function ArtifactViewer({ runId, path }: ViewerProps): ReactElement {
-  const [content, setContent] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
-    setContent(null);
-    void skill
-      .fetchArtifact(runId, path)
-      .then(text => {
-        setContent(text);
-      })
-      .catch((e: unknown) => {
-        setError(e instanceof Error ? e.message : 'Failed to load artifact');
-      })
-      .finally(() => {
-        setLoading(false);
-      });
-  }, [runId, path]);
-
-  const basename = path.split('/').pop() ?? path;
-  const isMarkdown = basename.endsWith('.md') || basename.endsWith('.mdx');
+  if (failed) {
+    return (
+      <span
+        aria-hidden
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-border bg-surface font-mono text-[10px] text-text-tertiary"
+      >
+        ▤
+      </span>
+    );
+  }
 
   return (
-    <>
-      <header className="flex shrink-0 items-center justify-between border-b border-border bg-surface px-6 py-2">
-        <span className="truncate font-mono text-[12px] text-text-primary">{path}</span>
-        <a
-          href={`/api/artifacts/${encodeURIComponent(runId)}/${path
-            .split('/')
-            .map(encodeURIComponent)
-            .join('/')}`}
-          target="_blank"
-          rel="noreferrer"
-          className="shrink-0 font-mono text-[10px] text-text-tertiary transition-colors hover:text-text-primary"
-        >
-          open raw ↗
-        </a>
-      </header>
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
-        {loading ? (
-          <p className="font-mono text-[12px] text-text-tertiary">Loading…</p>
-        ) : error !== null ? (
-          <p className="font-mono text-[12px] text-error">{error}</p>
-        ) : content === null ? null : isMarkdown ? (
-          <div className="chat-markdown max-w-[820px] text-[13px] leading-relaxed text-text-primary">
-            <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>
-              {content}
-            </ReactMarkdown>
-          </div>
-        ) : (
-          <pre className="max-w-[1100px] whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-text-primary">
-            {content}
-          </pre>
-        )}
-      </div>
-    </>
+    <img
+      src={url}
+      alt=""
+      title={name}
+      loading="lazy"
+      onError={() => {
+        setFailed(true);
+      }}
+      className="h-7 w-7 shrink-0 rounded border border-border object-cover"
+    />
   );
 }
