@@ -1,6 +1,7 @@
 import type { ReactElement } from 'react';
 import { relativeTime } from '../lib/format';
 import { conversationLabel, type ConversationSummary } from '../primitives/conversation';
+import { PlatformBadge } from './PlatformBadge';
 
 interface ChatListProps {
   conversations: ConversationSummary[];
@@ -16,6 +17,10 @@ interface ChatListProps {
  * A conversation the server has not titled yet still gets a readable row
  * (`conversationLabel` falls back to when it was last active), so the list
  * never shows a blank line.
+ *
+ * Every platform of the project is listed, not just the console's own chats:
+ * a conversation is born on one platform but is not owned by it. The badge
+ * says which one it came from.
  */
 export function ChatList({ conversations, activeId, onSelect }: ChatListProps): ReactElement {
   if (conversations.length === 0) {
@@ -42,17 +47,22 @@ export function ChatList({ conversations, activeId, onSelect }: ChatListProps): 
                 isActive ? 'bg-surface-elevated' : 'hover:bg-surface-hover'
               }`}
             >
-              <span
-                className={`truncate text-[12px] ${
-                  isActive ? 'text-text-primary' : 'text-text-secondary'
-                }`}
-              >
-                {conversationLabel(conversation)}
+              <span className="flex items-center gap-1.5">
+                <span
+                  className={`truncate text-[12px] ${
+                    isActive ? 'text-text-primary' : 'text-text-secondary'
+                  }`}
+                >
+                  {conversationLabel(conversation)}
+                </span>
               </span>
-              <span className="font-mono text-[10px] text-text-tertiary">
-                {conversation.lastActivityAt !== null
-                  ? relativeTime(conversation.lastActivityAt)
-                  : 'not started'}
+              <span className="flex items-center gap-1.5 font-mono text-[10px] text-text-tertiary">
+                <PlatformBadge platformType={conversation.platformType} />
+                <span>
+                  {conversation.lastActivityAt !== null
+                    ? relativeTime(conversation.lastActivityAt)
+                    : 'not started'}
+                </span>
               </span>
             </button>
           </li>

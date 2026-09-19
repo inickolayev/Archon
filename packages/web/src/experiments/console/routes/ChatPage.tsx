@@ -76,15 +76,12 @@ export function ChatPage(): ReactElement {
     () => (projectId !== undefined ? skill.listConversations(projectId) : Promise.resolve([]))
   );
 
-  // Only the console's own chats are switchable here: a Telegram or CLI
-  // conversation of the same project is not something this page can drive.
-  // Sorted here rather than trusting the API's order — "the most recent chat"
-  // is what a bare /chat adopts, so it has to be true.
-  const webConversations = useMemo(
-    () =>
-      (conversations ?? [])
-        .filter(c => c.platformType === 'web')
-        .sort((a, b) => activityMs(b) - activityMs(a)),
+  // Every conversation of the project, whatever platform it was born on: a
+  // chat started in Telegram continues here and vice versa. Sorted by last
+  // activity rather than trusting the API's order — "the most recent chat" is
+  // what a bare /chat adopts, so it has to be true.
+  const projectConversations = useMemo(
+    () => (conversations ?? []).slice().sort((a, b) => activityMs(b) - activityMs(a)),
     [conversations]
   );
 
@@ -102,9 +99,9 @@ export function ChatPage(): ReactElement {
   // so Back still leaves the chat rather than bouncing between the two forms).
   useEffect(() => {
     if (conversationId !== undefined || projectId === undefined) return;
-    const latest = webConversations[0];
+    const latest = projectConversations[0];
     if (latest !== undefined) navigate(chatPath(latest.id), { replace: true });
-  }, [conversationId, projectId, webConversations, navigate, chatPath]);
+  }, [conversationId, projectId, projectConversations, navigate, chatPath]);
 
   const { data: messages, error: messagesError } = useEntity<Message[]>(
     activeConvId !== null ? K.messages(activeConvId) : 'noop:no-conv',
@@ -341,7 +338,7 @@ export function ChatPage(): ReactElement {
             <p className="text-xs text-text-tertiary">{project?.path ?? 'Loading…'}</p>
           </div>
           <ChatPicker
-            conversations={webConversations}
+            conversations={projectConversations}
             activeId={activeConvId}
             onSelect={id => {
               navigate(chatPath(id));

@@ -45,3 +45,31 @@ export function conversationLabel(
   }
   return 'Untitled chat';
 }
+
+/**
+ * Short marker for where a conversation is read and written from. A
+ * conversation is born on one platform but is not owned by it — the console
+ * lists them all, and this is what makes a Telegram chat recognisable at a
+ * glance.
+ */
+export function platformLabel(platformType: string): string {
+  switch (platformType) {
+    case 'web':
+      return 'web';
+    case 'telegram':
+      return 'telegram';
+    case 'discord':
+      return 'discord';
+    case 'slack':
+      return 'slack';
+    case 'cli':
+      return 'cli';
+    default:
+      return platformType;
+  }
+}
+
+/** True for the console's own chats — the ones it created. */
+export function isWebConversation(conversation: ConversationSummary): boolean {
+  return conversation.platformType === 'web';
+}

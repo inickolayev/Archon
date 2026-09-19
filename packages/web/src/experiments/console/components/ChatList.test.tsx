@@ -91,3 +91,37 @@ describe('conversationLabel', () => {
     );
   });
 });
+
+describe('ChatList platform markers', () => {
+  test('a Telegram chat is recognisable at a glance', () => {
+    const html = renderToStaticMarkup(
+      <ChatList
+        conversations={[
+          conv({ id: 'web-1', title: 'From the browser' }),
+          conv({ id: '123456789:2', title: 'From the phone', platformType: 'telegram' }),
+        ]}
+        activeId={null}
+        onSelect={() => undefined}
+      />
+    );
+    expect(html).toContain('telegram');
+    expect(html).toContain('From the phone');
+  });
+
+  test('lists conversations of every platform, not just the console\u2019s own', () => {
+    const html = renderToStaticMarkup(
+      <ChatList
+        conversations={[
+          conv({ id: '123:2', platformType: 'telegram', title: 'Phone thread' }),
+          conv({ id: 'cli-9', platformType: 'cli', title: 'CLI run' }),
+        ]}
+        activeId="123:2"
+        onSelect={() => undefined}
+      />
+    );
+    expect(html.match(/<li>/g)?.length).toBe(2);
+    expect(html).toContain('Phone thread');
+    expect(html).toContain('CLI run');
+    expect(html).toContain('cli');
+  });
+});

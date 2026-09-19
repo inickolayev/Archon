@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { ChatList } from './ChatList';
+import { PlatformBadge } from './PlatformBadge';
 import { conversationLabel, type ConversationSummary } from '../primitives/conversation';
 
 interface ChatPickerProps {
@@ -63,6 +64,7 @@ export function ChatPicker({
         className="flex max-w-[220px] items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] text-text-secondary transition-colors hover:text-text-primary"
         style={{ borderColor: 'var(--border-bright)' }}
       >
+        {active !== null ? <PlatformBadge platformType={active.platformType} hideWeb /> : null}
         <span className="truncate">{label}</span>
         <span aria-hidden className="font-mono text-[9px] text-text-tertiary">
           ▾
