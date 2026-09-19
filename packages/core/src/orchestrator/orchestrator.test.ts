@@ -83,6 +83,9 @@ const mockTouchConversation = mock<typeof ConversationDb.touchConversation>(() =
 );
 
 mock.module('../db/conversations', () => ({
+  // handleMessage resolves the conversation through getOrAdopt (which falls
+  // back to getOrCreate); the mock keeps returning the same row either way.
+  getOrAdoptConversation: mockGetOrCreateConversation,
   getOrCreateConversation: mockGetOrCreateConversation,
   getConversationByPlatformId: mockGetConversationByPlatformId,
   updateConversation: mockUpdateConversation,

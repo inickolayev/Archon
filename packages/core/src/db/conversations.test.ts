@@ -16,7 +16,10 @@ mock.module('./connection', () => ({
 }));
 
 import {
+  getOrAdoptConversation,
   getOrCreateConversation,
+  listConversationsForChat,
+  markConversationActive,
   updateConversation,
   findConversationByPlatformId,
 } from './conversations';
@@ -416,5 +419,105 @@ describe('conversations', () => {
         );
       }
     });
+  });
+});
+
+describe('getOrAdoptConversation', () => {
+  beforeEach(() => {
+    mockQuery.mockClear();
+  });
+
+  const telegramRow: Conversation = {
+    id: 'conv-telegram',
+    platform_type: 'telegram',
+    platform_conversation_id: '123456789:2',
+    ai_assistant_type: 'claude',
+    codebase_id: null,
+    cwd: null,
+    isolation_env_id: null,
+    title: 'Started on the phone',
+    hidden: false,
+    deleted_at: null,
+    user_id: null,
+    last_activity_at: null,
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+
+  test('returns the row of the same platform when there is one', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([telegramRow]));
+
+    const result = await getOrAdoptConversation('telegram', '123456789:2');
+
+    expect(result).toEqual(telegramRow);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test('adopts a conversation born on another platform instead of forking a twin', async () => {
+    // Delivering through the web adapter, but the conversation is Telegram's.
+    mockQuery
+      .mockResolvedValueOnce(createQueryResult([])) // no ('web', '123456789:2')
+      .mockResolvedValueOnce(createQueryResult([telegramRow])); // but the id exists
+
+    const result = await getOrAdoptConversation('web', '123456789:2');
+
+    expect(result).toEqual(telegramRow);
+    // Two lookups, and crucially no INSERT.
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    const statements = mockQuery.mock.calls.map(call => String(call[0]));
+    expect(statements.some(sql => sql.includes('INSERT'))).toBe(false);
+  });
+
+  test('falls through to creation when the id is unknown everywhere', async () => {
+    const loadConfigSpy = spyOn(configLoader, 'loadConfig').mockResolvedValue({
+      assistant: 'claude',
+    } as Awaited<ReturnType<typeof configLoader.loadConfig>>);
+    mockQuery
+      .mockResolvedValueOnce(createQueryResult([])) // same platform
+      .mockResolvedValueOnce(createQueryResult([])) // any platform
+      .mockResolvedValueOnce(createQueryResult([])) // getOrCreate's own lookup
+      .mockResolvedValueOnce(createQueryResult([{ ...telegramRow, id: 'conv-new' }]));
+
+    const result = await getOrAdoptConversation('web', 'web-brand-new');
+
+    expect(result.id).toBe('conv-new');
+    const statements = mockQuery.mock.calls.map(call => String(call[0]));
+    expect(statements.some(sql => sql.includes('INSERT'))).toBe(true);
+    loadConfigSpy.mockRestore();
+  });
+});
+
+describe('listConversationsForChat', () => {
+  beforeEach(() => {
+    mockQuery.mockClear();
+  });
+
+  test('matches the chat exactly or by `<chat id>:` prefix, never a longer chat id', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+    await listConversationsForChat('telegram', '123');
+
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('platform_conversation_id = $2');
+    expect(sql).toContain('platform_conversation_id LIKE $3');
+    expect(sql).toContain('deleted_at IS NULL');
+    expect(params).toEqual(['telegram', '123', '123:%']);
+  });
+});
+
+describe('markConversationActive', () => {
+  beforeEach(() => {
+    mockQuery.mockClear();
+  });
+
+  test('bumps last_activity_at and updated_at together', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+    await markConversationActive('conv-1');
+
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('last_activity_at =');
+    expect(sql).toContain('updated_at =');
+    expect(params).toEqual(['conv-1']);
   });
 });

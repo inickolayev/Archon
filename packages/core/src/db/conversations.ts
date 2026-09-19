@@ -141,6 +141,53 @@ export async function getOrCreateConversation(
   return created.rows[0];
 }
 
+/**
+ * The conversation this turn belongs to, adopting a row that was born on
+ * another platform instead of forking a twin.
+ *
+ * A conversation is not owned by the platform it started on: the web console
+ * can continue a Telegram-born chat, and then `handleMessage` runs with the
+ * web adapter while `platform_conversation_id` still names a Telegram
+ * conversation. Looking it up by (platform_type, platform_conversation_id)
+ * alone would miss it and INSERT a second row with the same platform id under
+ * `web` — two half-conversations, one history each.
+ *
+ * Platform ids are globally unique in practice (the web API has relied on that
+ * in `findConversationByPlatformId` since before this), so a row found under a
+ * different platform type is the same conversation, not a collision.
+ */
+export async function getOrAdoptConversation(
+  platformType: string,
+  platformId: string,
+  codebaseId?: string,
+  parentConversationId?: string,
+  userId?: string
+): Promise<Conversation> {
+  const samePlatform = await getConversationByPlatformId(platformType, platformId);
+  if (samePlatform) return samePlatform;
+
+  const otherPlatform = await findConversationByPlatformId(platformId);
+  if (otherPlatform) {
+    getLog().debug(
+      {
+        platformId,
+        deliveringAs: platformType,
+        conversationPlatform: otherPlatform.platform_type,
+      },
+      'db.conversation_adopted_across_platforms'
+    );
+    return otherPlatform;
+  }
+
+  return getOrCreateConversation(
+    platformType,
+    platformId,
+    codebaseId,
+    parentConversationId,
+    userId
+  );
+}
+
 export async function updateConversation(
   id: string,
   updates: Partial<Pick<Conversation, 'codebase_id' | 'cwd' | 'isolation_env_id'>> & {

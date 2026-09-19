@@ -147,6 +147,9 @@ const mockUpdateConversation = mock<typeof ConversationDb.updateConversation>(()
   Promise.resolve()
 );
 mock.module('../db/conversations', () => ({
+  // handleMessage resolves the conversation through getOrAdopt (which falls
+  // back to getOrCreate); the mock keeps returning the same row either way.
+  getOrAdoptConversation: mockGetOrCreateConversation,
   getOrCreateConversation: mockGetOrCreateConversation,
   getConversationByPlatformId: mock(() => Promise.resolve(null)),
   updateConversation: mockUpdateConversation,

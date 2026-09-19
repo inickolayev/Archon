@@ -1991,7 +1991,10 @@ export async function handleMessage(
     // execution identity; each turn's prefs/credentials resolve from the
     // SENDER when the adapter supplied one (see executionUserId below).
     // Per-message attribution happens on workflow_runs.
-    let conversation = await db.getOrCreateConversation(
+    // Adopt, don't fork: the browser can answer a Telegram-born conversation,
+    // and the row it must land on is the one that already exists under that
+    // platform id — whatever platform this turn is being delivered through.
+    let conversation = await db.getOrAdoptConversation(
       platform.getPlatformType(),
       conversationId,
       undefined,
