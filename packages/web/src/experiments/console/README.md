@@ -13,7 +13,8 @@ Mounted at `/console/*`. Not part of the shipped product. Validates the mental m
 - `/console/builder` → Workflow builder (project picker + open a workflow) — global
 - `/console/builder/:name` → Workflow builder editing `:name` (deep-link with `?project=<id>`)
 - `/console/p/:projectId` → Runs view scoped to a project
-- `/console/p/:projectId/chat` → Project-scoped agent chat
+- `/console/p/:projectId/chat` → Project-scoped agent chat (redirects to the most recent chat)
+- `/console/p/:projectId/chat/:conversationId` → One chat of that project; `new` = an unsent chat, created on first send
 - `/console/p/:projectId/r/:runId` → Run detail
 
 ## Chat uploads

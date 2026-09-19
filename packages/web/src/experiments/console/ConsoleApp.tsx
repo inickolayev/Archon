@@ -79,6 +79,8 @@ export function ConsoleApp(): ReactElement {
             <Route path="_preview" element={<PreviewPage />} />
             <Route path="p/:projectId" element={<RunsPage />} />
             <Route path="p/:projectId/chat" element={<ChatPage />} />
+            {/* The chat on screen is named in the URL so reload / Back keep it. */}
+            <Route path="p/:projectId/chat/:conversationId" element={<ChatPage />} />
             <Route path="p/:projectId/r/:runId" element={<RunDetailPage />} />
           </Routes>
         </main>

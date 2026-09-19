@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
-import { useParams } from 'react-router';
+import { useNavigate, useParams } from 'react-router';
 import { ChatStream } from '../components/ChatStream';
 import { ChatComposer } from '../components/ChatComposer';
+import { ChatPicker } from '../components/ChatPicker';
 import { ProjectViewTabs } from '../components/ProjectViewTabs';
 import { WorkingIndicator } from '../components/WorkingIndicator';
 import { WorkflowDock } from '../components/WorkflowDock';
@@ -11,6 +12,7 @@ import { useConversationSSE } from '../lib/sse';
 import { useEntity, invalidate } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
+import { ensureUtc } from '../lib/format';
 import type { Project } from '../primitives/project';
 import type { Message } from '../primitives/message';
 import type { ConversationSummary } from '../primitives/conversation';
@@ -28,20 +30,41 @@ const MAX_WAIT_MS = 300_000;
 // Distance from the bottom (px) within which we treat the scroll as "at bottom"
 // — drives both auto-scroll stickiness and the jump-to-bottom button's visibility.
 const NEAR_BOTTOM_PX = 120;
+// URL segment for a chat that exists only on screen: nothing is created until
+// the first send, so `New chat` is a route, not a write.
+const NEW_CHAT_SEGMENT = 'new';
+
+/** Sort key for the chat list: never-used chats sink to the bottom. */
+function activityMs(conversation: ConversationSummary): number {
+  if (conversation.lastActivityAt === null) return 0;
+  const ms = new Date(ensureUtc(conversation.lastActivityAt)).getTime();
+  return Number.isNaN(ms) ? 0 : ms;
+}
 
 /**
  * Project-scoped agent chat. A tab peer of the runs view under a project.
  *
- * MVP conversation model: one active conversation per project — the most-recent
- * web conversation, or created lazily on first send. No multi-conversation
- * sidebar yet (spike decision #3, deferred).
+ * A project can hold many chats. The one on screen is named by the URL
+ * (`/console/p/:projectId/chat/:conversationId`), so a reload or the Back
+ * button returns to the same chat instead of silently landing on another;
+ * `/chat` with no id redirects to the most recent one, and `/chat/new` is an
+ * empty chat that becomes real on its first send (creation stays lazy — the
+ * button can be pressed all day without writing a row).
+ *
+ * Everything the composer shows — busy, the send error, the attachment chips —
+ * belongs to the conversation on screen and is reset when it changes, so no
+ * state leaks from one chat into another.
  *
  * Data flow mirrors RunDetailPage: load messages via useEntity(K.messages),
  * keep live via useConversationSSE (invalidate → refetch), render with the
  * shared MessageItem/ToolCallItem cards inside a StreamContextProvider.
  */
 export function ChatPage(): ReactElement {
-  const { projectId } = useParams<{ projectId: string }>();
+  const { projectId, conversationId } = useParams<{
+    projectId: string;
+    conversationId?: string;
+  }>();
+  const navigate = useNavigate();
 
   const { data: project } = useEntity<Project | null>(
     projectId !== undefined ? K.project(projectId) : 'noop:no-project',
@@ -53,13 +76,35 @@ export function ChatPage(): ReactElement {
     () => (projectId !== undefined ? skill.listConversations(projectId) : Promise.resolve([]))
   );
 
-  // Active conversation: most-recent web conversation, else null until first send.
-  const [activeConvId, setActiveConvId] = useState<string | null>(null);
+  // Only the console's own chats are switchable here: a Telegram or CLI
+  // conversation of the same project is not something this page can drive.
+  // Sorted here rather than trusting the API's order — "the most recent chat"
+  // is what a bare /chat adopts, so it has to be true.
+  const webConversations = useMemo(
+    () =>
+      (conversations ?? [])
+        .filter(c => c.platformType === 'web')
+        .sort((a, b) => activityMs(b) - activityMs(a)),
+    [conversations]
+  );
+
+  // The URL is the source of truth. `new` (or an id we have not been given)
+  // means "unsent chat" — null until the first send creates one.
+  const activeConvId =
+    conversationId === undefined || conversationId === NEW_CHAT_SEGMENT ? null : conversationId;
+
+  const chatPath = useCallback(
+    (segment: string): string => `/console/p/${projectId ?? ''}/chat/${segment}`,
+    [projectId]
+  );
+
+  // Bare `/chat` adopts the most recent chat and puts it in the URL (replace,
+  // so Back still leaves the chat rather than bouncing between the two forms).
   useEffect(() => {
-    if (activeConvId !== null) return;
-    const web = (conversations ?? []).find(c => c.platformType === 'web');
-    if (web !== undefined) setActiveConvId(web.id);
-  }, [conversations, activeConvId]);
+    if (conversationId !== undefined || projectId === undefined) return;
+    const latest = webConversations[0];
+    if (latest !== undefined) navigate(chatPath(latest.id), { replace: true });
+  }, [conversationId, projectId, webConversations, navigate, chatPath]);
 
   const { data: messages, error: messagesError } = useEntity<Message[]>(
     activeConvId !== null ? K.messages(activeConvId) : 'noop:no-conv',
@@ -130,6 +175,27 @@ export function ChatPage(): ReactElement {
     []
   );
 
+  // Switching chats: drop everything that described the previous one. `busy` is
+  // re-derived from the new chat's trailing message by the effect above, so a
+  // chat that is mid-turn still comes back locked. The one case we must not
+  // reset is the switch we make ourselves right after creating a conversation —
+  // its first message is already in flight.
+  const justCreatedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (justCreatedRef.current !== null && justCreatedRef.current === activeConvId) {
+      justCreatedRef.current = null;
+      return;
+    }
+    if (settleTimerRef.current !== null) {
+      clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = null;
+    }
+    settleSigRef.current = '';
+    setBusy(false);
+    setError(null);
+    setNotice(null);
+  }, [activeConvId]);
+
   // Recovery poll: while a reply is pending, refetch messages on a cadence so a
   // dropped or absent SSE event can't hide the reply. Hard-caps at MAX_WAIT_MS.
   const busySinceRef = useRef(0);
@@ -160,7 +226,9 @@ export function ChatPage(): ReactElement {
       try {
         if (activeConvId === null) {
           const conv = await skill.createConversation(projectId, text);
-          setActiveConvId(conv.conversationId);
+          justCreatedRef.current = conv.conversationId;
+          // Replace: the unsent `/chat/new` entry is not worth a Back step.
+          navigate(chatPath(conv.conversationId), { replace: true });
           invalidate(K.conversations(projectId));
           invalidate(K.messages(conv.conversationId));
           // createConversation is JSON-only — files can't ride the first message.
@@ -244,13 +312,23 @@ export function ChatPage(): ReactElement {
   return (
     <section className="flex h-full flex-col">
       <header className="flex flex-col gap-3 border-b border-border px-6 py-4">
-        <div className="flex items-baseline justify-between gap-4">
+        <div className="flex flex-wrap items-baseline justify-between gap-3">
           <div className="min-w-0">
             <h1 className="truncate text-base font-medium text-text-primary">
               {project?.name ?? 'Project'}
             </h1>
             <p className="text-xs text-text-tertiary">{project?.path ?? 'Loading…'}</p>
           </div>
+          <ChatPicker
+            conversations={webConversations}
+            activeId={activeConvId}
+            onSelect={id => {
+              navigate(chatPath(id));
+            }}
+            onNewChat={() => {
+              navigate(chatPath(NEW_CHAT_SEGMENT));
+            }}
+          />
         </div>
         <ProjectViewTabs projectId={projectId} active="chat" />
       </header>
@@ -264,10 +342,17 @@ export function ChatPage(): ReactElement {
           {/* Match the composer's centered 940px column (design: .stream-inner) */}
           <div className="mx-auto max-w-[940px]">
             {messageList.length === 0 && !busy ? (
-              <EmptyState
-                title="No messages yet."
-                hint="Ask the agent about this project, or tell it what to run."
-              />
+              activeConvId === null ? (
+                <EmptyState
+                  title="New chat."
+                  hint="It starts when you send the first message — nothing is saved before that."
+                />
+              ) : (
+                <EmptyState
+                  title="No messages yet."
+                  hint="Ask the agent about this project, or tell it what to run."
+                />
+              )
             ) : (
               <StreamContextProvider value={{ runStartedAt: null }}>
                 <ChatStream messages={messageList} showTools={showTools} />
@@ -311,7 +396,10 @@ export function ChatPage(): ReactElement {
         </div>
       ) : null}
 
-      <ChatComposer onSend={onSend} disabled={busy} />
+      {/* Keyed by conversation: a chat switch remounts the composer, so a draft
+          or an attachment chip can never follow you into another chat (the
+          unmount also revokes the thumbnails' object URLs). */}
+      <ChatComposer key={activeConvId ?? NEW_CHAT_SEGMENT} onSend={onSend} disabled={busy} />
     </section>
   );
 }
