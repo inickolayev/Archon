@@ -103,3 +103,51 @@ export interface Attachment {
   readonly file: File;
   readonly previewUrl: string | null;
 }
+
+/** The id and preview URL minted for one accepted file. */
+export type AttachmentMeta = Omit<Attachment, 'file'>;
+
+/** The list after one batch of picks, plus a reason per rejected file. */
+export interface AttachmentBatch {
+  readonly next: readonly Attachment[];
+  readonly skipped: readonly string[];
+}
+
+/**
+ * Apply one batch of picked files (a paste, a drop, a picker pick) on top of
+ * the attachments already held, returning a new list — never mutating the one
+ * passed in. The caller must feed it the *latest* list, not a render snapshot:
+ * two batches arriving in the same tick have to build on each other, or the
+ * first one is silently dropped.
+ *
+ * `mint` produces the per-attachment id and preview URL. It is injected (and
+ * called only for accepted files) so the accept/skip decision stays testable
+ * without a DOM and no object URL is created for a file that is thrown away.
+ *
+ * Every rejection reason is accumulated, not just the last, so a mixed pick
+ * surfaces all of them.
+ */
+export function attachFiles(
+  current: readonly Attachment[],
+  incoming: readonly File[],
+  mint: (file: File) => AttachmentMeta
+): AttachmentBatch {
+  const next = [...current];
+  const skipped: string[] = [];
+  for (const file of incoming) {
+    if (next.length >= MAX_FILES) {
+      skipped.push(`${file.name}: over the ${String(MAX_FILES)}-file limit`);
+      continue;
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      skipped.push(`${file.name}: larger than ${String(MAX_FILE_MB)} MB`);
+      continue;
+    }
+    if (!isAcceptedFileType(file)) {
+      skipped.push(`${file.name}: unsupported type`);
+      continue;
+    }
+    next.push({ file, ...mint(file) });
+  }
+  return { next, skipped };
+}

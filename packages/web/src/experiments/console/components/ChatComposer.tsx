@@ -11,12 +11,11 @@ import {
 import {
   ACCEPTED_EXTENSIONS,
   MAX_FILES,
-  MAX_FILE_BYTES,
-  MAX_FILE_MB,
-  isAcceptedFileType,
+  attachFiles,
   isImageFile,
   transferredFiles,
   type Attachment,
+  type AttachmentMeta,
 } from '../primitives/file';
 import { moveItem } from '../primitives/reorder';
 import { ChatAttachments } from './ChatAttachments';
@@ -62,8 +61,17 @@ export function ChatComposer({
   // Thumbnails are object URLs: the browser keeps the blob alive until each one
   // is revoked, so every path that drops an attachment revokes it, and unmount
   // sweeps whatever is left.
+  //
+  // `filesRef` — not the `files` render snapshot — is what every mutation reads
+  // and writes: two batches landing in the same tick (two quick pastes, a paste
+  // then a drop) have to build on each other. Reading the snapshot made both
+  // start from the same stale list, so the earlier batch was silently lost.
   const filesRef = useRef<Attachment[]>([]);
-  filesRef.current = files;
+
+  const setAttachments = (next: readonly Attachment[]): void => {
+    filesRef.current = [...next];
+    setFiles(filesRef.current);
+  };
 
   useEffect(
     () => (): void => {
@@ -80,31 +88,14 @@ export function ChatComposer({
     el.style.overflowY = next >= MAX_HEIGHT ? 'auto' : 'hidden';
   };
 
+  const mintAttachment = (file: File): AttachmentMeta => ({
+    id: String(idRef.current++),
+    previewUrl: isImageFile(file) ? URL.createObjectURL(file) : null,
+  });
+
   const addFiles = (incoming: File[]): void => {
-    const next = [...files];
-    // Accumulate every rejection reason (not just the last) so a mixed pick
-    // surfaces all of them.
-    const skipped: string[] = [];
-    for (const file of incoming) {
-      if (next.length >= MAX_FILES) {
-        skipped.push(`${file.name}: over the ${String(MAX_FILES)}-file limit`);
-        continue;
-      }
-      if (file.size > MAX_FILE_BYTES) {
-        skipped.push(`${file.name}: larger than ${String(MAX_FILE_MB)} MB`);
-        continue;
-      }
-      if (!isAcceptedFileType(file)) {
-        skipped.push(`${file.name}: unsupported type`);
-        continue;
-      }
-      next.push({
-        file,
-        id: String(idRef.current++),
-        previewUrl: isImageFile(file) ? URL.createObjectURL(file) : null,
-      });
-    }
-    setFiles(next);
+    const { next, skipped } = attachFiles(filesRef.current, incoming, mintAttachment);
+    setAttachments(next);
     setFileError(
       skipped.length > 0
         ? `Skipped ${String(skipped.length)} file(s) — ${skipped.join('; ')}`
@@ -113,29 +104,31 @@ export function ChatComposer({
   };
 
   const removeFile = (id: string): void => {
-    setFiles(prev => {
-      const gone = prev.find(f => f.id === id);
-      if (gone?.previewUrl != null) URL.revokeObjectURL(gone.previewUrl);
-      return prev.filter(f => f.id !== id);
-    });
+    const gone = filesRef.current.find(f => f.id === id);
+    if (gone === undefined) return;
+    // Revoked here rather than inside a state updater: React re-runs updaters
+    // (StrictMode does it on purpose), which would revoke the same URL twice.
+    if (gone.previewUrl !== null) URL.revokeObjectURL(gone.previewUrl);
+    setAttachments(filesRef.current.filter(f => f.id !== id));
     setPreviewId(current => (current === id ? null : current));
     setFileError(null);
   };
 
   const reorderFiles = (from: number, to: number): void => {
-    setFiles(prev => moveItem(prev, from, to));
+    setAttachments(moveItem(filesRef.current, from, to));
   };
 
   const clearFiles = (): void => {
     for (const f of filesRef.current) if (f.previewUrl !== null) URL.revokeObjectURL(f.previewUrl);
-    setFiles([]);
+    setAttachments([]);
     setPreviewId(null);
   };
 
   const submit = (): void => {
     const trimmed = value.trim();
     if (trimmed.length === 0 || disabled) return;
-    onSend(trimmed, files.length > 0 ? files.map(f => f.file) : undefined);
+    const attached = filesRef.current;
+    onSend(trimmed, attached.length > 0 ? attached.map(f => f.file) : undefined);
     setValue('');
     clearFiles();
     setFileError(null);
