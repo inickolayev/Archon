@@ -7,6 +7,8 @@ import { relativeTime } from '../lib/format';
 import { leaveForSignIn, performSignOut } from '../lib/session';
 import { errorText } from '../lib/http';
 import { PlatformBadge } from '../components/PlatformBadge';
+import { SettingsSection } from '../components/SettingsSection';
+import { INPUT_CLASS } from '../components/SettingsFormPrimitives';
 
 /**
  * The account: who you are here, what can sign in as you, and the way out.
@@ -30,34 +32,37 @@ export function ProfilePage(): ReactElement {
   }
 
   return (
-    <section className="flex h-full min-h-0 flex-col overflow-y-auto">
-      <header className="shrink-0 border-b border-border px-6 py-4">
-        <h1 className="text-base font-medium text-text-primary">Profile</h1>
-        <p className="text-xs text-text-tertiary">
-          Your account, what is linked to it, and how to sign out.
-        </p>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <header className="px-10 pt-[22px]">
+        <h1 className="text-[22px] font-extrabold tracking-[-0.4px] text-text-primary">Profile</h1>
       </header>
-
-      <div className="flex min-h-0 flex-1 flex-col gap-6 px-6 py-5">
-        <IdentityCard account={account} />
-        <PasswordCard />
-        <LinkedSourcesCard account={account} />
-        <SignOutCard
-          signOut={() =>
-            performSignOut({
-              signOut: skill.signOut,
-              // Wipe the cache before leaving: whatever is signed in next must
-              // not read this account's projects and chats out of a warm store.
-              clearAll,
-              redirect: leaveForSignIn,
-            })
-          }
-        />
+      <div className="flex-1 overflow-y-auto px-10 pb-14 pt-5">
+        <div className="mx-auto flex max-w-[680px] flex-col gap-[22px]">
+          <IdentityCard account={account} />
+          <PasswordCard />
+          <LinkedSourcesCard account={account} />
+          <SignOutCard
+            signOut={() =>
+              performSignOut({
+                signOut: skill.signOut,
+                // Wipe the cache before leaving: whatever is signed in next must
+                // not read this account's projects and chats out of a warm store.
+                clearAll,
+                redirect: leaveForSignIn,
+              })
+            }
+          />
+        </div>
       </div>
-    </section>
+    </div>
   );
 }
 
+/**
+ * One profile card. Deliberately the settings card shell (`SettingsSection`) so
+ * Profile and Settings are the same page in two places, with the hint carried
+ * as the section's first line.
+ */
 function Card({
   title,
   hint,
@@ -68,21 +73,23 @@ function Card({
   children: React.ReactNode;
 }): ReactElement {
   return (
-    <div
-      className="max-w-[640px] rounded-lg border bg-surface-inset p-4"
-      style={{ borderColor: 'var(--border)' }}
-    >
-      <h2 className="text-[13px] font-semibold text-text-primary">{title}</h2>
-      {hint !== undefined ? <p className="mt-1 text-[11px] text-text-tertiary">{hint}</p> : null}
-      <div className="mt-3">{children}</div>
-    </div>
+    <SettingsSection title={title}>
+      {hint !== undefined ? (
+        <p className="-mt-[10px] mb-[14px] text-[12.5px] leading-[1.5] text-text-secondary">
+          {hint}
+        </p>
+      ) : null}
+      {children}
+    </SettingsSection>
   );
 }
 
-const FIELD_CLASS =
-  'w-full rounded-md border bg-surface px-2.5 py-1.5 text-[12px] text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1';
+/** The action that changes something (design v5 brand bar). */
 const BUTTON_CLASS =
-  'rounded-md border px-3 py-1.5 text-[11px] text-text-secondary transition-colors hover:text-text-primary disabled:opacity-50';
+  'brand-bar rounded-[7px] px-3.5 py-[7px] text-[12px] font-medium text-white transition-all hover:brightness-110 disabled:opacity-40';
+/** The quieter action next to it (Unlink, Sign out). */
+const BUTTON_QUIET_CLASS =
+  'rounded-[7px] border border-border px-3 py-[6px] text-[12px] text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary disabled:opacity-40';
 
 export function IdentityCard({ account }: { account: Account }): ReactElement {
   const [name, setName] = useState(account.name ?? '');
@@ -129,8 +136,7 @@ export function IdentityCard({ account }: { account: Account }): ReactElement {
               setState('idle');
             }}
             placeholder="Your name"
-            className={FIELD_CLASS}
-            style={{ borderColor: 'var(--border-bright)' }}
+            className={INPUT_CLASS}
           />
         </label>
         <div className="flex items-center gap-3">
@@ -138,7 +144,6 @@ export function IdentityCard({ account }: { account: Account }): ReactElement {
             type="submit"
             disabled={state === 'saving' || name.trim() === (account.name ?? '')}
             className={BUTTON_CLASS}
-            style={{ borderColor: 'var(--border-bright)' }}
           >
             {state === 'saving' ? 'Saving…' : 'Save name'}
           </button>
@@ -189,8 +194,7 @@ export function PasswordCard(): ReactElement {
             setState('idle');
           }}
           placeholder="Current password"
-          className={FIELD_CLASS}
-          style={{ borderColor: 'var(--border-bright)' }}
+          className={INPUT_CLASS}
         />
         <input
           type="password"
@@ -201,15 +205,13 @@ export function PasswordCard(): ReactElement {
             setState('idle');
           }}
           placeholder="New password"
-          className={FIELD_CLASS}
-          style={{ borderColor: 'var(--border-bright)' }}
+          className={INPUT_CLASS}
         />
         <div className="flex items-center gap-3">
           <button
             type="submit"
             disabled={state === 'saving' || current.length === 0 || next.length < 8}
             className={BUTTON_CLASS}
-            style={{ borderColor: 'var(--border-bright)' }}
           >
             {state === 'saving' ? 'Changing…' : 'Change password'}
           </button>
@@ -284,8 +286,7 @@ export function LinkedSourcesCard({ account }: { account: Account }): ReactEleme
                     void unlink();
                   }}
                   disabled={busy}
-                  className={BUTTON_CLASS}
-                  style={{ borderColor: 'var(--border-bright)' }}
+                  className={BUTTON_QUIET_CLASS}
                 >
                   Unlink
                 </button>
@@ -316,8 +317,7 @@ export function SignOutCard({ signOut }: { signOut: () => Promise<void> }): Reac
             setMessage(errorText(err, 'Could not sign out'));
           });
         }}
-        className={BUTTON_CLASS}
-        style={{ borderColor: 'var(--border-bright)' }}
+        className={BUTTON_QUIET_CLASS}
       >
         {busy ? 'Signing out…' : 'Sign out'}
       </button>

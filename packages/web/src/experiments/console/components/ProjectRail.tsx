@@ -351,8 +351,8 @@ export function ProjectRail({ onAddProject }: ProjectRailProps): ReactElement {
         </button>
       </div>
 
-      {/* Nav menu — settings + the classic-UI escape hatches, under Add project
-          and separated from it by the border-t divider. */}
+      {/* Nav menu — where you can go, under Add project and separated from it by
+          the border-t divider. */}
       <div className="flex flex-col gap-0.5 border-t border-border px-2.5 py-2">
         <RailNavLink
           to="/console/builder"
@@ -362,12 +362,11 @@ export function ProjectRail({ onAddProject }: ProjectRailProps): ReactElement {
           badge="beta"
         />
         <RailNavLink
-          to="/console/profile"
-          icon={UserRound}
-          label="Profile"
-          title="Your account, linked sources and sign out"
+          to="/legacy/workflows"
+          icon={Workflow}
+          label="Workflows"
+          title="Workflows (classic UI)"
         />
-        <RailSignOut />
         <RailNavLink
           to="/console/settings"
           icon={Settings}
@@ -375,17 +374,23 @@ export function ProjectRail({ onAddProject }: ProjectRailProps): ReactElement {
           title="Settings ( , )"
         />
         <RailNavLink
-          to="/legacy/workflows"
-          icon={Workflow}
-          label="Workflows"
-          title="Workflows (classic UI)"
-        />
-        <RailNavLink
           to="/legacy"
           icon={ArrowLeft}
           label="Old UI"
           title="Switch back to the classic UI"
         />
+      </div>
+
+      {/* Account — who you are and the way out. Its own group so the way out is
+          the last thing in the rail, where people expect to find it. */}
+      <div className="flex flex-col gap-0.5 border-t border-border px-2.5 py-2">
+        <RailNavLink
+          to="/console/profile"
+          icon={UserRound}
+          label="Profile"
+          title="Your account, linked sources and sign out"
+        />
+        <RailSignOut />
       </div>
 
       {/* Resize handle */}
