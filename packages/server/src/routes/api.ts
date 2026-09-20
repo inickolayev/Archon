@@ -1900,9 +1900,16 @@ export function registerApiRoutes(
    * was meant for.
    */
   app.post('/api/auth/me/sign-out', async c => {
-    linkTokens.clear();
     const auth = getAuth();
     if (auth === null) return c.json({ ok: true });
+    // Only a real session may drop the pending links. Clearing them for anyone
+    // who can POST here would let an unauthenticated caller break the link
+    // handshake for everybody — cheap to do, annoying to diagnose. No session
+    // is not an error though: there is nothing to end, and the caller should
+    // still be allowed to walk to the sign-in page.
+    const session = await resolveAuthContext(c);
+    if (session === null) return c.json({ ok: true });
+    linkTokens.clear();
     try {
       const response = await auth.api.signOut({ headers: c.req.raw.headers, asResponse: true });
       // Forward Better Auth's cookie clearing verbatim.
