@@ -1,11 +1,11 @@
 import { useCallback, useState, type FormEvent, type ReactElement } from 'react';
-import { useNavigate } from 'react-router';
 import { useEntity, invalidate, clearAll } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
 import type { Account } from '../skills/account';
 import { relativeTime } from '../lib/format';
-import { performSignOut } from '../lib/session';
+import { leaveForSignIn, performSignOut } from '../lib/session';
+import { errorText } from '../lib/http';
 import { PlatformBadge } from '../components/PlatformBadge';
 
 /**
@@ -16,7 +16,6 @@ import { PlatformBadge } from '../components/PlatformBadge';
  * Archon's: they say which chat identities resolve to this account.
  */
 export function ProfilePage(): ReactElement {
-  const navigate = useNavigate();
   const { data: account, error, loading } = useEntity<Account>(K.account, () => skill.getAccount());
 
   if (loading) {
@@ -50,9 +49,7 @@ export function ProfilePage(): ReactElement {
               // Wipe the cache before leaving: whatever is signed in next must
               // not read this account's projects and chats out of a warm store.
               clearAll,
-              redirect: () => {
-                navigate('/login', { replace: true });
-              },
+              redirect: leaveForSignIn,
             })
           }
         />
@@ -104,7 +101,7 @@ export function IdentityCard({ account }: { account: Account }): ReactElement {
         setState('saved');
       } catch (err) {
         setState('failed');
-        setMessage(err instanceof Error ? err.message : 'Could not save the name');
+        setMessage(errorText(err, 'Could not save the name'));
       }
     },
     [name]
@@ -171,7 +168,7 @@ export function PasswordCard(): ReactElement {
         setState('saved');
       } catch (err) {
         setState('failed');
-        setMessage(err instanceof Error ? err.message : 'Could not change the password');
+        setMessage(errorText(err, 'Could not change the password'));
       }
     },
     [current, next]
@@ -245,7 +242,7 @@ export function LinkedSourcesCard({ account }: { account: Account }): ReactEleme
       invalidate(K.account);
       invalidate(K.directory);
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Could not unlink');
+      setMessage(errorText(err, 'Could not unlink'));
     } finally {
       setBusy(false);
     }
@@ -316,7 +313,7 @@ export function SignOutCard({ signOut }: { signOut: () => Promise<void> }): Reac
           setMessage(null);
           void signOut().catch((err: unknown) => {
             setBusy(false);
-            setMessage(err instanceof Error ? err.message : 'Could not sign out');
+            setMessage(errorText(err, 'Could not sign out'));
           });
         }}
         className={BUTTON_CLASS}

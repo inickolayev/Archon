@@ -70,3 +70,28 @@ export async function requestJson<T>(url: string, options?: RequestInit): Promis
   }
   return res.json() as Promise<T>;
 }
+
+/**
+ * What to show a person when a request fails.
+ *
+ * `HttpError.message` is built for a log — `API error 404
+ * (/api/auth/telegram/link/abc): {"error":"This link has expired…"}` — and
+ * putting that on screen makes a clear sentence unreadable. The server already
+ * writes a sentence in `{ error, detail? }`; this digs it out, and falls back
+ * to something plain when there is nothing usable.
+ */
+export function errorText(error: unknown, fallback: string): string {
+  if (error instanceof HttpError) {
+    try {
+      const body = JSON.parse(error.bodySnippet) as { error?: unknown; detail?: unknown };
+      const message = typeof body.error === 'string' ? body.error.trim() : '';
+      const detail = typeof body.detail === 'string' ? body.detail.trim() : '';
+      if (message.length > 0) return detail.length > 0 ? `${message} — ${detail}` : message;
+    } catch {
+      // A truncated or non-JSON body: nothing to read out of it.
+    }
+    return fallback;
+  }
+  if (error instanceof Error && error.message.trim().length > 0) return error.message;
+  return fallback;
+}

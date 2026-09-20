@@ -15,7 +15,8 @@ import { useEntity, invalidate, clearAll } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
 import type { Project } from '../primitives/project';
-import { performSignOut } from '../lib/session';
+import { leaveForSignIn, performSignOut } from '../lib/session';
+import { errorText } from '../lib/http';
 
 interface ProjectRailProps {
   onAddProject: () => void;
@@ -98,7 +99,6 @@ function RailNavLink({
  * attribute instead of throwing away the session silently.
  */
 function RailSignOut(): ReactElement {
-  const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
 
@@ -114,12 +114,10 @@ function RailSignOut(): ReactElement {
         void performSignOut({
           signOut: skill.signOut,
           clearAll,
-          redirect: () => {
-            navigate('/login', { replace: true });
-          },
+          redirect: leaveForSignIn,
         }).catch((err: unknown) => {
           setBusy(false);
-          setFailure(err instanceof Error ? err.message : 'Could not sign out');
+          setFailure(errorText(err, 'Could not sign out'));
         });
       }}
       className={`${RAIL_NAV_LINK_CLASS} disabled:opacity-50`}

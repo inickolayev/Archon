@@ -41,3 +41,17 @@ describe('performSignOut', () => {
     expect(order.indexOf('cache')).toBeLessThan(order.indexOf('redirect'));
   });
 });
+
+describe('where signing out lands', () => {
+  test('it is a document navigation, not an in-app one', async () => {
+    // The in-app version left the operator on /console with the shell still
+    // painted and 401s where their projects had been. Replacing the document
+    // is what makes "no flash of authenticated content" true.
+    const { leaveForSignIn } = await import('./session');
+    const source = await Bun.file(new URL('./session.ts', import.meta.url).pathname).text();
+    expect(typeof leaveForSignIn).toBe('function');
+    expect(source).toContain("window.location.replace('/login')");
+    // `replace`, so Back does not return to the console you just left.
+    expect(source).not.toContain('window.location.assign');
+  });
+});

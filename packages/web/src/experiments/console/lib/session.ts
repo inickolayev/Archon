@@ -21,7 +21,7 @@ export interface SignOutDeps {
   readonly signOut: () => Promise<void>;
   /** Empties the console's entity cache. */
   readonly clearAll: () => void;
-  /** Navigates to the sign-in page, replacing history. */
+  /** Leaves for the sign-in page, replacing history. */
   readonly redirect: () => void;
 }
 
@@ -29,4 +29,19 @@ export async function performSignOut(deps: SignOutDeps): Promise<void> {
   await deps.signOut();
   deps.clearAll();
   deps.redirect();
+}
+
+/**
+ * The default way out: a real page load of `/login`, replacing history.
+ *
+ * Not the router's `navigate`. The console mounts as a descendant route under
+ * `/console/*`, and an in-app navigation left the operator on `/console` with
+ * the shell still painted and `401` errors where their projects had been —
+ * the flash of stale, authenticated-looking content this is supposed to
+ * prevent. A document navigation throws the whole page away, so there is
+ * nothing left to flash and nothing left in memory; `replace` keeps Back from
+ * returning to it.
+ */
+export function leaveForSignIn(): void {
+  window.location.replace('/login');
 }

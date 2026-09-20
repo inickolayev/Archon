@@ -4,6 +4,7 @@ import * as skill from '../skills';
 import type { LinkPreview } from '../skills/account';
 import { invalidate } from '../store/cache';
 import { K } from '../store/keys';
+import { errorText } from '../lib/http';
 
 /**
  * The confirmation screen of the Telegram handshake.
@@ -38,7 +39,7 @@ export function LinkTelegramPage(): ReactElement {
       })
       .catch((e: unknown) => {
         if (!cancelled) {
-          setError(e instanceof Error ? e.message : 'This link cannot be used');
+          setError(errorText(e, 'This link cannot be used'));
           setState('ready');
         }
       });
@@ -59,7 +60,7 @@ export function LinkTelegramPage(): ReactElement {
       invalidate('conversations');
       setState('done');
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Could not link the account');
+      setError(errorText(e, 'Could not link the account'));
       setState('ready');
     }
   }, [token]);
