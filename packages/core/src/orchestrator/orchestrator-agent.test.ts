@@ -491,12 +491,13 @@ mock.module('./prompt-builder', () => ({
 const mockAddMessage = mock<typeof MessageDb.addMessage>((conversationId, role, content) =>
   Promise.resolve(makeMessage({ conversation_id: conversationId, role, content }))
 );
+const mockListMessages = mock<typeof MessageDb.listMessages>(() => Promise.resolve([]));
 const mockGetRecentWorkflowResultMessages = mock<typeof MessageDb.getRecentWorkflowResultMessages>(
   () => Promise.resolve([])
 );
 mock.module('../db/messages', () => ({
   addMessage: mockAddMessage,
-  listMessages: mock(() => Promise.resolve([])),
+  listMessages: mockListMessages,
   getRecentWorkflowResultMessages: mockGetRecentWorkflowResultMessages,
 }));
 
@@ -4769,6 +4770,8 @@ describe('stale session ID clearing on error_during_execution', () => {
     mockGetCodebase.mockImplementation(() => Promise.resolve(null));
     mockListCodebases.mockReset();
     mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockListMessages.mockReset();
+    mockListMessages.mockImplementation(() => Promise.resolve([]));
   });
 
   test('handleStreamMode: clears session ID on error_during_execution result', async () => {
@@ -4820,6 +4823,123 @@ describe('stale session ID clearing on error_during_execution', () => {
     await handleMessage(platform, 'conv-1', 'hello');
 
     expect(mockUpdateSession).toHaveBeenCalledWith('session-1', null);
+  });
+
+  // ─── Recovery from a lost session (a restart must not cost a turn) ────────
+
+  /** The provider fails the resume, then answers the retry. */
+  function restartedProvider(reply: string): void {
+    mockSendQuery.mockImplementationOnce(async function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        sessionId: 'stale-session-id',
+      };
+    });
+    mockSendQuery.mockImplementationOnce(async function* () {
+      yield { type: 'assistant', content: reply };
+      yield { type: 'result', sessionId: 'fresh-session-id' };
+    });
+  }
+
+  test('the first message after a restart is answered, not met with a session error', async () => {
+    restartedProvider('The deploy finished at 14:02.');
+    mockTransitionSession.mockResolvedValueOnce(
+      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
+    );
+
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
+    await handleMessage(platform, 'conv-1', 'and the deploy?');
+
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+      String(c[1])
+    );
+    expect(sent).toContain('The deploy finished at 14:02.');
+    expect(sent.join('\n')).not.toContain('Session error');
+    // The new session is the one the conversation carries from here.
+    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', null);
+    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', 'fresh-session-id');
+  });
+
+  test('the retry carries the conversation history the lost session held', async () => {
+    mockListMessages.mockImplementation(() =>
+      Promise.resolve([
+        makeMessage({ id: 'm1', role: 'user', content: 'deploy the branch' }),
+        makeMessage({ id: 'm2', role: 'assistant', content: 'Deploying now.' }),
+        makeMessage({ id: 'm3', role: 'user', content: 'and the deploy?' }),
+      ])
+    );
+    restartedProvider('Done.');
+    mockTransitionSession.mockResolvedValueOnce(
+      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
+    );
+
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
+    await handleMessage(platform, 'conv-1', 'and the deploy?');
+
+    expect(mockSendQuery).toHaveBeenCalledTimes(2);
+    const retryPrompt = String(mockSendQuery.mock.calls[1]?.[0]);
+    expect(retryPrompt).toContain('## Conversation So Far (recovered)');
+    expect(retryPrompt).toContain('> deploy the branch');
+    expect(retryPrompt).toContain('> Deploying now.');
+    // The live turn is not also replayed as history.
+    expect(retryPrompt.match(/and the deploy\?/g) ?? []).toHaveLength(1);
+    // The retry starts a session rather than resuming the dead one.
+    expect(mockSendQuery.mock.calls[1]?.[2]).toBeUndefined();
+  });
+
+  test('a healthy turn replays nothing — the live session already holds it', async () => {
+    mockSendQuery.mockImplementationOnce(async function* () {
+      yield { type: 'assistant', content: 'still here' };
+      yield { type: 'result', sessionId: 'live-session-id' };
+    });
+    mockTransitionSession.mockResolvedValueOnce(
+      makeSession({ id: 'session-1', assistant_session_id: 'live-session-id' })
+    );
+
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
+    await handleMessage(platform, 'conv-1', 'still there?');
+
+    expect(mockSendQuery).toHaveBeenCalledTimes(1);
+    expect(String(mockSendQuery.mock.calls[0]?.[0])).not.toContain('Conversation So Far');
+  });
+
+  test('a conversation with no history still gets its answer', async () => {
+    restartedProvider('Fresh start.');
+    mockTransitionSession.mockResolvedValueOnce(
+      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
+    );
+
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
+    await handleMessage(platform, 'conv-1', 'hello');
+
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+      String(c[1])
+    );
+    expect(sent).toContain('Fresh start.');
+    expect(String(mockSendQuery.mock.calls[1]?.[0])).not.toContain('Conversation So Far');
+  });
+
+  test('batch mode recovers the same way', async () => {
+    restartedProvider('Batched answer.');
+    mockTransitionSession.mockResolvedValueOnce(
+      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
+    );
+
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
+    await handleMessage(platform, 'conv-1', 'hello');
+
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+      String(c[1])
+    );
+    expect(sent.join('\n')).toContain('Batched answer.');
+    expect(sent.join('\n')).not.toContain('Session error');
   });
 
   test('does NOT surface error to user on stop_sequence success (#1425)', async () => {

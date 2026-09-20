@@ -1499,9 +1499,14 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
         bindingCleared &&
         abandonError === null &&
         abandonBlockedParentRunId === null;
+      // Says "blank", not just "fresh", because a turn can now also start a new
+      // session by RECOVERING one — after a restart the agent is handed this
+      // conversation's history and carries on. /reset is the opposite request,
+      // and an operator who cannot tell the two apart will keep typing it to
+      // get something it is not for.
       parts.push(
         resetComplete
-          ? 'Project attachment preserved — next message starts fresh.'
+          ? 'Project attachment preserved — the next message starts blank, with none of this conversation replayed.'
           : 'Project attachment preserved. Reset is incomplete — retry /reset before sending the next message.'
       );
 

@@ -997,7 +997,7 @@ describe('CommandHandler', () => {
         expect(result.success).toBe(false);
         expect(result.message).toContain('Could not clear the AI session: session DB unavailable');
         expect(result.message).toContain('Reset is incomplete — retry /reset');
-        expect(result.message).not.toContain('next message starts fresh');
+        expect(result.message).not.toContain('next message starts blank');
         expect(mockCancelResumableRunsForConversation).toHaveBeenCalledWith(baseConversation.id);
         expect(mockUpdateConversation).toHaveBeenCalledWith(baseConversation.id, {
           cwd: null,
@@ -1037,7 +1037,7 @@ describe('CommandHandler', () => {
         expect(result.success).toBe(false);
         expect(result.message).toContain('Could not look up resumable runs: database busy');
         expect(result.message).toContain('Reset is incomplete — retry /reset');
-        expect(result.message).not.toContain('next message starts fresh');
+        expect(result.message).not.toContain('next message starts blank');
       });
 
       test('surfaces a blocked-parent warning when abandoning a child strands its parent (#2731 R1)', async () => {
@@ -1075,7 +1075,7 @@ describe('CommandHandler', () => {
         expect(result.success).toBe(false);
         expect(result.message).toContain('Parent run parent-stuck was blocked');
         expect(result.message).toContain('stays paused');
-        expect(result.message).not.toContain('next message starts fresh');
+        expect(result.message).not.toContain('next message starts blank');
       });
 
       test('reports only the final state across a running status gap (#2731 R4)', async () => {
@@ -1094,7 +1094,7 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('Abandoned 2 resumable run(s).');
         expect(result.message).not.toContain('Parent run run-b was blocked');
         expect(result.message).not.toContain('sub-run(s) could not be cancelled');
-        expect(result.message).toContain('next message starts fresh');
+        expect(result.message).toContain('next message starts blank');
       });
     });
 

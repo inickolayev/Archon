@@ -17,6 +17,7 @@ import type {
   AttachedFile,
 } from '../types';
 import type { SendQueryOptions, TokenUsage } from '@archon/providers/types';
+import type { MessageChunk } from '@archon/providers/types';
 import { ConversationNotFoundError, isWebAdapter } from '../types';
 import * as db from '../db/conversations';
 import * as codebaseDb from '../db/codebases';
@@ -34,6 +35,13 @@ import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
 import { buildManageRunTool } from './manage-run-tool';
 import { beginTurn, TURN_STOPPED_NOTICE } from './turn-control';
 import { withPersistedOutbound } from './outbound-persistence';
+import { withRecoveredSession } from './session-recovery';
+import {
+  formatConversationReplaySection,
+  replayFetchLimit,
+  resolveReplayBudget,
+  selectReplayMessages,
+} from './conversation-replay';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
@@ -1776,6 +1784,93 @@ async function tryPersistSessionId(
   }
 }
 
+/**
+ * The conversation's history as a prompt block, for a turn whose session has
+ * just been lost.
+ *
+ * Non-throwing on purpose: this runs on the recovery path, where the
+ * alternative to a replay is answering with no memory at all. A database that
+ * cannot be read costs the agent its context, not the operator their turn.
+ */
+async function loadConversationReplay(
+  conversationDbId: string,
+  currentMessage: string
+): Promise<string> {
+  try {
+    const budget = resolveReplayBudget();
+    const rows = await messageDb.listMessages(conversationDbId, replayFetchLimit(budget));
+    return formatConversationReplaySection(selectReplayMessages(rows, currentMessage, budget));
+  } catch (error) {
+    getLog().warn(
+      { err: toError(error), conversationDbId },
+      'orchestrator.conversation_replay_load_failed'
+    );
+    return '';
+  }
+}
+
+/** Everything the two chat handlers share when they run a turn's query. */
+interface TurnQueryContext {
+  readonly aiClient: ReturnType<typeof getAgentProvider>;
+  readonly platform: IPlatformAdapter;
+  readonly conversationId: string;
+  readonly conversation: Conversation;
+  readonly session: { id: string; assistant_session_id: string | null };
+  readonly fullPrompt: string;
+  readonly originalMessage: string;
+  readonly cwd: string;
+  readonly requestOptions?: SendQueryOptions;
+}
+
+/**
+ * Run this turn's query, surviving the loss of the session it meant to resume.
+ *
+ * Stream and batch mode both go through here so the recovery is one behaviour
+ * rather than two that drift. See `session-recovery.ts` for when it fires; the
+ * handlers' own `error_during_execution` branches still cover the cases it
+ * deliberately leaves alone.
+ */
+function runTurnQuery(ctx: TurnQueryContext): AsyncGenerator<MessageChunk> {
+  return withRecoveredSession({
+    sendQuery: (prompt, resumeSessionId) =>
+      ctx.aiClient.sendQuery(prompt, ctx.cwd, resumeSessionId, ctx.requestOptions),
+    prompt: ctx.fullPrompt,
+    resumeSessionId: ctx.session.assistant_session_id ?? undefined,
+    loadReplay: () => loadConversationReplay(ctx.conversation.id, ctx.originalMessage),
+    onSessionLost: async staleSessionId => {
+      getLog().warn(
+        { conversationId: ctx.conversationId, staleSessionId },
+        'clearing_stale_session_id'
+      );
+      await tryPersistSessionId(ctx.session.id, null);
+    },
+    onRecovered: async ({ replayed }) => {
+      getLog().info(
+        { conversationId: ctx.conversationId, replayed },
+        'orchestrator.session_recovered'
+      );
+      // A note, not an error, and only where a surface has somewhere to put
+      // one: the turn itself is answered normally. It is also what separates
+      // this from a deliberate /reset, which announces itself in the chat.
+      if (ctx.platform.sendStructuredEvent) {
+        await ctx.platform
+          .sendStructuredEvent(ctx.conversationId, {
+            type: 'system',
+            content: replayed
+              ? 'Session lost (Archon restarted) — continuing from this conversation’s saved history.'
+              : 'Session lost (Archon restarted) — continuing without earlier context.',
+          })
+          .catch((err: unknown) => {
+            getLog().warn(
+              { err: toError(err), conversationId: ctx.conversationId },
+              'orchestrator.session_recovered_notice_failed'
+            );
+          });
+      }
+    },
+  });
+}
+
 // ─── Extracted Helpers ──────────────────────────────────────────────────────
 
 /** Copy parent conversation's project context to child thread if missing */
@@ -2841,12 +2936,17 @@ async function handleStreamMode(
   let commandFullyParsed = false;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
-  for await (const msg of aiClient.sendQuery(
+  for await (const msg of runTurnQuery({
+    aiClient,
+    platform,
+    conversationId,
+    conversation,
+    session,
     fullPrompt,
+    originalMessage,
     cwd,
-    session.assistant_session_id ?? undefined,
-    requestOptions
-  )) {
+    requestOptions,
+  })) {
     if (msg.type === 'assistant' && msg.content) {
       // Accumulate only while the command is not yet fully captured; post-command
       // trailing chunks would corrupt the project-name token if joined without a
@@ -3064,12 +3164,17 @@ async function handleBatchMode(
   let commandFullyParsed = false;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
-  for await (const msg of aiClient.sendQuery(
+  for await (const msg of runTurnQuery({
+    aiClient,
+    platform,
+    conversationId,
+    conversation,
+    session,
     fullPrompt,
+    originalMessage,
     cwd,
-    session.assistant_session_id ?? undefined,
-    requestOptions
-  )) {
+    requestOptions,
+  })) {
     if (msg.type === 'assistant' && msg.content) {
       // Always record in allChunks for debug logging; accumulate assistantMessages
       // only while the command is not yet fully captured (same reason as stream mode).
