@@ -24,7 +24,43 @@ const message = (over: Partial<Message> = {}): Message => ({
   category: null,
   dispatch: null,
   workflowResult: null,
+  files: [],
   ...over,
+});
+
+describe('MessageItem — a message that was spoken', () => {
+  const spoken = (note: string, words: string): Message =>
+    message({ content: `🎙 **Dictated** — ${note}\n\n${words}` });
+
+  test('draws the recording and the words it was turned into', () => {
+    const html = renderToStaticMarkup(
+      <MessageItem message={spoken('0:42, transcribed and tidied up', 'посмотри деплой')} />
+    );
+
+    expect(html).toContain('0:42, transcribed and tidied up');
+    // Open by default: the transcript IS the message, and a chat of folded rows
+    // could not be read back.
+    expect(html).toContain('посмотри деплой');
+    expect(html).toContain('aria-expanded="true"');
+    // The marker itself never reaches the screen as text.
+    expect(html).not.toContain('Dictated');
+  });
+
+  test('a recording nothing could be made of shows the reason and nothing to open', () => {
+    const html = renderToStaticMarkup(
+      <MessageItem message={spoken('0:42, not transcribed: speech recognition failed', '')} />
+    );
+
+    expect(html).toContain('not transcribed');
+    expect(html).not.toContain('aria-expanded');
+  });
+
+  test('a typed message is untouched by any of it', () => {
+    const html = renderToStaticMarkup(<MessageItem message={message()} />);
+
+    expect(html).toContain('ship it');
+    expect(html).not.toContain('aria-expanded');
+  });
 });
 
 describe('MessageItem — who wrote it', () => {

@@ -37,6 +37,20 @@ const ALLOWED_UPLOAD_BINARY_MIME_TYPES = new Set([
   'application/pdf',
   // application/json is a structured text type browsers may report for .json files
   'application/json',
+  // Recordings. The agent cannot listen to one, but a dictated message is
+  // transcribed on the way in and the audio stays attached beside the words —
+  // so the file has to survive the same validation every other upload passes.
+  'audio/ogg',
+  'audio/opus',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/wav',
+  'audio/x-wav',
+  'audio/wave',
+  'audio/webm',
+  'audio/aac',
+  'audio/flac',
+  'audio/x-m4a',
 ]);
 
 /** Extensions accepted when the sender reports an empty MIME type (code/config files). */
@@ -85,15 +99,34 @@ const ALLOWED_UPLOAD_EXTENSIONS = new Set([
   '.scala',
   '.r',
   '.sql',
+  '.ogg',
+  '.oga',
+  '.opus',
+  '.mp3',
+  '.wav',
+  '.m4a',
 ]);
+
+/**
+ * The type without its parameters: `audio/webm;codecs=opus` is `audio/webm`.
+ *
+ * A `MediaRecorder` always names its codec, and several sources append a
+ * charset, so the allow-list has to be consulted with the bare type or an
+ * accepted format is refused for saying more about itself. The stored type is
+ * normalized the same way a few lines down.
+ */
+function baseMimeType(mimeType: string): string {
+  return (mimeType.split(';')[0] ?? '').trim().toLowerCase();
+}
 
 /** Returns true if the MIME type is allowed for upload. */
 export function isAllowedUploadType(mimeType: string, fileName: string): boolean {
+  const type = baseMimeType(mimeType);
   // All text/* types are acceptable (covers .md, .py, .rs, .go, .sh, .yaml, etc.)
-  if (mimeType.startsWith('text/')) return true;
-  if (ALLOWED_UPLOAD_BINARY_MIME_TYPES.has(mimeType)) return true;
+  if (type.startsWith('text/')) return true;
+  if (ALLOWED_UPLOAD_BINARY_MIME_TYPES.has(type)) return true;
   // Browsers assign empty MIME types to many code/config extensions — fall back to extension
-  if (!mimeType) {
+  if (!type) {
     const dotIndex = fileName.lastIndexOf('.');
     if (dotIndex !== -1) {
       return ALLOWED_UPLOAD_EXTENSIONS.has(fileName.slice(dotIndex).toLowerCase());
@@ -206,8 +239,7 @@ export async function persistUploadedFiles(
       const safeName = safeUploadName(entry.name, fileId);
       const filePath = join(uploadDir, `${fileId}_${safeName}`);
       await writeFile(filePath, Buffer.from(await entry.bytes()));
-      const normalizedMime =
-        entry.type.split(';')[0].trim().toLowerCase() || 'application/octet-stream';
+      const normalizedMime = baseMimeType(entry.type) || 'application/octet-stream';
       savedFiles.push({
         path: filePath,
         name: safeName,

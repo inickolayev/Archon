@@ -30,10 +30,16 @@ export interface TelegramMessageLike {
     mime_type?: string;
     file_size?: number;
   };
-  readonly voice?: unknown;
+  readonly voice?: { file_id: string; mime_type?: string; file_size?: number; duration?: number };
+  readonly audio?: {
+    file_id: string;
+    file_name?: string;
+    mime_type?: string;
+    file_size?: number;
+    duration?: number;
+  };
   readonly video_note?: unknown;
   readonly sticker?: unknown;
-  readonly audio?: unknown;
   readonly video?: unknown;
   readonly animation?: unknown;
 }
@@ -65,6 +71,25 @@ export function largestPhoto(
  */
 export function filesOf(message: TelegramMessageLike): TelegramIncomingFile[] {
   const files: TelegramIncomingFile[] = [];
+  if (message.voice) {
+    // A voice note has no name of its own — Telegram sends OGG/Opus and nothing
+    // else — so one is generated with the extension the bytes actually are,
+    // which is also what tells the transcriber it can send them on untouched.
+    files.push({
+      fileId: message.voice.file_id,
+      fileName: `voice-${message.voice.file_id.slice(0, 8)}.ogg`,
+      mimeType: message.voice.mime_type ?? 'audio/ogg',
+      size: message.voice.file_size,
+    });
+  }
+  if (message.audio) {
+    files.push({
+      fileId: message.audio.file_id,
+      fileName: message.audio.file_name,
+      mimeType: message.audio.mime_type,
+      size: message.audio.file_size,
+    });
+  }
   if (message.document) {
     files.push({
       fileId: message.document.file_id,
@@ -87,21 +112,34 @@ export function filesOf(message: TelegramMessageLike): TelegramIncomingFile[] {
   return files;
 }
 
+/**
+ * True when the message carries something the operator spoke.
+ *
+ * Voice and audio take the ordinary attachment road — downloaded, validated and
+ * persisted like a photo — and are transcribed on the far side of it.
+ */
+export function carriesRecording(message: TelegramMessageLike): boolean {
+  return message.voice !== undefined || message.audio !== undefined;
+}
+
+/** How long the recording is, as Telegram measured it. */
+export function recordingDurationOf(message: TelegramMessageLike): number | undefined {
+  return message.voice?.duration ?? message.audio?.duration;
+}
+
 /** Media the agent cannot read — answered with one line instead of silence. */
-export type UnsupportedKind = 'voice' | 'video note' | 'sticker' | 'audio' | 'video' | 'animation';
+export type UnsupportedKind = 'video note' | 'sticker' | 'video' | 'animation';
 
 export function unsupportedKindOf(message: TelegramMessageLike): UnsupportedKind | null {
-  if (message.voice !== undefined) return 'voice';
   if (message.video_note !== undefined) return 'video note';
   if (message.sticker !== undefined) return 'sticker';
-  if (message.audio !== undefined) return 'audio';
   if (message.video !== undefined) return 'video';
   if (message.animation !== undefined) return 'animation';
   return null;
 }
 
 export function unsupportedMessage(kind: UnsupportedKind): string {
-  return `I can't read a ${kind} — send a photo, a document or text instead.`;
+  return `I can't read a ${kind} — send a photo, a document, a voice message or text instead.`;
 }
 
 /**
@@ -111,6 +149,10 @@ export function unsupportedMessage(kind: UnsupportedKind): string {
  * nothing to act on, and the agent would have to guess what the files are for.
  * Naming them is the smallest honest prompt — the agent sees the same names in
  * `attachedFiles`, and the operator can always add a caption to say more.
+ *
+ * A recording is the exception and does not come here: the transcript is what
+ * the operator said, so the server fills the text in on the far side of the
+ * upload rather than the adapter guessing at it (see `carriesRecording`).
  */
 export function defaultCaption(files: readonly TelegramIncomingFile[]): string {
   if (files.length === 0) return 'Sent a file.';

@@ -4,6 +4,7 @@ import {
   MAX_FILE_BYTES,
   attachFiles,
   isAcceptedFileType,
+  isVoiceFile,
   formatBytes,
   transferredFiles,
   type Attachment,
@@ -155,5 +156,23 @@ describe('attachFiles', () => {
       return { id: 'x', previewUrl: null };
     });
     expect(minted).toEqual([]);
+  });
+});
+
+describe('isVoiceFile', () => {
+  test('recognises a recording however it names itself', () => {
+    // What the console records…
+    expect(isVoiceFile(file('voice-2026-09-20.wav', 'audio/wav'))).toBe(true);
+    // …what a phone sends…
+    expect(isVoiceFile(file('voice-abc.ogg', 'audio/ogg'))).toBe(true);
+    expect(isVoiceFile(file('clip.webm', 'audio/webm;codecs=opus'))).toBe(true);
+    // …and a file whose type the browser declined to guess.
+    expect(isVoiceFile(file('memo.m4a'))).toBe(true);
+  });
+
+  test('is false for everything else, so Send still needs a sentence', () => {
+    expect(isVoiceFile(file('shot.png', 'image/png'))).toBe(false);
+    expect(isVoiceFile(file('run.log', 'text/plain'))).toBe(false);
+    expect(isVoiceFile(file('notes'))).toBe(false);
   });
 });

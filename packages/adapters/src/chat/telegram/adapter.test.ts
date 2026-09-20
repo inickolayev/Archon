@@ -464,15 +464,27 @@ describe('TelegramAdapter', () => {
     });
 
     /** Start with polling stubbed out; return the handlers and what was dispatched. */
+    interface Inbound {
+      message: string;
+      files?: { fileName?: string }[];
+      platformMessageId?: number;
+      voiceDurationSec?: number;
+    }
+
     async function startCapturing(waitMs = 20): Promise<{
       handlers: Map<string, (ctx: never) => void>;
-      received: { message: string; files?: { fileName?: string }[] }[];
+      received: Inbound[];
     }> {
       process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
       const adapter = new TelegramAdapter('fake-token-for-testing', 'stream', waitMs);
-      const received: { message: string; files?: { fileName?: string }[] }[] = [];
+      const received: Inbound[] = [];
       adapter.onMessage(async ctx => {
-        received.push({ message: ctx.message, files: ctx.files });
+        received.push({
+          message: ctx.message,
+          files: ctx.files,
+          platformMessageId: ctx.platformMessageId,
+          voiceDurationSec: ctx.voiceDurationSec,
+        });
       });
       const handlers = new Map<string, (ctx: never) => void>();
       const bot = adapter.getBot() as unknown as {
@@ -550,16 +562,44 @@ describe('TelegramAdapter', () => {
       expect(received[0]?.files).toHaveLength(3);
     });
 
-    test('voice, video notes and stickers get one line back instead of silence', async () => {
+    test('video notes and stickers get one line back instead of silence', async () => {
       const { handlers } = await startCapturing();
       const replies: string[] = [];
-      handlers.get('message:voice')?.(ctxWith({ voice: { file_id: 'v' } }, replies));
+      handlers.get('message:video_note')?.(ctxWith({ video_note: { file_id: 'n' } }, replies));
       handlers.get('message:sticker')?.(ctxWith({ sticker: { file_id: 's' } }, replies));
       await new Promise(resolve => setTimeout(resolve, 5));
 
       expect(replies).toHaveLength(2);
-      expect(replies[0]).toContain('voice');
+      expect(replies[0]).toContain('video note');
       expect(replies[1]).toContain('sticker');
+    });
+
+    test('a voice note arrives as a file with NO words of its own', async () => {
+      const { handlers, received } = await startCapturing();
+      handlers.get('message:voice')?.(
+        ctxWith({ message_id: 77, voice: { file_id: 'v-1', duration: 42, file_size: 9_000 } })
+      );
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(received).toHaveLength(1);
+      // Empty on purpose: the transcript is what the operator said, and the
+      // server fills it in once the recording has been downloaded. A generated
+      // caption here would end up in front of their own words.
+      expect(received[0]?.message).toBe('');
+      expect(received[0]?.files).toHaveLength(1);
+      // What the transcript is posted back as a reply to, and how long it is.
+      expect(received[0]?.platformMessageId).toBe(77);
+      expect(received[0]?.voiceDurationSec).toBe(42);
+    });
+
+    test('a voice note WITH a caption keeps the caption', async () => {
+      const { handlers, received } = await startCapturing();
+      handlers.get('message:audio')?.(
+        ctxWith({ caption: 'the standup', audio: { file_id: 'a-1', file_name: 'x.mp3' } })
+      );
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      expect(received[0]?.message).toBe('the standup');
     });
 
     test('a file from a sender outside the whitelist is dropped', async () => {

@@ -43,6 +43,16 @@ const ACCEPTED_EXTENSIONS_LIST = [
   '.h',
   '.sh',
   '.sql',
+  // Recordings. The console records its own as WAV, but a clip dragged in from
+  // a phone or a voice memo app is the same kind of message and takes the same
+  // road: transcribed on the way in, attached beside the words.
+  '.wav',
+  '.ogg',
+  '.oga',
+  '.opus',
+  '.mp3',
+  '.m4a',
+  '.webm',
 ];
 
 /** Comma-separated string for the file input's `accept` attribute. */
@@ -58,7 +68,9 @@ const ACCEPTED_SET = new Set(ACCEPTED_EXTENSIONS_LIST);
 export function isAcceptedFileType(file: File): boolean {
   // Strip any `;charset=…` parameter — some sources (and Bun's File) append one.
   const mime = (file.type.split(';')[0] ?? '').trim();
-  if (mime.startsWith('text/') || mime.startsWith('image/')) return true;
+  if (mime.startsWith('text/') || mime.startsWith('image/') || mime.startsWith('audio/')) {
+    return true;
+  }
   if (mime === 'application/pdf' || mime === 'application/json') return true;
   const dot = file.name.lastIndexOf('.');
   if (dot <= 0) return false; // no extension, or a dotfile like `.gitignore` (no real ext)
@@ -68,6 +80,22 @@ export function isAcceptedFileType(file: File): boolean {
 /** True for a file the browser can show as an image preview. */
 export function isImageFile(file: File): boolean {
   return file.type.split(';')[0]?.trim().startsWith('image/') ?? false;
+}
+
+const VOICE_EXTENSIONS = new Set(['.wav', '.ogg', '.oga', '.opus', '.mp3', '.m4a', '.webm']);
+
+/**
+ * True for a file the server will treat as something the operator spoke.
+ *
+ * The console shows such a message as a voice row rather than as a file chip,
+ * and lets it be sent with nothing typed — the words are in the recording. The
+ * server decides the same thing the same way; this is the client-side half.
+ */
+export function isVoiceFile(file: File): boolean {
+  const mime = (file.type.split(';')[0] ?? '').trim();
+  if (mime.startsWith('audio/')) return true;
+  const dot = file.name.lastIndexOf('.');
+  return dot > 0 && VOICE_EXTENSIONS.has(file.name.slice(dot).toLowerCase());
 }
 
 export function formatBytes(bytes: number): string {

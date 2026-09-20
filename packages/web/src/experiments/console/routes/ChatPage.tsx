@@ -481,6 +481,10 @@ export function ChatPage(): ReactElement {
       <ChatComposer
         key={activeConvId ?? NEW_CHAT_SEGMENT}
         onSend={onSend}
+        // The first send of a new chat goes through `createConversation`, which
+        // is JSON-only: nothing can ride it. So a recording alone cannot start a
+        // chat, and the composer says so instead of swallowing the clip.
+        canSendWithoutText={activeConvId !== null}
         disabled={busy}
         quote={replyTo}
         onCancelQuote={cancelReply}

@@ -1,4 +1,4 @@
-import { Paperclip } from 'lucide-react';
+import { Mic, Paperclip, Square, X } from 'lucide-react';
 import {
   useEffect,
   useRef,
@@ -13,10 +13,13 @@ import {
   MAX_FILES,
   attachFiles,
   isImageFile,
+  isVoiceFile,
   transferredFiles,
   type Attachment,
   type AttachmentMeta,
 } from '../primitives/file';
+import { MAX_RECORDING_SECONDS, clockLabel } from '../primitives/voice';
+import { canRecord, useVoiceRecorder } from '../lib/recorder';
 import { moveItem } from '../primitives/reorder';
 import { formatQuotedMessage, type MessageQuote } from '../primitives/quoted-context';
 import { ChatAttachments } from './ChatAttachments';
@@ -35,6 +38,12 @@ interface ChatComposerProps {
   quote?: MessageQuote | null;
   /** Drop the pending quote. Bound to the strip's ✕ and to Escape. */
   onCancelQuote?: () => void;
+  /**
+   * Whether a recording alone may be sent, with nothing typed. False for a
+   * chat that does not exist yet: its first message creates it, over a
+   * JSON-only route no attachment can ride.
+   */
+  canSendWithoutText?: boolean;
 }
 
 const MAX_HEIGHT = 200;
@@ -45,7 +54,10 @@ const MAX_HEIGHT = 200;
  * pasting them into the textarea (Cmd/Ctrl+V of a screenshot) or by dropping
  * them anywhere on the composer (the send skill builds the multipart upload).
  * Attachments show as chips with an image thumbnail, open full screen on a
- * click and can be dragged into the order they should be sent in.
+ * click and can be dragged into the order they should be sent in. The
+ * microphone records a clip into the same list of attachments — it is an
+ * attachment like any other, sent when the operator presses Send, so a
+ * recording can be listened back to, removed, or sent with words beside it.
  *
  * Reimplemented (not imported) from the old chat's MessageInput because the
  * console may not import production `@/components/**` (ESLint isolation rule).
@@ -61,12 +73,17 @@ export function ChatComposer({
   disabledReason,
   quote = null,
   onCancelQuote,
+  canSendWithoutText = true,
 }: ChatComposerProps): ReactElement {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<Attachment[]>([]);
   const [fileError, setFileError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [previewId, setPreviewId] = useState<string | null>(null);
+  const recorder = useVoiceRecorder();
+  // Asked once: the answer cannot change while the page is open, and calling it
+  // during render on every keystroke would be a `MediaRecorder` lookup per key.
+  const [micAvailable] = useState(canRecord);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const idRef = useRef(0);
@@ -144,7 +161,11 @@ export function ChatComposer({
 
   const submit = (): void => {
     const trimmed = value.trim();
-    if (trimmed.length === 0 || disabled) return;
+    // A recording carries the words, so it may be sent with nothing typed; the
+    // server transcribes it and the transcript becomes the message. Anything
+    // else still needs a sentence — an attachment alone tells the agent nothing.
+    const spoken = canSendWithoutText && filesRef.current.some(f => isVoiceFile(f.file));
+    if ((trimmed.length === 0 && !spoken) || disabled) return;
     const attached = filesRef.current;
     // With nothing quoted this is byte-for-byte what was typed.
     const text = formatQuotedMessage(quote === null ? [] : [quote], trimmed);
@@ -212,6 +233,22 @@ export function ChatComposer({
     if (dropped.length > 0) addFiles(dropped);
   };
 
+  const startRecording = (): void => {
+    void recorder.start();
+  };
+
+  // Stopping keeps the clip: it becomes an attachment like any other, so it can
+  // be removed, or sent with a typed sentence beside it.
+  const finishRecording = (): void => {
+    void (async (): Promise<void> => {
+      const clip = await recorder.stop();
+      if (clip !== null) addFiles([clip]);
+    })();
+  };
+
+  /** Something already attached carries the words, so Send needs no text. */
+  const hasVoice = canSendWithoutText && files.some(f => isVoiceFile(f.file));
+
   // The lightbox steps through the attached images only, in chip order.
   const images: LightboxImage[] = files.flatMap(f =>
     f.previewUrl === null ? [] : [{ id: f.id, name: f.file.name, url: f.previewUrl }]
@@ -257,6 +294,47 @@ export function ChatComposer({
             </button>
           </div>
         ) : null}
+        {recorder.recording ? (
+          <div
+            className="mb-[10px] flex items-center gap-[10px] rounded-[10px] border py-[7px] pl-[11px] pr-[7px]"
+            style={{ borderColor: 'var(--border-bright)', background: 'var(--surface-elevated)' }}
+          >
+            <span
+              aria-hidden
+              className="h-[9px] w-[9px] shrink-0 animate-pulse rounded-full"
+              style={{ background: 'var(--brand-magenta)' }}
+            />
+            <span className="font-mono text-[12px] text-text-primary" aria-live="polite">
+              Recording {clockLabel(recorder.seconds)}
+            </span>
+            <span className="font-mono text-[11px] text-text-tertiary">
+              stops at {clockLabel(MAX_RECORDING_SECONDS)}
+            </span>
+            <button
+              type="button"
+              onClick={finishRecording}
+              aria-label="Stop recording"
+              title="Stop recording"
+              className="ml-auto flex h-[24px] shrink-0 items-center gap-[5px] rounded-md border px-[8px] font-mono text-[11px] text-text-primary transition-colors hover:bg-[color:var(--surface-hover)]"
+              style={{ borderColor: 'var(--border-bright)' }}
+            >
+              <Square className="h-[11px] w-[11px]" />
+              stop
+            </button>
+            <button
+              type="button"
+              onClick={recorder.cancel}
+              aria-label="Discard recording"
+              title="Discard recording"
+              className="shrink-0 rounded p-[3px] text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+            >
+              <X className="h-[13px] w-[13px]" />
+            </button>
+          </div>
+        ) : null}
+        {recorder.error !== null ? (
+          <div className="mb-[8px] font-mono text-[11px] text-error">{recorder.error}</div>
+        ) : null}
         {files.length > 0 ? (
           <ChatAttachments
             files={files}
@@ -295,6 +373,20 @@ export function ChatComposer({
                 if (e.target.files !== null) addFiles(Array.from(e.target.files));
               }}
             />
+            {micAvailable ? (
+              <button
+                type="button"
+                onClick={recorder.recording ? finishRecording : startRecording}
+                aria-label={recorder.recording ? 'Stop recording' : 'Record a message'}
+                aria-pressed={recorder.recording}
+                disabled={disabled || (!recorder.recording && files.length >= MAX_FILES)}
+                title={recorder.recording ? 'Stop recording' : 'Record a message'}
+                className="flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary disabled:cursor-default disabled:opacity-50"
+                style={recorder.recording ? { color: 'var(--brand-magenta)' } : undefined}
+              >
+                <Mic className="h-5 w-5" />
+              </button>
+            ) : null}
             <button
               type="button"
               tabIndex={-1}
@@ -323,8 +415,12 @@ export function ChatComposer({
           <button
             type="button"
             onClick={submit}
-            disabled={disabled || value.trim().length === 0}
-            title="Send · Enter"
+            disabled={disabled || (value.trim().length === 0 && !hasVoice)}
+            title={
+              !hasVoice && value.trim().length === 0 && files.some(f => isVoiceFile(f.file))
+                ? "A recording can't start a new chat — type a line first"
+                : 'Send · Enter'
+            }
             className="brand-bar flex h-[36px] shrink-0 items-center gap-[7px] rounded-[10px] px-[15px] text-[13px] font-bold text-white shadow-[0_6px_18px_-8px_color-mix(in_oklch,var(--brand-magenta),transparent_30%)] transition-[filter,transform] hover:brightness-110 active:translate-y-[1px] disabled:opacity-45 disabled:shadow-none disabled:hover:brightness-100"
           >
             Send

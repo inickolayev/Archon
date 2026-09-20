@@ -1128,7 +1128,7 @@ export interface paths {
     put?: never;
     /**
      * Send a message (JSON or multipart with file uploads)
-     * @description Accepts `application/json` with `{ message: string }` or `multipart/form-data` with a `message` field and optional file attachments (max 5 files, 10 MB each).
+     * @description Accepts `application/json` with `{ message: string }` or `multipart/form-data` with a `message` field and optional file attachments (max 5 files, 10 MB each). The `message` may be empty only when one of the attachments is a recording: it is transcribed and the transcript becomes the message.
      */
     post: {
       parameters: {

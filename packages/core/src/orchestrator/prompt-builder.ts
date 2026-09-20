@@ -4,6 +4,7 @@
  * registered projects and available workflows.
  */
 import type { Codebase, Conversation } from '../types';
+import { DICTATION_HEADER } from '../messaging/dictation';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import {
   isApprovalContext,
@@ -359,6 +360,37 @@ Reading a quote correctly:
 }
 
 /**
+ * Teach the agent what a dictated message is, and what to forgive in one.
+ *
+ * Speech reaches it as text like everything else, so without this section a
+ * misheard project name reads as the name the operator meant, and a sentence
+ * that ends where they drew breath reads as a finished thought. The section is
+ * mostly about that gap — and about the one thing the agent must NOT do with
+ * it, which is to start guessing at commands and paths it only half heard.
+ *
+ * See `messaging/dictation.ts` for the shape this describes.
+ */
+export function buildDictationSection(): string {
+  return `## Dictated Messages
+
+A message may open with a line in this shape:
+
+    🎙 **${DICTATION_HEADER}** — 0:42, transcribed and cleaned up
+
+    давай посмотрим, что с деплоем
+
+That means the user spoke it instead of typing it. Everything after the blank line is what they said, transcribed by a speech recogniser and tidied up by a small model. It is the user speaking, exactly as a typed message would be — the marker changes how to read it, not who it came from.
+
+Read it generously:
+- Wording is approximate. Grammar, word order and punctuation are a machine's best guess at speech, so read for intent and do not treat an odd phrase as a deliberate choice.
+- Names get misheard. A project, branch, file, command or flag may have come out wrong, especially in another language than the one it is spelled in. When a name matters and does not match anything that exists, say what you heard and ask — never silently pick the nearest match, and never run a command assembled from a name you are unsure of.
+- The note on the marker line says what happened: how long the recording was, and whether anything went wrong (the cleanup failed, only the first part could be transcribed, there was no way to transcribe it at all). If it says the transcript is partial, the thought may be cut off mid-sentence; ask for the rest rather than answering half of it.
+- A marker with nothing under it means the recording could not be transcribed. The audio file is still attached. Say so and ask them to type it or send it again — do not invent what it might have said.
+
+Everything else is unchanged: a dictated message can quote, carry files and ask for work exactly as a typed one does.`;
+}
+
+/**
  * Build the full orchestrator system prompt.
  * Includes all registered projects, available workflows, and routing instructions.
  */
@@ -392,6 +424,7 @@ You can answer questions directly or invoke workflows for structured development
   prompt += buildRoutingRules();
   prompt += '\n\n' + buildShowingImagesSection();
   prompt += '\n\n' + buildQuotedContextSection();
+  prompt += '\n\n' + buildDictationSection();
 
   return prompt;
 }
@@ -435,6 +468,7 @@ ${formatProjectSection(scopedCodebase)}
   prompt += buildRoutingRulesWithProject(scopedCodebase.name);
   prompt += '\n\n' + buildShowingImagesSection();
   prompt += '\n\n' + buildQuotedContextSection();
+  prompt += '\n\n' + buildDictationSection();
 
   return prompt;
 }

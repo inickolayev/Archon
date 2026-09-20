@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  carriesRecording,
   defaultCaption,
   filesOf,
   largestPhoto,
+  recordingDurationOf,
   unsupportedKindOf,
   unsupportedMessage,
   type TelegramMessageLike,
@@ -64,16 +66,54 @@ describe('filesOf', () => {
   test('a plain text message carries no files', () => {
     expect(filesOf({ text: 'hello' })).toEqual([]);
   });
+
+  test('a voice note is a file, named for what its bytes actually are', () => {
+    const files = filesOf({ voice: { file_id: 'AwACAgIAAx', file_size: 9_400, duration: 7 } });
+    expect(files).toHaveLength(1);
+    expect(files[0]?.mimeType).toBe('audio/ogg');
+    // The extension is what tells the transcriber the bytes can go to the
+    // recogniser untouched, so it is pinned rather than left to chance.
+    expect(files[0]?.fileName).toMatch(/^voice-[\w-]+\.ogg$/);
+  });
+
+  test('an audio file keeps the name and type it was sent with', () => {
+    const files = filesOf({
+      audio: { file_id: 'a-1', file_name: 'note.mp3', mime_type: 'audio/mpeg', duration: 95 },
+    });
+    expect(files[0]).toEqual({
+      fileId: 'a-1',
+      fileName: 'note.mp3',
+      mimeType: 'audio/mpeg',
+      size: undefined,
+    });
+  });
+});
+
+describe('recordings', () => {
+  test('voice and audio are recordings; a photo is not', () => {
+    expect(carriesRecording({ voice: { file_id: 'v' } })).toBe(true);
+    expect(carriesRecording({ audio: { file_id: 'a' } })).toBe(true);
+    expect(carriesRecording({ photo: [{ file_id: 'p' }] })).toBe(false);
+  });
+
+  test('the length Telegram measured is passed on rather than probed for', () => {
+    expect(recordingDurationOf({ voice: { file_id: 'v', duration: 42 } })).toBe(42);
+    expect(recordingDurationOf({ audio: { file_id: 'a', duration: 610 } })).toBe(610);
+    expect(recordingDurationOf({ text: 'hello' })).toBeUndefined();
+  });
 });
 
 describe('unsupported media', () => {
   test('names what it cannot read', () => {
-    expect(unsupportedKindOf({ voice: {} })).toBe('voice');
     expect(unsupportedKindOf({ video_note: {} })).toBe('video note');
     expect(unsupportedKindOf({ sticker: {} })).toBe('sticker');
-    expect(unsupportedKindOf({ audio: {} })).toBe('audio');
     expect(unsupportedKindOf({ video: {} })).toBe('video');
     expect(unsupportedKindOf({ animation: {} })).toBe('animation');
+  });
+
+  test('a recording is no longer unsupported — it is transcribed', () => {
+    expect(unsupportedKindOf({ voice: { file_id: 'v' } })).toBeNull();
+    expect(unsupportedKindOf({ audio: { file_id: 'a' } })).toBeNull();
   });
 
   test('a photo or a document is not unsupported', () => {
@@ -82,8 +122,9 @@ describe('unsupported media', () => {
   });
 
   test('the reply says what to send instead, in one line', () => {
-    const line = unsupportedMessage('voice');
-    expect(line).toContain("can't read a voice");
+    const line = unsupportedMessage('sticker');
+    expect(line).toContain("can't read a sticker");
+    expect(line).toContain('voice message');
     expect(line.split('\n')).toHaveLength(1);
   });
 });

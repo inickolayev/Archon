@@ -8,6 +8,8 @@ import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
 import { MirrorBuffer, withOutboundMirror } from '../adapters/mirror';
 import { persistUploadedFiles, uploadEntryFromFile } from '../uploads/attachments';
+import { isVoiceUpload } from '../voice/audio-format';
+import { dictationFor } from '../voice/dictation';
 import { boundMetadataToolOutputs } from '../adapters/web/truncate';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
@@ -689,7 +691,9 @@ const sendMessageRoute = createRoute({
   summary: 'Send a message (JSON or multipart with file uploads)',
   description:
     'Accepts `application/json` with `{ message: string }` or `multipart/form-data` ' +
-    'with a `message` field and optional file attachments (max 5 files, 10 MB each).',
+    'with a `message` field and optional file attachments (max 5 files, 10 MB each). ' +
+    'The `message` may be empty only when one of the attachments is a recording: ' +
+    'it is transcribed and the transcript becomes the message.',
   request: {
     params: conversationIdParamsSchema,
   },
@@ -2982,7 +2986,7 @@ export function registerApiRoutes(
       }
 
       const rawMessage = body.message;
-      if (typeof rawMessage !== 'string' || !rawMessage) {
+      if (typeof rawMessage !== 'string') {
         return c.json({ error: 'message must be a non-empty string' }, 400);
       }
       message = rawMessage;
@@ -2998,6 +3002,16 @@ export function registerApiRoutes(
       }
 
       const fileEntries = fileList.filter((e): e is File => e instanceof File);
+      // A dictated message is allowed to arrive with nothing typed: the words
+      // are in the recording, and the server fills the text in below. Anything
+      // else still owes a message — an attachment with no instruction reaches
+      // the agent with nothing to act on.
+      if (
+        message.trim().length === 0 &&
+        !fileEntries.some(file => isVoiceUpload(file.type, file.name))
+      ) {
+        return c.json({ error: 'message must be a non-empty string' }, 400);
+      }
       if (fileEntries.length > 0) {
         const result = await persistUploadedFiles(
           conversationId,
@@ -3031,6 +3045,20 @@ export function registerApiRoutes(
       conv = await conversationDb.findConversationByPlatformId(conversationId);
     } catch (e: unknown) {
       getLog().error({ err: e, conversationId }, 'conversation_lookup_failed');
+    }
+
+    // A recording IS the message. Transcribed, tidied up and marked as spoken,
+    // it becomes the text that is persisted, shown in both windows and handed
+    // to the agent — while the audio stays attached, exactly as it does on the
+    // Telegram side of the same road.
+    if (savedFiles.length > 0) {
+      const dictated = await dictationFor({
+        typed: message,
+        files: savedFiles,
+        assistantType: conv?.ai_assistant_type ?? 'claude',
+        ...(userId === undefined ? {} : { userId }),
+      });
+      if (dictated !== null) message = dictated.text;
     }
 
     // Persist user message and pass DB ID to adapter for assistant message persistence

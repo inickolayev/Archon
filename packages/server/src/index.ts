@@ -80,6 +80,7 @@ import { PgNotifyListener } from './adapters/web/pg-notify-listener';
 import { registerApiRoutes } from './routes/api';
 import { withOutboundMirror } from './adapters/mirror';
 import { persistTelegramFiles } from './adapters/telegram-uploads';
+import { dictationFor } from './voice/dictation';
 import { LINK_TOKEN_TTL_MS, linkTokens } from './auth/link-tokens';
 import { rm, unlink } from 'fs/promises';
 import { registerGithubWebhookRoute } from './routes/webhooks';
@@ -1036,6 +1037,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         displayName,
         files,
         sentAtMs,
+        platformMessageId,
+        voiceDurationSec,
       }) => {
         // A tap on the persistent keyboard is a plain message carrying the
         // button's label; translate it back into the command it stands for.
@@ -1118,6 +1121,43 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           uploadDir = stored.uploadDir;
         }
 
+        // A recording IS the message: what the operator said replaces the
+        // caption (which a voice note cannot even have), and the file stays
+        // attached beside it. Everything below — the row, the console nudge,
+        // the turn — then carries the words rather than the name of an audio
+        // file nobody can listen to.
+        let turnText = message;
+        if (attachedFiles !== undefined) {
+          const conversation = await conversationDb
+            .findConversationByPlatformId(conversationId)
+            .catch((err: unknown) => {
+              getLog().warn({ err, conversationId }, 'telegram.assistant_lookup_failed');
+              return null;
+            });
+          const dictated = await dictationFor({
+            typed: message,
+            files: attachedFiles,
+            assistantType: conversation?.ai_assistant_type ?? 'claude',
+            ...(userId !== undefined ? { userId } : {}),
+            ...(voiceDurationSec === undefined ? {} : { durationSec: voiceDurationSec }),
+          });
+          if (dictated !== null) {
+            turnText = dictated.text;
+            // The phone's copy of the transcript, hanging off the voice note it
+            // came from. The console needs no such echo — it renders the
+            // transcript inside the message — and this one is best effort:
+            // the words are already persisted and already on their way to the
+            // agent, so a failed echo costs a convenience, not the turn.
+            if (platformMessageId !== undefined) {
+              await telegramAdapter
+                .replyToMessage(conversationId, dictated.echo, platformMessageId)
+                .catch((err: unknown) => {
+                  getLog().warn({ err, conversationId }, 'telegram.transcript_echo_failed');
+                });
+            }
+          }
+        }
+
         // Written HERE, before the lock, not inside the turn.
         //
         // `acquireLock` holds a message that arrives mid-turn in memory — no
@@ -1131,7 +1171,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const persistedUserMessage = await persistInboundMessage({
           platformType: 'telegram',
           platformConversationId: conversationId,
-          text: message,
+          text: turnText,
           ...(userId !== undefined ? { userId } : {}),
           ...(sentAtMs !== undefined ? { sentAtMs } : {}),
           ...(attachedFiles !== undefined && attachedFiles.length > 0
@@ -1155,7 +1195,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         await webAdapter
           .emitSSE(
             conversationId,
-            JSON.stringify({ type: 'user_message', content: message, timestamp: Date.now() })
+            JSON.stringify({ type: 'user_message', content: turnText, timestamp: Date.now() })
           )
           .catch((err: unknown) => {
             getLog().warn({ err, conversationId }, 'telegram.inbound_mirror_failed');
@@ -1165,7 +1205,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         lockManager
           .acquireLock(conversationId, async () => {
             try {
-              await handleMessage(deliverTo, conversationId, message, {
+              await handleMessage(deliverTo, conversationId, turnText, {
                 isolationHints: { workflowType: 'thread', workflowId: conversationId },
                 userId,
                 userMessagePersisted: persistedUserMessage,

@@ -33,6 +33,19 @@ export function isSystemCategory(category: string | null): boolean {
   return SYSTEM_CATEGORY_PREFIXES.some(p => category.startsWith(p));
 }
 
+/**
+ * One file the message arrived with, as the upload routes record it.
+ *
+ * No path: the file on disk is deleted once the agent has read it, so the
+ * history keeps only what it is safe to still believe — the name, the type and
+ * the size.
+ */
+export interface MessageFile {
+  name: string;
+  mimeType: string;
+  size: number;
+}
+
 export interface WorkflowDispatchMeta {
   workflowName: string;
   workerConversationId?: string;
@@ -59,6 +72,8 @@ export interface Message {
   dispatch: WorkflowDispatchMeta | null;
   /** Parsed workflowResult payload — present on `workflow_result` messages. */
   workflowResult: WorkflowResultMeta | null;
+  /** What was attached to it. Empty for the overwhelming majority of messages. */
+  files: MessageFile[];
 }
 
 interface RawMessage {
@@ -91,6 +106,7 @@ interface ParsedMetadata {
     workflowName: string;
     runId: string;
   };
+  files?: { name?: unknown; mimeType?: unknown; size?: unknown }[];
 }
 
 function parseMetadata(raw: string): ParsedMetadata {
@@ -145,6 +161,13 @@ export function toMessage(raw: RawMessage): Message {
     wr != null && typeof wr.workflowName === 'string' && typeof wr.runId === 'string'
       ? { workflowName: wr.workflowName, runId: wr.runId }
       : null;
+  // Every field is checked: the shape comes from JSON somebody else wrote, and
+  // a half-formed entry would render as `undefined` in the middle of a chat.
+  const files: MessageFile[] = (meta.files ?? []).flatMap(f =>
+    typeof f.name === 'string' && typeof f.mimeType === 'string' && typeof f.size === 'number'
+      ? [{ name: f.name, mimeType: f.mimeType, size: f.size }]
+      : []
+  );
   return {
     id: raw.id,
     role: toMessageRole(raw.role),
@@ -156,5 +179,6 @@ export function toMessage(raw: RawMessage): Message {
     category: meta.category ?? null,
     dispatch,
     workflowResult,
+    files,
   };
 }

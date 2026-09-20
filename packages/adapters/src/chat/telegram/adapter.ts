@@ -14,8 +14,10 @@ import { formatQuotedMessage, type MessageQuote } from '@archon/core/messaging/q
 import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
 import {
+  carriesRecording,
   defaultCaption,
   filesOf,
+  recordingDurationOf,
   unsupportedKindOf,
   unsupportedMessage,
   type TelegramIncomingFile,
@@ -295,13 +297,55 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
+   * Post a message hanging off another one in the chat.
+   *
+   * What the operator dictated comes back under the voice note it came from,
+   * where Telegram draws the quoted original above it — the only anchor a chat
+   * app offers, and the one the console gets for free by rendering the
+   * transcript inside the message itself.
+   *
+   * Best effort by contract: the transcript is already in the conversation's
+   * history and in the turn the agent is answering, so failing to echo it must
+   * never fail the turn. An anchor that no longer exists (the voice note was
+   * deleted) falls back to an ordinary message rather than dropping the text.
+   */
+  async replyToMessage(
+    conversationId: string,
+    message: string,
+    replyToMessageId: number
+  ): Promise<void> {
+    const id = telegramChatIdOf(conversationId);
+    const chunks =
+      message.length <= MAX_LENGTH
+        ? [message]
+        : splitIntoParagraphChunks(message, MAX_LENGTH - 200);
+    for (const [index, chunk] of chunks.entries()) {
+      // Only the first chunk hangs off the original: a reply arrow on every
+      // part of a long transcript is noise, and they already follow each other.
+      await this.sendFormattedChunk(
+        id,
+        chunk,
+        undefined,
+        index === 0 ? replyToMessageId : undefined
+      );
+    }
+  }
+
+  /**
    * Send a single chunk with MarkdownV2 formatting, with fallback to plain text
    */
   private async sendFormattedChunk(
     id: number,
     chunk: string,
-    markup?: Record<string, unknown>
+    markup?: Record<string, unknown>,
+    replyToMessageId?: number
   ): Promise<void> {
+    // Telegram drops the whole send when the message it points at is gone, so
+    // the anchor is an addition to the options rather than a required field.
+    const anchor =
+      replyToMessageId === undefined
+        ? {}
+        : { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } };
     // If chunk is still too long after paragraph splitting, fall back to plain text
     if (chunk.length > MAX_LENGTH) {
       getLog().debug({ chunkLength: chunk.length }, 'telegram.chunk_too_long_plain_text');
@@ -326,6 +370,7 @@ export class TelegramAdapter implements IPlatformAdapter {
     try {
       await this.bot.api.sendMessage(id, formatted, {
         parse_mode: 'MarkdownV2',
+        ...anchor,
         ...(markup ? { reply_markup: markup as never } : {}),
       });
       getLog().debug({ chunkLength: chunk.length }, 'telegram.markdownv2_chunk_sent');
@@ -342,9 +387,10 @@ export class TelegramAdapter implements IPlatformAdapter {
       );
       // Keep the call shape identical when there are no buttons — a bare
       // (id, text) plain-text fallback, exactly as before.
-      if (markup) {
+      if (markup || replyToMessageId !== undefined) {
         await this.bot.api.sendMessage(id, stripMarkdown(chunk), {
-          reply_markup: markup as never,
+          ...anchor,
+          ...(markup ? { reply_markup: markup as never } : {}),
         });
       } else {
         await this.bot.api.sendMessage(id, stripMarkdown(chunk));
@@ -414,11 +460,13 @@ export class TelegramAdapter implements IPlatformAdapter {
     // forwards takes the time of the part that arrived first — they are one
     // gesture, and that is when the operator made it.
     const sentAt = ctx.message?.date;
+    const messageId = ctx.message?.message_id;
     return {
       conversationId: this.getConversationId(ctx),
       userId,
       displayName: fullName ?? from?.username ?? undefined,
       ...(sentAt === undefined ? {} : { sentAtMs: sentAt * 1000 }),
+      ...(messageId === undefined ? {} : { platformMessageId: messageId }),
     };
   }
 
@@ -459,10 +507,12 @@ export class TelegramAdapter implements IPlatformAdapter {
       return;
     }
     const replied = replyQuoteOf(message, origin.userId);
+    const durationSec = recordingDurationOf(message);
     this.#dispatch({
       ...origin,
       message: formatQuotedMessage(replied === null ? [] : [replied], body),
       ...(files.length > 0 ? { files: [...files] } : {}),
+      ...(durationSec === undefined ? {} : { voiceDurationSec: durationSec }),
     });
   }
 
@@ -538,17 +588,24 @@ export class TelegramAdapter implements IPlatformAdapter {
       this.#dispatchQuoted(origin, ctx.message as unknown as InboundMessage, text, []);
     });
 
-    // Photos and documents. Everything the agent can actually read goes through
-    // the same path as a browser upload: the server downloads, validates and
-    // persists them; this only says what and where.
-    this.bot.on(['message:photo', 'message:document'], ctx => {
+    // Photos, documents and recordings. Everything the agent can be given goes
+    // through the same path as a browser upload: the server downloads,
+    // validates and persists them; this only says what and where. A recording
+    // is transcribed on the far side of that road, and the words become the
+    // message — which is why it must not be given a caption here.
+    this.bot.on(['message:photo', 'message:document', 'message:voice', 'message:audio'], ctx => {
       const origin = this.#originOf(ctx);
       if (origin === null) return;
       const message = ctx.message as unknown as InboundMessage;
       const files = filesOf(message);
       if (files.length === 0) return;
       const caption = message.caption?.trim();
-      const body = caption && caption.length > 0 ? caption : defaultCaption(files);
+      const body =
+        caption && caption.length > 0
+          ? caption
+          : carriesRecording(message)
+            ? ''
+            : defaultCaption(files);
 
       // A forwarded album is a batch of forwards, not an album of its own: it
       // goes to the per-chat buffer below, which already folds repeats of one
@@ -575,14 +632,7 @@ export class TelegramAdapter implements IPlatformAdapter {
     // Media the agent cannot read. Silence was the old behaviour and it looked
     // like the bot was broken — say so in one line instead.
     this.bot.on(
-      [
-        'message:voice',
-        'message:video_note',
-        'message:sticker',
-        'message:audio',
-        'message:video',
-        'message:animation',
-      ],
+      ['message:video_note', 'message:sticker', 'message:video', 'message:animation'],
       ctx => {
         const userId = ctx.from?.id;
         if (!isUserAuthorized(userId, this.allowedUserIds)) return;

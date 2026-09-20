@@ -4,6 +4,7 @@ import { AgentAvatar } from './AgentAvatar';
 import { MessageMarkdown } from './MessageMarkdown';
 import { ImageLightbox, type LightboxImage } from './ImageLightbox';
 import { QuotedBlock } from './QuotedBlock';
+import { VoiceMessage } from './VoiceMessage';
 import { formatClock } from '../lib/format';
 import { authorLabel, isMine, EMPTY_DIRECTORY, type Directory } from '../primitives/author';
 import { chatImageUrl, imageName, inlineImagePaths } from '../primitives/chat-image';
@@ -12,6 +13,7 @@ import {
   quoteOfMessage,
   type MessageQuote,
 } from '../primitives/quoted-context';
+import { parseDictatedMessage } from '../primitives/dictation';
 import type { Message } from '../primitives/message';
 
 interface MessageItemProps {
@@ -70,7 +72,11 @@ export function MessageItem({
   // here: the blocks are drawn as quotes, and only what is left is the message.
   const quoted = useMemo(() => parseQuotedMessage(message.content.trim()), [message.content]);
   const quotes = quoted.quotes;
-  const content = quoted.body;
+  // A dictated message says so on its first line, after any quotes. Taken off
+  // here so the row can draw the recording and fold the words under it; a typed
+  // message comes back byte for byte and renders exactly as it always has.
+  const spoken = useMemo(() => parseDictatedMessage(quoted.body), [quoted.body]);
+  const content = spoken.body;
   const clock = formatClock(message.timestamp);
   const log = variant === 'log';
 
@@ -148,7 +154,15 @@ export function MessageItem({
             boxShadow: '0 0 0 4px color-mix(in oklch, var(--brand-magenta), transparent 95%)',
           }}
         >
-          {content}
+          {spoken.note === null ? (
+            content
+          ) : (
+            <VoiceMessage
+              note={spoken.note}
+              transcript={content}
+              recording={message.files.find(f => f.mimeType.startsWith('audio/'))}
+            />
+          )}
         </div>
         {message.error !== null ? ERROR_BLOCK(message.error.message) : null}
       </div>
