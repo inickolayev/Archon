@@ -1,8 +1,10 @@
-import type { ReactElement } from 'react';
+import { useCallback, useMemo, useState, type ReactElement } from 'react';
 import { AgentAvatar } from './AgentAvatar';
 import { MessageMarkdown } from './MessageMarkdown';
+import { ImageLightbox, type LightboxImage } from './ImageLightbox';
 import { formatClock } from '../lib/format';
 import { authorLabel, EMPTY_DIRECTORY, type Directory } from '../primitives/author';
+import { chatImageUrl, imageName, inlineImagePaths } from '../primitives/chat-image';
 import type { Message } from '../primitives/message';
 
 interface MessageItemProps {
@@ -18,6 +20,12 @@ interface MessageItemProps {
    * (design v3 .log-agent-card): violet left accent + mono body, no avatar.
    */
   variant?: 'chat' | 'log';
+  /**
+   * The conversation on screen. Given, a path the agent wrote is drawn as the
+   * picture it names and opens full screen from here; omitted (the run log),
+   * the message reads exactly as before.
+   */
+  conversationId?: string;
 }
 
 const ERROR_BLOCK = (msg: string): ReactElement => (
@@ -41,12 +49,32 @@ export function MessageItem({
   message,
   variant = 'chat',
   directory = EMPTY_DIRECTORY,
+  conversationId,
 }: MessageItemProps): ReactElement {
   const kind = message.role;
   const author = authorLabel(directory, message.userId);
   const content = message.content.trim();
   const clock = formatClock(message.timestamp);
   const log = variant === 'log';
+
+  // The lightbox walks the pictures of THIS message, in the order it shows
+  // them — the same shape the artifact panel hands it.
+  const [openImage, setOpenImage] = useState<string | null>(null);
+  const images: LightboxImage[] = useMemo(
+    () =>
+      conversationId === undefined
+        ? []
+        : inlineImagePaths(content).map(path => ({
+            id: path,
+            name: imageName(path),
+            url: chatImageUrl(conversationId, path),
+          })),
+    [conversationId, content]
+  );
+  const openIndex = images.findIndex(image => image.id === openImage);
+  const onOpenImage = useCallback((path: string) => {
+    setOpenImage(path);
+  }, []);
 
   if (kind === 'user') {
     return (
@@ -134,13 +162,29 @@ export function MessageItem({
                     : 'max-w-none text-[14.5px] leading-[1.62] text-text-primary'
                 }
               >
-                <MessageMarkdown content={content} />
+                <MessageMarkdown
+                  content={content}
+                  conversationId={conversationId}
+                  onOpenImage={conversationId === undefined ? undefined : onOpenImage}
+                />
               </div>
             ) : null}
             {message.error !== null ? ERROR_BLOCK(message.error.message) : null}
           </div>
         </div>
       </div>
+      {openIndex !== -1 ? (
+        <ImageLightbox
+          images={images}
+          index={openIndex}
+          onIndex={i => {
+            setOpenImage(images[i]?.id ?? null);
+          }}
+          onClose={() => {
+            setOpenImage(null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

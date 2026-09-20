@@ -8,6 +8,11 @@
 import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 import type { Mock } from 'bun:test';
 import type { Api } from 'grammy';
+import { mkdtempSync } from 'node:fs';
+import { realpath, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { trackTempRoots } from '@archon/paths/test-utils';
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = {
@@ -773,5 +778,89 @@ describe('what does not belong in a chat', () => {
 
     await adapter.sendMessage('352328891', 'I read the screenshot: it shows the lobby.');
     expect(sent).toHaveLength(1);
+  });
+});
+
+/**
+ * The adapter's half of outbound images: the text goes out as before, and the
+ * pictures follow it. What may be shown is decided in `outbound-images.ts`,
+ * which has its own tests — these are about the wiring.
+ */
+describe('images in a reply', () => {
+  const trackTempRoot = trackTempRoots();
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+
+  function instrument(adapter: TelegramAdapter): { texts: string[]; photos: unknown[] } {
+    const texts: string[] = [];
+    const photos: unknown[] = [];
+    adapter.getBot().api.sendMessage = mock(async (chatId: unknown, text: unknown) => {
+      texts.push(String(text));
+      return {
+        message_id: 1,
+        date: 0,
+        chat: { id: Number(chatId), type: 'private', first_name: 'Test' },
+        text: String(text),
+      };
+    }) as unknown as Api['sendMessage'];
+    adapter.getBot().api.sendPhoto = mock(async (_chatId: unknown, photo: unknown) => {
+      photos.push(photo);
+      return { message_id: 2 };
+    }) as unknown as Api['sendPhoto'];
+    return { texts, photos };
+  }
+
+  test('a reply carries no picture until the install says which roots are allowed', async () => {
+    const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-tg-adapter-')));
+    await writeFile(join(root, 'shot.png'), PNG);
+    const adapter = new TelegramAdapter('fake-token-for-testing');
+    const { texts, photos } = instrument(adapter);
+
+    await adapter.sendMessage('352328891', `Готово: ${join(root, 'shot.png')}`);
+
+    expect(texts).toHaveLength(1);
+    expect(photos).toHaveLength(0);
+  });
+
+  test('with roots resolved, the picture follows the text', async () => {
+    const root = await realpath(trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-tg-adapter-'))));
+    await writeFile(join(root, 'shot.png'), PNG);
+    const adapter = new TelegramAdapter('fake-token-for-testing');
+    adapter.onImageRoots(async () => [root]);
+    const { texts, photos } = instrument(adapter);
+
+    await adapter.sendMessage('352328891', `Готово: ${join(root, 'shot.png')}`);
+
+    expect(texts).toHaveLength(1);
+    expect(photos).toHaveLength(1);
+  });
+
+  test('a resolver that fails costs the picture, not the answer', async () => {
+    const root = await realpath(trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-tg-adapter-'))));
+    await writeFile(join(root, 'shot.png'), PNG);
+    const adapter = new TelegramAdapter('fake-token-for-testing');
+    adapter.onImageRoots(async () => {
+      throw new Error('the conversation row is gone');
+    });
+    const { texts, photos } = instrument(adapter);
+
+    await adapter.sendMessage('352328891', `Готово: ${join(root, 'shot.png')}`);
+
+    expect(texts).toHaveLength(1);
+    expect(photos).toHaveLength(0);
+  });
+
+  test('a structural message is still dropped whole, pictures included', async () => {
+    const root = await realpath(trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-tg-adapter-'))));
+    await writeFile(join(root, 'shot.png'), PNG);
+    const adapter = new TelegramAdapter('fake-token-for-testing');
+    adapter.onImageRoots(async () => [root]);
+    const { texts, photos } = instrument(adapter);
+
+    await adapter.sendMessage('352328891', `Reading: ${join(root, 'shot.png')}`, {
+      category: 'tool_call_formatted',
+    });
+
+    expect(texts).toHaveLength(0);
+    expect(photos).toHaveLength(0);
   });
 });

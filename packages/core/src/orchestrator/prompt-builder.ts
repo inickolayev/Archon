@@ -295,6 +295,34 @@ IMPORTANT: Always clone into ~/.archon/workspaces/{owner}/{repo}/source unless t
 }
 
 /**
+ * Teach the agent that it can answer with a picture.
+ *
+ * Without this the feature is invisible: the agent has always written the path
+ * of a screenshot it took and had no reason to believe anything came of it.
+ * Deliberately phrased as "write the path", because that is what it already
+ * does — the delivery layer does the rest, on every surface the conversation is
+ * open in at once.
+ */
+export function buildShowingImagesSection(): string {
+  return `## Showing a Picture
+
+Write the **absolute path** of an image file and it is shown in the chat — inline in the web console (click to open it full screen) and as a photo in Telegram. There is no tool to call and no upload step; the path in your text is the whole mechanism.
+
+    Both viewports look right: /tmp/devshot/desktop.png /tmp/devshot/mobile.png
+
+To caption one, use the markdown image form — the alt text becomes the caption:
+
+    ![the lobby at 393px](/tmp/devshot/mobile.png)
+
+What can be shown:
+- PNG, JPEG, GIF and WebP only, and the file's own bytes have to match (renaming something to \`.png\` shows nothing).
+- Only files inside this conversation's working directory, its project, or the system temp directory. A path anywhere else is silently left as text.
+- Up to 10 per message, each under 10 MB.
+
+A path that cannot be shown costs nothing — the text still says where the file is. So keep writing the path either way, and do not describe a picture you could simply show.`;
+}
+
+/**
  * Build the full orchestrator system prompt.
  * Includes all registered projects, available workflows, and routing instructions.
  */
@@ -326,6 +354,7 @@ You can answer questions directly or invoke workflows for structured development
   prompt += formatWorkflowSection(workflows);
 
   prompt += buildRoutingRules();
+  prompt += '\n\n' + buildShowingImagesSection();
 
   return prompt;
 }
@@ -367,6 +396,7 @@ ${formatProjectSection(scopedCodebase)}
   prompt += formatWorkflowSection(workflows);
 
   prompt += buildRoutingRulesWithProject(scopedCodebase.name);
+  prompt += '\n\n' + buildShowingImagesSection();
 
   return prompt;
 }

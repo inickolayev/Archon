@@ -76,3 +76,22 @@ describe('MessageItem — who wrote it', () => {
     expect(html).not.toContain('Igor Nikolaev');
   });
 });
+
+describe('MessageItem — pictures an answer names', () => {
+  const answer = message({
+    role: 'assistant',
+    content: 'Готово. Файлы: /tmp/devshot/desktop.png',
+  });
+
+  test('renders the picture, and a way to open it full screen', () => {
+    const html = renderToStaticMarkup(<MessageItem message={answer} conversationId="web-1" />);
+    expect(html).toContain('/api/conversations/web-1/image?path=%2Ftmp%2Fdevshot%2Fdesktop.png');
+    expect(html).toContain('Open desktop.png full screen');
+  });
+
+  test('the run log, which has no conversation, still reads as plain text', () => {
+    const html = renderToStaticMarkup(<MessageItem message={answer} variant="log" />);
+    expect(html).not.toContain('<img');
+    expect(html).toContain('/tmp/devshot/desktop.png');
+  });
+});

@@ -1,9 +1,15 @@
-import type { ReactElement } from 'react';
+import { useMemo, type ReactElement } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
 import rehypeHighlight from 'rehype-highlight';
 import { CodeBlock } from './CodeBlock';
+import {
+  chatImageUrl,
+  imageName,
+  isLocalImagePath,
+  withInlineImages,
+} from '../primitives/chat-image';
 
 /**
  * The markdown element map for chat message bodies (and the run log, which
@@ -115,19 +121,79 @@ export const MD_COMPONENTS: Components = {
 const REMARK_PLUGINS = [remarkGfm, remarkBreaks];
 const REHYPE_PLUGINS = [rehypeHighlight];
 
+/**
+ * The `img` element map for a message that belongs to a conversation: a local
+ * path becomes a thumbnail the reader can open full screen, and anything else
+ * (a remote image the agent linked) renders as the plain image it already was.
+ *
+ * The bytes come from the conversation's own image route, which re-decides
+ * whether that path may be shown at all — a path here is a request, not a
+ * permission. A path the server refuses simply fails to load, exactly as a
+ * broken link does, and the surrounding text still says where the file is.
+ */
+function imageComponents(conversationId: string, onOpen: (path: string) => void): Components {
+  return {
+    ...MD_COMPONENTS,
+    img: ({ src, alt }): ReactElement => {
+      const path = typeof src === 'string' ? src : undefined;
+      if (!isLocalImagePath(path)) return <img src={path} alt={alt ?? ''} />;
+      const label = alt !== undefined && alt.length > 0 ? alt : imageName(path);
+      return (
+        <button
+          type="button"
+          onClick={() => {
+            onOpen(path);
+          }}
+          title={path}
+          aria-label={`Open ${label} full screen`}
+          className="my-[6px] block max-w-full overflow-hidden rounded-[8px] border transition-opacity hover:opacity-85"
+          style={{ borderColor: 'var(--border-bright)' }}
+        >
+          <img
+            src={chatImageUrl(conversationId, path)}
+            alt={label}
+            className="block max-h-[320px] max-w-full object-contain"
+          />
+        </button>
+      );
+    },
+  };
+}
+
 interface MessageMarkdownProps {
   content: string;
+  /**
+   * The conversation this message belongs to. Given, the paths the message
+   * names are drawn as pictures; omitted (the run log, where the artifact panel
+   * already shows the files), they stay as the text the agent wrote.
+   */
+  conversationId?: string;
+  onOpenImage?: (path: string) => void;
 }
 
 /** Chat/log markdown body: GFM + soft line breaks + syntax highlighting. */
-export function MessageMarkdown({ content }: MessageMarkdownProps): ReactElement {
+export function MessageMarkdown({
+  content,
+  conversationId,
+  onOpenImage,
+}: MessageMarkdownProps): ReactElement {
+  const inline = conversationId !== undefined && onOpenImage !== undefined;
+  const body = useMemo(() => (inline ? withInlineImages(content) : content), [inline, content]);
+  const components = useMemo(
+    () =>
+      conversationId !== undefined && onOpenImage !== undefined
+        ? imageComponents(conversationId, onOpenImage)
+        : MD_COMPONENTS,
+    [conversationId, onOpenImage]
+  );
+
   return (
     <ReactMarkdown
       remarkPlugins={REMARK_PLUGINS}
       rehypePlugins={REHYPE_PLUGINS}
-      components={MD_COMPONENTS}
+      components={components}
     >
-      {content}
+      {body}
     </ReactMarkdown>
   );
 }

@@ -109,6 +109,8 @@ import type { MessageRow } from '@archon/core/schemas/message';
 import type { DashboardWorkflowRun } from '@archon/core/schemas/workflow-run';
 import { findCommandFiles } from '@archon/core/utils/commands';
 import { resumeWorkflowRunFromServer } from '../services/workflow-resume-service';
+import { conversationImageRoots } from '../messaging/conversation-image-roots';
+import { resolveOutboundImage } from '@archon/core/messaging/image-access';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -4909,6 +4911,62 @@ export function registerApiRoutes(
     return new Response(new Uint8Array(content), {
       status: 200,
       headers: artifactHeaders(filename),
+    });
+  });
+
+  // GET /api/conversations/:id/image?path=... — the bytes of one image a reply
+  // pointed at, so the console can render it inline instead of printing a path.
+  //
+  // The client's reading of the message text is a rendering hint, never a
+  // permission: the path is re-validated here from scratch against the
+  // conversation's own roots, and the file's header has to agree that it is an
+  // image. Registered with app.get() rather than an OpenAPI route for the same
+  // reason the artifact route is — the response is raw bytes, not JSON.
+  app.get('/api/conversations/:id/image', async c => {
+    const platformId = c.req.param('id') ?? '';
+    const requested = c.req.query('path') ?? '';
+    if (requested === '' || requested.includes('\0')) {
+      return apiError(c, 400, 'Invalid image path');
+    }
+
+    let roots: readonly string[];
+    try {
+      roots = await conversationImageRoots(platformId);
+    } catch (error) {
+      getLog().error({ err: error, platformId }, 'conversation_image.roots_failed');
+      return apiError(c, 500, 'Failed to resolve this conversation');
+    }
+
+    const image = await resolveOutboundImage(requested, roots);
+    if (!image.ok) {
+      // One status for every refusal on purpose: which rule a path broke tells
+      // whoever asked something about the filesystem they were not shown.
+      getLog().warn(
+        { platformId, path: requested, reason: image.reason },
+        'conversation_image.refused'
+      );
+      return apiError(c, 404, 'Image not available');
+    }
+
+    let content: Buffer;
+    try {
+      content = await readFile(image.path);
+    } catch (err) {
+      getLog().error({ err, platformId, path: image.path }, 'conversation_image.read_failed');
+      return apiError(c, 404, 'Image not available');
+    }
+
+    return new Response(new Uint8Array(content), {
+      status: 200,
+      headers: {
+        // The type comes from the header bytes, never from the extension, and
+        // the browser is told not to second-guess it either.
+        'Content-Type': image.mediaType,
+        'X-Content-Type-Options': 'nosniff',
+        // A screenshot is overwritten in place by the next run, so a cached
+        // copy would show the previous answer's picture.
+        'Cache-Control': 'no-store',
+      },
     });
   });
 

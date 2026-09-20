@@ -10,6 +10,11 @@ interface ChatStreamProps {
   /** Who is who, for the `you (…)` / other-person labels on each message. */
   directory?: Directory;
   /**
+   * The conversation on screen, which is what makes the pictures an answer
+   * names loadable — they are fetched through its own image route.
+   */
+  conversationId?: string;
+  /**
    * When false (default) the chat reads like a conversation: only user/assistant
    * prose, no raw tool-call cards, no framework/system rows. The "agent is
    * working" indicator stands in for tool activity. When true (toggled from that
@@ -30,6 +35,7 @@ export function ChatStream({
   messages,
   showTools = false,
   directory,
+  conversationId,
 }: ChatStreamProps): ReactElement {
   // `workflow_result` messages are normally swept up by `isSystemCategory` (the
   // `workflow_` prefix), but they carry the run summary + a completion card — let
@@ -53,7 +59,7 @@ export function ChatStream({
               summary={message.content}
             />
           ) : (
-            <MessageItem message={message} directory={directory} />
+            <MessageItem message={message} directory={directory} conversationId={conversationId} />
           )}
           {showTools
             ? message.toolCalls.map((call, i) => (

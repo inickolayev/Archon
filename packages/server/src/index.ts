@@ -121,6 +121,7 @@ import type { AttachedFile, IPlatformAdapter } from '@archon/core';
 import type { IdentityPlatform } from '@archon/core';
 import * as userDb from '@archon/core/db/users';
 import * as conversationDb from '@archon/core/db/conversations';
+import { conversationImageRoots } from './messaging/conversation-image-roots';
 import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import {
   createLogger,
@@ -952,6 +953,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const streamingMode = (process.env.TELEGRAM_STREAMING_MODE ?? 'stream') as 'stream' | 'batch';
     telegram = new TelegramAdapter(process.env.TELEGRAM_BOT_TOKEN, streamingMode);
     const telegramAdapter = telegram; // Capture for use in callback
+
+    // Without this an answer naming a screenshot arrives on the phone as a path
+    // to a file the operator cannot reach. The roots come from the conversation
+    // itself, so one chat's reply can never show another project's files.
+    telegramAdapter.onImageRoots(conversationImageRoots);
 
     // A tapped button on the persistent keyboard arrives as ordinary text, and
     // the lists it opens are edited in place rather than re-sent.

@@ -22,6 +22,7 @@ import {
 } from './attachments';
 import { MediaGroupCollector } from './media-group';
 import { convertToTelegramMarkdown, stripMarkdown } from './markdown';
+import { sendReferencedImages } from './outbound-images';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
 import type { TelegramMessageContext } from './types';
 
@@ -70,6 +71,16 @@ export interface TelegramCallbackResponse {
   readonly toast?: string;
 }
 
+/**
+ * Which directories a conversation's answers may show pictures from.
+ *
+ * Injected rather than computed here: the roots are the conversation's working
+ * directory and its project, which live in the database, and this package knows
+ * nothing about either. Left unset — as it is for a bare adapter in a test or a
+ * tool — no reply carries an image, which is the behaviour before this existed.
+ */
+export type ImageRootsResolver = (conversationId: string) => Promise<readonly string[]>;
+
 /** Telegram's markup for a keyboard, or nothing when there are no buttons. */
 function toReplyMarkup(keyboard: MenuKeyboard | undefined): Record<string, unknown> | undefined {
   if (keyboard === undefined) return undefined;
@@ -103,6 +114,7 @@ export class TelegramAdapter implements IPlatformAdapter {
   readonly #mediaGroups: MediaGroupCollector<TelegramIncomingFile>;
   /** Album parts carry no chat/sender of their own once collected. */
   readonly #mediaGroupOrigins = new Map<string, TelegramMessageContext>();
+  #imageRoots: ImageRootsResolver | null = null;
 
   constructor(token: string, mode: 'stream' | 'batch' = 'stream', mediaGroupWaitMs?: number) {
     this.#token = token;
@@ -191,6 +203,44 @@ export class TelegramAdapter implements IPlatformAdapter {
         await this.sendFormattedChunk(id, chunk, index === chunks.length - 1 ? markup : undefined);
       }
     }
+
+    // After the whole text, never between its chunks: a picture belongs under
+    // the sentence that introduced it.
+    await this.#sendReferencedImages(id, conversationId, message);
+  }
+
+  /**
+   * Upload the pictures this message names, if any and if the install has said
+   * which directories this conversation may show.
+   *
+   * The text is parsed as it was delivered. A streamed answer arrives one block
+   * at a time, so a path is only found when it sits whole inside one block —
+   * true for every provider that emits text a block at a time, and a missed
+   * reference costs the picture, not the answer.
+   */
+  async #sendReferencedImages(
+    chatId: number,
+    conversationId: string,
+    message: string
+  ): Promise<void> {
+    const resolver = this.#imageRoots;
+    if (resolver === null) return;
+    let roots: readonly string[];
+    try {
+      roots = await resolver(conversationId);
+    } catch (err) {
+      getLog().warn({ err, conversationId }, 'telegram.image_roots_unresolved');
+      return;
+    }
+    await sendReferencedImages(this.bot.api, chatId, message, roots);
+  }
+
+  /**
+   * Say which directories this bot's replies may show pictures from. Without it
+   * every reply is text only.
+   */
+  onImageRoots(resolver: ImageRootsResolver): void {
+    this.#imageRoots = resolver;
   }
 
   /**

@@ -66,3 +66,39 @@ describe('MessageMarkdown code blocks', () => {
     expect(html).not.toContain('<button');
   });
 });
+
+describe('MessageMarkdown images', () => {
+  const inConversation = (md: string): string =>
+    renderToStaticMarkup(
+      <MessageMarkdown content={md} conversationId="web-1" onOpenImage={() => undefined} />
+    );
+
+  test('draws the screenshot an answer names instead of printing its path', () => {
+    const html = inConversation('Файлы: /tmp/devshot/desktop.png');
+    expect(html).toContain(
+      'src="/api/conversations/web-1/image?path=%2Ftmp%2Fdevshot%2Fdesktop.png"'
+    );
+    expect(html).toContain('alt="desktop.png"');
+  });
+
+  test('uses the alt text of a markdown image as its label', () => {
+    expect(inConversation('![the lobby](/tmp/a.png)')).toContain('alt="the lobby"');
+  });
+
+  test('leaves a path in a code fence as code', () => {
+    const html = inConversation('```\n/tmp/a.png\n```');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('/tmp/a.png');
+  });
+
+  test('a remote image is not routed through the conversation', () => {
+    const html = inConversation('![remote](https://example.com/a.png)');
+    expect(html).toContain('src="https://example.com/a.png"');
+  });
+
+  test('without a conversation the path stays the text the agent wrote', () => {
+    const html = render('Файлы: /tmp/devshot/desktop.png');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('/tmp/devshot/desktop.png');
+  });
+});

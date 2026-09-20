@@ -4,6 +4,7 @@ import {
   formatWorkflowContextSection,
   buildOrchestratorSystemAppend,
   buildRunManagementSection,
+  buildShowingImagesSection,
   formatPausedGateSection,
 } from './prompt-builder';
 import type { Codebase, Conversation } from '../types';
@@ -139,6 +140,20 @@ describe('buildOrchestratorSystemAppend', () => {
     expect(result).toContain('# Archon Orchestrator');
     expect(result).toContain('## Active Project');
     expect(result).toContain('my-project');
+  });
+
+  test('every chat is told it can answer with a picture', () => {
+    // Both shapes of the prompt, because a chat with no project can still show
+    // a screenshot from the temp directory.
+    for (const codebaseId of [null, 'cb-1']) {
+      const result = buildOrchestratorSystemAppend(
+        makeConversation(codebaseId),
+        codebases,
+        workflows
+      );
+      expect(result).toContain('## Showing a Picture');
+      expect(result).toContain('absolute path');
+    }
   });
 
   test('falls back to orchestrator prompt when codebase_id does not match', () => {
@@ -422,5 +437,21 @@ describe('formatPausedGateSection', () => {
     expect(section).toContain('Abandon it');
     expect(section).not.toContain('Paused Approval Gate');
     expect(section).not.toContain('/workflow approve');
+  });
+});
+
+describe('buildShowingImagesSection', () => {
+  test('says what to write, not which tool to call — there is no tool', () => {
+    const section = buildShowingImagesSection();
+    expect(section).toContain('absolute path');
+    expect(section).toContain('![the lobby at 393px](/tmp/devshot/mobile.png)');
+    expect(section).not.toContain('/invoke-workflow');
+  });
+
+  test('states the limits the delivery layer actually enforces', () => {
+    const section = buildShowingImagesSection();
+    expect(section).toContain('10 per message');
+    expect(section).toContain('10 MB');
+    expect(section).toContain('temp directory');
   });
 });
