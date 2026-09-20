@@ -1,4 +1,4 @@
-import { useMemo, type ReactElement } from 'react';
+import { Children, isValidElement, useMemo, type ReactElement, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -132,29 +132,66 @@ const REHYPE_PLUGINS = [rehypeHighlight];
  * broken link does, and the surrounding text still says where the file is.
  */
 function imageComponents(conversationId: string, onOpen: (path: string) => void): Components {
+  /**
+   * Held in a named binding so the paragraph below can recognise its own
+   * thumbnails among a paragraph's children — comparing against the element
+   * type is the only way to tell a picture from a word once react-markdown has
+   * rendered it. (Lowercase to satisfy the repo's naming rule; it is never used
+   * as a JSX tag, only as the `img` mapping and as that identity.)
+   */
+  const thumbnail = ({ src, alt }: { src?: string; alt?: string }): ReactElement => {
+    const path = typeof src === 'string' ? src : undefined;
+    if (!isLocalImagePath(path)) return <img src={path} alt={alt ?? ''} />;
+    const label = alt !== undefined && alt.length > 0 ? alt : imageName(path);
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          onOpen(path);
+        }}
+        title={path}
+        aria-label={`Open ${label} full screen`}
+        className="my-[6px] inline-block max-w-full overflow-hidden rounded-[8px] border align-top transition-opacity hover:opacity-85"
+        style={{ borderColor: 'var(--border-bright)' }}
+      >
+        <img
+          src={chatImageUrl(conversationId, path)}
+          alt={label}
+          className="block max-h-[320px] max-w-full object-contain"
+        />
+      </button>
+    );
+  };
+
+  const isThumbnail = (node: ReactNode): boolean => isValidElement(node) && node.type === thumbnail;
+
   return {
     ...MD_COMPONENTS,
-    img: ({ src, alt }): ReactElement => {
-      const path = typeof src === 'string' ? src : undefined;
-      if (!isLocalImagePath(path)) return <img src={path} alt={alt ?? ''} />;
-      const label = alt !== undefined && alt.length > 0 ? alt : imageName(path);
+    img: thumbnail,
+    /**
+     * A paragraph of several pictures is laid out as a grid rather than a
+     * column. Screenshots are tall and narrow, so one per line wastes most of
+     * the width; side by side, four of them fit where one used to be. Any prose
+     * that shares the paragraph keeps its place on a line of its own
+     * (`basis-full`), so nothing is reordered — only rewrapped.
+     */
+    p: ({ children }): ReactElement => {
+      const nodes = Children.toArray(children);
+      if (nodes.filter(isThumbnail).length < 2) return <p>{children}</p>;
       return (
-        <button
-          type="button"
-          onClick={() => {
-            onOpen(path);
-          }}
-          title={path}
-          aria-label={`Open ${label} full screen`}
-          className="my-[6px] block max-w-full overflow-hidden rounded-[8px] border transition-opacity hover:opacity-85"
-          style={{ borderColor: 'var(--border-bright)' }}
-        >
-          <img
-            src={chatImageUrl(conversationId, path)}
-            alt={label}
-            className="block max-h-[320px] max-w-full object-contain"
-          />
-        </button>
+        <div className="flex flex-wrap items-start gap-[6px]">
+          {nodes
+            .filter(node => !(isValidElement(node) && node.type === 'br'))
+            .map((node, index) =>
+              isThumbnail(node) ? (
+                node
+              ) : (
+                <span key={index} className="basis-full">
+                  {node}
+                </span>
+              )
+            )}
+        </div>
       );
     },
   };

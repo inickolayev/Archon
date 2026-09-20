@@ -91,3 +91,35 @@ describe('imageName', () => {
     expect(imageName('/tmp/devshot/desktop.png')).toBe('desktop.png');
   });
 });
+
+describe('withInlineImages — pictures share a paragraph', () => {
+  test('a run of image-only lines becomes one line, so they lay out as a grid', () => {
+    const content = 'Вот экраны:\n/tmp/a.png\n/tmp/b.png\n/tmp/c.png';
+    expect(withInlineImages(content)).toBe(
+      'Вот экраны:\n\n![a.png](/tmp/a.png) ![b.png](/tmp/b.png) ![c.png](/tmp/c.png)'
+    );
+  });
+
+  test('a blank line between two pictures does not split them into two paragraphs', () => {
+    expect(withInlineImages('/tmp/a.png\n\n/tmp/b.png')).toBe(
+      '![a.png](/tmp/a.png) ![b.png](/tmp/b.png)'
+    );
+  });
+
+  test('prose after the pictures keeps its own paragraph', () => {
+    const content = '/tmp/a.png\n/tmp/b.png\n\nЭто dev в текущем состоянии.';
+    expect(withInlineImages(content)).toBe(
+      '![a.png](/tmp/a.png) ![b.png](/tmp/b.png)\n\nЭто dev в текущем состоянии.'
+    );
+  });
+
+  test('a picture named inside a sentence stays inside that sentence', () => {
+    expect(withInlineImages('Файлы: /tmp/a.png, /tmp/b.png.')).toBe(
+      'Файлы: ![a.png](/tmp/a.png), ![b.png](/tmp/b.png).'
+    );
+  });
+
+  test('a lone picture is left exactly where it was', () => {
+    expect(withInlineImages('до\n/tmp/a.png\nпосле')).toBe('до\n\n![a.png](/tmp/a.png)\nпосле');
+  });
+});

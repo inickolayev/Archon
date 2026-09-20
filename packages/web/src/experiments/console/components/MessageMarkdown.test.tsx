@@ -102,3 +102,28 @@ describe('MessageMarkdown images', () => {
     expect(html).toContain('/tmp/devshot/desktop.png');
   });
 });
+
+describe('MessageMarkdown image grid', () => {
+  const inConversation = (md: string): string =>
+    renderToStaticMarkup(
+      <MessageMarkdown content={md} conversationId="web-1" onOpenImage={() => undefined} />
+    );
+
+  test('several pictures lay out as a grid instead of a column', () => {
+    const html = inConversation('Вот экраны:\n/tmp/a.png\n/tmp/b.png\n/tmp/c.png');
+    expect(html).toContain('flex flex-wrap');
+    expect(html.match(/<img/g)?.length).toBe(3);
+  });
+
+  test('the sentence that introduces them keeps its own line', () => {
+    const html = inConversation('Вот экраны:\n/tmp/a.png\n/tmp/b.png');
+    expect(html).toContain('Вот экраны:');
+    expect(html).toContain('basis-full');
+  });
+
+  test('a single picture stays an ordinary paragraph', () => {
+    const html = inConversation('Скрин: /tmp/a.png');
+    expect(html).toContain('<p>');
+    expect(html).not.toContain('flex flex-wrap');
+  });
+});

@@ -57,6 +57,54 @@ function linkBarePaths(prose: string): string {
   });
 }
 
+/** A line that is nothing but images (one or more), with no prose around them. */
+const IMAGE_ONLY_LINE = /^\s*(?:!\[[^\]\n]*\]\([^)\n]+\)\s*)+$/;
+
+/**
+ * Put a run of image-only lines on a single line, so the renderer sees one
+ * paragraph of pictures instead of one paragraph per picture.
+ *
+ * Screenshots are the common case and they are tall and narrow: left one per
+ * line, four of them fill a screen and waste the whole right half of it. Joined,
+ * they lay out as a grid. Blank lines inside the run are swallowed for the same
+ * reason; a blank line is kept around the run so the pictures stay their own
+ * paragraph and never glue themselves onto the sentence that introduced them.
+ */
+function groupImageLines(markdown: string): string {
+  const out: string[] = [];
+  const run: string[] = [];
+  let pendingBlank = false;
+
+  const flush = (): void => {
+    if (run.length === 0) return;
+    out.push(run.join(' '));
+    run.length = 0;
+  };
+
+  for (const line of markdown.split('\n')) {
+    if (IMAGE_ONLY_LINE.test(line)) {
+      if (run.length === 0 && out.length > 0 && out[out.length - 1] !== '') out.push('');
+      run.push(line.trim());
+      pendingBlank = false;
+      continue;
+    }
+    // A blank line between two image lines belongs to the run, not after it.
+    if (run.length > 0 && line.trim() === '') {
+      pendingBlank = true;
+      continue;
+    }
+    flush();
+    if (pendingBlank) {
+      out.push('');
+      pendingBlank = false;
+    }
+    out.push(line);
+  }
+  flush();
+  if (pendingBlank) out.push('');
+  return out.join('\n');
+}
+
 /**
  * The message as markdown, with every bare image path turned into a markdown
  * image so the renderer draws it. Paths inside code, links and existing images
@@ -70,7 +118,7 @@ export function withInlineImages(content: string): string {
     result += linkBarePaths(content.slice(cursor, start)) + match[0];
     cursor = start + match[0].length;
   }
-  return result + linkBarePaths(content.slice(cursor));
+  return groupImageLines(result + linkBarePaths(content.slice(cursor)));
 }
 
 /** Every local image the message shows, in order and without repeats. */
