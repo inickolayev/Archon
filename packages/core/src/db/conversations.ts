@@ -6,6 +6,9 @@ import type { Conversation } from '../types';
 import { ConversationNotFoundError } from '../types';
 import { createLogger } from '@archon/paths';
 import { loadConfig } from '../config/config-loader';
+// Re-exported below: `markConversationActive` and the message writer both need
+// it, and it belongs with the hydrator that reads the shape back.
+import { formatSqliteTimestamp } from './timestamps';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -366,14 +369,7 @@ export async function listConversationsForChat(
   return result.rows;
 }
 
-/**
- * `YYYY-MM-DD HH:MM:SS.mmm` in UTC — the shape SQLite's `datetime('now')`
- * writes, plus milliseconds, so the two compare correctly both in SQL and
- * after parsing.
- */
-export function formatSqliteTimestamp(ms: number): string {
-  return new Date(ms).toISOString().replace('T', ' ').replace('Z', '');
-}
+export { formatSqliteTimestamp };
 
 /**
  * Make a conversation the most recently active one of its chat — this is what

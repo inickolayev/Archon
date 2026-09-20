@@ -106,6 +106,20 @@ export interface WarningEvent extends BaseSSEEvent {
   message: string;
 }
 
+/**
+ * A message somebody sent from another window — Telegram, most often.
+ *
+ * Emitted the moment it arrives, before the conversation lock is taken, so a
+ * message typed while a turn is running is announced instead of sitting
+ * unseen in a queue until that turn ends. The row is already written by the
+ * time this goes out; the event exists so an open console refetches now
+ * rather than on its next poll.
+ */
+export interface UserMessageEvent extends BaseSSEEvent {
+  type: 'user_message';
+  content: string;
+}
+
 // Keep-alive
 export interface HeartbeatEvent extends BaseSSEEvent {
   type: 'heartbeat';
@@ -236,6 +250,7 @@ export type SSEEvent =
   | ConversationLockEvent
   | ErrorEvent
   | WarningEvent
+  | UserMessageEvent
   | HeartbeatEvent
   | WorkflowStatusEvent
   | DagNodeEvent

@@ -50,12 +50,58 @@ describe('messages', () => {
       const result = await addMessage('conv-456', 'user', 'Hello, world!');
 
       expect(result).toEqual(mockMessage);
+      // `to_timestamp($6)`, not `NOW()`: the instant is computed in-process so
+      // it can be made strictly increasing (and so a platform-reported send
+      // time can take its place). `to_timestamp` lands a timestamptz the column
+      // converts exactly as it converted `NOW()`, keeping new rows comparable
+      // with every row written before this.
       expect(mockQuery).toHaveBeenCalledWith(
         `INSERT INTO remote_agent_messages (conversation_id, role, content, metadata, user_id, created_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())
+     VALUES ($1, $2, $3, $4, $5, to_timestamp($6))
      RETURNING *`,
-        ['conv-456', 'user', 'Hello, world!', '{}', null]
+        ['conv-456', 'user', 'Hello, world!', '{}', null, expect.any(Number)]
       );
+    });
+
+    test('a platform-reported send time is what the row is stamped with', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockMessage]));
+      // Telegram hands over `ctx.message.date` in whole seconds.
+      const sentAtMs = Date.parse('2026-09-20T13:35:00.000Z');
+
+      await addMessage('conv-456', 'user', 'typed mid-turn', undefined, undefined, { sentAtMs });
+
+      const params = mockQuery.mock.calls[0]?.[1] as unknown[];
+      expect(params[5]).toBe(sentAtMs / 1000);
+    });
+
+    test('two rows never share an instant, so the order is never left to the id', async () => {
+      mockQuery.mockResolvedValue(createQueryResult([mockMessage]));
+
+      await addMessage('conv-456', 'user', 'question');
+      await addMessage('conv-456', 'assistant', 'answer');
+
+      const first = (mockQuery.mock.calls[0]?.[1] as unknown[])[5] as number;
+      const second = (mockQuery.mock.calls[1]?.[1] as unknown[])[5] as number;
+      expect(second).toBeGreaterThan(first);
+    });
+
+    test('a reported send time is used verbatim, older than rows already written', async () => {
+      mockQuery.mockResolvedValue(createQueryResult([mockMessage]));
+
+      await addMessage('conv-456', 'assistant', 'mid-turn bubble');
+      await addMessage('conv-456', 'user', 'typed while that ran', undefined, undefined, {
+        sentAtMs: Date.parse('2020-01-01T00:00:00.000Z'),
+      });
+      await addMessage('conv-456', 'assistant', 'next bubble');
+
+      const firstBubble = (mockQuery.mock.calls[0]?.[1] as unknown[])[5] as number;
+      const reported = (mockQuery.mock.calls[1]?.[1] as unknown[])[5] as number;
+      const nextBubble = (mockQuery.mock.calls[2]?.[1] as unknown[])[5] as number;
+      // The message sits where it was sent — before the bubbles, truthfully —
+      // while the turn's own rows keep marching forward from the clock.
+      expect(reported).toBe(Date.parse('2020-01-01T00:00:00.000Z') / 1000);
+      expect(reported).toBeLessThan(firstBubble);
+      expect(nextBubble).toBeGreaterThan(firstBubble);
     });
 
     test('includes metadata as JSON string when provided', async () => {
@@ -75,6 +121,7 @@ describe('messages', () => {
         'Done.',
         JSON.stringify(metadata),
         null,
+        expect.any(Number),
       ]);
     });
 
@@ -89,6 +136,7 @@ describe('messages', () => {
         'Hi there',
         '{}',
         'user-uuid-1',
+        expect.any(Number),
       ]);
     });
 

@@ -410,10 +410,15 @@ export class TelegramAdapter implements IPlatformAdapter {
       from?.first_name || from?.last_name
         ? [from.first_name, from.last_name].filter(Boolean).join(' ')
         : undefined;
+    // Telegram dates are whole seconds since the epoch. An album or a batch of
+    // forwards takes the time of the part that arrived first — they are one
+    // gesture, and that is when the operator made it.
+    const sentAt = ctx.message?.date;
     return {
       conversationId: this.getConversationId(ctx),
       userId,
       displayName: fullName ?? from?.username ?? undefined,
+      ...(sentAt === undefined ? {} : { sentAtMs: sentAt * 1000 }),
     };
   }
 

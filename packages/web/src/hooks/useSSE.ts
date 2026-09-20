@@ -231,6 +231,12 @@ export function useSSE(
             pendingMetaRef.current = {};
             h.onRetract?.();
             break;
+          case 'user_message':
+            // Somebody sent a message from another window — Telegram, usually.
+            // It is already persisted, so a reload shows it; this view renders
+            // only its own sends live, and a known type here is what keeps it
+            // out of the unknown-event warning below.
+            break;
           case 'heartbeat':
             break;
           default: {

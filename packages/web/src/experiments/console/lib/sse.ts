@@ -83,7 +83,7 @@ export function useDashboardSSE(): void {
  * conversation id is known.
  *
  * Events we care about:
- *   text                  — new assistant text → messages changed
+ *   text / user_message   — new assistant or operator text → messages changed
  *   tool_call/tool_result — new tool activity  → messages + run events changed
  *   workflow_status       — run status changed
  *   workflow_tool_activity / dag_node — workflow_events table grew
@@ -124,6 +124,7 @@ export function useRunStreamSSE(conversationPlatformId: string | null, runId: st
 
       switch (ev.type) {
         case 'text':
+        case 'user_message':
           messagesDirty = true;
           break;
         case 'tool_call':
@@ -166,7 +167,7 @@ export function useRunStreamSSE(conversationPlatformId: string | null, runId: st
  * invalidates the message cache on text/tool events, and surfaces the
  * conversation lock so the composer can disable while the agent is responding.
  *
- *   text / tool_call / tool_result → messages changed (debounced refetch)
+ *   text / user_message / tool_call / tool_result → messages changed (debounced refetch)
  *   conversation_lock              → onLockChange(locked)
  */
 export function useConversationSSE(
@@ -199,7 +200,11 @@ export function useConversationSSE(
       if (ev?.type === undefined || ev.type === 'heartbeat') return;
 
       switch (ev.type) {
+        // `user_message` is one somebody sent from another window — Telegram,
+        // most often. It is persisted at ingest now, so the refetch has
+        // something to find instead of waiting out the turn already running.
         case 'text':
+        case 'user_message':
         case 'tool_call':
         case 'tool_result':
           messagesDirty = true;

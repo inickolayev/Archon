@@ -33,6 +33,7 @@ import { safeDeactivateSession } from '../state/session-transitions';
 import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
 import { buildManageRunTool } from './manage-run-tool';
 import { beginTurn, TURN_STOPPED_NOTICE } from './turn-control';
+import { withPersistedOutbound } from './outbound-persistence';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
@@ -1966,7 +1967,7 @@ function buildFullPrompt(
  * and workflows upfront.
  */
 export async function handleMessage(
-  platform: IPlatformAdapter,
+  inboundPlatform: IPlatformAdapter,
   conversationId: string,
   message: string,
   context?: HandleMessageContext
@@ -1978,7 +1979,15 @@ export async function handleMessage(
     isolationHints,
     attachedFiles,
     userId,
+    userMessagePersisted,
   } = context ?? {};
+  // Swapped for a persisting wrapper as soon as the conversation row is known
+  // (a few lines into the try below). Everything after that point — refusals,
+  // command answers, streamed bubbles, the closing note of a stopped turn —
+  // reaches the history by being DELIVERED, so no send site has to remember to
+  // write one. Before that point there is no row to write against, and nothing
+  // is sent either.
+  let platform = inboundPlatform;
   // Anchor "is this a slash command" at the true start of the message —
   // leading whitespace (e.g. from a platform that doesn't pre-trim after
   // stripping a bot mention) must not let a command masquerade as a plain
@@ -2017,6 +2026,37 @@ export async function handleMessage(
       const claimed = await db.claimConversationOwner(conversation.id, userId);
       if (claimed) conversation = { ...conversation, user_id: userId };
     }
+
+    // The web adapter keeps its own persistence (a buffer that also records
+    // tool calls), and running both would double-write every reply — the
+    // reason the `!isWebAdapter` guard exists at all (#1182).
+    if (!isWebAdapter(inboundPlatform)) {
+      platform = withPersistedOutbound(inboundPlatform, conversation.id);
+    }
+
+    // The operator's own message, written before anything can decline the turn.
+    // The surface that received it may have done this already, at the moment it
+    // arrived and with the time the platform said it was sent (see
+    // persistInboundMessage) — that is strictly better and this is the fallback
+    // for surfaces that have not been wired for it.
+    //
+    // There is no ordering dance left to get right here. It used to sit below
+    // the command and guard early-returns so a declined turn could not orphan a
+    // user row; now every one of those refusals is itself persisted as it is
+    // sent, so the pair is complete on every path and this can be the first
+    // thing the turn does.
+    if (!isWebAdapter(inboundPlatform) && userMessagePersisted !== true) {
+      await messageDb
+        .addMessage(conversation.id, 'user', message, undefined, userId)
+        .catch((e: unknown) => {
+          const err = e instanceof Error ? e : new Error(String(e));
+          getLog().warn(
+            { err, errorType: err.constructor.name, conversationId },
+            'orchestrator.user_message_persist_failed'
+          );
+        });
+    }
+
     conversation = await inheritThreadContext(
       platform,
       conversation,
@@ -2193,14 +2233,9 @@ export async function handleMessage(
 
     // 3. Load codebases, discover workflows, build prompt
     //
-    // The codebase load sits ABOVE the user-message persist so the missing-project
-    // guard below can read `default_cwd` without paying a second query. It reads
-    // `remote_agent_codebases` while the persist writes `remote_agent_messages`, so
-    // the two are independent in both directions, and every OTHER consumer of
-    // `codebases` runs far below (the guard just under this line is the one that
-    // needed the hoist). Keep it here: moved back down, the guard would have to
-    // refuse AFTER the user row is written, which is exactly the orphaned-row bug
-    // this ordering exists to prevent.
+    // Loaded here rather than with its other consumers further down so the
+    // missing-project guard immediately below can read `default_cwd` without
+    // paying a second query.
     const codebases = await codebaseDb.listCodebases();
 
     // A registered project's directory can vanish under a long-lived conversation —
@@ -2262,33 +2297,6 @@ export async function handleMessage(
         );
         return;
       }
-    }
-
-    // Persist the inbound user message for non-web platforms (Slack/Telegram/
-    // GitHub/Discord/CLI) — the web adapter's route persists web turns itself.
-    // Placed AFTER every early return that declines the turn — deterministic
-    // commands (including `/workflow approve|reject`), the stale-worktree guard and
-    // the missing-project guard above — so only AI-bound turns get a user row (no
-    // orphaned user message without an assistant reply), and BEFORE the AI call so
-    // the user row's timestamp precedes the assistant row's. A plain message at a
-    // gate is NOT a refusal since #2577; it flows into the AI turn and earns its
-    // user row.
-    //
-    // A new refusal that needs nothing computed below belongs above this block. One
-    // that needs data from further down (workflow discovery, gate lookup) has to
-    // hoist that dependency first, the way `codebases` was hoisted here — putting
-    // the refusal below the persist instead is what orphans the row.
-    // Fire-and-forget: a DB failure must not break platform delivery (#1182).
-    if (!isWebAdapter(platform)) {
-      messageDb
-        .addMessage(conversation.id, 'user', message, undefined, userId)
-        .catch((e: unknown) => {
-          const err = e instanceof Error ? e : new Error(String(e));
-          getLog().warn(
-            { err, errorType: err.constructor.name, conversationId },
-            'orchestrator.user_message_persist_failed'
-          );
-        });
     }
 
     const {
@@ -3002,19 +3010,9 @@ async function handleStreamMode(
     return;
   }
 
-  // Text was already streamed — nothing more to send.
-  // Persist the assistant reply for non-web platforms so it appears in the
-  // Web UI conversation history. The web adapter persists through its
-  // MessagePersistence buffer; skip it here to avoid double-write (#1182).
-  if (!isWebAdapter(platform) && fullResponse) {
-    messageDb.addMessage(conversation.id, 'assistant', fullResponse).catch((e: unknown) => {
-      const err = e instanceof Error ? e : new Error(String(e));
-      getLog().warn(
-        { err, errorType: err.constructor.name, conversationId },
-        'orchestrator.assistant_message_persist_failed'
-      );
-    });
-  }
+  // Text was already streamed, and each chunk was persisted as it was
+  // delivered — one row per bubble, at the moment that bubble appeared. There
+  // is nothing left to write at the end.
   await maybeSendResultFooter(platform, conversationId, lastResult);
   // Anonymous telemetry: one completed direct-chat turn. The workflow-invocation
   // and project-registration paths return above without reaching this — those
@@ -3265,19 +3263,9 @@ async function handleBatchMode(
 
   // No orchestrator commands — send the clean response
   getLog().debug({ messageLength: finalMessage.length }, 'sending_final_message');
+  // Batch mode is one message by construction, and sending it is what persists
+  // it — the same path every other outbound message takes.
   await platform.sendMessage(conversationId, finalMessage);
-  // Persist the assistant reply for non-web platforms so it appears in the
-  // Web UI conversation history. The web adapter persists through its
-  // MessagePersistence buffer; skip it here to avoid double-write (#1182).
-  if (!isWebAdapter(platform) && finalMessage) {
-    messageDb.addMessage(conversation.id, 'assistant', finalMessage).catch((e: unknown) => {
-      const err = e instanceof Error ? e : new Error(String(e));
-      getLog().warn(
-        { err, errorType: err.constructor.name, conversationId },
-        'orchestrator.assistant_message_persist_failed'
-      );
-    });
-  }
   await maybeSendResultFooter(platform, conversationId, lastResult);
   // Anonymous telemetry: one completed direct-chat turn (same exclusion
   // rationale as the stream-mode capture in handleStreamMode above).

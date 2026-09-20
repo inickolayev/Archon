@@ -19,3 +19,15 @@ export function toHydratedTimestamp(value: string): Date {
   const zoned = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(value);
   return new Date(zoned ? value : `${value.replace(' ', 'T')}Z`);
 }
+
+/**
+ * `YYYY-MM-DD HH:MM:SS.mmm` in UTC — the shape SQLite's `datetime('now')`
+ * writes, plus milliseconds, so the two compare correctly both in SQL (the
+ * string sorts the same way the instant does) and after parsing. The extra
+ * digits are what let two writes in the same second be ordered at all:
+ * `datetime('now')` resolves to whole seconds, so anything relying on it alone
+ * has to break ties some other way.
+ */
+export function formatSqliteTimestamp(ms: number): string {
+  return new Date(ms).toISOString().replace('T', ' ').replace('Z', '');
+}

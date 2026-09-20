@@ -2018,7 +2018,7 @@ describe('provider cwd resolution', () => {
       expect(sent).toContain('/update-project "Bob\\"s \\\\Ops" <new-path>');
     });
 
-    test('writes no user row when it refuses, so none is left unpaired', async () => {
+    test('the refusal is persisted beside the message, so neither is left unpaired', async () => {
       mockAddMessage.mockClear();
       const codebase = makeCodebaseForSync();
       const conversation = makeConversation({ codebase_id: 'codebase-1' });
@@ -2028,13 +2028,21 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
 
       // Non-web only: the web adapter's route persists its own turns, so the
-      // orchestrator never writes a user row for it and this could not regress.
+      // orchestrator never writes rows for it and this could not regress.
       const platform = makePlatform();
       platform.getPlatformType = mock(() => 'telegram') as typeof platform.getPlatformType;
       await handleMessage(platform, 'conv-1', 'hello');
 
       expect(mockSendQuery).not.toHaveBeenCalled();
-      expect(mockAddMessage.mock.calls.filter(c => c[1] === 'user')).toHaveLength(0);
+      // The user row is written before anything can decline the turn, and the
+      // refusal itself is persisted as it is delivered — so a declined turn
+      // reads in the history exactly as it read on the phone, as a question
+      // and the answer it got. This is what replaced the old ordering dance of
+      // keeping the persist below every early return.
+      expect(mockAddMessage.mock.calls.filter(c => c[1] === 'user')).toHaveLength(1);
+      const assistantRows = mockAddMessage.mock.calls.filter(c => c[1] === 'assistant');
+      expect(assistantRows).toHaveLength(1);
+      expect(assistantRows[0]?.[2] as string).toContain('no longer exists');
     });
 
     test('a stale cwd override gets the conversation-cwd message, not this one', async () => {
@@ -6107,7 +6115,8 @@ describe('message persistence for non-web platforms', () => {
     expect(mockAddMessage).toHaveBeenCalledWith(
       'conv-db-id',
       'assistant',
-      expect.stringContaining('hello back')
+      expect.stringContaining('hello back'),
+      undefined
     );
     expect(mockAddMessage).toHaveBeenCalledTimes(2);
   });
@@ -6131,7 +6140,8 @@ describe('message persistence for non-web platforms', () => {
     expect(mockAddMessage).toHaveBeenCalledWith(
       'conv-db-id',
       'assistant',
-      expect.stringContaining('hello back')
+      expect.stringContaining('hello back'),
+      undefined
     );
     expect(mockAddMessage).toHaveBeenCalledTimes(2);
   });
@@ -6190,12 +6200,13 @@ describe('message persistence for non-web platforms', () => {
     expect(mockAddMessage).toHaveBeenCalledWith(
       'conv-db-id',
       'assistant',
-      expect.stringContaining('hello back')
+      expect.stringContaining('hello back'),
+      undefined
     );
     expect(mockAddMessage).toHaveBeenCalledTimes(2);
   });
 
-  test('does NOT persist a user row for a deterministic slash command (no orphan)', async () => {
+  test('a deterministic slash command is history too — the command and its answer', async () => {
     const platform: IPlatformAdapter = {
       ...makePlatform(),
       getPlatformType: mock(() => 'github'),
@@ -6208,9 +6219,19 @@ describe('message persistence for non-web platforms', () => {
 
     await handleMessage(platform, 'conv-1', '/status');
 
-    // Deterministic slash commands return before the AI dispatch, so persisting a
-    // user row here would orphan it (no paired assistant row in the Web UI history).
-    expect(mockAddMessage).not.toHaveBeenCalled();
+    // The command returns before the AI dispatch, but its ANSWER is delivered
+    // and therefore persisted, so the user row it pairs with is no longer an
+    // orphan — and the console now shows what the phone showed, instead of a
+    // silent gap where the operator ran a command.
+    expect(mockAddMessage).toHaveBeenCalledWith(
+      'conv-db-id',
+      'user',
+      '/status',
+      undefined,
+      undefined
+    );
+    expect(mockAddMessage).toHaveBeenCalledWith('conv-db-id', 'assistant', 'status ok', undefined);
+    expect(mockAddMessage).toHaveBeenCalledTimes(2);
   });
 });
 

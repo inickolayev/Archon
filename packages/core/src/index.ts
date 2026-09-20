@@ -140,6 +140,7 @@ export {
   createTelegramChatStore,
   resolveActiveTelegramConversationId,
 } from './conversations/telegram-chat-store';
+export { persistInboundMessage, type InboundMessage } from './conversations/inbound-message';
 export {
   ADVERTISED_COMMANDS,
   MAIN_KEYBOARD,

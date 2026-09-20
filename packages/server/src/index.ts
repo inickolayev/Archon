@@ -116,6 +116,7 @@ import {
   createTelegramChatStore,
   handleTelegramCallback,
   isStopCommand,
+  persistInboundMessage,
   setProjectForConversation,
   stopTurn as stopConversationTurn,
   NOTHING_RUNNING_NOTICE,
@@ -1034,6 +1035,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         userId: telegramUserId,
         displayName,
         files,
+        sentAtMs,
       }) => {
         // A tap on the persistent keyboard is a plain message carrying the
         // button's label; translate it back into the command it stands for.
@@ -1074,6 +1076,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // onto its web stream so the console updates live instead of waiting
         // for a refetch; the message rows themselves are persisted by the
         // orchestrator, as they are for every non-web platform.
+        //
+        // The operator's own message is the exception, and it is written just
+        // below rather than by the orchestrator — see there for why.
         const deliverTo = withOutboundMirror(telegramAdapter, (text, metadata) => {
           void webAdapter
             .emitSSE(
@@ -1113,6 +1118,49 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           uploadDir = stored.uploadDir;
         }
 
+        // Written HERE, before the lock, not inside the turn.
+        //
+        // `acquireLock` holds a message that arrives mid-turn in memory — no
+        // row, no event, nothing on any screen — until the running turn ends
+        // and the queued handler finally starts. A line typed at 13:35 could
+        // surface in the console at 13:41. Persisting at ingest makes it
+        // visible the moment it lands, and stamps it with the time Telegram
+        // says it was sent rather than the time we got around to inserting it,
+        // so it also sits in the right place among the bubbles it arrived
+        // between. The orchestrator is told not to write a second one.
+        const persistedUserMessage = await persistInboundMessage({
+          platformType: 'telegram',
+          platformConversationId: conversationId,
+          text: message,
+          ...(userId !== undefined ? { userId } : {}),
+          ...(sentAtMs !== undefined ? { sentAtMs } : {}),
+          ...(attachedFiles !== undefined && attachedFiles.length > 0
+            ? {
+                // Shaped as the browser upload route writes it. The on-disk
+                // path is left out on purpose: the file is deleted once the
+                // agent has read it, and a stale path in the history would
+                // only mislead whoever reads it next.
+                metadata: {
+                  files: attachedFiles.map(f => ({
+                    name: f.name,
+                    mimeType: f.mimeType,
+                    size: f.size,
+                  })),
+                },
+              }
+            : {}),
+        });
+        // The console may be watching this conversation; nudge it rather than
+        // leaving the message to the next poll.
+        await webAdapter
+          .emitSSE(
+            conversationId,
+            JSON.stringify({ type: 'user_message', content: message, timestamp: Date.now() })
+          )
+          .catch((err: unknown) => {
+            getLog().warn({ err, conversationId }, 'telegram.inbound_mirror_failed');
+          });
+
         // Fire-and-forget: handler returns immediately, processing happens async
         lockManager
           .acquireLock(conversationId, async () => {
@@ -1120,6 +1168,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
               await handleMessage(deliverTo, conversationId, message, {
                 isolationHints: { workflowType: 'thread', workflowId: conversationId },
                 userId,
+                userMessagePersisted: persistedUserMessage,
                 ...(attachedFiles !== undefined ? { attachedFiles } : {}),
               });
             } finally {

@@ -27,7 +27,11 @@ const ACTIVE_POLL_MS = 3000;
 // has stayed stable this long. Independent of any SSE lock event.
 const SETTLE_MS = 6000;
 // Hard cap so a turn that never produces a reply (server error, etc.) can't
-// disable the composer forever.
+// disable the composer forever. Measured from the last thing that HAPPENED in
+// the conversation, not from the moment the wait began: a chat can legitimately
+// stay busy for longer than this now that a message typed on the phone
+// mid-turn lands in the history immediately and queues behind the running
+// turn. Time since the last row is the honest reading of "nothing is coming".
 const MAX_WAIT_MS = 300_000;
 // Distance from the bottom (px) within which we treat the scroll as "at bottom"
 // — drives both auto-scroll stickiness and the jump-to-bottom button's visibility.
@@ -137,6 +141,10 @@ export function ChatPage(): ReactElement {
   // works even when SSE is absent. The SSE lock event is a fast-path on top of it.
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settleSigRef = useRef('');
+  // Last trailing message seen, whatever its role — the clock the hard cap
+  // below runs against.
+  const activitySigRef = useRef('');
+  const busySinceRef = useRef(0);
 
   // Read inside callbacks that must not re-subscribe the SSE stream on every
   // conversation switch (see onLockChange below).
@@ -181,6 +189,14 @@ export function ChatPage(): ReactElement {
     const list = messages ?? [];
     const last = list[list.length - 1];
     if (last === undefined) return;
+    const sig = `${list.length}:${last.id}`;
+    // Any new trailing row is activity, whoever wrote it — a mid-turn message
+    // from the phone counts as much as a reply does. The cap restarts from here
+    // so a long queue is waited out rather than declared dead.
+    if (sig !== activitySigRef.current) {
+      activitySigRef.current = sig;
+      busySinceRef.current = Date.now();
+    }
     if (last.role === 'user') {
       settleSigRef.current = '';
       if (settleTimerRef.current !== null) {
@@ -193,7 +209,6 @@ export function ChatPage(): ReactElement {
     // Trailing message is an assistant/system reply. Arm the settle timer once;
     // re-arm only on real content change so identical poll refetches (same sig)
     // don't reset it forever.
-    const sig = `${list.length}:${last.id}`;
     if (sig === settleSigRef.current) return;
     settleSigRef.current = sig;
     if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
@@ -231,8 +246,8 @@ export function ChatPage(): ReactElement {
   }, [activeConvId]);
 
   // Recovery poll: while a reply is pending, refetch messages on a cadence so a
-  // dropped or absent SSE event can't hide the reply. Hard-caps at MAX_WAIT_MS.
-  const busySinceRef = useRef(0);
+  // dropped or absent SSE event can't hide the reply. Hard-caps at MAX_WAIT_MS
+  // since the last activity (see the settle detector above).
   useEffect(() => {
     if (!busy || activeConvId === null) return;
     busySinceRef.current = Date.now();

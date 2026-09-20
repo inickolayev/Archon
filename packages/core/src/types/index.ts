@@ -57,6 +57,13 @@ export interface HandleMessageContext {
    */
   readonly userId?: string;
   /**
+   * True when the surface that received this message already wrote its `user`
+   * row — at ingest, before the conversation lock, and stamped with the time
+   * the platform said it was sent. `handleMessage` then skips its own fallback
+   * persist rather than writing the message twice.
+   */
+  readonly userMessagePersisted?: boolean;
+  /**
    * Declared workflow inputs supplied by the caller (#2554), keyed by input name.
    *
    * Set ONLY by the `POST /api/workflows/:name/run` route, whose body carries an
