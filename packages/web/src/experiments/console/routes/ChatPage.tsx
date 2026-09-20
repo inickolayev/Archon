@@ -251,6 +251,28 @@ export function ChatPage(): ReactElement {
   // Reveal the raw tool trace inline (toggled from the working indicator).
   const [showTools, setShowTools] = useState(false);
 
+  // Call off the running turn. `busy` is deliberately NOT cleared here: the
+  // abort has to travel to the provider and the turn writes its own closing
+  // note, and clearing the composer before that lands would invite a second
+  // message into a conversation still finishing the first. The existing
+  // detectors (the lock event, else the settle timer) end the turn as they do
+  // for any other ending. A conversation that turns out not to be running is
+  // said out loud rather than swallowed — otherwise the button looks broken.
+  const onStop = useCallback((): void => {
+    if (activeConvId === null) return;
+    setError(null);
+    setNotice(null);
+    void (async (): Promise<void> => {
+      try {
+        const stopped = await skill.stopConversation(activeConvId);
+        if (!stopped) setNotice('Nothing was running — the turn had already finished.');
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : 'Could not stop the agent.');
+      }
+      invalidate(K.messages(activeConvId));
+    })();
+  }, [activeConvId]);
+
   const onSend = (text: string, files?: File[]): void => {
     if (projectId === undefined) return;
     setError(null);
@@ -404,6 +426,7 @@ export function ChatPage(): ReactElement {
                     onToggle={() => {
                       setShowTools(v => !v);
                     }}
+                    onStop={activeConvId !== null ? onStop : undefined}
                   />
                 ) : null}
               </StreamContextProvider>

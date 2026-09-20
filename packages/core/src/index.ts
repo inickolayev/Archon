@@ -100,6 +100,13 @@ export {
 } from './orchestrator/orchestrator-agent';
 export type { TitleRequest } from './orchestrator/orchestrator-agent';
 export {
+  isTurnRunning,
+  stopTurn,
+  NOTHING_RUNNING_NOTICE,
+  STOP_REQUESTED_NOTICE,
+  TURN_STOPPED_NOTICE,
+} from './orchestrator/turn-control';
+export {
   buildOrchestratorPrompt,
   buildProjectScopedPrompt,
   buildOrchestratorSystemAppend,
@@ -137,6 +144,8 @@ export {
   ADVERTISED_COMMANDS,
   MAIN_KEYBOARD,
   PAGE_SIZE,
+  STOP_COMMAND,
+  isStopCommand,
   buildChatsKeyboard,
   buildMainMenu,
   buildProjectsKeyboard,

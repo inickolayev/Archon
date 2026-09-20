@@ -91,6 +91,17 @@ export const sendMessageMultipartSchema = z
   })
   .openapi('SendMessageMultipartBody');
 
+/**
+ * POST /api/conversations/:id/stop response.
+ *
+ * `stopped: false` is a normal answer, not a failure: the conversation was
+ * idle, or the turn ended between the tap and the request. The caller says so
+ * instead of claiming an abort that never happened.
+ */
+export const stopTurnResponseSchema = z
+  .object({ stopped: z.boolean() })
+  .openapi('StopTurnResponse');
+
 /** Response for dispatch endpoints (send message, run workflow). */
 export const dispatchResponseSchema = z
   .object({

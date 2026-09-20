@@ -587,6 +587,7 @@ import {
   resolveTitleRequest,
   continueResolvedGateRun,
 } from './orchestrator-agent';
+import { isTurnRunning, stopTurn, TURN_STOPPED_NOTICE } from './turn-control';
 import { buildAiProfile } from '@archon/workflows/model-validation';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 
@@ -6655,3 +6656,134 @@ describe('continueResolvedGateRun — chat gate continuation source (#2646)', ()
     expect(messages.some(m => m.includes('retry with `/workflow resume'))).toBe(false);
   });
 });
+
+// ─── Stopping a turn in flight ───────────────────────────────────────────────
+
+describe('stopping a turn', () => {
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(makeConversation({ id: 'conv-db-id', platform_conversation_id: 'conv-1' }))
+    );
+    mockLoadConfig.mockReset();
+    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
+    mockAddMessage.mockReset();
+    mockAddMessage.mockImplementation((conversationId, role, content) =>
+      Promise.resolve(makeMessage({ conversation_id: conversationId, role, content }))
+    );
+    mockSendQuery.mockReset();
+    mockSendQuery.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'test response' };
+      yield { type: 'result', sessionId: 'session-1' };
+    });
+  });
+
+  function sentTexts(platform: ReturnType<typeof makePlatform>): string[] {
+    return (platform.sendMessage.mock.calls as unknown[][]).map(c => c[1] as string);
+  }
+
+  test('the provider is handed a signal it can be aborted through', async () => {
+    const platform = makePlatform();
+
+    await handleMessage(platform, 'conv-1', 'hello');
+
+    const options = (mockSendQuery.mock.calls as unknown[][])[0]?.[3] as
+      | { abortSignal?: AbortSignal }
+      | undefined;
+    expect(options?.abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  test('a stop aborts the provider and says so instead of reporting a crash', async () => {
+    const platform = makePlatform();
+    // Stands in for a provider that throws out of its abort, which is what all
+    // of them do: the SDK kills the subprocess and the iterator rejects.
+    mockSendQuery.mockImplementation(async function* (_p, _cwd, _s, requestOptions) {
+      yield { type: 'assistant', content: 'starting on the wrong thing' };
+      await rejectOnAbort(requestOptions?.abortSignal);
+    });
+
+    const turn = handleMessage(platform, 'conv-1', 'do the wrong thing');
+    await drainUntilTurnRunning();
+    expect(stopTurn('conv-1')).toBe(true);
+    await turn;
+
+    expect(sentTexts(platform)).toContain(TURN_STOPPED_NOTICE);
+    // The stop must not read as a failure — no error formatting reaches the chat.
+    expect(sentTexts(platform).some(t => t.includes('Something went wrong'))).toBe(false);
+  });
+
+  test('a provider that ends its stream on abort still gets the stopped note', async () => {
+    const platform = makePlatform();
+    mockSendQuery.mockImplementation(async function* (_p, _cwd, _s, requestOptions) {
+      yield { type: 'assistant', content: 'partial answer' };
+      await drainUntil(() => requestOptions?.abortSignal?.aborted === true, 'the signal aborted');
+      // No throw: the provider simply stops yielding, as OpenCode's session does.
+    });
+
+    const turn = handleMessage(platform, 'conv-1', 'do the wrong thing');
+    await drainUntilTurnRunning();
+    stopTurn('conv-1');
+    await turn;
+
+    expect(sentTexts(platform)).toContain(TURN_STOPPED_NOTICE);
+  });
+
+  test('the handle is released, so the next message runs a turn of its own', async () => {
+    const platform = makePlatform();
+    mockSendQuery.mockImplementation(async function* (_p, _cwd, _s, requestOptions) {
+      yield { type: 'assistant', content: 'first' };
+      await rejectOnAbort(requestOptions?.abortSignal);
+    });
+    const stopped = handleMessage(platform, 'conv-1', 'first message');
+    await drainUntilTurnRunning();
+    stopTurn('conv-1');
+    await stopped;
+    expect(isTurnRunning('conv-1')).toBe(false);
+
+    mockSendQuery.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'second answer' };
+      yield { type: 'result', sessionId: 'session-2' };
+    });
+    const secondPlatform = makePlatform();
+    await handleMessage(secondPlatform, 'conv-1', 'second message');
+
+    expect(sentTexts(secondPlatform)).toContain('second answer');
+    expect(sentTexts(secondPlatform)).not.toContain(TURN_STOPPED_NOTICE);
+  });
+});
+
+/**
+ * What every provider does with an abort: throw out of the query. Checks the
+ * flag as well as listening, because the stop can (and here does) land while
+ * the turn is still in setup — the signal is then already aborted by the time
+ * the provider reads it, and a listener alone would wait forever.
+ */
+function rejectOnAbort(signal: AbortSignal | undefined): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    const fail = (): void => {
+      reject(new Error('Query aborted'));
+    };
+    if (signal?.aborted === true) {
+      fail();
+      return;
+    }
+    signal?.addEventListener('abort', fail, { once: true });
+  });
+}
+
+/** Bounded microtask drain — nothing here waits on the clock. */
+async function drainUntil(predicate: () => boolean, expectation: string): Promise<void> {
+  for (let tick = 0; tick < 2000; tick++) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  throw new Error(`never reached expected state: ${expectation}`);
+}
+
+/**
+ * handleMessage claims the conversation before it does anything else, so the
+ * registry is the earliest honest signal that the turn is under way.
+ */
+function drainUntilTurnRunning(): Promise<void> {
+  return drainUntil(() => isTurnRunning('conv-1'), 'the turn registered as running');
+}

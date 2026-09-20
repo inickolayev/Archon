@@ -24,6 +24,7 @@ import type {
 } from '@archon/core';
 import {
   handleMessage,
+  stopTurn,
   getDatabaseType,
   getSchemaVersion,
   loadConfig,
@@ -321,6 +322,7 @@ import {
   messageListResponseSchema,
   listMessagesQuerySchema,
   dispatchResponseSchema,
+  stopTurnResponseSchema,
 } from './schemas/conversation.schemas';
 import {
   codebaseListResponseSchema,
@@ -697,6 +699,24 @@ const sendMessageRoute = createRoute({
       description: 'Accepted',
     },
     400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const stopTurnRoute = createRoute({
+  method: 'post',
+  path: '/api/conversations/{id}/stop',
+  tags: ['Conversations'],
+  summary: 'Call off the turn running in a conversation',
+  description:
+    'Aborts the agent call in flight for this conversation. Answers `{ stopped: false }` ' +
+    'when nothing was running, which is not an error.',
+  request: { params: conversationIdParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: stopTurnResponseSchema } },
+      description: 'Stop requested',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -2917,6 +2937,19 @@ export function registerApiRoutes(
       getLog().error({ err: error }, 'list_messages_failed');
       return apiError(c, 500, 'Failed to list messages');
     }
+  });
+
+  // POST /api/conversations/:id/stop - Call off the running turn
+  //
+  // Deliberately does NOT touch the conversation lock or the queue: the aborted
+  // turn returns through its own handler, which is what releases the lock and
+  // starts whatever was waiting behind it. A queued message is the operator's
+  // own correction — stopping the agent is not a reason to throw it away.
+  registerOpenApiRoute(stopTurnRoute, async c => {
+    const conversationId = c.req.param('id') ?? '';
+    const stopped = stopTurn(conversationId);
+    getLog().info({ conversationId, stopped }, 'api.conversation_stop_requested');
+    return c.json({ stopped });
   });
 
   // POST /api/conversations/:id/message - Send message

@@ -630,11 +630,11 @@ describe('TelegramAdapter', () => {
         },
       }) as never;
 
-    test('only /start, /help and /menu are published to Telegram', async () => {
+    test('only the few worth typing are published to Telegram', async () => {
       const { commandsPublished } = await startCapturing();
       await new Promise(resolve => setTimeout(resolve, 5));
       const published = commandsPublished[0] as { command: string }[] | undefined;
-      expect(published?.map(c => c.command)).toEqual(['start', 'help', 'menu']);
+      expect(published?.map(c => c.command)).toEqual(['start', 'help', 'menu', 'stop']);
     });
 
     test('a tap edits the message in place and answers the query', async () => {

@@ -1067,6 +1067,56 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/conversations/{id}/stop': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Call off the turn running in a conversation
+     * @description Aborts the agent call in flight for this conversation. Answers `{ stopped: false }` when nothing was running, which is not an error.
+     */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          id: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Stop requested */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['StopTurnResponse'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/conversations/{id}/message': {
     parameters: {
       query?: never;
@@ -3420,6 +3470,9 @@ export interface components {
       user_id: string | null;
       /** Format: date-time */
       created_at: string;
+    };
+    StopTurnResponse: {
+      stopped: boolean;
     };
     DispatchResponse: {
       accepted: boolean;

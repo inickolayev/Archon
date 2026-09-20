@@ -32,6 +32,7 @@ import { toError } from '../utils/error';
 import { safeDeactivateSession } from '../state/session-transitions';
 import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
 import { buildManageRunTool } from './manage-run-tool';
+import { beginTurn, TURN_STOPPED_NOTICE } from './turn-control';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
@@ -1983,6 +1984,11 @@ export async function handleMessage(
   // stripping a bot mention) must not let a command masquerade as a plain
   // AI turn. Mirrors the trim already done inside commandHandler.parseCommand.
   const trimmedMessage = message.trim();
+  // Claimed for the whole turn, not just the provider call: setup can take
+  // seconds of its own (workspace sync, workflow discovery), and an operator
+  // who has already seen the misunderstanding should not have to wait for the
+  // model to start before the stop button means anything.
+  const turn = beginTurn(conversationId);
   try {
     getLog().debug({ conversationId, userId }, 'orchestrator_message_received');
 
@@ -2579,6 +2585,11 @@ export async function handleMessage(
       protectedEnvKeys: protectedEnvKeys.length > 0 ? protectedEnvKeys : undefined,
       model: chatRequest.model,
       systemPrompt,
+      // The one thread that reaches the running agent from outside this
+      // function. Every provider forwards it to its SDK, which is what
+      // actually tears the subprocess down; without it a stop could only hide
+      // the answer, not stop the work producing it.
+      abortSignal: turn.signal,
     };
     if (chatRequest.preset) {
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
@@ -2742,6 +2753,16 @@ export async function handleMessage(
       }
     }
 
+    // Not every provider throws on abort — some end their stream and return
+    // what they had. The turn is still over at the operator's request, so it
+    // says so here and stops short of the post-turn work (the unpushed-work
+    // reminder, the cost footer, the completed-turn telemetry) that would
+    // otherwise describe it as a turn that ran its course.
+    if (turn.wasStopped()) {
+      await platform.sendMessage(conversationId, TURN_STOPPED_NOTICE);
+      return;
+    }
+
     // Direct-chat turns may have written to source/. If there is local-only state
     // (uncommitted edits, unpushed commits), surface a one-line reminder so the
     // user can push or commit + push before the next worktree creation or
@@ -2761,13 +2782,25 @@ export async function handleMessage(
     getLog().debug({ conversationId }, 'orchestrator_message_completed');
   } catch (error) {
     const err = toError(error);
-    getLog().error({ err, conversationId }, 'orchestrator_message_failed');
-    const userMessage = classifyAndFormatError(err);
+    // A stopped turn fails the same way a crashed one does — the provider
+    // throws out of the abort — so the difference has to come from the handle,
+    // not from the error. Saying "something went wrong" about an abort the
+    // operator asked for would be a lie, and one that reads as a bug.
+    if (turn.wasStopped()) {
+      getLog().info({ err, conversationId }, 'orchestrator_message_stopped');
+    } else {
+      getLog().error({ err, conversationId }, 'orchestrator_message_failed');
+    }
+    const userMessage = turn.wasStopped() ? TURN_STOPPED_NOTICE : classifyAndFormatError(err);
     try {
       await platform.sendMessage(conversationId, userMessage);
     } catch (sendError) {
       getLog().error({ err: toError(sendError), conversationId }, 'error_notification_failed');
     }
+  } finally {
+    // Released before the lock is, so the next message — including one already
+    // queued behind this turn — begins a turn of its own with a fresh signal.
+    turn.release();
   }
 }
 

@@ -115,7 +115,11 @@ import {
   commandForLabel,
   createTelegramChatStore,
   handleTelegramCallback,
+  isStopCommand,
   setProjectForConversation,
+  stopTurn as stopConversationTurn,
+  NOTHING_RUNNING_NOTICE,
+  STOP_REQUESTED_NOTICE,
 } from '@archon/core';
 import type { AttachedFile, IPlatformAdapter } from '@archon/core';
 import type { IdentityPlatform } from '@archon/core';
@@ -959,6 +963,25 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // itself, so one chat's reply can never show another project's files.
     telegramAdapter.onImageRoots(conversationImageRoots);
 
+    /**
+     * Call off whatever this Telegram chat's active conversation is doing.
+     *
+     * Both the tapped button and the typed command land here, and neither goes
+     * anywhere near the conversation lock — a stop that queued behind the turn
+     * it is meant to interrupt would arrive after that turn had already
+     * finished. A lookup failure falls back to the chat's legacy-shaped
+     * conversation id, the same fallback the message handler uses.
+     */
+    const stopActiveTurn = async (chatId: string): Promise<boolean> => {
+      let conversationId = chatId;
+      try {
+        conversationId = await resolveActiveTelegramConversationId(chatId);
+      } catch (err) {
+        getLog().error({ err, chatId }, 'telegram.stop_conversation_lookup_failed');
+      }
+      return stopConversationTurn(conversationId);
+    };
+
     // A tapped button on the persistent keyboard arrives as ordinary text, and
     // the lists it opens are edited in place rather than re-sent.
     telegramAdapter.onCallback(async ({ data, chatId, userId: telegramUserId }) => {
@@ -998,6 +1021,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           const conversationId = await resolveActiveTelegramConversationId(chatId);
           return setProjectForConversation(conversationId, projectName);
         },
+        stopTurn: async () =>
+          (await stopActiveTurn(chatId)) ? STOP_REQUESTED_NOTICE : NOTHING_RUNNING_NOTICE,
       });
     });
 
@@ -1013,6 +1038,24 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // A tap on the persistent keyboard is a plain message carrying the
         // button's label; translate it back into the command it stands for.
         const message = commandForLabel(rawMessage) ?? rawMessage;
+
+        // Stop is answered here and goes no further: everything below this
+        // point ends at `acquireLock`, where a stop would queue behind the very
+        // turn it exists to interrupt. Nothing is persisted either — calling the
+        // agent off is a control gesture, not something said to it. When a turn
+        // was actually running, its own closing note is the answer, so the bot
+        // stays quiet rather than saying the same thing twice.
+        if (isStopCommand(message)) {
+          if (!(await stopActiveTurn(chatId))) {
+            await telegramAdapter
+              .sendMessage(chatId, NOTHING_RUNNING_NOTICE)
+              .catch((err: unknown) => {
+                getLog().warn({ err, chatId }, 'telegram.stop_reply_failed');
+              });
+          }
+          return;
+        }
+
         // Resolve Telegram user id (numeric) → Archon user UUID.
         const userId = await resolveUserId('telegram', telegramUserId, displayName);
 

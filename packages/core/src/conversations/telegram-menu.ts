@@ -37,23 +37,42 @@ export interface MenuKeyboard {
 }
 
 /**
- * The persistent keyboard: one button.
+ * The persistent keyboard: the way in, and the way out.
  *
- * It used to carry shortcuts too (Chats / New chat / Project / Status). They
- * were removed because a keyboard label is sent as an ordinary MESSAGE, so
- * each tap produced a fresh list underneath the last one — tap Chats five
+ * It used to carry LIST shortcuts too (Chats / New chat / Project / Status).
+ * They were removed because a keyboard label is sent as an ordinary MESSAGE,
+ * so each tap produced a fresh list underneath the last one — tap Chats five
  * times and there are five lists in the chat. Inline buttons edit the message
  * they are attached to, so the list the operator is looking at is the one that
- * changes.
+ * changes. Telegram's own menu button cannot fire a command (only a command
+ * list or a web app), which is why the keyboard, not that button, is what
+ * makes the menu reachable at all.
  *
- * So there is exactly one entry point, always within reach, and everything
- * behind it is inline and edits in place. Telegram's own menu button cannot
- * fire a command (only a command list or a web app), which is why the
- * keyboard, not that button, is what makes the menu reachable at all.
+ * Stop is the exception that proves the rule, and it has to be here rather
+ * than one tap deeper in the menu: it is wanted exactly when the operator is
+ * watching the agent do the wrong thing, and it answers with one line instead
+ * of a list, so tapping it twice costs nothing.
  */
 export const MAIN_KEYBOARD: MenuKeyboard = {
-  persistent: [['☰ Menu']],
+  persistent: [['☰ Menu', '⏹ Stop']],
 };
+
+/**
+ * Calling the agent off.
+ *
+ * Deliberately NOT one of the commands the orchestrator routes: by the time a
+ * message reaches the orchestrator it has been through the conversation lock,
+ * which is exactly where a stop would sit waiting for the turn it is meant to
+ * interrupt. The surface that receives the update acts on it first and never
+ * takes the lock — both the typed command and the button below.
+ */
+export const STOP_COMMAND = 'stop';
+
+/** True for the stop command however it was typed or tapped. */
+export function isStopCommand(text: string): boolean {
+  const normalized = (commandForLabel(text) ?? text).trim().toLowerCase();
+  return normalized === `/${STOP_COMMAND}`;
+}
 
 /**
  * Labels the bot answers to. Wider than what MAIN_KEYBOARD shows on purpose: a
@@ -63,6 +82,8 @@ export const MAIN_KEYBOARD: MenuKeyboard = {
 const LABEL_COMMANDS: ReadonlyMap<string, string> = new Map([
   ['☰ Menu', '/menu'],
   ['Menu', '/menu'],
+  ['⏹ Stop', `/${STOP_COMMAND}`],
+  ['Stop', `/${STOP_COMMAND}`],
   ['Chats', '/chats'],
   ['New chat', '/new'],
   ['Project', '/projects'],
@@ -83,6 +104,7 @@ export const ADVERTISED_COMMANDS: readonly { command: string; description: strin
   { command: 'start', description: 'Show the buttons' },
   { command: 'help', description: 'What the buttons do' },
   { command: 'menu', description: 'Chats and projects' },
+  { command: STOP_COMMAND, description: 'Call off what the agent is doing' },
 ];
 
 // --- callback tokens --------------------------------------------------------
@@ -104,7 +126,8 @@ export type CallbackAction =
   | { readonly kind: 'switch'; readonly index: number }
   | { readonly kind: 'new' }
   | { readonly kind: 'project'; readonly name: string }
-  | { readonly kind: 'link' };
+  | { readonly kind: 'link' }
+  | { readonly kind: 'stop' };
 
 export function encodeAction(action: CallbackAction): string {
   switch (action.kind) {
@@ -122,6 +145,8 @@ export function encodeAction(action: CallbackAction): string {
       return `p:${action.name.slice(0, MAX_PROJECT_TOKEN)}`;
     case 'link':
       return 'lk';
+    case 'stop':
+      return 'x';
   }
 }
 
@@ -137,6 +162,7 @@ export function parseAction(data: string): CallbackAction | null {
   if (data === 'm') return { kind: 'menu' };
   if (data === 'n') return { kind: 'new' };
   if (data === 'lk') return { kind: 'link' };
+  if (data === 'x') return { kind: 'stop' };
   const switchMatch = /^s:(\d{1,4})$/.exec(data);
   if (switchMatch) {
     const index = Number(switchMatch[1]);
@@ -256,6 +282,7 @@ export function buildMainMenu(): { text: string; keyboard: MenuKeyboard } {
           { label: 'Projects', action: encodeAction({ kind: 'projects' }) },
         ],
         [{ label: '+ New chat', action: encodeAction({ kind: 'new' }) }],
+        [{ label: '⏹ Stop the agent', action: encodeAction({ kind: 'stop' }) }],
         [{ label: 'Link this chat to my account', action: encodeAction({ kind: 'link' }) }],
       ],
       persistent: MAIN_KEYBOARD.persistent,
@@ -285,6 +312,12 @@ export interface TelegramCallbackInput {
    * server, and because a build without it should simply not offer the button.
    */
   readonly issueAccountLink?: () => Promise<string>;
+  /**
+   * Calls off whatever this chat's active conversation is doing and returns
+   * what to show. Injected like the two above: the registry of running turns
+   * lives with the process that started them, not with this keyboard.
+   */
+  readonly stopTurn?: () => Promise<string>;
   readonly now?: number;
 }
 
@@ -312,6 +345,17 @@ export async function handleTelegramCallback(
   if (action.kind === 'menu') {
     const menu = buildMainMenu();
     return { text: menu.text, keyboard: menu.keyboard };
+  }
+
+  if (action.kind === 'stop') {
+    if (input.stopTurn === undefined) {
+      return { text: 'Stopping is not available on this install.' };
+    }
+    // The menu stays put under the answer: after a stop the next thing the
+    // operator usually wants is another chat or another project, and a stop
+    // that swallowed the menu would cost them a tap to get it back.
+    const menu = buildMainMenu();
+    return { text: await input.stopTurn(), keyboard: menu.keyboard, toast: 'Stopped' };
   }
 
   if (action.kind === 'link') {

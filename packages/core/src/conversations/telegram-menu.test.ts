@@ -12,7 +12,9 @@ import {
   handleTelegramCallback,
   handleTelegramMenuCommand,
   isMenuCommand,
+  isStopCommand,
   parseAction,
+  STOP_COMMAND,
 } from './telegram-menu';
 import {
   numberConversations,
@@ -63,8 +65,8 @@ function fakeStore(initial: TelegramChatRow[]): TelegramChatStore & {
 }
 
 describe('advertised commands', () => {
-  test('only the three worth typing are published to Telegram', () => {
-    expect(ADVERTISED_COMMANDS.map(c => c.command)).toEqual(['start', 'help', 'menu']);
+  test('only the few worth typing are published to Telegram', () => {
+    expect(ADVERTISED_COMMANDS.map(c => c.command)).toEqual(['start', 'help', 'menu', 'stop']);
   });
 
   test('start and menu are handled as menu commands', () => {
@@ -72,10 +74,18 @@ describe('advertised commands', () => {
     expect(isMenuCommand('menu')).toBe(true);
     expect(isMenuCommand('workflow')).toBe(false);
   });
+
+  test('stop is NOT a menu command — it must never reach the orchestrator', () => {
+    // Everything the orchestrator routes has already passed the conversation
+    // lock, which is where a stop would sit waiting for the turn it means to
+    // interrupt. The surface that receives the update acts on it instead.
+    expect(isMenuCommand(STOP_COMMAND)).toBe(false);
+  });
 });
 
 describe('persistent keyboard labels', () => {
   test('a tapped label becomes the command it stands for', () => {
+    expect(commandForLabel('⏹ Stop')).toBe('/stop');
     expect(commandForLabel('Chats')).toBe('/chats');
     expect(commandForLabel('New chat')).toBe('/new');
     expect(commandForLabel('Project')).toBe('/projects');
@@ -166,15 +176,16 @@ describe('keyboards', () => {
 
   test('the main menu offers both lists and keeps the persistent keyboard', () => {
     const menu = buildMainMenu();
-    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual(['l:c', 'l:p', 'n', 'lk']);
-    expect(menu.keyboard.persistent?.flat()).toEqual(['☰ Menu']);
+    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual(['l:c', 'l:p', 'n', 'x', 'lk']);
+    expect(menu.keyboard.persistent?.flat()).toEqual(['☰ Menu', '⏹ Stop']);
   });
 
-  test('the persistent keyboard is one button — the rest would pile up messages', () => {
-    // A keyboard label is sent as a MESSAGE: each tap adds a new list under the
-    // last one. Inline buttons edit the message they belong to, so everything
-    // except the single entry point lives inline.
-    expect(MAIN_KEYBOARD.persistent).toEqual([['☰ Menu']]);
+  test('the persistent keyboard carries no LIST — those would pile up messages', () => {
+    // A keyboard label is sent as a MESSAGE: each tap of a list label added a
+    // new list under the last one. Inline buttons edit the message they belong
+    // to, so every list lives inline. What stays here is the one entry point
+    // and the one action that is wanted mid-turn and answers in a single line.
+    expect(MAIN_KEYBOARD.persistent).toEqual([['☰ Menu', '⏹ Stop']]);
   });
 
   test('a client still showing the older keyboard keeps working', () => {
@@ -304,7 +315,7 @@ describe('handleTelegramMenuCommand', () => {
     // Only the persistent keyboard: Telegram allows one markup per message and
     // an inline keyboard would win, so a /start carrying both would never
     // install the keyboard it exists to install.
-    expect(reply?.keyboard?.persistent?.flat()).toEqual(['☰ Menu']);
+    expect(reply?.keyboard?.persistent?.flat()).toEqual(['☰ Menu', '⏹ Stop']);
     expect(reply?.keyboard?.inline).toBeUndefined();
   });
 
@@ -459,7 +470,7 @@ describe('long lists', () => {
 
 describe('the menu is one tap away', () => {
   test('the persistent keyboard always carries a menu entry', () => {
-    expect(MAIN_KEYBOARD.persistent?.[0]).toEqual(['☰ Menu']);
+    expect(MAIN_KEYBOARD.persistent?.[0]).toContain('☰ Menu');
   });
 
   test('tapping it is understood as /menu', () => {
@@ -480,6 +491,7 @@ describe('the menu is one tap away', () => {
       'Chats',
       'Projects',
       '+ New chat',
+      '⏹ Stop the agent',
       'Link this chat to my account',
     ]);
     expect(reply?.keyboard?.persistent?.flat()).toContain('☰ Menu');
@@ -525,6 +537,60 @@ describe('linking this chat to a web account', () => {
     expect(encodeAction({ kind: 'link' })).toBe('lk');
     expect(parseAction('lk')).toEqual({ kind: 'link' });
     expect(parseAction('lk:some-token')).toBeNull();
+  });
+});
+
+describe('calling the agent off', () => {
+  test('stop is on the persistent keyboard, within reach of a running turn', () => {
+    expect(MAIN_KEYBOARD.persistent?.flat()).toContain('⏹ Stop');
+  });
+
+  test('the menu carries it too, for clients showing an inline keyboard', () => {
+    const labels =
+      buildMainMenu()
+        .keyboard.inline?.flat()
+        .map(b => b.label) ?? [];
+    expect(labels).toContain('⏹ Stop the agent');
+  });
+
+  test('typed, tapped or labelled, it is recognised as the same gesture', () => {
+    expect(isStopCommand('/stop')).toBe(true);
+    expect(isStopCommand(' /STOP ')).toBe(true);
+    expect(isStopCommand('⏹ Stop')).toBe(true);
+    expect(isStopCommand('stop doing that')).toBe(false);
+    expect(isStopCommand('/status')).toBe(false);
+  });
+
+  test('tapping it calls the injected stop and keeps the menu on screen', async () => {
+    const store = fakeStore([row({ platform_conversation_id: CHAT })]);
+    let asked = 0;
+    const reply = await handleTelegramCallback({
+      data: encodeAction({ kind: 'stop' }),
+      chatId: CHAT,
+      store,
+      stopTurn: async () => {
+        asked += 1;
+        return 'Stopping the agent — it will say so in the chat.';
+      },
+    });
+
+    expect(asked).toBe(1);
+    expect(reply?.text).toContain('Stopping the agent');
+    expect(reply?.toast).toBe('Stopped');
+    // The next thing wanted after a stop is usually another chat or project.
+    expect(reply?.keyboard?.inline?.flat().map(b => b.label)).toContain('Chats');
+  });
+
+  test('a build without stopping says so instead of failing', async () => {
+    const store = fakeStore([row({ platform_conversation_id: CHAT })]);
+    const reply = await handleTelegramCallback({ data: 'x', chatId: CHAT, store });
+    expect(reply?.text).toContain('not available');
+  });
+
+  test('the token carries no conversation id — the chat comes from the update', () => {
+    expect(encodeAction({ kind: 'stop' })).toBe('x');
+    expect(parseAction('x')).toEqual({ kind: 'stop' });
+    expect(parseAction('x:99')).toBeNull();
   });
 });
 

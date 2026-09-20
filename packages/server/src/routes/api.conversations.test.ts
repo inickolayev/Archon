@@ -39,8 +39,11 @@ const mockHandleMessage = mock(
     _context?: unknown
   ) => {}
 );
+/** The orchestrator's registry of running turns, as the stop route sees it. */
+const mockStopTurn = mock((_conversationId: string) => true);
 mock.module('@archon/core', () => ({
   handleMessage: mockHandleMessage,
+  stopTurn: mockStopTurn,
   // Real behaviour, not a stub: the fan-out decision depends on it.
   isTelegramConversationId: (id: string) => /^-?\d+(?::\d+)?$/.test(id),
   getDatabaseType: () => 'sqlite',
@@ -836,5 +839,33 @@ describe('POST /api/conversations/:id/message — fan-out to Telegram', () => {
       body: JSON.stringify({ message: 'hi' }),
     });
     expect(response.status).toBe(400);
+  });
+});
+
+describe('POST /api/conversations/:id/stop', () => {
+  test('calls off the turn under the platform conversation id the UI knows', async () => {
+    mockStopTurn.mockClear();
+    const app = new OpenAPIHono();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/conversations/web-test-abc/stop', { method: 'POST' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ stopped: true });
+    // The registry is keyed by the same id Telegram and the console both use,
+    // so a stop from either window reaches the same turn.
+    expect(mockStopTurn).toHaveBeenCalledWith('web-test-abc');
+  });
+
+  test('an idle conversation answers honestly rather than failing', async () => {
+    mockStopTurn.mockClear();
+    mockStopTurn.mockImplementationOnce(() => false);
+    const app = new OpenAPIHono();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/conversations/web-test-abc/stop', { method: 'POST' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ stopped: false });
   });
 });
