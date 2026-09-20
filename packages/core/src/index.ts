@@ -142,6 +142,12 @@ export {
 } from './conversations/telegram-chat-store';
 export { persistInboundMessage, type InboundMessage } from './conversations/inbound-message';
 export {
+  ARGLESS_COMMANDS,
+  commandTrailingText,
+  trailingTextNotice,
+  withTrailingTextNotice,
+} from './handlers/command-trailing-text';
+export {
   ADVERTISED_COMMANDS,
   MAIN_KEYBOARD,
   PAGE_SIZE,

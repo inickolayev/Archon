@@ -559,6 +559,10 @@ describe('calling the agent off', () => {
     expect(isStopCommand('⏹ Stop')).toBe(true);
     expect(isStopCommand('stop doing that')).toBe(false);
     expect(isStopCommand('/status')).toBe(false);
+    // Words after the command no longer hide the stop — it queued behind the
+    // very turn it was meant to interrupt (the tail is reported, not run).
+    expect(isStopCommand('/stop и посмотри логи')).toBe(true);
+    expect(isStopCommand('/stopwatch')).toBe(false);
   });
 
   test('tapping it calls the injected stop and keeps the menu on screen', async () => {

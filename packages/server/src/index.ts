@@ -118,6 +118,8 @@ import {
   handleTelegramCallback,
   isStopCommand,
   persistInboundMessage,
+  STOP_COMMAND,
+  trailingTextNotice,
   setProjectForConversation,
   stopTurn as stopConversationTurn,
   NOTHING_RUNNING_NOTICE,
@@ -1051,12 +1053,22 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // was actually running, its own closing note is the answer, so the bot
         // stays quiet rather than saying the same thing twice.
         if (isStopCommand(message)) {
-          if (!(await stopActiveTurn(chatId))) {
-            await telegramAdapter
-              .sendMessage(chatId, NOTHING_RUNNING_NOTICE)
-              .catch((err: unknown) => {
-                getLog().warn({ err, chatId }, 'telegram.stop_reply_failed');
-              });
+          const stopped = await stopActiveTurn(chatId);
+          // Words typed after `/stop` are not a second instruction to run —
+          // starting a turn in the same breath as calling one off is the
+          // opposite of the request — but they are not dropped in silence
+          // either. Everything else here is unchanged: the turn's own closing
+          // note is the answer when one was running.
+          const ignored = trailingTextNotice(STOP_COMMAND, message);
+          const reply = stopped
+            ? ignored
+            : ignored === null
+              ? NOTHING_RUNNING_NOTICE
+              : `${NOTHING_RUNNING_NOTICE}\n\n${ignored}`;
+          if (reply !== null) {
+            await telegramAdapter.sendMessage(chatId, reply).catch((err: unknown) => {
+              getLog().warn({ err, chatId }, 'telegram.stop_reply_failed');
+            });
           }
           return;
         }

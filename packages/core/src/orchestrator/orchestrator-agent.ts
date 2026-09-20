@@ -23,6 +23,7 @@ import * as db from '../db/conversations';
 import * as codebaseDb from '../db/codebases';
 import * as sessionDb from '../db/sessions';
 import * as commandHandler from '../handlers/command-handler';
+import { withTrailingTextNotice } from '../handlers/command-trailing-text';
 import { handleTelegramChatCommand, isTelegramChatCommand } from '../conversations/telegram-chats';
 import { handleTelegramMenuCommand, isMenuCommand } from '../conversations/telegram-menu';
 import { createTelegramChatStore } from '../conversations/telegram-chat-store';
@@ -2186,9 +2187,13 @@ export async function handleMessage(
               handleTelegramChatCommand({ command: chatCommand, args: chatArgs, chatId, store }),
           });
           if (reply !== null) {
+            // `/start` and `/menu` read nothing after themselves, and a
+            // leftover command in the composer is exactly how a paragraph of
+            // instruction ends up behind one. Say what was dropped rather than
+            // answering the command as if the rest had never been typed.
             await platform.sendMessage(
               conversationId,
-              reply.text,
+              withTrailingTextNotice(reply.text, command, message),
               reply.keyboard ? { keyboard: reply.keyboard } : undefined
             );
             return;
@@ -2244,7 +2249,10 @@ export async function handleMessage(
 
         getLog().debug({ command, conversationId }, 'deterministic_command');
         const result = await commandHandler.handleCommand(conversation, message);
-        await platform.sendMessage(conversationId, result.message);
+        await platform.sendMessage(
+          conversationId,
+          withTrailingTextNotice(result.message, command, message)
+        );
 
         if (result.workflow) {
           await handleWorkflowRunCommand(

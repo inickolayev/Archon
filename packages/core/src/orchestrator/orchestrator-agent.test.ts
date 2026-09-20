@@ -6355,6 +6355,53 @@ describe('message persistence for non-web platforms', () => {
   });
 });
 
+// ─── Text typed after an argument-less command ───────────────────────────────
+
+describe('trailing text after a command', () => {
+  test('a command that swallowed a paragraph now says so', async () => {
+    const platform = makePlatform();
+    mockParseCommand.mockReturnValueOnce({ command: 'reset', args: ['do', 'the', 'thing'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({ success: true, message: 'Session cleared.', workflow: undefined })
+    );
+
+    await handleMessage(platform, 'conv-1', '/reset do the thing');
+
+    const sent = String((platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1]);
+    expect(sent).toContain('Session cleared.');
+    expect(sent).toContain('was NOT');
+    expect(sent).toContain('do the thing');
+  });
+
+  test('a command on its own is answered exactly as before', async () => {
+    const platform = makePlatform();
+    mockParseCommand.mockReturnValueOnce({ command: 'reset', args: [] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({ success: true, message: 'Session cleared.', workflow: undefined })
+    );
+
+    await handleMessage(platform, 'conv-1', '/reset');
+
+    expect(String((platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1])).toBe(
+      'Session cleared.'
+    );
+  });
+
+  test('a command that reads its own arguments is left alone', async () => {
+    const platform = makePlatform();
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['status'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({ success: true, message: 'No active runs.', workflow: undefined })
+    );
+
+    await handleMessage(platform, 'conv-1', '/workflow status');
+
+    expect(String((platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1])).toBe(
+      'No active runs.'
+    );
+  });
+});
+
 // ─── resolveChatModelRequest (#1998): per-user default chat model ─────────────
 
 describe('resolveChatModelRequest', () => {

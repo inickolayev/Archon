@@ -68,10 +68,21 @@ export const MAIN_KEYBOARD: MenuKeyboard = {
  */
 export const STOP_COMMAND = 'stop';
 
-/** True for the stop command however it was typed or tapped. */
+/**
+ * True for the stop command however it was typed or tapped.
+ *
+ * Matched on the FIRST WORD, like every other command. An exact match read
+ * `/stop и посмотри логи` as ordinary chat, so the stop silently did not
+ * happen and the message queued behind the very turn it was meant to
+ * interrupt — the opposite of what the operator asked for, with nothing said
+ * about it. The words after the command are reported as ignored by the caller
+ * (`command-trailing-text.ts`) rather than acted on: calling a turn off and
+ * starting another in the same breath is not what "stop" means.
+ */
 export function isStopCommand(text: string): boolean {
   const normalized = (commandForLabel(text) ?? text).trim().toLowerCase();
-  return normalized === `/${STOP_COMMAND}`;
+  const [firstWord] = normalized.split(/\s/);
+  return firstWord === `/${STOP_COMMAND}`;
 }
 
 /**
