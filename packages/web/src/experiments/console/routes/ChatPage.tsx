@@ -16,6 +16,7 @@ import { ensureUtc } from '../lib/format';
 import type { Project } from '../primitives/project';
 import type { Message } from '../primitives/message';
 import type { ConversationSummary } from '../primitives/conversation';
+import type { MessageQuote } from '../primitives/quoted-context';
 import { EMPTY_DIRECTORY, type Directory } from '../primitives/author';
 
 // While a turn is active, refetch messages on this cadence so streamed replies
@@ -124,6 +125,13 @@ export function ChatPage(): ReactElement {
   // Non-error advisory (distinct channel from `error` so it doesn't read as a
   // send failure) — e.g. files dropped from a first message.
   const [notice, setNotice] = useState<string | null>(null);
+  // The message the next send answers, picked from the stream. It belongs to
+  // the conversation on screen, so switching chats drops it with everything
+  // else that described the previous one.
+  const [replyTo, setReplyTo] = useState<MessageQuote | null>(null);
+  const cancelReply = useCallback((): void => {
+    setReplyTo(null);
+  }, []);
 
   // Turn-completion state. The settle timer (below) is the correctness floor — it
   // works even when SSE is absent. The SSE lock event is a fast-path on top of it.
@@ -219,6 +227,7 @@ export function ChatPage(): ReactElement {
     setBusy(false);
     setError(null);
     setNotice(null);
+    setReplyTo(null);
   }, [activeConvId]);
 
   // Recovery poll: while a reply is pending, refetch messages on a cadence so a
@@ -386,6 +395,7 @@ export function ChatPage(): ReactElement {
                   showTools={showTools}
                   directory={directory}
                   conversationId={activeConvId ?? undefined}
+                  onReply={setReplyTo}
                 />
                 {busy ? (
                   <WorkingIndicator
@@ -430,7 +440,13 @@ export function ChatPage(): ReactElement {
       {/* Keyed by conversation: a chat switch remounts the composer, so a draft
           or an attachment chip can never follow you into another chat (the
           unmount also revokes the thumbnails' object URLs). */}
-      <ChatComposer key={activeConvId ?? NEW_CHAT_SEGMENT} onSend={onSend} disabled={busy} />
+      <ChatComposer
+        key={activeConvId ?? NEW_CHAT_SEGMENT}
+        onSend={onSend}
+        disabled={busy}
+        quote={replyTo}
+        onCancelQuote={cancelReply}
+      />
     </section>
   );
 }

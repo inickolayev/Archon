@@ -95,3 +95,56 @@ describe('MessageItem — pictures an answer names', () => {
     expect(html).toContain('/tmp/devshot/desktop.png');
   });
 });
+
+describe('MessageItem — something the writer quoted', () => {
+  const quoted = (body: string): string =>
+    `> **Quoted context — forwarded from the channel "Ops"**\n> staging is down\n\n${body}`;
+
+  test('draws the quote as a quote, with where it came from', () => {
+    const html = renderToStaticMarkup(
+      <MessageItem message={message({ content: quoted('look') })} />
+    );
+
+    expect(html).toContain('<blockquote');
+    expect(html).toContain('forwarded from the channel &quot;Ops&quot;');
+    expect(html).toContain('staging is down');
+    // The markup itself never reaches the screen — it is drawn, not printed.
+    expect(html).not.toContain('Quoted context —');
+  });
+
+  test("the operator's own words stay outside the quote", () => {
+    const html = renderToStaticMarkup(
+      <MessageItem message={message({ content: quoted('what do you make of this') })} />
+    );
+    const afterQuote = html.slice(html.lastIndexOf('</blockquote>'));
+
+    expect(afterQuote).toContain('what do you make of this');
+    expect(afterQuote).not.toContain('staging is down');
+  });
+
+  test('an agent reply that quotes something renders it the same way', () => {
+    const html = renderToStaticMarkup(
+      <MessageItem message={message({ role: 'assistant', content: quoted('reading it now') })} />
+    );
+
+    expect(html).toContain('<blockquote');
+    expect(html).toContain('reading it now');
+  });
+
+  test('a message with no quote is drawn exactly as before', () => {
+    const html = renderToStaticMarkup(<MessageItem message={message({ content: 'ship it' })} />);
+
+    expect(html).not.toContain('<blockquote');
+    expect(html).toContain('ship it');
+  });
+
+  test('the reply affordance appears only where a reply can be taken', () => {
+    const withReply = renderToStaticMarkup(
+      <MessageItem message={message()} onReply={() => undefined} />
+    );
+    const without = renderToStaticMarkup(<MessageItem message={message()} />);
+
+    expect(withReply).toContain('Reply to this message');
+    expect(without).not.toContain('Reply to this message');
+  });
+});

@@ -10,6 +10,7 @@ import {
   type MenuKeyboard,
   type MessageMetadata,
 } from '@archon/core';
+import { formatQuotedMessage, type MessageQuote } from '@archon/core/messaging/quoted-context';
 import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
 import {
@@ -21,6 +22,14 @@ import {
   type TelegramMessageLike,
 } from './attachments';
 import { MediaGroupCollector } from './media-group';
+import {
+  FORWARDED_WITHOUT_INSTRUCTION,
+  batchedForward,
+  forwardQuoteOf,
+  replyQuoteOf,
+  type ForwardedPiece,
+  type QuotableMessage,
+} from './quotes';
 import { convertToTelegramMarkdown, stripMarkdown } from './markdown';
 import { sendReferencedImages } from './outbound-images';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
@@ -81,6 +90,18 @@ export interface TelegramCallbackResponse {
  */
 export type ImageRootsResolver = (conversationId: string) => Promise<readonly string[]>;
 
+/** Everything about an inbound message except the words it carried. */
+type InboundOrigin = Omit<TelegramMessageContext, 'message'>;
+
+/** What an album's first part told us, held until the rest of it lands. */
+interface PendingGroupOrigin {
+  readonly origin: InboundOrigin;
+  readonly quotes: readonly MessageQuote[];
+}
+
+/** The pieces of an inbound message the quoting code reads. */
+type InboundMessage = TelegramMessageLike & QuotableMessage;
+
 /** Telegram's markup for a keyboard, or nothing when there are no buttons. */
 function toReplyMarkup(keyboard: MenuKeyboard | undefined): Record<string, unknown> | undefined {
   if (keyboard === undefined) return undefined;
@@ -112,8 +133,21 @@ export class TelegramAdapter implements IPlatformAdapter {
   /** Kept only to build the file-download URL; never logged, never sent. */
   readonly #token: string;
   readonly #mediaGroups: MediaGroupCollector<TelegramIncomingFile>;
-  /** Album parts carry no chat/sender of their own once collected. */
-  readonly #mediaGroupOrigins = new Map<string, TelegramMessageContext>();
+  /**
+   * Album parts carry no chat/sender of their own once collected — and no reply
+   * either, since only the first part of an album can point at anything.
+   */
+  readonly #mediaGroupOrigins = new Map<string, PendingGroupOrigin>();
+  /**
+   * Forwards arriving back-to-back, buffered per chat.
+   *
+   * Forwarding four messages is one gesture. Telegram delivers it as four
+   * updates with nothing tying them together — no `media_group_id` unless they
+   * happen to be one album — so the only thing they share is the chat and the
+   * moment. Same collector, same wait, keyed by the chat instead.
+   */
+  readonly #forwards: MediaGroupCollector<ForwardedPiece<TelegramIncomingFile>>;
+  readonly #forwardOrigins = new Map<string, InboundOrigin>();
   #imageRoots: ImageRootsResolver | null = null;
 
   constructor(token: string, mode: 'stream' | 'batch' = 'stream', mediaGroupWaitMs?: number) {
@@ -122,14 +156,31 @@ export class TelegramAdapter implements IPlatformAdapter {
       mediaGroupWaitMs ?? MEDIA_GROUP_WAIT_MS,
       (groupId, group) => {
         // The chat and sender were stashed when the group's first part arrived.
-        const origin = this.#mediaGroupOrigins.get(groupId);
+        const pending = this.#mediaGroupOrigins.get(groupId);
         this.#mediaGroupOrigins.delete(groupId);
-        if (origin === undefined || group.items.length === 0) return;
+        if (pending === undefined || group.items.length === 0) return;
         const caption = group.caption?.trim();
+        const body = caption && caption.length > 0 ? caption : defaultCaption(group.items);
+        this.#dispatch({
+          ...pending.origin,
+          message: formatQuotedMessage(pending.quotes, body),
+          files: [...group.items],
+        });
+      }
+    );
+    this.#forwards = new MediaGroupCollector<ForwardedPiece<TelegramIncomingFile>>(
+      mediaGroupWaitMs ?? MEDIA_GROUP_WAIT_MS,
+      (chatId, group) => {
+        const origin = this.#forwardOrigins.get(chatId);
+        this.#forwardOrigins.delete(chatId);
+        if (origin === undefined || group.items.length === 0) return;
+        const { quotes, files } = batchedForward(group.items);
         this.#dispatch({
           ...origin,
-          message: caption && caption.length > 0 ? caption : defaultCaption(group.items),
-          files: [...group.items],
+          // Nothing the operator wrote: Telegram gives no way to add words to a
+          // forward. The agent is told that, rather than handed an empty turn.
+          message: formatQuotedMessage(quotes, FORWARDED_WITHOUT_INSTRUCTION),
+          ...(files.length > 0 ? { files } : {}),
         });
       }
     );
@@ -345,7 +396,7 @@ export class TelegramAdapter implements IPlatformAdapter {
    * The authorized chat + sender behind an update, or null when the sender is
    * not on the whitelist (rejected silently, as before).
    */
-  #originOf(ctx: Context): Omit<TelegramMessageContext, 'message'> | null {
+  #originOf(ctx: Context): InboundOrigin | null {
     const userId = ctx.from?.id;
     if (!isUserAuthorized(userId, this.allowedUserIds)) {
       // Log unauthorized attempt (mask user ID for privacy)
@@ -380,6 +431,34 @@ export class TelegramAdapter implements IPlatformAdapter {
     }
     // Fire-and-forget - errors handled by caller
     void this.messageHandler(context);
+  }
+
+  /**
+   * Hand over one inbound message together with whatever it pointed at.
+   *
+   * A forward goes into the per-chat buffer instead of straight out, because
+   * the next one is probably a millisecond away. Anything else — including a
+   * reply — leaves immediately, with the quote written into the text so both
+   * windows and the agent read the same thing.
+   */
+  #dispatchQuoted(
+    origin: InboundOrigin,
+    message: InboundMessage,
+    body: string,
+    files: readonly TelegramIncomingFile[]
+  ): void {
+    const forwarded = forwardQuoteOf(message);
+    if (forwarded !== null) {
+      this.#forwardOrigins.set(origin.conversationId, origin);
+      this.#forwards.add(origin.conversationId, { items: [{ quote: forwarded, files }] });
+      return;
+    }
+    const replied = replyQuoteOf(message, origin.userId);
+    this.#dispatch({
+      ...origin,
+      message: formatQuotedMessage(replied === null ? [] : [replied], body),
+      ...(files.length > 0 ? { files: [...files] } : {}),
+    });
   }
 
   /**
@@ -447,11 +526,11 @@ export class TelegramAdapter implements IPlatformAdapter {
 
     // Register message handler before launch
     this.bot.on('message:text', ctx => {
-      const message = ctx.message.text;
-      if (!message) return;
+      const text = ctx.message.text;
+      if (!text) return;
       const origin = this.#originOf(ctx);
       if (origin === null) return;
-      this.#dispatch({ ...origin, message });
+      this.#dispatchQuoted(origin, ctx.message as unknown as InboundMessage, text, []);
     });
 
     // Photos and documents. Everything the agent can actually read goes through
@@ -460,25 +539,32 @@ export class TelegramAdapter implements IPlatformAdapter {
     this.bot.on(['message:photo', 'message:document'], ctx => {
       const origin = this.#originOf(ctx);
       if (origin === null) return;
-      const message = ctx.message as unknown as TelegramMessageLike;
+      const message = ctx.message as unknown as InboundMessage;
       const files = filesOf(message);
       if (files.length === 0) return;
       const caption = message.caption?.trim();
+      const body = caption && caption.length > 0 ? caption : defaultCaption(files);
 
-      const groupId = message.media_group_id;
+      // A forwarded album is a batch of forwards, not an album of its own: it
+      // goes to the per-chat buffer below, which already folds repeats of one
+      // origin together. Only an album the operator sent themselves lands here.
+      const groupId = message.forward_origin === undefined ? message.media_group_id : undefined;
       if (groupId !== undefined && groupId !== '') {
         // An album arrives as several updates; collect them into one message
-        // instead of starting a turn per photo.
-        this.#mediaGroupOrigins.set(groupId, { ...origin, message: '' });
+        // instead of starting a turn per photo. Only its first part can be a
+        // reply, so the quote is taken there and later parts do not erase it.
+        if (!this.#mediaGroupOrigins.has(groupId)) {
+          const replied = replyQuoteOf(message, origin.userId);
+          this.#mediaGroupOrigins.set(groupId, {
+            origin,
+            quotes: replied === null ? [] : [replied],
+          });
+        }
         this.#mediaGroups.add(groupId, { caption, items: files });
         return;
       }
 
-      this.#dispatch({
-        ...origin,
-        message: caption && caption.length > 0 ? caption : defaultCaption(files),
-        files,
-      });
+      this.#dispatchQuoted(origin, message, body, files);
     });
 
     // Media the agent cannot read. Silence was the old behaviour and it looked

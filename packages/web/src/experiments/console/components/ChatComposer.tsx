@@ -18,13 +18,23 @@ import {
   type AttachmentMeta,
 } from '../primitives/file';
 import { moveItem } from '../primitives/reorder';
+import { formatQuotedMessage, type MessageQuote } from '../primitives/quoted-context';
 import { ChatAttachments } from './ChatAttachments';
 import { ImageLightbox, type LightboxImage } from './ImageLightbox';
+import { QuotedBlock } from './QuotedBlock';
 
 interface ChatComposerProps {
   onSend: (message: string, files?: File[]) => void;
   disabled: boolean;
   disabledReason?: string;
+  /**
+   * The message this send is replying to, picked from the stream. It rides
+   * inside the sent text as a labelled blockquote — the same shape a Telegram
+   * reply produces — so both windows and the agent read one thing.
+   */
+  quote?: MessageQuote | null;
+  /** Drop the pending quote. Bound to the strip's ✕ and to Escape. */
+  onCancelQuote?: () => void;
 }
 
 const MAX_HEIGHT = 200;
@@ -49,6 +59,8 @@ export function ChatComposer({
   onSend,
   disabled,
   disabledReason,
+  quote = null,
+  onCancelQuote,
 }: ChatComposerProps): ReactElement {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<Attachment[]>([]);
@@ -80,6 +92,12 @@ export function ChatComposer({
     },
     []
   );
+
+  // Picking a message to reply to is a request to type: land the caret in the
+  // box rather than making the operator click it after every reply.
+  useEffect(() => {
+    if (quote !== null) textareaRef.current?.focus();
+  }, [quote]);
 
   const grow = (el: HTMLTextAreaElement): void => {
     el.style.height = 'auto';
@@ -128,7 +146,10 @@ export function ChatComposer({
     const trimmed = value.trim();
     if (trimmed.length === 0 || disabled) return;
     const attached = filesRef.current;
-    onSend(trimmed, attached.length > 0 ? attached.map(f => f.file) : undefined);
+    // With nothing quoted this is byte-for-byte what was typed.
+    const text = formatQuotedMessage(quote === null ? [] : [quote], trimmed);
+    onSend(text, attached.length > 0 ? attached.map(f => f.file) : undefined);
+    onCancelQuote?.();
     setValue('');
     clearFiles();
     setFileError(null);
@@ -149,6 +170,13 @@ export function ChatComposer({
       return;
     }
     if (e.key === 'Escape') {
+      // A pending quote is the first thing Escape undoes: losing focus with the
+      // quote still armed is the version of this that sends the wrong message.
+      if (quote !== null && onCancelQuote !== undefined) {
+        e.preventDefault();
+        onCancelQuote();
+        return;
+      }
       e.currentTarget.blur();
     }
   };
@@ -210,6 +238,25 @@ export function ChatComposer({
         </div>
       ) : null}
       <div className="mx-auto max-w-[940px]">
+        {quote !== null ? (
+          <div
+            className="mb-[10px] flex items-center gap-[8px] rounded-[10px] border bg-[color:var(--surface-elevated)] py-[7px] pl-[10px] pr-[7px]"
+            style={{ borderColor: 'var(--border-bright)' }}
+          >
+            <QuotedBlock quote={quote} variant="composer" />
+            <button
+              type="button"
+              onClick={onCancelQuote}
+              aria-label="Cancel reply"
+              title="Cancel reply · Esc"
+              className="ml-auto shrink-0 rounded p-[2px] text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+            >
+              <span aria-hidden className="text-[11px] leading-none">
+                ✕
+              </span>
+            </button>
+          </div>
+        ) : null}
         {files.length > 0 ? (
           <ChatAttachments
             files={files}

@@ -1,10 +1,17 @@
+import { Reply } from 'lucide-react';
 import { useCallback, useMemo, useState, type ReactElement } from 'react';
 import { AgentAvatar } from './AgentAvatar';
 import { MessageMarkdown } from './MessageMarkdown';
 import { ImageLightbox, type LightboxImage } from './ImageLightbox';
+import { QuotedBlock } from './QuotedBlock';
 import { formatClock } from '../lib/format';
-import { authorLabel, EMPTY_DIRECTORY, type Directory } from '../primitives/author';
+import { authorLabel, isMine, EMPTY_DIRECTORY, type Directory } from '../primitives/author';
 import { chatImageUrl, imageName, inlineImagePaths } from '../primitives/chat-image';
+import {
+  parseQuotedMessage,
+  quoteOfMessage,
+  type MessageQuote,
+} from '../primitives/quoted-context';
 import type { Message } from '../primitives/message';
 
 interface MessageItemProps {
@@ -26,6 +33,11 @@ interface MessageItemProps {
    * the message reads exactly as before.
    */
   conversationId?: string;
+  /**
+   * Take this message as the composer's quote. Absent (the run log, a static
+   * render) there is no reply affordance at all.
+   */
+  onReply?: (quote: MessageQuote) => void;
 }
 
 const ERROR_BLOCK = (msg: string): ReactElement => (
@@ -50,12 +62,33 @@ export function MessageItem({
   variant = 'chat',
   directory = EMPTY_DIRECTORY,
   conversationId,
+  onReply,
 }: MessageItemProps): ReactElement {
   const kind = message.role;
   const author = authorLabel(directory, message.userId);
-  const content = message.content.trim();
+  // What the writer quoted travels inside the text, so it is split back out
+  // here: the blocks are drawn as quotes, and only what is left is the message.
+  const quoted = useMemo(() => parseQuotedMessage(message.content.trim()), [message.content]);
+  const quotes = quoted.quotes;
+  const content = quoted.body;
   const clock = formatClock(message.timestamp);
   const log = variant === 'log';
+
+  const mine = isMine(directory, message.userId);
+  const replyButton =
+    onReply === undefined ? null : (
+      <button
+        type="button"
+        onClick={() => {
+          onReply(quoteOfMessage(message.content, message.role, author, mine));
+        }}
+        aria-label="Reply to this message"
+        title="Reply"
+        className="rounded p-[2px] text-text-tertiary opacity-0 transition-[opacity,color] hover:bg-[color:var(--surface-hover)] hover:text-text-primary focus-visible:opacity-100 group-hover/message:opacity-100"
+      >
+        <Reply className="h-[13px] w-[13px]" />
+      </button>
+    );
 
   // The lightbox walks the pictures of THIS message, in the order it shows
   // them — the same shape the artifact panel hands it.
@@ -78,7 +111,7 @@ export function MessageItem({
 
   if (kind === 'user') {
     return (
-      <div className="flex flex-col items-end">
+      <div className="group/message flex flex-col items-end">
         <header className="mb-2 flex flex-row-reverse items-center gap-[9px] font-mono">
           <span
             className="max-w-[260px] truncate rounded px-[7px] py-[2px] text-[10px] font-bold uppercase tracking-[0.14em]"
@@ -97,7 +130,15 @@ export function MessageItem({
           >
             {clock}
           </time>
+          {replyButton}
         </header>
+        {quotes.length > 0 ? (
+          <div className="mb-[7px] max-w-[76%] self-end">
+            {quotes.map((quote, index) => (
+              <QuotedBlock key={index} quote={quote} />
+            ))}
+          </div>
+        ) : null}
         <div
           className="max-w-[76%] self-end rounded-[14px_14px_4px_14px] px-[17px] py-[13px] text-[14.5px] leading-[1.5] break-words"
           style={{
@@ -117,7 +158,7 @@ export function MessageItem({
   const label = kind === 'system' ? 'System' : 'Agent';
 
   return (
-    <div className="flex flex-col">
+    <div className="group/message flex flex-col">
       <header className="mb-2 flex items-center gap-[9px] font-mono">
         <span
           className="rounded px-[7px] py-[2px] text-[10px] font-bold uppercase tracking-[0.14em]"
@@ -135,6 +176,7 @@ export function MessageItem({
         >
           {clock}
         </time>
+        {replyButton}
       </header>
       <div className="flex max-w-full items-start gap-[13px]">
         {log ? null : (
@@ -154,6 +196,9 @@ export function MessageItem({
                 : { borderColor: 'var(--border)' }
             }
           >
+            {quotes.map((quote, index) => (
+              <QuotedBlock key={index} quote={quote} />
+            ))}
             {content.length > 0 ? (
               <div
                 className={

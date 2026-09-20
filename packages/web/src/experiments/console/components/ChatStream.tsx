@@ -4,6 +4,7 @@ import type { Directory } from '../primitives/author';
 import { ToolCallItem } from './ToolCallItem';
 import { ConsoleWorkflowResultCard } from './ConsoleWorkflowResultCard';
 import { isSystemCategory, type Message } from '../primitives/message';
+import type { MessageQuote } from '../primitives/quoted-context';
 
 interface ChatStreamProps {
   messages: Message[];
@@ -21,6 +22,11 @@ interface ChatStreamProps {
    * indicator) the full trace is revealed inline.
    */
   showTools?: boolean;
+  /**
+   * Take a message as the composer's quote. Absent, the stream reads exactly as
+   * it did before and no message offers a reply.
+   */
+  onReply?: (quote: MessageQuote) => void;
 }
 
 /**
@@ -36,6 +42,7 @@ export function ChatStream({
   showTools = false,
   directory,
   conversationId,
+  onReply,
 }: ChatStreamProps): ReactElement {
   // `workflow_result` messages are normally swept up by `isSystemCategory` (the
   // `workflow_` prefix), but they carry the run summary + a completion card — let
@@ -59,7 +66,12 @@ export function ChatStream({
               summary={message.content}
             />
           ) : (
-            <MessageItem message={message} directory={directory} conversationId={conversationId} />
+            <MessageItem
+              message={message}
+              directory={directory}
+              conversationId={conversationId}
+              onReply={onReply}
+            />
           )}
           {showTools
             ? message.toolCalls.map((call, i) => (
