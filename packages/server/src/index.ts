@@ -79,6 +79,7 @@ import { DashboardEventPoller } from './adapters/web/dashboard-event-poller';
 import { PgNotifyListener } from './adapters/web/pg-notify-listener';
 import { registerApiRoutes } from './routes/api';
 import { withOutboundMirror } from './adapters/mirror';
+import { createTurnStatus, withTurnStatus } from './adapters/telegram-status';
 import { persistTelegramFiles } from './adapters/telegram-uploads';
 import { dictationFor } from './voice/dictation';
 import { LINK_TOKEN_TTL_MS, linkTokens } from './auth/link-tokens';
@@ -1094,7 +1095,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         //
         // The operator's own message is the exception, and it is written just
         // below rather than by the orchestrator — see there for why.
-        const deliverTo = withOutboundMirror(telegramAdapter, (text, metadata) => {
+        const mirrored = withOutboundMirror(telegramAdapter, (text, metadata) => {
           void webAdapter
             .emitSSE(
               conversationId,
@@ -1110,6 +1111,19 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
               getLog().warn({ err, conversationId }, 'telegram.web_mirror_failed');
             });
         });
+
+        // The phone's own "agent is working" line, fed by the tool stream the
+        // console's trace is built from. Outermost of the chain on purpose: it
+        // ADDS `sendStructuredEvent`, which the wrapper inside it would answer
+        // for the bare adapter (which has none). The line itself never travels
+        // through `sendMessage`, so neither the mirror above nor the history
+        // writer inside `handleMessage` can see it — the console draws its own
+        // indicator, and this one is chrome rather than something anybody said.
+        const turnStatus = createTurnStatus(
+          id => telegramAdapter.statusTransport(id),
+          conversationId
+        );
+        const deliverTo = withTurnStatus(mirrored, turnStatus);
 
         // Photos and documents take the same road as a browser upload:
         // validated and written by the shared helper, handed to the agent as
@@ -1216,6 +1230,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // Fire-and-forget: handler returns immediately, processing happens async
         lockManager
           .acquireLock(conversationId, async () => {
+            // Posted the moment the turn starts, before anything has been
+            // called: the silence being fixed here starts at "send", not at
+            // the first tool. A turn that answers in seconds shows it briefly
+            // and then removes it, which is what was asked for.
+            turnStatus?.begin();
             try {
               await handleMessage(deliverTo, conversationId, turnText, {
                 isolationHints: { workflowType: 'thread', workflowId: conversationId },
@@ -1224,6 +1243,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
                 ...(attachedFiles !== undefined ? { attachedFiles } : {}),
               });
             } finally {
+              // Before the file cleanup, and in `finally` so it covers all
+              // three endings: an answer, a failure, and an operator pressing
+              // ⏹ Stop. A stopped turn that left "Running tests…" on screen
+              // forever is exactly the failure this must not have.
+              await turnStatus?.clear();
               // Clean up inside the lock, after the agent has read them —
               // mirrors what the web message route does.
               if (attachedFiles !== undefined && uploadDir !== undefined) {

@@ -48,6 +48,32 @@ TELEGRAM_STREAMING_MODE=stream  # stream (default) | batch
 
 For streaming mode details, see [Configuration](/getting-started/configuration/).
 
+## The "agent is working" line
+
+While a turn runs the bot keeps one transient message in the chat saying what the
+agent is doing right now -- `⏳ Thinking…`, then `⏳ Reading adapter.ts…`,
+`⏳ Running tests…` as the work moves on. It is posted the moment the turn starts,
+rewritten in place, and deleted when the turn ends -- including when the turn is
+called off with **⏹ Stop**.
+
+It is chrome, not conversation: it is sent straight down the Bot API rather than
+through the adapter's `sendMessage`, so it is never written to the conversation
+history and never mirrored to the web console (which draws its own indicator).
+The steps come from the same tool-call stream the console's trace is built from,
+and the wording is chosen from the tool name -- a file's name may appear, an
+absolute path never does.
+
+```ini
+TELEGRAM_STATUS_ENABLED=true       # false for silence until the answer lands
+TELEGRAM_STATUS_THROTTLE_MS=3000   # shortest gap between rewrites (min 1000)
+```
+
+Telegram rate-limits edits and answers `400 message is not modified` when the text
+has not changed. Both are treated as ordinary outcomes: identical text is never
+re-sent, rewrites are throttled, and a failed update -- or a delete Telegram
+refuses, which falls back to editing the line to `✓ Done.` -- can never fail the
+turn it is decorating.
+
 ## Further Reading
 
 - [Configuration](/getting-started/configuration/)

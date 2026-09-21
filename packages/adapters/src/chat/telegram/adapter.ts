@@ -35,6 +35,7 @@ import {
 import { convertToTelegramMarkdown, stripMarkdown } from './markdown';
 import { sendReferencedImages } from './outbound-images';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
+import type { StatusTransport } from './turn-status';
 import type { TelegramMessageContext } from './types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -396,6 +397,64 @@ export class TelegramAdapter implements IPlatformAdapter {
         await this.bot.api.sendMessage(id, stripMarkdown(chunk));
       }
     }
+  }
+
+  /**
+   * The Bot API calls behind this chat's transient "agent is working" line.
+   *
+   * Handed out as a port rather than as a message-sending method on purpose:
+   * everything this returns goes straight to Telegram, bypassing `sendMessage`
+   * and therefore the outbound mirror and the history writer that wrap it. That
+   * is the whole point — the line is chrome, not something anybody said, so it
+   * must not become a row or a second indicator in the console (see
+   * `turn-status.ts`).
+   *
+   * Plain text, no MarkdownV2: the line can carry a file name, and a name with
+   * an underscore in it would make the formatter's job a source of failures for
+   * something nobody is reading closely. And by contract NONE of these throw —
+   * a rate-limited edit or a message somebody deleted by hand is an ordinary
+   * afternoon, not a reason for a turn to go wrong.
+   */
+  statusTransport(conversationId: string): StatusTransport {
+    const chatId = telegramChatIdOf(conversationId);
+    const api = this.bot.api;
+    return {
+      send: async (text: string): Promise<number | null> => {
+        try {
+          const sent = await api.sendMessage(chatId, text);
+          return sent.message_id;
+        } catch (err) {
+          getLog().debug({ err, chatId }, 'telegram.status_send_failed');
+          return null;
+        }
+      },
+      edit: async (messageId: number, text: string): Promise<void> => {
+        try {
+          await api.editMessageText(chatId, messageId, text);
+        } catch (err) {
+          // Both expected members of this set — a flood-limited edit and
+          // `400 message is not modified` — are normal, so this is debug.
+          getLog().debug({ err, chatId, messageId }, 'telegram.status_edit_failed');
+        }
+      },
+      remove: async (messageId: number): Promise<boolean> => {
+        try {
+          await api.deleteMessage(chatId, messageId);
+          return true;
+        } catch (err) {
+          getLog().debug({ err, chatId, messageId }, 'telegram.status_delete_failed');
+          return false;
+        }
+      },
+      typing: async (): Promise<void> => {
+        try {
+          await api.sendChatAction(chatId, 'typing');
+        } catch {
+          // The cheapest thing in this file and the least load-bearing: it
+          // expires by itself in five seconds. Not worth a log line.
+        }
+      },
+    };
   }
 
   /**
