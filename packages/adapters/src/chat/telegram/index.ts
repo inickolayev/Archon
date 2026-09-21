@@ -4,4 +4,11 @@ export type { TelegramIncomingFile } from './attachments';
 export type { TelegramMessageContext } from './types';
 export { TurnStatus } from './turn-status';
 export type { StatusTransport, TurnStatusOptions } from './turn-status';
-export { describeTool, STATUS_FINISHED, STATUS_THINKING, STATUS_WORKING } from './turn-status-text';
+export {
+  describeTool,
+  STATUS_FINISHED,
+  STATUS_QUEUED,
+  STATUS_THINKING,
+  STATUS_TRANSCRIBING,
+  STATUS_WORKING,
+} from './turn-status-text';

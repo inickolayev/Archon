@@ -24,7 +24,12 @@
  */
 
 import { createLogger } from '@archon/paths';
-import { STATUS_FINISHED, STATUS_THINKING } from './turn-status-text';
+import {
+  STATUS_FINISHED,
+  STATUS_QUEUED,
+  STATUS_THINKING,
+  STATUS_TRANSCRIBING,
+} from './turn-status-text';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -98,7 +103,44 @@ export class TurnStatus {
   }
 
   /**
-   * Post the line, immediately, saying the agent is thinking.
+   * Put the line up for the first time. Later calls do nothing: ONE message per
+   * turn, whichever state happened to open it.
+   *
+   * Returns at once — nothing may wait on a Telegram round trip.
+   */
+  #open(text: string): void {
+    if (this.#over || this.#wanted !== null) return;
+    this.#wanted = text;
+    this.#lastWriteAt = Date.now();
+    this.#enqueue(() => this.#write());
+  }
+
+  /**
+   * A voice note is being turned into words.
+   *
+   * Opens the line BEFORE the turn exists, because transcription does too: it
+   * runs at ingest, ahead of the conversation lock. Handed over to the states
+   * below by `begin` editing the same message rather than posting a second one.
+   */
+  transcribing(): void {
+    this.#open(STATUS_TRANSCRIBING);
+  }
+
+  /**
+   * The message is ready but something else is running in this chat.
+   *
+   * Deliberately will NOT open a line that is not already up. It exists to keep
+   * a transcription line honest while it waits, not to announce every queued
+   * message — a typed message that queues behaves exactly as it always has,
+   * and its line starts at `begin` when its turn finally runs.
+   */
+  queued(): void {
+    if (this.#wanted === null) return;
+    this.step(STATUS_QUEUED);
+  }
+
+  /**
+   * The turn has started: the agent is thinking.
    *
    * No delay before the first send, deliberately. An earlier draft waited a
    * couple of seconds so a fast turn would never flash a status message; the
@@ -109,13 +151,16 @@ export class TurnStatus {
    * defect. (A turn that ends before the send has even left is quieter still:
    * `#write` checks `#over` when it runs, so nothing is posted at all.)
    *
-   * Returns at once — the turn must not wait on a Telegram round trip to start.
+   * When a line is already up — a dictated message — this is a rewrite of it
+   * rather than a second message, and it goes through the throttle like any
+   * other step, which is also what keeps the handover from flickering.
    */
   begin(): void {
-    if (this.#over || this.#wanted !== null) return;
-    this.#wanted = STATUS_THINKING;
-    this.#lastWriteAt = Date.now();
-    this.#enqueue(() => this.#write());
+    if (this.#wanted === null) {
+      this.#open(STATUS_THINKING);
+      return;
+    }
+    this.step(STATUS_THINKING);
   }
 
   /**

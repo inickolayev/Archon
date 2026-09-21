@@ -123,6 +123,7 @@ import {
   trailingTextNotice,
   setProjectForConversation,
   stopTurn as stopConversationTurn,
+  isTurnRunning,
   NOTHING_RUNNING_NOTICE,
   STOP_REQUESTED_NOTICE,
 } from '@archon/core';
@@ -1125,107 +1126,137 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         );
         const deliverTo = withTurnStatus(mirrored, turnStatus);
 
+        // A voice note is the one message whose wait begins before its turn
+        // does: the recording is fetched and recognised HERE, ahead of the
+        // conversation lock, and the operator used to watch an empty chat for
+        // as long as that took. `voiceDurationSec` is set only for a
+        // recording, which makes this the earliest point at which the bot can
+        // honestly say what it is busy with.
+        if (voiceDurationSec !== undefined) turnStatus?.transcribing();
+
         // Photos and documents take the same road as a browser upload:
         // validated and written by the shared helper, handed to the agent as
         // `attachedFiles`, and visible in the web console's history afterwards.
         let attachedFiles: AttachedFile[] | undefined;
         let uploadDir: string | undefined;
-        if (files !== undefined && files.length > 0) {
-          const stored = await persistTelegramFiles(conversationId, files, file =>
-            telegramAdapter.downloadFile(file)
-          );
-          if (!stored.ok) {
-            // A refused file is answered, never swallowed.
-            await telegramAdapter
-              .sendMessage(conversationId, stored.error)
-              .catch((err: unknown) => {
-                getLog().warn({ err, conversationId }, 'telegram.upload_refusal_send_failed');
-              });
-            return;
-          }
-          attachedFiles = stored.savedFiles;
-          uploadDir = stored.uploadDir;
-        }
-
         // A recording IS the message: what the operator said replaces the
         // caption (which a voice note cannot even have), and the file stays
         // attached beside it. Everything below — the row, the console nudge,
         // the turn — then carries the words rather than the name of an audio
         // file nobody can listen to.
         let turnText = message;
-        if (attachedFiles !== undefined) {
-          const conversation = await conversationDb
-            .findConversationByPlatformId(conversationId)
-            .catch((err: unknown) => {
-              getLog().warn({ err, conversationId }, 'telegram.assistant_lookup_failed');
-              return null;
-            });
-          const dictated = await dictationFor({
-            typed: message,
-            files: attachedFiles,
-            assistantType: conversation?.ai_assistant_type ?? 'claude',
-            ...(userId !== undefined ? { userId } : {}),
-            ...(voiceDurationSec === undefined ? {} : { durationSec: voiceDurationSec }),
-          });
-          if (dictated !== null) {
-            turnText = dictated.text;
-            // The phone's copy of the transcript, hanging off the voice note it
-            // came from. The console needs no such echo — it renders the
-            // transcript inside the message — and this one is best effort:
-            // the words are already persisted and already on their way to the
-            // agent, so a failed echo costs a convenience, not the turn.
-            if (platformMessageId !== undefined) {
+        let persistedUserMessage = false;
+
+        // Everything between here and the lock can end this message early — a
+        // refused upload returns, a database lookup can throw — and none of
+        // those endings may leave a line on screen saying work is happening.
+        // `clear` is idempotent, so the turn's own `finally` further down is
+        // free to call it again.
+        try {
+          if (files !== undefined && files.length > 0) {
+            const stored = await persistTelegramFiles(conversationId, files, file =>
+              telegramAdapter.downloadFile(file)
+            );
+            if (!stored.ok) {
+              // A refused file is answered, never swallowed — and the line
+              // goes before the refusal does, so the operator is not told
+              // "Transcribing…" directly above "that file is too large".
+              await turnStatus?.clear();
               await telegramAdapter
-                .replyToMessage(conversationId, dictated.echo, platformMessageId)
+                .sendMessage(conversationId, stored.error)
                 .catch((err: unknown) => {
-                  getLog().warn({ err, conversationId }, 'telegram.transcript_echo_failed');
+                  getLog().warn({ err, conversationId }, 'telegram.upload_refusal_send_failed');
                 });
+              return;
+            }
+            attachedFiles = stored.savedFiles;
+            uploadDir = stored.uploadDir;
+          }
+
+          if (attachedFiles !== undefined) {
+            const conversation = await conversationDb
+              .findConversationByPlatformId(conversationId)
+              .catch((err: unknown) => {
+                getLog().warn({ err, conversationId }, 'telegram.assistant_lookup_failed');
+                return null;
+              });
+            const dictated = await dictationFor({
+              typed: message,
+              files: attachedFiles,
+              assistantType: conversation?.ai_assistant_type ?? 'claude',
+              ...(userId !== undefined ? { userId } : {}),
+              ...(voiceDurationSec === undefined ? {} : { durationSec: voiceDurationSec }),
+            });
+            if (dictated !== null) {
+              turnText = dictated.text;
+              // The phone's copy of the transcript, hanging off the voice note it
+              // came from. The console needs no such echo — it renders the
+              // transcript inside the message — and this one is best effort:
+              // the words are already persisted and already on their way to the
+              // agent, so a failed echo costs a convenience, not the turn.
+              if (platformMessageId !== undefined) {
+                await telegramAdapter
+                  .replyToMessage(conversationId, dictated.echo, platformMessageId)
+                  .catch((err: unknown) => {
+                    getLog().warn({ err, conversationId }, 'telegram.transcript_echo_failed');
+                  });
+              }
             }
           }
+
+          // Written HERE, before the lock, not inside the turn.
+          //
+          // `acquireLock` holds a message that arrives mid-turn in memory — no
+          // row, no event, nothing on any screen — until the running turn ends
+          // and the queued handler finally starts. A line typed at 13:35 could
+          // surface in the console at 13:41. Persisting at ingest makes it
+          // visible the moment it lands, and stamps it with the time Telegram
+          // says it was sent rather than the time we got around to inserting it,
+          // so it also sits in the right place among the bubbles it arrived
+          // between. The orchestrator is told not to write a second one.
+          persistedUserMessage = await persistInboundMessage({
+            platformType: 'telegram',
+            platformConversationId: conversationId,
+            text: turnText,
+            ...(userId !== undefined ? { userId } : {}),
+            ...(sentAtMs !== undefined ? { sentAtMs } : {}),
+            ...(attachedFiles !== undefined && attachedFiles.length > 0
+              ? {
+                  // Shaped as the browser upload route writes it. The on-disk
+                  // path is left out on purpose: the file is deleted once the
+                  // agent has read it, and a stale path in the history would
+                  // only mislead whoever reads it next.
+                  metadata: {
+                    files: attachedFiles.map(f => ({
+                      name: f.name,
+                      mimeType: f.mimeType,
+                      size: f.size,
+                    })),
+                  },
+                }
+              : {}),
+          });
+          // The console may be watching this conversation; nudge it rather than
+          // leaving the message to the next poll.
+          await webAdapter
+            .emitSSE(
+              conversationId,
+              JSON.stringify({ type: 'user_message', content: turnText, timestamp: Date.now() })
+            )
+            .catch((err: unknown) => {
+              getLog().warn({ err, conversationId }, 'telegram.inbound_mirror_failed');
+            });
+        } catch (err) {
+          await turnStatus?.clear();
+          throw err;
         }
 
-        // Written HERE, before the lock, not inside the turn.
-        //
-        // `acquireLock` holds a message that arrives mid-turn in memory — no
-        // row, no event, nothing on any screen — until the running turn ends
-        // and the queued handler finally starts. A line typed at 13:35 could
-        // surface in the console at 13:41. Persisting at ingest makes it
-        // visible the moment it lands, and stamps it with the time Telegram
-        // says it was sent rather than the time we got around to inserting it,
-        // so it also sits in the right place among the bubbles it arrived
-        // between. The orchestrator is told not to write a second one.
-        const persistedUserMessage = await persistInboundMessage({
-          platformType: 'telegram',
-          platformConversationId: conversationId,
-          text: turnText,
-          ...(userId !== undefined ? { userId } : {}),
-          ...(sentAtMs !== undefined ? { sentAtMs } : {}),
-          ...(attachedFiles !== undefined && attachedFiles.length > 0
-            ? {
-                // Shaped as the browser upload route writes it. The on-disk
-                // path is left out on purpose: the file is deleted once the
-                // agent has read it, and a stale path in the history would
-                // only mislead whoever reads it next.
-                metadata: {
-                  files: attachedFiles.map(f => ({
-                    name: f.name,
-                    mimeType: f.mimeType,
-                    size: f.size,
-                  })),
-                },
-              }
-            : {}),
-        });
-        // The console may be watching this conversation; nudge it rather than
-        // leaving the message to the next poll.
-        await webAdapter
-          .emitSSE(
-            conversationId,
-            JSON.stringify({ type: 'user_message', content: turnText, timestamp: Date.now() })
-          )
-          .catch((err: unknown) => {
-            getLog().warn({ err, conversationId }, 'telegram.inbound_mirror_failed');
-          });
+        // The words are ready, but this chat may still be busy with the
+        // message before it. Saying "Thinking…" now would be untrue and
+        // leaving "Transcribing…" up would be stale, so the line says what is
+        // actually happening until `begin` replaces it. Nothing to do for a
+        // typed message: `queued` will not open a line that is not already up.
+        if (isTurnRunning(conversationId)) turnStatus?.queued();
 
         // Fire-and-forget: handler returns immediately, processing happens async
         lockManager
@@ -1268,7 +1299,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
               }
             }
           })
-          .catch(createMessageErrorHandler('Telegram', telegramAdapter, conversationId));
+          .catch(async (err: unknown) => {
+            // The lock itself refused or broke, so the turn's own `finally`
+            // never ran: the line would otherwise outlive the message it was
+            // put up for. Idempotent, so this costs nothing when it already did.
+            await turnStatus?.clear();
+            return createMessageErrorHandler('Telegram', telegramAdapter, conversationId)(err);
+          });
       }
     );
 

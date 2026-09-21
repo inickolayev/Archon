@@ -56,6 +56,14 @@ agent is doing right now -- `⏳ Thinking…`, then `⏳ Reading adapter.ts…`,
 rewritten in place, and deleted when the turn ends -- including when the turn is
 called off with **⏹ Stop**.
 
+A dictated message opens the line earlier still. Transcription runs at ingest,
+before the conversation lock, so a voice note shows `⏳ Transcribing…` from the
+moment it arrives; the same message is then rewritten to `⏳ Thinking…` when the
+turn starts. If the chat is busy with an earlier message the line reads
+`⏳ Waiting for the current turn…` in between, rather than claiming work that has
+not begun. A recording that never reaches a turn -- a refused upload, a failure
+on the way -- takes its line with it.
+
 It is chrome, not conversation: it is sent straight down the Bot API rather than
 through the adapter's `sendMessage`, so it is never written to the conversation
 history and never mirrored to the web console (which draws its own indicator).

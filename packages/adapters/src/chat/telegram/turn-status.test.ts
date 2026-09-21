@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { TurnStatus, type StatusTransport } from './turn-status';
-import { STATUS_FINISHED, STATUS_THINKING } from './turn-status-text';
+import {
+  STATUS_FINISHED,
+  STATUS_QUEUED,
+  STATUS_THINKING,
+  STATUS_TRANSCRIBING,
+} from './turn-status-text';
 
 const tick = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -265,5 +270,104 @@ describe('TurnStatus', () => {
 
     expect(transport.edited).toHaveLength(0);
     expect(transport.sent).toHaveLength(1);
+  });
+});
+
+/**
+ * Dictation is the one thing that happens BEFORE a turn: the recording is
+ * fetched and recognised at ingest, ahead of the conversation lock. The line
+ * therefore has to open early and be handed over, not replaced.
+ */
+describe('TurnStatus, on a dictated message', () => {
+  test('says it is transcribing, straight away', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.transcribing();
+    await tick(10);
+
+    expect(transport.sent).toEqual([STATUS_TRANSCRIBING]);
+  });
+
+  test('the turn starting rewrites that line rather than posting a second', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.transcribing();
+    await tick(10);
+    status.begin();
+    await tick(THROTTLE_MS * 2);
+
+    expect(transport.sent).toEqual([STATUS_TRANSCRIBING]);
+    expect(transport.edited.map(e => e.text)).toEqual([STATUS_THINKING]);
+  });
+
+  test('words ready but the chat is busy: it says so, and begin takes over', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.transcribing();
+    await tick(10);
+    status.queued();
+    await tick(THROTTLE_MS * 2);
+    expect(transport.edited.map(e => e.text)).toEqual([STATUS_QUEUED]);
+
+    status.begin();
+    await tick(THROTTLE_MS * 2);
+
+    expect(transport.sent).toHaveLength(1);
+    expect(transport.edited.map(e => e.text)).toEqual([STATUS_QUEUED, STATUS_THINKING]);
+  });
+
+  test('a typed message that queues is left alone — queued opens nothing', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.queued();
+    await tick(THROTTLE_MS * 2);
+
+    expect(transport.sent).toHaveLength(0);
+    expect(transport.edited).toHaveLength(0);
+  });
+
+  test('a message abandoned before its turn — a refused upload — takes the line with it', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.transcribing();
+    await tick(10);
+    // The handler answers the refusal and returns; `begin` is never reached.
+    await status.clear();
+
+    expect(transport.removed).toHaveLength(1);
+  });
+
+  test('a transcription that throws clears the line the same way', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.transcribing();
+    await tick(10);
+    try {
+      throw new Error('the recogniser fell over');
+    } catch {
+      await status.clear();
+    }
+    await tick(THROTTLE_MS * 3);
+
+    expect(transport.removed).toHaveLength(1);
+    expect(transport.edited).toHaveLength(0);
+  });
+
+  test('transcribing twice is still one message', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.transcribing();
+    status.transcribing();
+    await tick(THROTTLE_MS * 2);
+
+    expect(transport.sent).toHaveLength(1);
+    expect(transport.edited).toHaveLength(0);
   });
 });

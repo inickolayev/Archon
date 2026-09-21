@@ -424,7 +424,14 @@ export class TelegramAdapter implements IPlatformAdapter {
           const sent = await api.sendMessage(chatId, text);
           return sent.message_id;
         } catch (err) {
-          getLog().debug({ err, chatId }, 'telegram.status_send_failed');
+          // WARN, not debug, and the only one in this group that is. The
+          // default LOG_LEVEL is `info`, so a line logged at debug is a line
+          // nobody will ever see — and "the status message never appeared" is
+          // precisely the failure that must leave evidence, because from the
+          // outside it is indistinguishable from the feature being switched
+          // off. Once per turn at most, so it cannot flood. The edit and
+          // delete below stay at debug: their failures are routine.
+          getLog().warn({ err, chatId }, 'telegram.status_send_failed');
           return null;
         }
       },

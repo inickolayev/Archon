@@ -23,6 +23,29 @@ const WORKING = '⏳';
 /** The very first thing a turn says, before it has called anything. */
 export const STATUS_THINKING = `${WORKING} Thinking…`;
 
+/**
+ * A voice note being turned into words.
+ *
+ * The only state that exists BEFORE a turn does. Transcription happens at
+ * ingest — the recording is fetched and recognised before the conversation
+ * lock is even asked for — so a dictated message used to sit in silence for as
+ * long as the recogniser took, which on a long recording is the better part of
+ * a minute. That is the same silence the rest of this file exists to remove.
+ */
+export const STATUS_TRANSCRIBING = `${WORKING} Transcribing…`;
+
+/**
+ * Words ready, but the agent is still on the previous message.
+ *
+ * Only ever shown on a line that is already up — a dictated message that
+ * finished transcribing into a busy chat. Saying "Thinking…" there would be a
+ * lie (nothing is thinking about THIS message yet) and saying nothing would
+ * leave "Transcribing…" on screen, stale, for however long the turn in front
+ * takes. This says the true thing, and `begin` replaces it the moment the
+ * turn actually starts.
+ */
+export const STATUS_QUEUED = `${WORKING} Waiting for the current turn…`;
+
 /** Where a tool nobody has a phrase for lands. */
 export const STATUS_WORKING = `${WORKING} Working…`;
 
