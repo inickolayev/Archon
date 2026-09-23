@@ -85,7 +85,7 @@ Each platform adapter supports an optional user whitelist via environment variab
 | Platform | Whitelist Variable | Format |
 | --- | --- | --- |
 | Slack | `SLACK_ALLOWED_USER_IDS` | Comma-separated Slack user IDs (e.g., `U01ABC,U02DEF`) |
-| Telegram | `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated Telegram user IDs |
+| Telegram | account link | The sender's Telegram identity must be linked to a console account — see the Telegram adapter page |
 | Discord | `DISCORD_ALLOWED_USER_IDS` | Comma-separated Discord user IDs |
 | GitHub | `GITHUB_ALLOWED_USERS` | Comma-separated GitHub usernames (case-insensitive) |
 | Gitea | `GITEA_ALLOWED_USERS` | Comma-separated Gitea usernames (case-insensitive) |

@@ -82,7 +82,7 @@ import { withOutboundMirror } from './adapters/mirror';
 import { createTurnStatus, withTurnStatus } from './adapters/telegram-status';
 import { persistTelegramFiles } from './adapters/telegram-uploads';
 import { dictationFor } from './voice/dictation';
-import { LINK_TOKEN_TTL_MS, linkTokens } from './auth/link-tokens';
+import { accountLinkMessage, telegramAccess } from './adapters/telegram-access';
 import { rm, unlink } from 'fs/promises';
 import { registerGithubWebhookRoute } from './routes/webhooks';
 import {
@@ -1003,25 +1003,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           if (telegramUserId === undefined) {
             return 'I could not tell who you are on Telegram — try again from the menu.';
           }
-          const issued = linkTokens.issue({
+          // Same text an unlinked sender gets, from the same place: the menu
+          // and the gate must not drift into two different handshakes.
+          return accountLinkMessage({
             platformUserId: String(telegramUserId),
             chatId,
           });
-          const minutes = Math.round(LINK_TOKEN_TTL_MS / 60000);
-          // BETTER_AUTH_URL is the install's public origin when there is one
-          // (a proxy in front); otherwise the loopback address the operator
-          // opens the console on. Never a guess at a hostname.
-          const origin = (
-            process.env.BETTER_AUTH_URL ?? `http://127.0.0.1:${process.env.PORT ?? '3090'}`
-          ).replace(/\/+$/, '');
-          const url = `${origin}/console/link/${issued.token}`;
-          return [
-            'Open this once in the browser where you are signed in to the console:',
-            '',
-            url,
-            '',
-            `It works once and expires in ${String(minutes)} minutes.`,
-          ].join('\n');
         },
         bindProject: async projectName => {
           const conversationId = await resolveActiveTelegramConversationId(chatId);
@@ -1308,6 +1295,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           });
       }
     );
+
+    // Who may drive the agent from here (ADR 0004). Set before start(), which
+    // refuses without it: a bot that cannot tell a linked account from a
+    // stranger does not poll.
+    telegramAdapter.setAuthorizer(telegramAccess());
 
     try {
       await telegramAdapter.start();

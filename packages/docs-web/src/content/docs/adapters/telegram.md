@@ -28,17 +28,25 @@ Connect Archon to Telegram so you can interact with your AI coding assistant fro
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHI...
 ```
 
-## Configure User Whitelist (Optional)
+## Who may use the bot
 
-To restrict bot access to specific users:
-1. Message [@userinfobot](https://t.me/userinfobot) on Telegram to get your user ID
-2. Add to environment:
+There is no list of ids to configure. A sender may drive the agent when their
+Telegram identity is **linked to a console account**; everyone else is refused.
 
-```ini
-TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
-```
+Linking is a handshake, and it starts by writing to the bot:
 
-When set, only listed user IDs can interact with the bot. When empty/unset, the bot responds to all users.
+1. Send the bot any message. It replies with a one-time link and does nothing else —
+   no conversation is started and no agent runs.
+2. Open that link in a browser already signed in to the console. It shows what would
+   be connected to which account.
+3. Confirm. From then on the chat is yours, and the same link is available any time
+   from **☰ Menu → Link this chat to my account**.
+
+The link is bound to the Telegram id it was issued for, is single-use, and expires in
+ten minutes — so it is safe to hand to a sender nobody has met yet.
+
+Who may have an account in the first place is `ARCHON_AUTH_ALLOWED_EMAILS`. That one
+list is the whole gate, for the console and the bot alike.
 
 ## Configure Streaming Mode (Optional)
 

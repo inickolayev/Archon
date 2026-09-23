@@ -5,7 +5,7 @@
  * Mocking internal modules with mock.module() causes test isolation issues
  * since the mock persists across test files.
  */
-import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import type { Mock } from 'bun:test';
 import type { Api } from 'grammy';
 import { mkdtempSync } from 'node:fs';
@@ -247,17 +247,6 @@ describe('TelegramAdapter', () => {
   });
 
   describe('start()', () => {
-    // Every start() case needs a whitelist: this fork refuses to launch an open
-    // bot (see the 'refuses an open bot' block at the end).
-    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
-    beforeEach(() => {
-      process.env.TELEGRAM_ALLOWED_USER_IDS = '111';
-    });
-    afterAll(() => {
-      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
-      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
-    });
-
     beforeEach(() => {
       mockLogger.warn.mockClear();
       mockLogger.info.mockClear();
@@ -265,6 +254,7 @@ describe('TelegramAdapter', () => {
 
     test('should retry on 409 and succeed on second attempt', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      adapter.setAuthorizer(async () => ({ allow: true }));
       // grammY's start() resolves when bot stops, not when started — onStart fires on startup
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
@@ -288,6 +278,7 @@ describe('TelegramAdapter', () => {
 
     test('should throw immediately on non-409 error', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      adapter.setAuthorizer(async () => ({ allow: true }));
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
       >().mockRejectedValueOnce(new Error('401: Unauthorized'));
@@ -299,6 +290,7 @@ describe('TelegramAdapter', () => {
 
     test('should retry twice on 409 and succeed on third attempt', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      adapter.setAuthorizer(async () => ({ allow: true }));
       const conflictError = new Error('409: Conflict: terminated by other getUpdates request');
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
@@ -324,6 +316,7 @@ describe('TelegramAdapter', () => {
 
     test('should throw after exhausting all 409 retry attempts', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      adapter.setAuthorizer(async () => ({ allow: true }));
       const conflictError = new Error('409: Conflict: terminated by other getUpdates request');
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
@@ -338,35 +331,24 @@ describe('TelegramAdapter', () => {
     });
   });
   describe('refuses an open bot', () => {
-    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
-    afterAll(() => {
-      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
-      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
-    });
-
-    test('start() refuses when the whitelist is empty, and never polls', async () => {
-      delete process.env.TELEGRAM_ALLOWED_USER_IDS;
-      delete process.env.TELEGRAM_ALLOWED_USERS;
+    test('start() refuses without an authorizer, and never polls', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
       >(async () => undefined);
       (adapter.getBot() as unknown as { start: typeof mockStart }).start = mockStart;
 
-      await expect(adapter.start({ retryDelayMs: 0 })).rejects.toThrow(
-        /TELEGRAM_ALLOWED_USER_IDS is empty/
-      );
+      await expect(adapter.start({ retryDelayMs: 0 })).rejects.toThrow(/no authorizer was set/);
       // The reason is logged, and no polling was attempted.
       expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ envVar: 'TELEGRAM_ALLOWED_USER_IDS' }),
-        'telegram.refusing_to_start_open_bot'
+        'telegram.refusing_to_start_without_authorizer'
       );
       expect(mockStart).not.toHaveBeenCalled();
     });
 
-    test('start() proceeds when the whitelist names someone', async () => {
-      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+    test('start() proceeds once an authorizer is set', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      adapter.setAuthorizer(async () => ({ allow: true }));
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
       >().mockImplementationOnce(opts => {
@@ -380,12 +362,6 @@ describe('TelegramAdapter', () => {
     });
   });
   describe('inbound handler (fake grammY context)', () => {
-    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
-    afterAll(() => {
-      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
-      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
-    });
-
     /** Start the adapter with polling stubbed out and capture its message handler. */
     /** Start with polling stubbed out and capture the handler of one update type. */
     async function handlerOf(
@@ -419,8 +395,11 @@ describe('TelegramAdapter', () => {
     });
 
     test('passes the chat id and sender on to the message handler', async () => {
-      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      // Only 4242 is linked to an account; everyone else is a stranger.
+      adapter.setAuthorizer(async ({ userId }) =>
+        userId === 4242 ? { allow: true } : { allow: false }
+      );
       const received: { conversationId: string; message: string; displayName?: string }[] = [];
       adapter.onMessage(async ctx => {
         received.push({
@@ -441,9 +420,12 @@ describe('TelegramAdapter', () => {
       ]);
     });
 
-    test('a sender outside the whitelist is dropped silently', async () => {
-      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
+    test('a sender with no account link is dropped silently', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      // Only 4242 is linked to an account; everyone else is a stranger.
+      adapter.setAuthorizer(async ({ userId }) =>
+        userId === 4242 ? { allow: true } : { allow: false }
+      );
       const received: string[] = [];
       adapter.onMessage(async ctx => {
         received.push(ctx.message);
@@ -457,12 +439,6 @@ describe('TelegramAdapter', () => {
     });
   });
   describe('photos and documents', () => {
-    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
-    afterAll(() => {
-      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
-      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
-    });
-
     /** Start with polling stubbed out; return the handlers and what was dispatched. */
     interface Inbound {
       message: string;
@@ -475,8 +451,11 @@ describe('TelegramAdapter', () => {
       handlers: Map<string, (ctx: never) => void>;
       received: Inbound[];
     }> {
-      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
       const adapter = new TelegramAdapter('fake-token-for-testing', 'stream', waitMs);
+      // Only 4242 is linked to an account; everyone else is a stranger.
+      adapter.setAuthorizer(async ({ userId }) =>
+        userId === 4242 ? { allow: true } : { allow: false }
+      );
       const received: Inbound[] = [];
       adapter.onMessage(async ctx => {
         received.push({
@@ -602,7 +581,7 @@ describe('TelegramAdapter', () => {
       expect(received[0]?.message).toBe('the standup');
     });
 
-    test('a file from a sender outside the whitelist is dropped', async () => {
+    test('a file from a sender with no account link is dropped', async () => {
       const { handlers, received } = await startCapturing();
       handlers.get('message:document')?.({
         chat: { id: 555 },
@@ -616,12 +595,6 @@ describe('TelegramAdapter', () => {
     });
   });
   describe('buttons', () => {
-    const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
-    afterAll(() => {
-      if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
-      else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
-    });
-
     interface Captured {
       handlers: Map<string, (ctx: never) => void>;
       commandsPublished: unknown[];
@@ -629,8 +602,11 @@ describe('TelegramAdapter', () => {
     }
 
     async function startCapturing(): Promise<Captured> {
-      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      // Only 4242 is linked to an account; everyone else is a stranger.
+      adapter.setAuthorizer(async ({ userId }) =>
+        userId === 4242 ? { allow: true } : { allow: false }
+      );
       const handlers = new Map<string, (ctx: never) => void>();
       const commandsPublished: unknown[] = [];
       const bot = adapter.getBot() as unknown as {
@@ -758,8 +734,11 @@ describe('TelegramAdapter', () => {
     });
 
     test('a message with a keyboard sends it as Telegram markup', async () => {
-      process.env.TELEGRAM_ALLOWED_USER_IDS = '4242';
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      // Only 4242 is linked to an account; everyone else is a stranger.
+      adapter.setAuthorizer(async ({ userId }) =>
+        userId === 4242 ? { allow: true } : { allow: false }
+      );
       const sent: { options?: { reply_markup?: unknown } }[] = [];
       (adapter.getBot() as unknown as { api: { sendMessage: unknown } }).api.sendMessage = (async (
         _chatId: number,

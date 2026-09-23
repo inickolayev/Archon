@@ -12,7 +12,7 @@ import {
 } from '@archon/core';
 import { formatQuotedMessage, type MessageQuote } from '@archon/core/messaging/quoted-context';
 import { createLogger } from '@archon/paths';
-import { parseAllowedUserIds, isUserAuthorized } from './auth';
+import type { TelegramAccess, TelegramAuthorizer } from './auth';
 import {
   carriesRecording,
   defaultCaption,
@@ -128,7 +128,7 @@ function toReplyMarkup(keyboard: MenuKeyboard | undefined): Record<string, unkno
 export class TelegramAdapter implements IPlatformAdapter {
   private bot: Bot;
   private streamingMode: 'stream' | 'batch';
-  private allowedUserIds: number[];
+  #authorize: TelegramAuthorizer | null = null;
   private messageHandler: ((ctx: TelegramMessageContext) => Promise<void>) | null = null;
   private callbackHandler:
     | ((request: TelegramCallbackRequest) => Promise<TelegramCallbackResponse | null>)
@@ -190,19 +190,6 @@ export class TelegramAdapter implements IPlatformAdapter {
     // grammY does not impose a handler timeout by default (unlike Telegraf's 90s limit)
     this.bot = new Bot(token);
     this.streamingMode = mode;
-
-    // Parse Telegram user whitelist (optional - empty = open access)
-    // Support both TELEGRAM_ALLOWED_USER_IDS and TELEGRAM_ALLOWED_USERS
-    this.allowedUserIds = parseAllowedUserIds(
-      process.env.TELEGRAM_ALLOWED_USER_IDS ?? process.env.TELEGRAM_ALLOWED_USERS
-    );
-    if (this.allowedUserIds.length > 0) {
-      getLog().info({ userCount: this.allowedUserIds.length }, 'telegram.whitelist_enabled');
-    } else {
-      // Not fatal here — `start()` is what refuses, so constructing an adapter
-      // (tests, tooling) stays possible.
-      getLog().warn('telegram.whitelist_missing');
-    }
 
     getLog().info({ mode }, 'telegram.adapter_initialized');
   }
@@ -505,15 +492,20 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
-   * The authorized chat + sender behind an update, or null when the sender is
-   * not on the whitelist (rejected silently, as before).
+   * The chat + sender behind an update, or null when the sender is not linked
+   * to a console account (ADR 0004). An unlinked sender is answered once with
+   * the one-time link and nothing else happens: no turn, no conversation.
    */
-  #originOf(ctx: Context): InboundOrigin | null {
+  async #originOf(ctx: Context): Promise<InboundOrigin | null> {
     const userId = ctx.from?.id;
-    if (!isUserAuthorized(userId, this.allowedUserIds)) {
-      // Log unauthorized attempt (mask user ID for privacy)
-      const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
-      getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_message');
+    const conversationId = this.getConversationId(ctx);
+    const access = await this.#accessFor(ctx, userId, conversationId);
+    if (!access.allow) {
+      if (access.reply !== undefined) {
+        await ctx.reply(access.reply).catch((err: unknown) => {
+          getLog().warn({ err }, 'telegram.link_offer_failed');
+        });
+      }
       return null;
     }
     // Derive a Telegram display name from inbound payload — no extra API call needed.
@@ -534,6 +526,41 @@ export class TelegramAdapter implements IPlatformAdapter {
       ...(sentAt === undefined ? {} : { sentAtMs: sentAt * 1000 }),
       ...(messageId === undefined ? {} : { platformMessageId: messageId }),
     };
+  }
+
+  /**
+   * Ask the injected authorizer. A missing authorizer denies — the same
+   * fail-closed direction `start()` enforces, in case an adapter is ever used
+   * without going through it.
+   */
+  async #accessFor(
+    ctx: Context,
+    userId: number | undefined,
+    chatId: string
+  ): Promise<TelegramAccess> {
+    if (this.#authorize === null) {
+      getLog().error('telegram.no_authorizer_denying');
+      return { allow: false };
+    }
+    const from = ctx.from;
+    const displayName =
+      from?.first_name || from?.last_name
+        ? [from.first_name, from.last_name].filter(Boolean).join(' ')
+        : (from?.username ?? undefined);
+    const access = await this.#authorize({
+      userId,
+      chatId,
+      ...(displayName ? { displayName } : {}),
+    });
+    if (!access.allow) {
+      // The id is masked: an operator needs to know someone knocked, not who.
+      const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
+      getLog().info(
+        { maskedUserId: maskedId, offeredLink: access.reply !== undefined },
+        'telegram.sender_not_linked'
+      );
+    }
+    return access;
   }
 
   /** Hand one inbound message to the server, if it has registered a handler. */
@@ -610,6 +637,17 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
+   * Who may drive the agent (ADR 0004): the Telegram identity has to be linked
+   * to a console account. The adapter cannot know that — the identities are in
+   * the database — so it asks this and obeys. Required: start() refuses
+   * without it, because an adapter that cannot tell who is allowed must not
+   * poll.
+   */
+  setAuthorizer(authorize: TelegramAuthorizer): void {
+    this.#authorize = authorize;
+  }
+
+  /**
    * Register a message handler for incoming messages
    * Must be called before start()
    */
@@ -631,25 +669,23 @@ export class TelegramAdapter implements IPlatformAdapter {
    * Makes up to 3 attempts on 409 Conflict (stale getUpdates connection).
    */
   async start(options?: { retryDelayMs?: number }): Promise<void> {
-    // An unconfigured whitelist is refused, not treated as open access: this bot
-    // reaches an agent that can write to a real checkout, so "anyone who finds
-    // the bot" is never an acceptable audience. Upstream's default is the
-    // opposite; see docs/adr/0001-telegram-as-second-front-end.md in the Factory.
-    if (this.allowedUserIds.length === 0) {
-      getLog().error(
-        { envVar: 'TELEGRAM_ALLOWED_USER_IDS' },
-        'telegram.refusing_to_start_open_bot'
-      );
+    // No authorizer, no bot. This one reaches an agent that can write to a real
+    // checkout, so "anyone who finds it" is never an acceptable audience, and a
+    // permissive default is not an acceptable way to discover that. Who is
+    // allowed is decided by the account link — see
+    // docs/adr/0004-telegram-access-by-account-link.md in the Factory.
+    if (this.#authorize === null) {
+      getLog().error('telegram.refusing_to_start_without_authorizer');
       throw new Error(
-        'Refusing to start the Telegram bot: TELEGRAM_ALLOWED_USER_IDS is empty, which would let any Telegram user drive an agent with write access. Set it to the comma-separated numeric ids allowed to use this bot.'
+        'Refusing to start the Telegram bot: no authorizer was set. Call setAuthorizer() before start() — without it the adapter cannot tell a linked account from a stranger.'
       );
     }
 
     // Register message handler before launch
-    this.bot.on('message:text', ctx => {
+    this.bot.on('message:text', async ctx => {
       const text = ctx.message.text;
       if (!text) return;
-      const origin = this.#originOf(ctx);
+      const origin = await this.#originOf(ctx);
       if (origin === null) return;
       this.#dispatchQuoted(origin, ctx.message as unknown as InboundMessage, text, []);
     });
@@ -659,49 +695,55 @@ export class TelegramAdapter implements IPlatformAdapter {
     // validates and persists them; this only says what and where. A recording
     // is transcribed on the far side of that road, and the words become the
     // message — which is why it must not be given a caption here.
-    this.bot.on(['message:photo', 'message:document', 'message:voice', 'message:audio'], ctx => {
-      const origin = this.#originOf(ctx);
-      if (origin === null) return;
-      const message = ctx.message as unknown as InboundMessage;
-      const files = filesOf(message);
-      if (files.length === 0) return;
-      const caption = message.caption?.trim();
-      const body =
-        caption && caption.length > 0
-          ? caption
-          : carriesRecording(message)
-            ? ''
-            : defaultCaption(files);
+    this.bot.on(
+      ['message:photo', 'message:document', 'message:voice', 'message:audio'],
+      async ctx => {
+        const origin = await this.#originOf(ctx);
+        if (origin === null) return;
+        const message = ctx.message as unknown as InboundMessage;
+        const files = filesOf(message);
+        if (files.length === 0) return;
+        const caption = message.caption?.trim();
+        const body =
+          caption && caption.length > 0
+            ? caption
+            : carriesRecording(message)
+              ? ''
+              : defaultCaption(files);
 
-      // A forwarded album is a batch of forwards, not an album of its own: it
-      // goes to the per-chat buffer below, which already folds repeats of one
-      // origin together. Only an album the operator sent themselves lands here.
-      const groupId = message.forward_origin === undefined ? message.media_group_id : undefined;
-      if (groupId !== undefined && groupId !== '') {
-        // An album arrives as several updates; collect them into one message
-        // instead of starting a turn per photo. Only its first part can be a
-        // reply, so the quote is taken there and later parts do not erase it.
-        if (!this.#mediaGroupOrigins.has(groupId)) {
-          const replied = replyQuoteOf(message, origin.userId);
-          this.#mediaGroupOrigins.set(groupId, {
-            origin,
-            quotes: replied === null ? [] : [replied],
-          });
+        // A forwarded album is a batch of forwards, not an album of its own: it
+        // goes to the per-chat buffer below, which already folds repeats of one
+        // origin together. Only an album the operator sent themselves lands here.
+        const groupId = message.forward_origin === undefined ? message.media_group_id : undefined;
+        if (groupId !== undefined && groupId !== '') {
+          // An album arrives as several updates; collect them into one message
+          // instead of starting a turn per photo. Only its first part can be a
+          // reply, so the quote is taken there and later parts do not erase it.
+          if (!this.#mediaGroupOrigins.has(groupId)) {
+            const replied = replyQuoteOf(message, origin.userId);
+            this.#mediaGroupOrigins.set(groupId, {
+              origin,
+              quotes: replied === null ? [] : [replied],
+            });
+          }
+          this.#mediaGroups.add(groupId, { caption, items: files });
+          return;
         }
-        this.#mediaGroups.add(groupId, { caption, items: files });
-        return;
-      }
 
-      this.#dispatchQuoted(origin, message, body, files);
-    });
+        this.#dispatchQuoted(origin, message, body, files);
+      }
+    );
 
     // Media the agent cannot read. Silence was the old behaviour and it looked
     // like the bot was broken — say so in one line instead.
     this.bot.on(
       ['message:video_note', 'message:sticker', 'message:video', 'message:animation'],
-      ctx => {
+      async ctx => {
         const userId = ctx.from?.id;
-        if (!isUserAuthorized(userId, this.allowedUserIds)) return;
+        // No link offer here: a sticker from a stranger is not a person trying
+        // to use the product, and answering it turns the bot into an echo.
+        const access = await this.#accessFor(ctx, userId, this.getConversationId(ctx));
+        if (!access.allow) return;
         const kind = unsupportedKindOf(ctx.message as unknown as TelegramMessageLike);
         if (kind === null) return;
         void ctx.reply(unsupportedMessage(kind)).catch((err: unknown) => {
@@ -720,9 +762,12 @@ export class TelegramAdapter implements IPlatformAdapter {
 
       void (async (): Promise<void> => {
         try {
-          if (!isUserAuthorized(userId, this.allowedUserIds)) {
-            const maskedId = `${String(userId).slice(0, 4)}***`;
-            getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_callback');
+          // The link rule applies to buttons exactly as it does to messages —
+          // otherwise the keyboards would be a way straight past it. No link is
+          // offered on a tap: a stranger has no keyboard to tap in the first
+          // place, so a tap here is a stale message or someone poking.
+          const access = await this.#accessFor(ctx, userId, String(chatId ?? ''));
+          if (!access.allow) {
             await ctx.answerCallbackQuery();
             return;
           }

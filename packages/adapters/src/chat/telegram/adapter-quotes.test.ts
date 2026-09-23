@@ -5,7 +5,7 @@
  * is never started, the update handlers are captured from a stubbed `bot.on`,
  * and a hand-built context stands in for a real update.
  */
-import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { beforeEach, describe, expect, mock, test } from 'bun:test';
 
 const mockLogger = {
   fatal: mock(() => undefined),
@@ -42,8 +42,11 @@ async function startCapturing(): Promise<{
   handlers: Map<string, (ctx: never) => void>;
   received: Dispatched[];
 }> {
-  process.env.TELEGRAM_ALLOWED_USER_IDS = String(SENDER_ID);
   const adapter = new TelegramAdapter('fake-token-for-testing', 'stream', WAIT_MS);
+  // The sender is linked; anybody else is not. Same shape the server injects.
+  adapter.setAuthorizer(async ({ userId }) =>
+    userId === SENDER_ID ? { allow: true } : { allow: false }
+  );
   const received: Dispatched[] = [];
   adapter.onMessage(async ctx => {
     received.push({ message: ctx.message, files: ctx.files });
@@ -75,12 +78,6 @@ const ctxWith = (message: Record<string, unknown>): never =>
 const settle = (ms = WAIT_MS * 4): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 describe('quoting in Telegram', () => {
-  const previousWhitelist = process.env.TELEGRAM_ALLOWED_USER_IDS;
-  afterAll(() => {
-    if (previousWhitelist === undefined) delete process.env.TELEGRAM_ALLOWED_USER_IDS;
-    else process.env.TELEGRAM_ALLOWED_USER_IDS = previousWhitelist;
-  });
-
   let handlers: Map<string, (ctx: never) => void>;
   let received: Dispatched[];
   beforeEach(async () => {

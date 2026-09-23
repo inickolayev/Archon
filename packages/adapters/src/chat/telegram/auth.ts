@@ -1,45 +1,38 @@
 /**
- * Telegram user authorization utilities
- * Parses and validates user IDs for whitelist-based access control
- */
-
-/**
- * Parse comma-separated user IDs from environment variable.
- * Returns an empty array when unset or unparseable — which this fork treats as
- * "no one is allowed", not "everyone is" (see `isUserAuthorized`).
- */
-export function parseAllowedUserIds(envValue: string | undefined): number[] {
-  if (!envValue || envValue.trim() === '') {
-    return [];
-  }
-
-  return envValue
-    .split(',')
-    .map(id => id.trim())
-    .filter(id => id !== '')
-    .map(id => parseInt(id, 10))
-    .filter(id => !isNaN(id) && id > 0);
-}
-
-/**
- * Check if a user ID is authorized.
+ * Who may drive the agent from Telegram.
  *
- * Upstream reads an empty whitelist as open access. This fork does the
- * opposite: the bot drives an agent with write access to a real checkout, so an
- * empty list authorizes nobody. `TelegramAdapter.start()` refuses to launch in
- * that state — this is the second line of defence, in case an adapter is ever
- * constructed and used without going through `start()`.
+ * This fork does not keep a list of ids. A sender is allowed when their
+ * Telegram identity is linked to a console account, and the adapter cannot
+ * answer that on its own — the identities live in the database, which is the
+ * server's side of the house. So it asks, through the function injected here,
+ * and does what it is told: proceed, or send the reply it was handed and stop.
+ *
+ * The rule itself, and why it replaced the whitelist, is ADR 0004 in the
+ * Factory (`docs/adr/0004-telegram-access-by-account-link.md`).
+ *
+ * Fail-closed is kept and moved: `TelegramAdapter.start()` refuses to poll when
+ * no authorizer was injected. An adapter that cannot tell who is allowed is not
+ * a bot with a permissive default — it is a bot that does not run.
  */
-export function isUserAuthorized(userId: number | undefined, allowedIds: number[]): boolean {
-  // No whitelist configured — deny everyone rather than open the bot.
-  if (allowedIds.length === 0) {
-    return false;
-  }
 
-  // No user ID available (should not happen in normal Telegram flow)
-  if (userId === undefined) {
-    return false;
-  }
-
-  return allowedIds.includes(userId);
+/** Everything the decision is allowed to depend on. */
+export interface TelegramSender {
+  /** Telegram's numeric user id. Absent on updates with no sender. */
+  readonly userId: number | undefined;
+  /** The chat the message arrived in, for a reply. */
+  readonly chatId: string;
+  /** First + last name as Telegram gave them, when it gave them. */
+  readonly displayName?: string;
 }
+
+export type TelegramAccess =
+  /** Linked to an account: the message becomes a turn. */
+  | { readonly allow: true }
+  /**
+   * Not linked. `reply` is sent to the chat and nothing else happens — no
+   * turn, no conversation, no cost. Absent means stay silent, which is what
+   * repeat messages inside the rate-limit window get.
+   */
+  | { readonly allow: false; readonly reply?: string };
+
+export type TelegramAuthorizer = (sender: TelegramSender) => Promise<TelegramAccess>;

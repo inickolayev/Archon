@@ -225,7 +225,9 @@ CODEX_ACCOUNT_ID=account1
       expect(content).toContain('GITHUB_ALLOWED_USERS=user1,user2');
       expect(content).toContain('GITHUB_BOT_MENTION=mybot');
       expect(content).toContain('TELEGRAM_BOT_TOKEN=123:ABC');
-      expect(content).toContain('TELEGRAM_ALLOWED_USER_IDS=111,222');
+      // Access is the account link, not a list of ids (ADR 0004): the wizard
+      // must not write a setting nothing reads.
+      expect(content).not.toContain('TELEGRAM_ALLOWED_USER_IDS');
       expect(content).toContain('TELEGRAM_STREAMING_MODE=stream');
     });
 

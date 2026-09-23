@@ -1,5 +1,6 @@
 // Chat adapters
 export { TelegramAdapter } from './chat/telegram';
+export type { TelegramAccess, TelegramAuthorizer, TelegramSender } from './chat/telegram';
 export type {
   TelegramCallbackRequest,
   TelegramCallbackResponse,

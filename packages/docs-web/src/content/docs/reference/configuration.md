@@ -480,7 +480,7 @@ The Copilot provider also reads `assistants.copilot.{model, modelReasoningEffort
 | Variable | Description | Default |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather | -- |
-| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated Telegram user IDs for whitelist | Open access |
+| _(removed)_ | Telegram access is the account link, not a setting | — |
 | `TELEGRAM_STREAMING_MODE` | Streaming mode (`stream` or `batch`) | `stream` |
 | `TELEGRAM_STATUS_ENABLED` | Show the transient "agent is working" line while a turn runs | `true` |
 | `TELEGRAM_STATUS_THROTTLE_MS` | Shortest gap between two rewrites of that line (min `1000`) | `3000` |

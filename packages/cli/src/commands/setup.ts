@@ -1472,10 +1472,11 @@ async function collectGitHubConfig(): Promise<GitHubConfig> {
 async function collectTelegramConfig(): Promise<TelegramConfig> {
   note(
     'SECURITY: Telegram bots are public by default — anyone can DM your bot.\n' +
-      'Set TELEGRAM_ALLOWED_USER_IDS to restrict access to your user ID only.\n\n' +
-      'To find your user ID:\n' +
-      '1. Open Telegram and search for @userinfobot\n' +
-      '2. Send any message — it replies with your user ID (a number)',
+      'This build does not use a list of ids. Access is the account link: write\n' +
+      'to the bot, open the one-time link it replies with in the console, and\n' +
+      'confirm. Until then the bot answers with that link and nothing else.\n\n' +
+      'There is nothing to enter here for access — the email allowlist\n' +
+      '(ARCHON_AUTH_ALLOWED_EMAILS) decides who can have an account at all.',
     'Telegram Security'
   );
 
@@ -1505,29 +1506,11 @@ async function collectTelegramConfig(): Promise<TelegramConfig> {
     process.exit(0);
   }
 
-  // Do NOT set required: true — clack's text() blocks the enter key when
-  // required is true and the value is empty, which traps the user. Validate
-  // post-hoc with a warning instead.
-  const allowedUserIds = await text({
-    message: 'Enter allowed Telegram user IDs (comma-separated):',
-    placeholder: '123456789,987654321',
-  });
-
-  if (isCancel(allowedUserIds)) {
-    cancel('Setup cancelled.');
-    process.exit(0);
-  }
-
-  if (!allowedUserIds?.trim()) {
-    log.warning(
-      'No allowlist set — your Telegram bot will accept messages from ANYONE.\n' +
-        'Add TELEGRAM_ALLOWED_USER_IDS to ~/.archon/.env after setup to restrict access.'
-    );
-  }
-
+  // No id prompt: the gate is the account link, and asking for a number that
+  // nothing reads would be a setting the operator believes in for nothing.
   return {
     botToken,
-    allowedUserIds: allowedUserIds || '',
+    allowedUserIds: '',
   };
 }
 
@@ -1723,9 +1706,8 @@ export function generateEnvContent(config: SetupConfig): string {
   if (config.platforms.telegram && config.telegram) {
     lines.push('# Telegram');
     lines.push(`TELEGRAM_BOT_TOKEN=${config.telegram.botToken}`);
-    if (config.telegram.allowedUserIds) {
-      lines.push(`TELEGRAM_ALLOWED_USER_IDS=${config.telegram.allowedUserIds}`);
-    }
+    // No TELEGRAM_ALLOWED_USER_IDS: access is the account link (ADR 0004), and
+    // a written-down setting that nothing reads is worse than none.
     lines.push('TELEGRAM_STREAMING_MODE=stream');
     lines.push('');
   }
