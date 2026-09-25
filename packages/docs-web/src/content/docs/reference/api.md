@@ -433,6 +433,7 @@ workflow's total node count. This state describes node lifecycle, not process-ow
 | PATCH | `/api/config/tiers` | Update model-tier presets (`small`/`medium`/`large`) |
 | PATCH | `/api/config/aliases` | Update `@custom` model aliases (per-key merge; `null` unsets) |
 | GET | `/api/providers/pi/models` | Pi's model catalog (cost/reasoning metadata; best-effort, `[]` on failure) |
+| GET | `/api/providers/{id}/supported-models` | Models the provider's own runtime offers now (Claude, Codex, Copilot — providers with `listsModels: true`); `503` with the runtime's reason when it can't answer |
 
 `GET /api/config` returns the safe config subset, now including the configured `tiers`, the built-in `tierDefaults` for the current default provider (what an unset tier resolves to), and the configured `aliases`.
 

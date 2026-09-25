@@ -43,7 +43,7 @@ import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import { spawn, execSync, spawnSync, type ChildProcess } from 'child_process';
 import { execFileAsync } from '@archon/git';
-import { getRegisteredProviders } from '@archon/providers';
+import { getRegisteredProviders, listProviderModels, type ProviderModel } from '@archon/providers';
 import { TIER_NAMES, buildAiProfile } from '@archon/workflows/model-validation';
 import {
   getArchonEnvPath as pathsGetArchonEnvPath,
@@ -117,23 +117,6 @@ const PI_DEFAULT_MODELS: Record<string, string> = {
   xai: 'xai/grok-3',
   cerebras: 'cerebras/llama3.1-70b',
   huggingface: 'huggingface/Qwen/Qwen2.5-72B-Instruct',
-};
-
-/**
- * Curated default-chat-model suggestions for the built-in SDK providers
- * (#1999). CONVENIENCE only, not authority — mirrors CLAUDE_MODEL_OPTIONS /
- * CODEX_MODEL_OPTIONS in packages/web/src/experiments/console/lib/
- * model-options.ts (the web package can't be imported from the CLI, same
- * mirroring convention as that file's effort vocabularies). The prompt always
- * keeps a free-text escape; nothing blocks an unlisted model string.
- */
-const DEFAULT_CHAT_MODEL_OPTIONS: Record<string, { value: string; hint?: string }[]> = {
-  claude: [
-    { value: 'sonnet', hint: 'balanced (SDK default)' },
-    { value: 'opus', hint: 'most capable' },
-    { value: 'haiku', hint: 'fastest' },
-  ],
-  codex: [{ value: 'gpt-5.6-sol' }, { value: 'gpt-5.6-terra' }, { value: 'gpt-5.6-luna' }],
 };
 
 /** Sentinel select values for the default-chat-model prompt. Prefixed with
@@ -666,37 +649,69 @@ async function confirmModelTiers(provider: string): Promise<void> {
 
 /**
  * Build the select options for the default-chat-model step: keep-current/skip
- * first (so plain Enter is the happy path), curated suggestions next, and a
- * free-text escape last.
+ * first (so plain Enter is the happy path), the models the provider's runtime
+ * reports next, and a free-text escape last.
  */
 export function buildDefaultModelChoices(
-  provider: string,
-  currentModel: string | undefined
+  currentModel: string | undefined,
+  models: readonly ProviderModel[]
 ): { value: string; label: string; hint?: string }[] {
-  const curated = DEFAULT_CHAT_MODEL_OPTIONS[provider] ?? [];
   return [
     {
       value: KEEP_MODEL,
       label: currentModel ? `Keep current (${currentModel})` : 'Keep SDK default',
       ...(currentModel ? {} : { hint: 'set one later with `archon ai default`' }),
     },
-    ...curated.map(o => ({ value: o.value, label: o.value, ...(o.hint ? { hint: o.hint } : {}) })),
+    ...models.map(m => {
+      const hint = [m.displayName, m.description].filter(Boolean).join(' · ');
+      return { value: m.id, label: m.id, ...(hint ? { hint } : {}) };
+    }),
     { value: CUSTOM_MODEL, label: 'Other…', hint: 'type a model id' },
   ];
+}
+
+/**
+ * Ask the provider's runtime for its models. A shortlist baked into the CLI
+ * would be stale by the next vendor release, so there is none: when the
+ * runtime can't answer (not logged in yet, binary missing) the user sees why
+ * and still gets keep/Other.
+ */
+async function fetchSetupModels(
+  provider: string,
+  assistantConfig: Record<string, unknown>
+): Promise<ProviderModel[]> {
+  const spin = spinner();
+  spin.start(`Asking ${provider} for its models...`);
+  try {
+    const models = (await listProviderModels(provider, assistantConfig)) ?? [];
+    spin.stop(models.length > 0 ? `${provider} offers ${models.length} models` : 'No model list');
+    return models;
+  } catch (error) {
+    spin.stop(`Could not list ${provider} models`);
+    log.warning(
+      `${error instanceof Error ? error.message : String(error)}\n` +
+        'Pick "Other…" to type a model id, or keep the default.'
+    );
+    return [];
+  }
 }
 
 /**
  * Optional, skippable default-chat-model prompt for the chosen default
  * assistant (#1999). Returns the chosen model string, or undefined when the
  * user keeps the current/SDK default. Free-text escape for anything the
- * curated shortlist misses.
+ * runtime list misses.
  */
-async function collectDefaultChatModel(provider: string): Promise<string | undefined> {
+async function collectDefaultChatModel(
+  provider: string,
+  assistantConfig: Record<string, unknown>
+): Promise<string | undefined> {
   const currentModel = readInstallDefaultModel(provider);
+  const models = await fetchSetupModels(provider, assistantConfig);
 
   const choice = await select({
     message: `Default chat model for ${provider}? (Enter to keep ${currentModel ?? 'the SDK default'})`,
-    options: buildDefaultModelChoices(provider, currentModel),
+    options: buildDefaultModelChoices(currentModel, models),
   });
 
   if (isCancel(choice)) {
@@ -709,7 +724,7 @@ async function collectDefaultChatModel(provider: string): Promise<string | undef
   if (choice === CUSTOM_MODEL) {
     const typed = await text({
       message: `Model id for ${provider}:`,
-      placeholder: provider === 'codex' ? 'gpt-5.6-sol' : 'claude-sonnet-4-6',
+      placeholder: models[0]?.id ?? 'model id',
     });
     if (isCancel(typed)) {
       cancel('Setup cancelled.');
@@ -1283,7 +1298,12 @@ After upgrading, run 'archon setup' again.`,
   // and is written by writeHomePiModelConfig.
   let defaultModel: string | undefined;
   if (selectedProviders.length > 0 && defaultAssistant !== 'pi') {
-    defaultModel = await collectDefaultChatModel(defaultAssistant);
+    // The binary chosen above is not in the environment yet; hand it over so
+    // the model list comes from the CLI this install will actually run.
+    defaultModel = await collectDefaultChatModel(
+      defaultAssistant,
+      defaultAssistant === 'claude' && claudeBinaryPath ? { claudeBinaryPath } : {}
+    );
   }
 
   return {

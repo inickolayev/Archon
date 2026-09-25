@@ -39,4 +39,5 @@ export const K = {
   account: 'account' as const,
   directory: 'directory' as const,
   piModels: 'pi-models' as const,
+  providerModels: (providerId: string): string => `provider-models:${providerId}`,
 } as const;

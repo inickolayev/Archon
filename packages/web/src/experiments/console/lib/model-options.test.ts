@@ -1,9 +1,5 @@
 import { describe, test, expect } from 'bun:test';
 import {
-  CLAUDE_MODEL_OPTIONS,
-  CODEX_MODEL_OPTIONS,
-  COPILOT_MODEL_OPTIONS,
-  curatedOptionsForAgent,
   effortOptionsForAgent,
   filterModelOptions,
   findPiModel,
@@ -14,6 +10,7 @@ import {
   piDisconnectedBackendHint,
   piModelHint,
   piModelOptions,
+  providerModelOptions,
   usablePiBackends,
 } from './model-options';
 import type {
@@ -51,31 +48,51 @@ function model(over: Partial<PiModelInfo> & { ref: string; provider: string }): 
 }
 
 describe('modelPickerShape', () => {
-  test('maps each known agent to its shape', () => {
-    expect(modelPickerShape('pi')).toBe('pi');
-    expect(modelPickerShape('opencode')).toBe('opencode');
-    expect(modelPickerShape('copilot')).toBe('select');
-    expect(modelPickerShape('claude')).toBe('curated');
-    expect(modelPickerShape('codex')).toBe('curated');
+  /** `GET /api/providers` shape, trimmed to what the shape decision reads. */
+  const LISTING = [
+    { id: 'claude', listsModels: true },
+    { id: 'codex', listsModels: true },
+    { id: 'copilot', listsModels: true },
+    { id: 'pi', listsModels: false },
+    { id: 'opencode', listsModels: false },
+    { id: 'community-x', listsModels: false },
+  ];
+
+  test('pi and opencode keep their own catalog shapes', () => {
+    expect(modelPickerShape('pi', LISTING)).toBe('pi');
+    expect(modelPickerShape('opencode', LISTING)).toBe('opencode');
   });
 
-  test('unknown agents (and the unset row sentinel) fall back to free text', () => {
-    expect(modelPickerShape('')).toBe('free');
-    expect(modelPickerShape('some-future-agent')).toBe('free');
+  test('the provider API, not a client-side id list, decides who gets live suggestions', () => {
+    expect(modelPickerShape('claude', LISTING)).toBe('live');
+    expect(modelPickerShape('codex', LISTING)).toBe('live');
+    expect(modelPickerShape('copilot', LISTING)).toBe('live');
+    expect(modelPickerShape('community-x', LISTING)).toBe('free');
+    expect(modelPickerShape('future-agent', [{ id: 'future-agent', listsModels: true }])).toBe(
+      'live'
+    );
+  });
+
+  test('unknown agents, the unset row, and a not-yet-loaded provider list fall back to free text', () => {
+    expect(modelPickerShape('', LISTING)).toBe('free');
+    expect(modelPickerShape('some-future-agent', LISTING)).toBe('free');
+    expect(modelPickerShape('claude', undefined)).toBe('free');
   });
 });
 
-describe('curatedOptionsForAgent', () => {
-  test('claude/codex/copilot get their curated lists; others get none', () => {
-    expect(curatedOptionsForAgent('claude')).toBe(CLAUDE_MODEL_OPTIONS);
-    expect(curatedOptionsForAgent('codex')).toBe(CODEX_MODEL_OPTIONS);
-    expect(curatedOptionsForAgent('copilot')).toBe(COPILOT_MODEL_OPTIONS);
-    expect(curatedOptionsForAgent('pi')).toEqual([]);
-    expect(curatedOptionsForAgent('')).toEqual([]);
-  });
-
-  test("copilot's list includes 'auto' (the SDK default when nothing is configured)", () => {
-    expect(COPILOT_MODEL_OPTIONS.some(o => o.value === 'auto')).toBe(true);
+describe('providerModelOptions', () => {
+  test('keeps the runtime order and folds name + description into the hint', () => {
+    expect(
+      providerModelOptions([
+        { id: 'claude-fable-5-1', displayName: 'Fable', description: 'Fable 5.1 · hardest tasks' },
+        { id: 'sonnet', description: 'Sonnet 5' },
+        { id: 'gpt-6-astra' },
+      ])
+    ).toEqual([
+      { value: 'claude-fable-5-1', hint: 'Fable · Fable 5.1 · hardest tasks' },
+      { value: 'sonnet', hint: 'Sonnet 5' },
+      { value: 'gpt-6-astra' },
+    ]);
   });
 });
 

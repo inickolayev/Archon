@@ -2,6 +2,7 @@ import { isRegisteredProvider, registerProvider } from '../../registry';
 
 import { COPILOT_CAPABILITIES } from './capabilities';
 import { parseCopilotRunConfig } from './config';
+import { listCopilotModels } from './models';
 import { CopilotProvider } from './provider';
 
 /**
@@ -22,6 +23,7 @@ export function registerCopilotProvider(): void {
     capabilities: COPILOT_CAPABILITIES,
     builtIn: false,
     parseRunConfig: parseCopilotRunConfig,
+    listModels: listCopilotModels,
     credentials: {
       kind: 'static',
       specs: [

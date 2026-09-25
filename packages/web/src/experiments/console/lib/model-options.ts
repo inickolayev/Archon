@@ -1,8 +1,8 @@
 /**
  * Pure helpers for the agent-aware model pickers (#1957) in the Model Tiers /
  * Aliases / Defaults panels. The valid model space is agent-shaped — Pi has a
- * baked catalog, OpenCode a runtime-introspected one, Copilot a small fixed
- * list, Claude/Codex small curated sets that evolve — so each agent gets a
+ * baked catalog, OpenCode a runtime-introspected one, and agents whose runtime
+ * reports its models (`listsModels`) a live list — so each agent gets a
  * differently sourced suggestion list. Pickers GUIDE, they never GATE: every
  * shape keeps a free-text path and the server stays permissive.
  *
@@ -14,6 +14,7 @@ import type {
   OpencodeCredentialProvider,
   PiModelInfo,
   ProviderInfo,
+  ProviderModel,
 } from '../skills';
 import { isCredentialUsable } from './agent-status';
 
@@ -32,75 +33,28 @@ export interface ModelOption {
 }
 
 /**
- * How the model field renders for an agent. Unknown agent ids (future
- * community providers) fall back to plain free text — never an empty picker.
+ * How the model field renders for an agent. `live` asks the agent's runtime
+ * (GET /api/providers/{id}/supported-models) — never a list baked into the
+ * client, which goes stale the day a vendor ships a model. Agents without a
+ * catalog, and unknown ids, fall back to plain free text.
  */
-export type ModelPickerShape = 'pi' | 'opencode' | 'select' | 'curated' | 'free';
+export type ModelPickerShape = 'pi' | 'opencode' | 'live' | 'free';
 
-export function modelPickerShape(agentId: string): ModelPickerShape {
-  switch (agentId) {
-    case 'pi':
-      return 'pi';
-    case 'opencode':
-      return 'opencode';
-    case 'copilot':
-      return 'select';
-    case 'claude':
-    case 'codex':
-      return 'curated';
-    default:
-      return 'free';
-  }
+export function modelPickerShape(
+  agentId: string,
+  providers: readonly Pick<ProviderInfo, 'id' | 'listsModels'>[] | undefined
+): ModelPickerShape {
+  if (agentId === 'pi') return 'pi';
+  if (agentId === 'opencode') return 'opencode';
+  return providers?.find(p => p.id === agentId)?.listsModels === true ? 'live' : 'free';
 }
 
-// ---------------------------------------------------------------------------
-// Curated lists. These are CONVENIENCE suggestions, not authority — the SDKs
-// ship models faster than Archon can enumerate them, so every consumer keeps a
-// free-text escape and nothing client-side blocks an unlisted model string.
-// ---------------------------------------------------------------------------
-
-/**
- * Claude SDK model keywords, mirroring the `.archon/config.yaml` examples in
- * CLAUDE.md and docs/getting-started/ai-assistants.md (`model: sonnet # or
- * 'opus', 'haiku', 'claude-*'`). Full `claude-*` ids are free-typed.
- */
-export const CLAUDE_MODEL_OPTIONS: readonly ModelOption[] = [
-  { value: 'sonnet' },
-  { value: 'opus' },
-  { value: 'haiku' },
-];
-
-/**
- * Codex model strings mirroring the current lineup in the repo's config
- * examples (docs/getting-started/ai-assistants.md and CLAUDE.md): `gpt-5.6-sol`
- * (flagship), `gpt-5.6-terra` (mid), `gpt-5.6-luna` (light).
- */
-export const CODEX_MODEL_OPTIONS: readonly ModelOption[] = [
-  { value: 'gpt-5.6-sol' },
-  { value: 'gpt-5.6-terra' },
-  { value: 'gpt-5.6-luna' },
-];
-
-/**
- * Copilot model list. PROVENANCE: no Archon API exposes Copilot's model
- * catalog (the Copilot CLI negotiates it per subscription at runtime), so this
- * is hand-curated from docs/getting-started/ai-assistants.md ("'gpt-5',
- * 'gpt-5-mini', 'claude-sonnet-4.5', 'auto', etc."). NOT authoritative — the
- * select keeps a "Custom…" free-text escape for anything Copilot ships next.
- */
-export const COPILOT_MODEL_OPTIONS: readonly ModelOption[] = [
-  { value: 'auto', hint: 'Copilot picks' },
-  { value: 'gpt-5' },
-  { value: 'gpt-5-mini' },
-  { value: 'claude-sonnet-4.5' },
-];
-
-/** Curated suggestions for an agent's combobox; empty when none exist. */
-export function curatedOptionsForAgent(agentId: string): readonly ModelOption[] {
-  if (agentId === 'claude') return CLAUDE_MODEL_OPTIONS;
-  if (agentId === 'codex') return CODEX_MODEL_OPTIONS;
-  if (agentId === 'copilot') return COPILOT_MODEL_OPTIONS;
-  return [];
+/** Runtime-reported models → suggestions; the name and description ride the hint line. */
+export function providerModelOptions(models: readonly ProviderModel[]): ModelOption[] {
+  return models.map(m => {
+    const hint = [m.displayName, m.description].filter(Boolean).join(' · ');
+    return hint === '' ? { value: m.id } : { value: m.id, hint };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +197,7 @@ export function piDisconnectedBackendHint(
 // Generic + OpenCode.
 // ---------------------------------------------------------------------------
 
-/** Case-insensitive substring filter over option values (curated/OpenCode lists). */
+/** Case-insensitive substring filter over option values (live/OpenCode lists). */
 export function filterModelOptions(options: readonly ModelOption[], query: string): ModelOption[] {
   const q = query.trim().toLowerCase();
   if (q === '') return [...options];

@@ -31,6 +31,7 @@ export const providerInfoSchema = z
     capabilities: providerCapabilitiesSchema,
     builtIn: z.boolean(),
     effortLevels: z.array(z.enum(EFFORT_LADDER)).optional(),
+    listsModels: z.boolean(),
   })
   .openapi('ProviderInfo');
 
@@ -40,6 +41,25 @@ export const providerListResponseSchema = z
     providers: z.array(providerInfoSchema),
   })
   .openapi('ProviderListResponse');
+
+/** Path params for GET /api/providers/{id}/supported-models. */
+export const providerIdParamsSchema = z.object({ id: z.string() });
+
+/** One model a provider's runtime reports as selectable right now. */
+export const providerModelSchema = z
+  .object({
+    id: z.string(),
+    displayName: z.string().optional(),
+    description: z.string().optional(),
+  })
+  .openapi('ProviderModel');
+
+/** Response for GET /api/providers/{id}/supported-models. */
+export const providerModelListResponseSchema = z
+  .object({
+    models: z.array(providerModelSchema),
+  })
+  .openapi('ProviderModelListResponse');
 
 /** One Pi catalog model — metadata only (no credentials). */
 export const piModelInfoSchema = z

@@ -10,6 +10,20 @@ export function listProviders(): Promise<ProviderInfo[]> {
   );
 }
 
+/** One model an agent's runtime reports as selectable right now. */
+export type ProviderModel = components['schemas']['ProviderModel'];
+
+/**
+ * GET /api/providers/{id}/supported-models — spawns the agent's CLI on a cache
+ * miss (a second or two), so pickers call it when a field is opened, not on
+ * page load. Throws HttpError 503 with the runtime's reason when it can't answer.
+ */
+export function listProviderModels(providerId: string): Promise<ProviderModel[]> {
+  return requestJson<components['schemas']['ProviderModelListResponse']>(
+    `/api/providers/${encodeURIComponent(providerId)}/supported-models`
+  ).then(r => r.models);
+}
+
 /**
  * One Pi catalog model — drives the cost/reasoning hint next to Pi tier
  * models. Inline-typed until a regen lands PiModelInfo in api.generated

@@ -193,7 +193,6 @@ export function AssistantConfigPanel(): ReactElement {
             setModel(form.assistant, v);
           }}
           placeholder="model — blank = tier default"
-          selectEmptyLabel="tier default"
           ariaLabel="Install default chat model"
           className="min-w-[160px] flex-1"
           agents={keyData?.agents}
@@ -241,7 +240,6 @@ export function AssistantConfigPanel(): ReactElement {
             placeholder={
               userDraft.provider === '' ? 'inherit (this install)' : 'model — blank = tier default'
             }
-            selectEmptyLabel="tier default"
             ariaLabel="Your default chat model"
             className="min-w-[160px] flex-1"
             agents={keyData?.agents}
@@ -304,7 +302,6 @@ export function AssistantConfigPanel(): ReactElement {
                     setModel(p.id, v);
                   }}
                   placeholder="model (e.g. sonnet, gpt-5.6-sol) — blank = inherit"
-                  selectEmptyLabel="inherit"
                   ariaLabel={`${p.displayName} default model`}
                   className="w-full"
                   agents={keyData?.agents}

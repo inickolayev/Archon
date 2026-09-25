@@ -12,6 +12,7 @@ import type {
   ProviderCapabilities,
   ProviderRegistration,
   ProviderInfo,
+  ProviderModel,
 } from './types';
 import { ClaudeProvider } from './claude/provider';
 import { CodexProvider } from './codex/provider';
@@ -19,6 +20,8 @@ import { parseClaudeRunConfig } from './claude/config';
 import { parseCodexRunConfig } from './codex/config';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
+import { listClaudeModels } from './claude/models';
+import { listCodexModels } from './codex/models';
 import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
 import { registerPiProvider } from './community/pi/registration';
@@ -107,13 +110,44 @@ export function getRegisteredProviders(): ProviderRegistration[] {
  * Get API-safe provider info (excludes the factory).
  */
 export function getProviderInfoList(): ProviderInfo[] {
-  return getRegisteredProviders().map(({ id, displayName, capabilities, builtIn }) => ({
+  return getRegisteredProviders().map(({ id, displayName, capabilities, builtIn, listModels }) => ({
     id,
     displayName,
     capabilities,
     builtIn,
     ...(capabilities.effortControl ? { effortLevels: EFFORT_LADDER } : {}),
+    listsModels: listModels !== undefined,
   }));
+}
+
+/**
+ * Asking a runtime spawns its CLI (1–3s), and every model field on a settings
+ * page asks, so answers are shared briefly. Failures are never cached: a retry
+ * after fixing a login or binary path must ask again.
+ */
+const MODEL_LIST_TTL_MS = 5 * 60_000;
+const modelListCache = new Map<string, { at: number; models: Promise<ProviderModel[]> }>();
+
+/**
+ * The models a provider's runtime offers right now, or null when the provider
+ * has no live catalog (Pi and OpenCode expose theirs through their own routes).
+ * @throws UnknownProviderError if not registered; the runtime's error if it cannot answer
+ */
+export async function listProviderModels(
+  id: string,
+  assistantConfig: Record<string, unknown>
+): Promise<ProviderModel[] | null> {
+  const { listModels } = getRegistration(id);
+  if (listModels === undefined) return null;
+  const key = `${id}\0${JSON.stringify(assistantConfig)}`;
+  const cached = modelListCache.get(key);
+  if (cached && Date.now() - cached.at < MODEL_LIST_TTL_MS) return cached.models;
+  const models = listModels(assistantConfig);
+  modelListCache.set(key, { at: Date.now(), models });
+  models.catch(() => {
+    if (modelListCache.get(key)?.models === models) modelListCache.delete(key);
+  });
+  return models;
 }
 
 /**
@@ -136,6 +170,7 @@ export function registerBuiltinProviders(): void {
       capabilities: CLAUDE_CAPABILITIES,
       builtIn: true,
       parseRunConfig: parseClaudeRunConfig,
+      listModels: listClaudeModels,
       credentials: {
         kind: 'static',
         specs: [
@@ -154,6 +189,7 @@ export function registerBuiltinProviders(): void {
       capabilities: CODEX_CAPABILITIES,
       builtIn: true,
       parseRunConfig: parseCodexRunConfig,
+      listModels: listCodexModels,
       credentials: {
         kind: 'static',
         specs: [
@@ -207,4 +243,5 @@ export function registerCommunityProviders(): void {
 /** @internal Test-only — clears the registry. Not for production use. */
 export function clearRegistry(): void {
   registry.clear();
+  modelListCache.clear();
 }

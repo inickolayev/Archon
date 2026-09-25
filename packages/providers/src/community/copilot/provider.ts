@@ -109,6 +109,55 @@ function resolveGenericGitHubToken(env: Record<string, string>): string | undefi
   return undefined;
 }
 
+/**
+ * SDK client options for one Copilot runtime: binary, config dir, env and the
+ * auth precedence. Shared by runs and the model listing so both authenticate
+ * exactly the same way.
+ */
+export async function buildCopilotClientOptions(
+  copilotConfig: CopilotProviderDefaults,
+  requestEnv: Record<string, string> | undefined,
+  cwd: string
+): Promise<{
+  clientOpts: CopilotClientOptions;
+  tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
+}> {
+  const mergedEnv = buildCopilotEnv(requestEnv);
+  const copilotToken = resolveCopilotToken(mergedEnv);
+  const genericGithubToken = resolveGenericGitHubToken(mergedEnv);
+  const cliPath = await resolveCopilotBinaryPath(copilotConfig.copilotCliPath);
+
+  const clientOpts: CopilotClientOptions = {
+    workingDirectory: cwd,
+    env: mergedEnv,
+  };
+  // copilot-sdk 1.0: a custom CLI binary rides a stdio runtime connection
+  // (replaces the removed `cliPath` option).
+  if (cliPath) clientOpts.connection = { kind: 'stdio', path: cliPath };
+  // configDir override → baseDirectory (sets COPILOT_HOME on the runtime).
+  if (copilotConfig.configDir) clientOpts.baseDirectory = copilotConfig.configDir;
+  // Auth precedence: see COPILOT_TOKEN_ENV_KEY / GENERIC_GITHUB_TOKEN_ENV_KEYS docs.
+  let tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
+  if (copilotToken) {
+    clientOpts.gitHubToken = copilotToken;
+    clientOpts.useLoggedInUser = false;
+    tokenSource = 'copilot-token';
+  } else if (copilotConfig.useLoggedInUser === false) {
+    if (genericGithubToken) {
+      clientOpts.gitHubToken = genericGithubToken;
+      tokenSource = 'generic-token';
+    } else {
+      tokenSource = 'logged-in-user';
+    }
+    clientOpts.useLoggedInUser = false;
+  } else {
+    clientOpts.useLoggedInUser = true;
+    tokenSource = 'logged-in-user';
+  }
+  if (copilotConfig.logLevel) clientOpts.logLevel = copilotConfig.logLevel;
+  return { clientOpts, tokenSource };
+}
+
 // ─── Reasoning ──────────────────────────────────────────────────────────────
 
 function normalizeReasoning(value: unknown): CopilotReasoningEffort | undefined {
@@ -439,10 +488,11 @@ export class CopilotProvider implements IAgentProvider {
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const copilotConfig = parseCopilotConfig(assistantConfig);
 
-    const mergedEnv = buildCopilotEnv(requestOptions?.env);
-    const copilotToken = resolveCopilotToken(mergedEnv);
-    const genericGithubToken = resolveGenericGitHubToken(mergedEnv);
-    const cliPath = await resolveCopilotBinaryPath(copilotConfig.copilotCliPath);
+    const { clientOpts, tokenSource } = await buildCopilotClientOptions(
+      copilotConfig,
+      requestOptions?.env,
+      cwd
+    );
 
     const sdk = await import('@github/copilot-sdk');
     const { CopilotClient: copilotClientCtor, approveAll } = sdk;
@@ -472,34 +522,6 @@ export class CopilotProvider implements IAgentProvider {
       ? augmentPromptForJsonSchema(prompt, outputFormat.schema)
       : prompt;
 
-    const clientOpts: CopilotClientOptions = {
-      workingDirectory: cwd,
-      env: mergedEnv,
-    };
-    // copilot-sdk 1.0: a custom CLI binary rides a stdio runtime connection
-    // (replaces the removed `cliPath` option).
-    if (cliPath) clientOpts.connection = { kind: 'stdio', path: cliPath };
-    // configDir override → baseDirectory (sets COPILOT_HOME on the runtime).
-    if (copilotConfig.configDir) clientOpts.baseDirectory = copilotConfig.configDir;
-    // Auth precedence: see COPILOT_TOKEN_ENV_KEY / GENERIC_GITHUB_TOKEN_ENV_KEYS docs.
-    let tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
-    if (copilotToken) {
-      clientOpts.gitHubToken = copilotToken;
-      clientOpts.useLoggedInUser = false;
-      tokenSource = 'copilot-token';
-    } else if (copilotConfig.useLoggedInUser === false) {
-      if (genericGithubToken) {
-        clientOpts.gitHubToken = genericGithubToken;
-        tokenSource = 'generic-token';
-      } else {
-        tokenSource = 'logged-in-user';
-      }
-      clientOpts.useLoggedInUser = false;
-    } else {
-      clientOpts.useLoggedInUser = true;
-      tokenSource = 'logged-in-user';
-    }
-    if (copilotConfig.logLevel) clientOpts.logLevel = copilotConfig.logLevel;
     const client = new copilotClientCtor(clientOpts);
 
     let session: CopilotSession;

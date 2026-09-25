@@ -1,6 +1,11 @@
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeAll, beforeEach } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerProvider,
+  getRegistration,
+  clearRegistry,
+} from '@archon/providers';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { EFFORT_LADDER } from '@archon/paths/effort';
@@ -218,9 +223,11 @@ describe('GET /api/providers', () => {
       expect(provider).toHaveProperty('displayName');
       expect(provider).toHaveProperty('capabilities');
       expect(provider).toHaveProperty('builtIn');
+      expect(typeof provider.listsModels).toBe('boolean');
       // Non-serializable fields must NOT leak
       expect(provider).not.toHaveProperty('factory');
       expect(provider).not.toHaveProperty('isModelCompatible');
+      expect(provider).not.toHaveProperty('listModels');
     }
   });
 
@@ -239,6 +246,76 @@ describe('GET /api/providers', () => {
     expect(typeof caps.hooks).toBe('boolean');
     // structuredOutput is the tiered union, not a boolean.
     expect(['enforced', 'best-effort', false]).toContain(caps.structuredOutput);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: GET /api/providers/:id/supported-models
+// ---------------------------------------------------------------------------
+
+describe('GET /api/providers/:id/supported-models', () => {
+  const seenConfigs: Record<string, unknown>[] = [];
+  let listModels: (config: Record<string, unknown>) => Promise<{ id: string }[]>;
+
+  // Registered once, when this block starts (registering at collection time
+  // would leak into the earlier "all built-in" assertions). The route reads the
+  // real registry and its cache, so each test uses a distinct provider id.
+  beforeAll(() => {
+    const claude = getRegistration('claude');
+    for (const id of ['fake-live', 'fake-failing']) {
+      registerProvider({
+        ...claude,
+        id,
+        displayName: id,
+        builtIn: false,
+        listModels: async config => {
+          seenConfigs.push(config);
+          return listModels(config);
+        },
+      });
+    }
+    registerProvider({ ...claude, id: 'fake-no-catalog', builtIn: false, listModels: undefined });
+  });
+
+  let app: Hono;
+  beforeEach(() => {
+    app = makeApp();
+    seenConfigs.length = 0;
+    mockLoadConfig.mockImplementation(async () => ({
+      assistants: { claude: { model: 'sonnet' }, 'fake-live': { binaryPath: '/opt/fake' } },
+      worktree: { baseBranch: 'main' },
+    }));
+  });
+
+  test("returns the runtime's models, asked with that provider's assistant config", async () => {
+    listModels = async () => [{ id: 'claude-fable-5-1' }, { id: 'sonnet' }];
+    const response = await app.request('/api/providers/fake-live/supported-models');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      models: [{ id: 'claude-fable-5-1' }, { id: 'sonnet' }],
+    });
+    expect(seenConfigs).toEqual([{ binaryPath: '/opt/fake' }]);
+  });
+
+  test('503 carries the runtime reason when it cannot answer', async () => {
+    listModels = async () => {
+      throw new Error('Claude CLI not logged in');
+    };
+    const response = await app.request('/api/providers/fake-failing/supported-models');
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { error: string; detail?: string };
+    expect(body.error).toBe('Could not list fake-failing models');
+    expect(body.detail).toBe('Claude CLI not logged in');
+  });
+
+  test('404 for a provider without a live catalog', async () => {
+    const response = await app.request('/api/providers/fake-no-catalog/supported-models');
+    expect(response.status).toBe(404);
+  });
+
+  test('404 for an unknown provider', async () => {
+    const response = await app.request('/api/providers/nope/supported-models');
+    expect(response.status).toBe(404);
   });
 });
 
