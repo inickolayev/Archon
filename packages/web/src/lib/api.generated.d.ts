@@ -3063,6 +3063,65 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/providers/{id}/supported-models': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * List the models a provider's runtime offers right now
+     * @description Asks the provider's own CLI/SDK (same binary and install credentials as runs), so newly shipped models appear without an Archon release. Answers are cached for a few minutes; a failure is not cached. Only providers with `listsModels: true` in GET /api/providers support it.
+     */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          id: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Models reported by the runtime, in its own order */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['ProviderModelListResponse'];
+          };
+        };
+        /** @description Unknown provider, or the provider has no live model catalog */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description The provider runtime could not report its models */
+        503: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/providers/opencode/credentials': {
     parameters: {
       query?: never;
@@ -4253,6 +4312,7 @@ export interface components {
         | 'ultra'
         | 'persistent'
       )[];
+      listsModels: boolean;
     };
     ProviderCapabilities: {
       sessionResume: boolean;
@@ -4282,6 +4342,14 @@ export interface components {
         output: number;
       };
       contextWindow: number;
+    };
+    ProviderModelListResponse: {
+      models: components['schemas']['ProviderModel'][];
+    };
+    ProviderModel: {
+      id: string;
+      displayName?: string;
+      description?: string;
     };
     OpencodeCredentialListResponse: {
       providers: components['schemas']['OpencodeCredentialProvider'][];

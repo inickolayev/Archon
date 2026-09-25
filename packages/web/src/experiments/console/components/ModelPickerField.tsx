@@ -1,9 +1,13 @@
 import { useState, type ReactElement } from 'react';
 import * as skill from '../skills';
-import type { AgentCredentials, OpencodeCredentialProvider, PiModelInfo } from '../skills';
+import type {
+  AgentCredentials,
+  OpencodeCredentialProvider,
+  PiModelInfo,
+  ProviderInfo,
+  ProviderModel,
+} from '../skills';
 import {
-  COPILOT_MODEL_OPTIONS,
-  curatedOptionsForAgent,
   filterModelOptions,
   findPiModel,
   modelPickerShape,
@@ -11,11 +15,16 @@ import {
   piDisconnectedBackendHint,
   piModelHint,
   piModelOptions,
+  providerModelOptions,
   usablePiBackends,
   type ModelOption,
+  type ModelPickerShape,
 } from '../lib/model-options';
+import { errorText } from '../lib/http';
 import { useCancelledRef } from '../lib/use-cancelled-ref';
-import { INPUT_CLASS, SELECT_CLASS, SelectShell } from './SettingsFormPrimitives';
+import { useEntity } from '../store/cache';
+import { K } from '../store/keys';
+import { INPUT_CLASS } from './SettingsFormPrimitives';
 
 /** Cap on rendered Pi suggestions — the catalog is ~920 models. */
 const PI_SUGGESTION_LIMIT = 30;
@@ -43,12 +52,6 @@ interface ModelPickerFieldProps {
   ariaLabel?: string;
   /** Sizing classes for the field wrapper (e.g. 'min-w-[160px] flex-1'). */
   className?: string;
-  /**
-   * Label for the empty option in select-shaped pickers (Copilot). The free
-   * text `placeholder` is often too long for an option label, so panels pass a
-   * short one ('inherit', 'Select model…').
-   */
-  selectEmptyLabel?: string;
   /** Agents matrix (K.providerConnections) — undefined means no readiness data (solo/401). */
   agents?: AgentCredentials[];
   /** Pi catalog (K.piModels) — best-effort, undefined/[] means no Pi suggestions. */
@@ -56,7 +59,7 @@ interface ModelPickerFieldProps {
 }
 
 /**
- * Agent-aware model input (#1957). One component, four shapes:
+ * Agent-aware model input (#1957). One component, three sourced shapes:
  * - Pi: searchable picker over the baked catalog, default-filtered to usable
  *   backends per the agents matrix, with an explicit "show all backends"
  *   toggle. Cost/context/reasoning hints ride each suggestion and the exact
@@ -66,18 +69,18 @@ interface ModelPickerFieldProps {
  *   the user explicitly clicks "Load backend suggestions" inside the open
  *   dropdown; it lists `backend/` prefixes (model counts, connected state) and
  *   the model id itself stays free-typed — the endpoint doesn't expose ids.
- * - Copilot: fixed select over the curated list + a "Custom…" free-text escape.
- * - Claude/Codex (and unknown agents): free text; Claude/Codex surface their
- *   curated common options as suggestions.
+ * - Live (every agent whose runtime reports its models — `listsModels`):
+ *   suggestions come from the runtime itself, fetched the first time a field
+ *   is opened and shared by every field through the cache. Nothing is baked
+ *   into the client: a list here would go stale the day a vendor ships.
+ * - Anything else: plain free text.
  *
  * Pickers guide, never gate: every shape saves arbitrary strings, and a model
  * on a disconnected backend only draws a non-blocking inline hint.
  */
 export function ModelPickerField(props: ModelPickerFieldProps): ReactElement {
-  if (modelPickerShape(props.agentId) === 'select') {
-    return <CopilotModelSelect {...props} />;
-  }
-  return <ModelCombobox {...props} />;
+  const { data: providers } = useEntity<ProviderInfo[]>(K.providers, skill.listProviders);
+  return <ModelCombobox {...props} shape={modelPickerShape(props.agentId, providers)} />;
 }
 
 /** Suggestion row; `onMouseDown` is prevented by the list container so the input never blurs. */
@@ -114,11 +117,11 @@ function ModelCombobox({
   className = '',
   agents,
   piModels,
-}: ModelPickerFieldProps): ReactElement {
+  shape,
+}: ModelPickerFieldProps & { shape: ModelPickerShape }): ReactElement {
   const [open, setOpen] = useState(false);
   // Pi only: include backends without a usable credential in the suggestions.
   const [showAll, setShowAll] = useState(false);
-  const shape = modelPickerShape(agentId);
 
   // OpenCode on-demand backend list. Per-field state by design: the endpoint
   // is only hit on this field's explicit "Load backend suggestions" click.
@@ -163,7 +166,9 @@ function ModelCombobox({
     options =
       ocPhase === 'loaded' ? filterModelOptions(opencodeBackendOptions(ocProviders), value) : [];
   } else {
-    options = filterModelOptions(curatedOptionsForAgent(agentId), value);
+    // Live suggestions render inside the dropdown (LiveModelOptions), which is
+    // what defers the runtime query until a field is actually opened.
+    options = [];
   }
 
   const pick = (o: ModelOption): void => {
@@ -177,7 +182,7 @@ function ModelCombobox({
   const disconnectedHint =
     shape === 'pi' && !disabled ? piDisconnectedBackendHint(value, agents) : null;
 
-  const hasDropdownContent = options.length > 0 || shape === 'pi' || shape === 'opencode';
+  const hasDropdownContent = options.length > 0 || shape !== 'free';
 
   return (
     <span className={`relative inline-flex flex-col gap-1 ${className}`}>
@@ -250,6 +255,10 @@ function ModelCombobox({
                 </button>
               ) : null}
             </>
+          ) : null}
+
+          {shape === 'live' ? (
+            <LiveModelOptions agentId={agentId} value={value} onPick={pick} />
           ) : null}
 
           {shape === 'opencode' ? (
@@ -331,81 +340,59 @@ function OpencodeDropdownFooter({
   );
 }
 
-/** Sentinel select value that switches the Copilot field to free-text mode. */
-const CUSTOM_SENTINEL = '__custom__';
-
 /**
- * Copilot's fixed select (the curated list is hand-maintained, see
- * COPILOT_MODEL_OPTIONS provenance) with a "Custom…" free-text escape. A saved
- * value outside the list renders in custom mode so it's never misdisplayed.
+ * The runtime's own model list for a `live` agent. Mounted only while the
+ * dropdown is open, so the first open asks the server (which may spawn the
+ * agent CLI) and every later field reads the shared cache entry.
  */
-function CopilotModelSelect({
+function LiveModelOptions({
+  agentId,
   value,
-  onChange,
-  disabled = false,
-  placeholder,
-  ariaLabel,
-  className = '',
-  selectEmptyLabel,
-}: ModelPickerFieldProps): ReactElement {
-  const inList = value === '' || COPILOT_MODEL_OPTIONS.some(o => o.value === value);
-  const [customMode, setCustomMode] = useState(false);
-  const custom = customMode || !inList;
-
-  if (custom) {
+  onPick,
+}: {
+  agentId: string;
+  value: string;
+  onPick: (o: ModelOption) => void;
+}): ReactElement {
+  const { data, error, refetch } = useEntity<ProviderModel[]>(K.providerModels(agentId), () =>
+    skill.listProviderModels(agentId)
+  );
+  if (error !== undefined) {
     return (
-      <span className={`inline-flex items-center gap-2 ${className}`}>
-        <input
-          value={value}
-          onChange={e => {
-            onChange(e.target.value);
-          }}
-          disabled={disabled}
-          placeholder={placeholder ?? 'model id'}
-          aria-label={ariaLabel}
-          autoComplete="off"
-          className={`${INPUT_CLASS} ${disabled ? 'opacity-50' : ''}`}
-        />
+      <div className="flex flex-wrap items-center gap-2 px-3 py-2">
+        <p className="font-mono text-[11px] text-error">
+          {errorText(error, 'Could not load the model list.')} Free text is fine.
+        </p>
         <button
           type="button"
-          onClick={() => {
-            setCustomMode(false);
-            // A non-curated value can't render in the select — clear it.
-            if (!inList) onChange('');
-          }}
-          disabled={disabled}
-          className="shrink-0 rounded border border-border px-2.5 py-1.5 font-mono text-[11px] text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary disabled:opacity-40"
+          onClick={refetch}
+          className="rounded border border-border px-2.5 py-1 font-mono text-[11px] text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary"
         >
-          List
+          Retry
         </button>
-      </span>
+      </div>
     );
   }
-
+  if (data === undefined) {
+    return (
+      <p className="px-3 py-2 font-mono text-[11px] text-text-tertiary">
+        Asking the agent for its models…
+      </p>
+    );
+  }
+  const options = filterModelOptions(providerModelOptions(data), value);
+  if (options.length === 0) {
+    return (
+      <p className="px-3 py-2 font-mono text-[11px] text-text-tertiary">
+        No listed model matches — free text is fine.
+      </p>
+    );
+  }
   return (
-    <SelectShell className={className}>
-      <select
-        value={value}
-        onChange={e => {
-          if (e.target.value === CUSTOM_SENTINEL) {
-            setCustomMode(true);
-          } else {
-            onChange(e.target.value);
-          }
-        }}
-        disabled={disabled}
-        aria-label={ariaLabel}
-        className={`${SELECT_CLASS} ${disabled ? 'opacity-50' : ''}`}
-      >
-        <option value="">{selectEmptyLabel ?? 'Select model…'}</option>
-        {COPILOT_MODEL_OPTIONS.map(o => (
-          <option key={o.value} value={o.value}>
-            {o.value}
-            {o.hint !== undefined ? ` — ${o.hint}` : ''}
-          </option>
-        ))}
-        <option value={CUSTOM_SENTINEL}>Custom…</option>
-      </select>
-    </SelectShell>
+    <>
+      {options.map(o => (
+        <OptionRow key={o.value} option={o} onPick={onPick} />
+      ))}
+    </>
   );
 }

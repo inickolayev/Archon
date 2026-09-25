@@ -10,6 +10,7 @@ import {
   getHealth,
   listCodebases,
   listProviders,
+  listProviderModels,
   addCodebase,
   getCodebaseInput,
   deleteCodebase,
@@ -392,6 +393,63 @@ function ProjectsSection(): React.ReactElement {
   );
 }
 
+/**
+ * Free-text model field whose suggestions come from the provider's runtime
+ * (GET /api/providers/{id}/supported-models), so a newly shipped model shows up
+ * without an Archon release. Empty means "provider default". The list loads on
+ * first focus — asking may spawn the agent CLI.
+ */
+function ProviderModelInput({
+  id,
+  provider,
+  value,
+  onChange,
+}: {
+  id: string;
+  provider: ProviderInfo;
+  value: string;
+  onChange: (model: string) => void;
+}): React.ReactElement {
+  const [wanted, setWanted] = useState(false);
+  const { data: models, error } = useQuery({
+    queryKey: ['provider-models', provider.id],
+    queryFn: () => listProviderModels(provider.id),
+    enabled: wanted && provider.listsModels === true,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  const listId = `${id}-options`;
+  return (
+    <div className="flex flex-col gap-1">
+      <Input
+        id={id}
+        list={listId}
+        value={value}
+        onFocus={() => {
+          setWanted(true);
+        }}
+        onChange={e => {
+          onChange(e.target.value);
+        }}
+        placeholder="provider default"
+        autoComplete="off"
+      />
+      <datalist id={listId}>
+        {models?.map(m => (
+          <option key={m.id} value={m.id}>
+            {[m.displayName, m.description].filter(Boolean).join(' · ')}
+          </option>
+        ))}
+      </datalist>
+      {error ? (
+        <span className="text-xs text-muted-foreground">
+          Model list unavailable ({error.message}) — free text is fine.
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 function AssistantConfigSection({ config }: { config: SafeConfigResponse }): React.ReactElement {
   const queryClient = useQueryClient();
   const { data: providers } = useQuery({
@@ -504,18 +562,14 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
                     <div className="text-muted-foreground">Built-in provider settings</div>
 
                     <label htmlFor="claude-model">Model</label>
-                    <select
+                    <ProviderModelInput
                       id="claude-model"
-                      value={(providerSettings.model as string | undefined) ?? 'sonnet'}
-                      onChange={e => {
-                        updateProviderSettings('claude', { model: e.target.value });
+                      provider={provider}
+                      value={(providerSettings.model as string | undefined) ?? ''}
+                      onChange={model => {
+                        updateProviderSettings('claude', { model });
                       }}
-                      className={selectClass}
-                    >
-                      <option value="sonnet">sonnet</option>
-                      <option value="opus">opus</option>
-                      <option value="haiku">haiku</option>
-                    </select>
+                    />
                   </div>
                 );
               }
@@ -530,13 +584,13 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
                     <div className="text-muted-foreground">Built-in provider settings</div>
 
                     <label htmlFor="codex-model">Model</label>
-                    <Input
+                    <ProviderModelInput
                       id="codex-model"
+                      provider={provider}
                       value={(providerSettings.model as string | undefined) ?? ''}
-                      onChange={e => {
-                        updateProviderSettings('codex', { model: e.target.value });
+                      onChange={model => {
+                        updateProviderSettings('codex', { model });
                       }}
-                      placeholder="gpt-5.6-sol"
                     />
 
                     <label htmlFor="reasoning">Reasoning Effort</label>

@@ -782,6 +782,26 @@ export interface ProviderRegistration {
    * reject values the provider would otherwise silently discard.
    */
   parseRunConfig: ProviderRunConfigParser;
+
+  /**
+   * Ask the agent runtime which models it currently offers. Present only for
+   * agents whose runtime exposes a live catalog; the model pickers read it
+   * instead of a hand-maintained list, which is stale the day a vendor ships.
+   * `assistantConfig` is this agent's `assistants.<id>` block (binary path,
+   * config dir); credentials are the install's, as for any server-side call.
+   * Throws when the runtime cannot be reached — callers surface the reason.
+   */
+  listModels?: (assistantConfig: Record<string, unknown>) => Promise<ProviderModel[]>;
+}
+
+/** One model an agent runtime reports as selectable right now. */
+export interface ProviderModel {
+  /** The string to put in a `model:` field; the runtime accepts it verbatim. */
+  id: string;
+  /** Runtime's human-readable name, when it differs from `id`. */
+  displayName?: string;
+  /** Runtime's one-line description (capabilities, pricing). */
+  description?: string;
 }
 
 /**
@@ -795,6 +815,8 @@ export interface ProviderInfo {
   builtIn: boolean;
   /** The shared ladder when this provider accepts `effort:`; absent otherwise. */
   effortLevels?: readonly EffortRung[];
+  /** True when GET /api/providers/{id}/supported-models can ask the runtime for its models. */
+  listsModels: boolean;
 }
 
 /**

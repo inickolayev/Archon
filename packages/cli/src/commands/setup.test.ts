@@ -895,35 +895,34 @@ describe('checkPiModule', () => {
 
 describe('buildDefaultModelChoices (#1999)', () => {
   it('leads with "Keep SDK default" when no current model and ends with the free-text escape', () => {
-    const choices = buildDefaultModelChoices('claude', undefined);
+    const choices = buildDefaultModelChoices(undefined, []);
     expect(choices[0].value).toBe('__keep__');
     expect(choices[0].label).toBe('Keep SDK default');
     expect(choices[choices.length - 1].value).toBe('__custom__');
   });
 
   it('surfaces the current model in the keep option label on re-run', () => {
-    const choices = buildDefaultModelChoices('claude', 'opus');
+    const choices = buildDefaultModelChoices('opus', []);
     expect(choices[0].label).toBe('Keep current (opus)');
   });
 
-  it('includes the curated claude shortlist between keep and custom', () => {
-    const values = buildDefaultModelChoices('claude', undefined).map(c => c.value);
-    expect(values).toEqual(['__keep__', 'sonnet', 'opus', 'haiku', '__custom__']);
-  });
-
-  it('includes the curated codex shortlist', () => {
-    const values = buildDefaultModelChoices('codex', undefined).map(c => c.value);
-    expect(values).toEqual([
+  it("offers the runtime's models, in its order, between keep and custom", () => {
+    const choices = buildDefaultModelChoices(undefined, [
+      { id: 'claude-fable-5-1', displayName: 'Fable', description: 'Fable 5.1' },
+      { id: 'sonnet' },
+    ]);
+    expect(choices.map(c => c.value)).toEqual([
       '__keep__',
-      'gpt-5.6-sol',
-      'gpt-5.6-terra',
-      'gpt-5.6-luna',
+      'claude-fable-5-1',
+      'sonnet',
       '__custom__',
     ]);
+    expect(choices[1].hint).toBe('Fable · Fable 5.1');
+    expect(choices[2].hint).toBeUndefined();
   });
 
-  it('falls back to keep + custom only for providers without a curated list', () => {
-    const values = buildDefaultModelChoices('some-future-provider', undefined).map(c => c.value);
+  it('falls back to keep + custom only when the runtime reported nothing', () => {
+    const values = buildDefaultModelChoices(undefined, []).map(c => c.value);
     expect(values).toEqual(['__keep__', '__custom__']);
   });
 });

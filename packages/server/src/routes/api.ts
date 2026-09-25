@@ -354,6 +354,8 @@ import {
 import type { RunModelOverrides } from '@archon/workflows/model-validation';
 import {
   providerListResponseSchema,
+  providerIdParamsSchema,
+  providerModelListResponseSchema,
   piModelListResponseSchema,
   opencodeCredentialListResponseSchema,
 } from './schemas/provider.schemas';
@@ -385,6 +387,7 @@ import { mapDeviceFlowErrorToPollStatus } from './auth-poll-status';
 import {
   getProviderInfoList,
   isRegisteredProvider,
+  listProviderModels,
   listPiModels,
   introspectOpencodeCredentials,
 } from '@archon/providers';
@@ -1275,6 +1278,27 @@ const getProvidersRoute = createRoute({
       content: { 'application/json': { schema: providerListResponseSchema } },
       description: 'List of registered providers',
     },
+  },
+});
+
+const getProviderModelsRoute = createRoute({
+  method: 'get',
+  path: '/api/providers/{id}/supported-models',
+  tags: ['System'],
+  summary: "List the models a provider's runtime offers right now",
+  description:
+    "Asks the provider's own CLI/SDK (same binary and install credentials as " +
+    'runs), so newly shipped models appear without an Archon release. Answers ' +
+    'are cached for a few minutes; a failure is not cached. Only providers ' +
+    'with `listsModels: true` in GET /api/providers support it.',
+  request: { params: providerIdParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: providerModelListResponseSchema } },
+      description: 'Models reported by the runtime, in its own order',
+    },
+    404: jsonError('Unknown provider, or the provider has no live model catalog'),
+    503: jsonError('The provider runtime could not report its models'),
   },
 });
 
@@ -5169,6 +5193,25 @@ export function registerApiRoutes(
       getLog().warn({ err: error }, 'providers.pi_models_list_failed');
       return c.json({ models: [] });
     }
+  });
+
+  // GET /api/providers/:id/supported-models - live model catalog from the runtime
+  registerOpenApiRoute(getProviderModelsRoute, async c => {
+    const { id } = c.req.param();
+    if (!isRegisteredProvider(id)) return apiError(c, 404, `Unknown provider: ${id}`);
+    let models;
+    try {
+      const config = await loadConfig();
+      models = await listProviderModels(id, { ...(config.assistants[id] ?? {}) });
+    } catch (error) {
+      getLog().warn({ err: error, provider: id }, 'providers.models_list_failed');
+      // The runtime's own message (missing binary, not logged in, timeout) is
+      // what the operator needs to fix it; it carries no credentials.
+      const reason = error instanceof Error ? error.message : String(error);
+      return apiError(c, 503, `Could not list ${id} models`, reason);
+    }
+    if (models === null) return apiError(c, 404, `Provider ${id} has no live model catalog`);
+    return c.json({ models });
   });
 
   // GET /api/providers/opencode/credentials - OpenCode backend introspection

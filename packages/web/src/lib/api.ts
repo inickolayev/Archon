@@ -66,6 +66,8 @@ export interface ProviderInfo {
   capabilities: Partial<components['schemas']['ProviderCapabilities']>;
   builtIn: boolean;
   effortLevels?: components['schemas']['ProviderInfo']['effortLevels'];
+  /** Absent on the placeholder entries SettingsPage synthesizes for config-only providers. */
+  listsModels?: boolean;
 }
 
 export type ProviderDefaults = Record<string, unknown>;
@@ -76,6 +78,16 @@ export type UpdateAssistantConfigBody = components['schemas']['UpdateAssistantCo
 export async function listProviders(): Promise<ProviderInfo[]> {
   const data = await fetchJSON<{ providers: ProviderInfo[] }>('/api/providers');
   return data.providers;
+}
+
+export type ProviderModel = components['schemas']['ProviderModel'];
+
+/** The models a provider's runtime reports right now (spawns its CLI on a server cache miss). */
+export async function listProviderModels(providerId: string): Promise<ProviderModel[]> {
+  const data = await fetchJSON<components['schemas']['ProviderModelListResponse']>(
+    `/api/providers/${encodeURIComponent(providerId)}/supported-models`
+  );
+  return data.models;
 }
 
 // Web auth status (opt-in). Drives the login gate: when `enabled` is false the

@@ -6,6 +6,7 @@ import {
   getRegistration,
   getRegisteredProviders,
   getProviderInfoList,
+  listProviderModels,
   isRegisteredProvider,
   registerBuiltinProviders,
   registerCommunityProviders,
@@ -241,6 +242,61 @@ describe('registry', () => {
         expect(info).not.toHaveProperty('isModelCompatible');
       }
       expect(infos.find(info => info.id === 'codex')?.effortLevels).toBe(EFFORT_LADDER);
+    });
+
+    test('listsModels is derived from the registration having listModels', () => {
+      registerProvider(makeMockRegistration('no-catalog'));
+      const infos = getProviderInfoList();
+      expect(infos.find(info => info.id === 'claude')?.listsModels).toBe(true);
+      expect(infos.find(info => info.id === 'codex')?.listsModels).toBe(true);
+      expect(infos.find(info => info.id === 'no-catalog')?.listsModels).toBe(false);
+    });
+  });
+
+  describe('listProviderModels', () => {
+    test('returns null for a provider without a live catalog', async () => {
+      registerProvider(makeMockRegistration('no-catalog'));
+      expect(await listProviderModels('no-catalog', {})).toBeNull();
+    });
+
+    test('throws UnknownProviderError for an unregistered provider', async () => {
+      await expect(listProviderModels('nope', {})).rejects.toBeInstanceOf(UnknownProviderError);
+    });
+
+    test('passes the assistant config through and shares an answer across callers', async () => {
+      const seen: Record<string, unknown>[] = [];
+      registerProvider(
+        makeMockRegistration('live', {
+          listModels: async config => {
+            seen.push(config);
+            return [{ id: 'model-a' }];
+          },
+        })
+      );
+      const first = await listProviderModels('live', { binaryPath: '/x' });
+      const second = await listProviderModels('live', { binaryPath: '/x' });
+      expect(first).toEqual([{ id: 'model-a' }]);
+      expect(second).toEqual(first);
+      expect(seen).toEqual([{ binaryPath: '/x' }]);
+      // A different config (e.g. another binary) is a different runtime to ask.
+      await listProviderModels('live', { binaryPath: '/y' });
+      expect(seen).toHaveLength(2);
+    });
+
+    test('does not cache a failure, so a retry asks the runtime again', async () => {
+      let calls = 0;
+      registerProvider(
+        makeMockRegistration('flaky', {
+          listModels: async () => {
+            calls++;
+            if (calls === 1) throw new Error('not logged in');
+            return [{ id: 'model-a' }];
+          },
+        })
+      );
+      await expect(listProviderModels('flaky', {})).rejects.toThrow('not logged in');
+      expect(await listProviderModels('flaky', {})).toEqual([{ id: 'model-a' }]);
+      expect(calls).toBe(2);
     });
   });
 
