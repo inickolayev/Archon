@@ -1990,22 +1990,23 @@ branch refs/heads/feature/auth
       expect(resetCalls).toHaveLength(0);
     });
 
-    test('reset mode checks out the base branch at origin instead of moving the current one', async () => {
+    test('hard-resets working tree to origin in reset mode', async () => {
       execSpy.mockResolvedValue({ stdout: '', stderr: '' });
 
       await git.syncWorkspace(repo('/workspace/repo'), branch('main'), { mode: 'reset' });
 
-      const calls = execSpy.mock.calls.map((call: unknown[]) => call[1] as string[]);
-      expect(calls.filter(args => args.includes('reset'))).toHaveLength(0);
-      const checkoutCalls = calls.filter(args => args.includes('checkout'));
-      expect(checkoutCalls).toEqual([
-        ['-C', '/workspace/repo', 'checkout', '-f', '-B', 'main', 'origin/main'],
-      ]);
+      const resetCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('reset');
+      });
+
+      expect(resetCalls).toHaveLength(1);
+      expect(resetCalls[0][1]).toEqual(['-C', '/workspace/repo', 'reset', '--hard', 'origin/main']);
     });
 
     test('throws if reset mode fails after successful fetch', async () => {
       execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
-        if (args.includes('checkout')) {
+        if (args.includes('reset')) {
           throw new Error('fatal: Could not reset index file');
         }
         return { stdout: '', stderr: '' };
@@ -2370,7 +2371,7 @@ branch refs/heads/feature/auth
       );
     });
 
-    test('fetches and checks out the base from custom remote when provided in options', async () => {
+    test('fetches and resets from custom remote when provided in options', async () => {
       execSpy.mockResolvedValue({ stdout: '', stderr: '' });
 
       await git.syncWorkspace(repo('/workspace/repo'), branch('main'), {
@@ -2384,20 +2385,12 @@ branch refs/heads/feature/auth
         expect.any(Object)
       );
 
-      const checkoutCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+      const resetCalls = execSpy.mock.calls.filter((call: unknown[]) => {
         const args = call[1] as string[];
-        return args.includes('checkout');
+        return args.includes('reset');
       });
-      expect(checkoutCalls).toHaveLength(1);
-      expect(checkoutCalls[0][1]).toEqual([
-        '-C',
-        '/workspace/repo',
-        'checkout',
-        '-f',
-        '-B',
-        'main',
-        'mar/main',
-      ]);
+      expect(resetCalls).toHaveLength(1);
+      expect(resetCalls[0][1]).toEqual(['-C', '/workspace/repo', 'reset', '--hard', 'mar/main']);
     });
 
     test('classifies state against the custom remote ref in fast-forward mode', async () => {

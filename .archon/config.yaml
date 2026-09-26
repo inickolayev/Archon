@@ -1,7 +1,5 @@
 worktree:
-  # This fork's working branch. Upstream's `dev` lacks the fork's own work, so a run
-  # cut from it builds on code the operator no longer runs.
-  baseBranch: chesswin
+  baseBranch: dev
   # `git worktree add` carries tracked files only, so every gitignored runtime file is
   # absent from a fresh worktree. Agents work inside worktrees, so without this they
   # cannot start the server, run integration tests, or reproduce anything that reads

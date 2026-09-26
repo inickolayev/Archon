@@ -273,13 +273,11 @@ export async function syncWorkspace(
   }
 
   // Hard-reset local working tree to match the remote — only safe for Archon-managed
-  // clones, never for a user's local working directory. `checkout -f -B` rather than
-  // `reset --hard`: a reset moves whatever branch happens to be checked out, so a
-  // clone sitting on another branch had that branch silently repointed at the base.
+  // clones, never for a user's local working directory.
   try {
     await execFileAsync(
       'git',
-      ['-C', workspacePath, 'checkout', '-f', '-B', branchToSync, `${remote}/${branchToSync}`],
+      ['-C', workspacePath, 'reset', '--hard', `${remote}/${branchToSync}`],
       {
         timeout: 30000,
       }
