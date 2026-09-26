@@ -61,6 +61,8 @@ curl http://localhost:3090/api/health
 | GET | `/api/conversations/{id}` | Get a single conversation |
 | POST | `/api/conversations` | Create a new conversation |
 | PATCH | `/api/conversations/{id}` | Update a conversation (rename) |
+| GET | `/api/conversations/{id}/model` | The provider/model the next chat turn in this conversation runs on |
+| PUT | `/api/conversations/{id}/model` | Pin (or, with `model: null`, clear) this conversation's chat model — `400` if the provider rejects the id, `503` if its live model list can't be read |
 | DELETE | `/api/conversations/{id}` | Soft-delete a conversation |
 | GET | `/api/conversations/{id}/messages` | List messages in a conversation |
 | POST | `/api/conversations/{id}/message` | Send a message to a conversation |

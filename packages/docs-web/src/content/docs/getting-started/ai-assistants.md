@@ -813,6 +813,17 @@ When you're logged in (a web identity resolves), the **Model Tiers** and **Model
 
 If a chat asks for the `large` tier and only a different tier is configured, Archon uses the nearest preset and posts a one-line notice telling you which tier answered and where to set `large`.
 
+### Pinning a conversation's chat model
+
+Any conversation can pin its own chat model, on top of your personal default. In the
+console, the chat header's model combo edits it directly; on Telegram, **☰ Menu →
+Model** (or `/model`) does the same — see [the Telegram adapter page](/adapters/telegram/#choosing-the-chat-model)
+for the exact flow. The pin is a literal model id for the conversation's own AI
+assistant type, validated against the provider's live model list when it has one, and
+it applies only when that conversation's own provider is the one actually in effect —
+if your personal default provider is a different one, the chat runs on that instead and
+the pin is stored but not applied (both surfaces say so).
+
 ### Connecting from the CLI
 
 The same actions are available headless via [`archon ai`](/reference/cli/#ai):
@@ -838,7 +849,7 @@ archon ai default codex --scope user
 archon ai default pi openrouter/minimax/minimax-m2 --scope user
 ```
 
-**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: your `default_model` pin (only when your default provider matches the effective provider) → the configured `large` tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when no `large` tier is configured anywhere) → the built-in tier default (claude and codex only — other providers have none). Workflow nodes are unaffected — `model: large` keeps meaning the tier.
+**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: the conversation's own model pin (only when the conversation's provider is the effective one) → your `default_model` pin (only when your default provider matches the effective provider) → the configured `large` tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when no `large` tier is configured anywhere) → the built-in tier default (claude and codex only — other providers have none). Workflow nodes are unaffected — `model: large` keeps meaning the tier.
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
 
