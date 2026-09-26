@@ -23,6 +23,7 @@ import {
   createWorkflowRun,
   getWorkflowRun,
   getWorkflowRunStatus,
+  findWorkflowRunsByIdPrefix,
   getActiveWorkflowRun,
   getActiveWorkflowRunByPath,
   updateWorkflowRun,
@@ -405,6 +406,24 @@ describe('workflows database', () => {
       await expect(getWorkflowRunStatus('test-id')).rejects.toThrow(
         'Failed to get workflow run status: Connection refused'
       );
+    });
+  });
+
+  describe('findWorkflowRunsByIdPrefix', () => {
+    test('matches the prefix against the id as text, which PostgreSQL uuid requires', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await findWorkflowRunsByIdPrefix('4cbeae13', 'codebase-1');
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'SELECT * FROM remote_agent_workflow_runs WHERE codebase_id = $1 AND CAST(id AS TEXT) LIKE $2 LIMIT 2',
+        ['codebase-1', '4cbeae13%']
+      );
+    });
+
+    test('rejects a prefix outside the uuid charset without querying', async () => {
+      expect(await findWorkflowRunsByIdPrefix('4cb%', 'codebase-1')).toEqual([]);
+      expect(mockQuery).not.toHaveBeenCalled();
     });
   });
 
