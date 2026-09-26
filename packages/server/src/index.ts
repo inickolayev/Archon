@@ -117,6 +117,8 @@ import {
   commandForLabel,
   createTelegramChatStore,
   handleTelegramCallback,
+  createChatModelControls,
+  type ChatModelControls,
   isStopCommand,
   persistInboundMessage,
   STOP_COMMAND,
@@ -992,6 +994,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // the lists it opens are edited in place rather than re-sent.
     telegramAdapter.onCallback(async ({ data, chatId, userId: telegramUserId }) => {
       const store = createTelegramChatStore();
+      // Only a model tap pays for these lookups. The conversation is the chat's
+      // active one — where the next message would go — and the tapper is who
+      // the model is shown for, since the next turn from here runs as its sender.
+      const chatModelControls = async (): Promise<ChatModelControls> =>
+        createChatModelControls(
+          await resolveActiveTelegramConversationId(chatId),
+          await resolveUserId('telegram', telegramUserId, undefined)
+        );
       return handleTelegramCallback({
         data,
         chatId,
@@ -1016,6 +1026,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         },
         stopTurn: async () =>
           (await stopActiveTurn(chatId)) ? STOP_REQUESTED_NOTICE : NOTHING_RUNNING_NOTICE,
+        chatModel: {
+          describe: async () => (await chatModelControls()).describe(),
+          pin: async model => (await chatModelControls()).pin(model),
+        },
       });
     });
 
@@ -1111,7 +1125,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           id => telegramAdapter.statusTransport(id),
           conversationId
         );
-        const deliverTo = withTurnStatus(mirrored, turnStatus);
+        const deliverTo = withTurnStatus(mirrored, turnStatus, () =>
+          createTurnStatus(id => telegramAdapter.statusTransport(id), conversationId)
+        );
 
         // A voice note is the one message whose wait begins before its turn
         // does: the recording is fetched and recognised HERE, ahead of the

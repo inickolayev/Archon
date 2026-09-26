@@ -64,6 +64,10 @@ import {
   setUserTiers,
   setUserAliases,
   setUserDefault,
+  setChatModelOverride,
+  resolveEffectiveChatModel,
+  InvalidModelOverrideError,
+  ModelOverrideCatalogUnavailableError,
 } from '@archon/core';
 import type { UserTiersPatch, UserAliasesPatch, AliasesPatch } from '@archon/core';
 import { isTelegramConversationId } from '@archon/core';
@@ -320,6 +324,8 @@ import {
   createConversationBodySchema,
   createConversationResponseSchema,
   updateConversationBodySchema,
+  conversationChatModelSchema,
+  updateConversationChatModelBodySchema,
   successResponseSchema,
   messageListResponseSchema,
   listMessagesQuerySchema,
@@ -645,6 +651,50 @@ const updateConversationRoute = createRoute({
     400: jsonError('Bad request'),
     404: jsonError('Not found'),
     500: jsonError('Server error'),
+  },
+});
+
+const getConversationChatModelRoute = createRoute({
+  method: 'get',
+  path: '/api/conversations/{id}/model',
+  tags: ['Conversations'],
+  summary: 'Which provider and model the next chat turn in a conversation runs on',
+  request: { params: conversationIdParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: conversationChatModelSchema } },
+      description: 'Effective chat model',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const updateConversationChatModelRoute = createRoute({
+  method: 'put',
+  path: '/api/conversations/{id}/model',
+  tags: ['Conversations'],
+  summary: "Pin (or, with null, clear) the conversation's chat model",
+  description:
+    "The model must be a model id for the conversation's own provider. Where the provider " +
+    'lists its models live, the id must be one of them (400 otherwise, 503 when the list ' +
+    'cannot be read); elsewhere any id is accepted. Answers with the new effective model.',
+  request: {
+    params: conversationIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: updateConversationChatModelBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: conversationChatModelSchema } },
+      description: 'Effective chat model after the change',
+    },
+    400: jsonError('Not a model the provider accepts'),
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+    503: jsonError('Provider model list unavailable'),
   },
 });
 
@@ -2928,6 +2978,44 @@ export function registerApiRoutes(
       }
       getLog().error({ err: error }, 'update_conversation_failed');
       return apiError(c, 500, 'Failed to update conversation');
+    }
+  });
+
+  // GET /api/conversations/:id/model - Effective chat model
+  registerOpenApiRoute(getConversationChatModelRoute, async c => {
+    const platformId = c.req.param('id') ?? '';
+    try {
+      const conv = await conversationDb.findConversationByPlatformId(platformId);
+      if (!conv) return apiError(c, 404, 'Conversation not found');
+      return c.json(await resolveEffectiveChatModel(conv.id, await resolveWebUserId(c)));
+    } catch (error) {
+      getLog().error({ err: error, platformId }, 'get_conversation_chat_model_failed');
+      return apiError(c, 500, 'Failed to resolve the chat model');
+    }
+  });
+
+  // PUT /api/conversations/:id/model - Pin or clear the chat model
+  registerOpenApiRoute(updateConversationChatModelRoute, async c => {
+    const platformId = c.req.param('id') ?? '';
+    const { model } = getValidatedBody(c, updateConversationChatModelBodySchema);
+    try {
+      const conv = await conversationDb.findConversationByPlatformId(platformId);
+      if (!conv) return apiError(c, 404, 'Conversation not found');
+      await setChatModelOverride(conv.id, model);
+      return c.json(await resolveEffectiveChatModel(conv.id, await resolveWebUserId(c)));
+    } catch (error) {
+      if (error instanceof ConversationNotFoundError) {
+        return apiError(c, 404, 'Conversation not found');
+      }
+      if (error instanceof InvalidModelOverrideError) {
+        return apiError(c, 400, error.message);
+      }
+      if (error instanceof ModelOverrideCatalogUnavailableError) {
+        getLog().warn({ err: error, platformId }, 'conversation_chat_model_catalog_unavailable');
+        return apiError(c, 503, `Could not list ${error.provider} models`, error.reason);
+      }
+      getLog().error({ err: error, platformId }, 'update_conversation_chat_model_failed');
+      return apiError(c, 500, 'Failed to update the chat model');
     }
   });
 

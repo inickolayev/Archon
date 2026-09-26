@@ -21,7 +21,17 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
+/**
+ * Map an engine event to its SSE frame (or null to skip).
+ *
+ * `workflowName` is supplied by a bridge that knows which run it follows —
+ * node events do not carry it, and looking it up per event would cost a query
+ * for a name the dispatcher already had.
+ */
+export function mapWorkflowEvent(
+  event: WorkflowEmitterEvent,
+  workflowName?: string
+): string | null {
   switch (event.type) {
     case 'workflow_started':
     case 'workflow_completed':
@@ -119,6 +129,15 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
           event.type === 'node_skipped' && event.reason !== 'prior_success'
             ? event.cause
             : undefined,
+        ...(event.type === 'node_started'
+          ? {
+              provider: event.provider,
+              model: event.model,
+              tier: event.tier,
+              effort: event.effort,
+            }
+          : {}),
+        workflowName,
         timestamp: Date.now(),
       };
       return JSON.stringify(payload);
@@ -416,13 +435,17 @@ export class WorkflowEventBridge {
    * Bridge workflow events from a worker conversation to a parent conversation's SSE stream.
    * Forwards compact progress events (step progress, status) and output previews.
    */
-  bridgeWorkerEvents(workerConversationId: string, parentConversationId: string): () => void {
+  bridgeWorkerEvents(
+    workerConversationId: string,
+    parentConversationId: string,
+    workflowName: string
+  ): () => void {
     const emitter = getWorkflowEventEmitter();
 
     const unsubscribe = emitter.subscribeForConversation(
       workerConversationId,
       (event: WorkflowEmitterEvent) => {
-        const sseEvent = mapWorkflowEvent(event);
+        const sseEvent = mapWorkflowEvent(event, workflowName);
         if (sseEvent) {
           // Send to parent's stream (not worker's)
           this.transport.emitWorkflowEvent(parentConversationId, sseEvent);

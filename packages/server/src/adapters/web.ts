@@ -215,6 +215,13 @@ export class WebAdapter implements IWebPlatformAdapter {
         workflowName: chunk.workflowName,
         timestamp: Date.now(),
       });
+    } else if (chunk.type === 'model_info') {
+      event = JSON.stringify({
+        type: 'model_info',
+        provider: chunk.provider,
+        ...(chunk.model !== undefined ? { model: chunk.model } : {}),
+        timestamp: Date.now(),
+      });
     } else if (chunk.type === 'system') {
       event = JSON.stringify({
         type: 'system_status',
@@ -323,8 +330,16 @@ export class WebAdapter implements IWebPlatformAdapter {
    * Bridge workflow events from a worker conversation to a parent conversation's SSE stream.
    * Forwards compact progress events (step progress, status) and output previews.
    */
-  setupEventBridge(workerConversationId: string, parentConversationId: string): () => void {
-    return this.workflowBridge.bridgeWorkerEvents(workerConversationId, parentConversationId);
+  setupEventBridge(
+    workerConversationId: string,
+    parentConversationId: string,
+    workflowName: string
+  ): () => void {
+    return this.workflowBridge.bridgeWorkerEvents(
+      workerConversationId,
+      parentConversationId,
+      workflowName
+    );
   }
 
   registerOutputCallback(conversationId: string, callback: (text: string) => void): void {

@@ -650,7 +650,7 @@ describe('TelegramAdapter', () => {
       const { commandsPublished } = await startCapturing();
       await new Promise(resolve => setTimeout(resolve, 5));
       const published = commandsPublished[0] as { command: string }[] | undefined;
-      expect(published?.map(c => c.command)).toEqual(['start', 'help', 'menu', 'stop']);
+      expect(published?.map(c => c.command)).toEqual(['start', 'help', 'menu', 'stop', 'model']);
     });
 
     test('a tap edits the message in place and answers the query', async () => {

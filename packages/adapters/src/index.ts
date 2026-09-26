@@ -7,7 +7,7 @@ export type {
   TelegramIncomingFile,
   TelegramMessageContext,
 } from './chat/telegram';
-export { TurnStatus, describeTool } from './chat/telegram';
+export { TurnStatus, describeTool, describeWorkflowNode, formatModelLabel } from './chat/telegram';
 export type { StatusTransport, TurnStatusOptions } from './chat/telegram';
 export { SlackAdapter, SlackWorkflowBridge } from './chat/slack';
 

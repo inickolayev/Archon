@@ -371,3 +371,47 @@ describe('TurnStatus, on a dictated message', () => {
     expect(transport.edited).toHaveLength(0);
   });
 });
+
+describe('TurnStatus model label', () => {
+  test('a model named before the line opens rides on the first send', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.showModel('claude · opus');
+    expect(transport.sent).toEqual([]); // a label alone opens nothing
+    status.begin();
+    await tick(THROTTLE_MS * 2);
+
+    expect(transport.sent).toEqual([`${STATUS_THINKING}\nclaude · opus`]);
+    await status.clear();
+  });
+
+  test('a model named after the line opens is an edit under the same activity', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.begin();
+    await tick(5);
+    status.showModel('claude · opus');
+    await tick(THROTTLE_MS * 2);
+
+    expect(transport.sent).toEqual([STATUS_THINKING]);
+    expect(transport.edited.map(e => e.text)).toEqual([`${STATUS_THINKING}\nclaude · opus`]);
+    await status.clear();
+  });
+
+  test('steps replace the activity and keep the model; the same label twice costs nothing', async () => {
+    const transport = new FakeTransport();
+    const status = statusOver(transport);
+
+    status.showModel('codex');
+    status.begin();
+    await tick(5);
+    status.step('⏳ Reading a.ts…');
+    status.showModel('codex');
+    await tick(THROTTLE_MS * 2);
+
+    expect(transport.edited.map(e => e.text)).toEqual(['⏳ Reading a.ts…\ncodex']);
+    await status.clear();
+  });
+});

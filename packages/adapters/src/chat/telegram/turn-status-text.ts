@@ -169,3 +169,25 @@ export function describeTool(toolName: string, toolInput?: Record<string, unknow
       return STATUS_WORKING;
   }
 }
+
+/**
+ * Which provider and model the work runs on — `claude · opus`, or just the
+ * provider when its own default applies. Shown on its own line under the
+ * activity, so it reads as a fact about the whole turn rather than one step.
+ * A model id is configuration, not a path, and this line never passes through
+ * Markdown, so the id is shown as the provider reported it.
+ */
+export function formatModelLabel(provider: string, model?: string): string {
+  return model === undefined ? provider : `${provider} · ${model}`;
+}
+
+/**
+ * A workflow dispatched from this chat, and the node it is on.
+ *
+ * Node names are the workflow author's ids (`lint`, `implement`) — chosen
+ * words, never input values — so they are safe to show as they are.
+ */
+export function describeWorkflowNode(workflowName: string, nodeName?: string): string {
+  const running = `Running workflow ${workflowName}`;
+  return working(nodeName === undefined ? running : `${running} (node: ${nodeName})`);
+}

@@ -93,7 +93,6 @@ import { getDecryptedAccessToken } from '../db/user-github-token-store';
 import { isPerUserProviderKeysEnabled } from '../credentials/config';
 import { deliverCredential } from '../credentials/delivery';
 import { listDecryptedUserProviderCredentials } from '../db/user-provider-key-store';
-import { getUserAiPrefs, type UserAiPrefs } from '../db/user-ai-prefs-store';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import { resolveWorkflowAdoption, WorkflowAdoptionError } from '../operations/workflow-adoption';
@@ -115,15 +114,16 @@ import * as messageDb from '../db/messages';
 import * as workflowDb from '../db/workflows';
 import { getCodebaseEnvVars } from '../db/env-vars';
 import {
+  resolveChatTurnModel,
+  resolveModelRequest,
+  resolveUserAiPrefsForChat,
+} from './chat-model-resolution';
+import { createChatModelControls } from './chat-model-override';
+import {
   buildAiProfile,
-  isLiteralSpec,
-  isTierName,
-  resolveModelSpec,
-  resolveTierWithFallback,
   resolvePresetEffort,
   type ModelAliasPreset,
   type RunModelOverrides,
-  type TierName,
 } from '@archon/workflows/model-validation';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -164,83 +164,6 @@ function applyPresetToRequestOptions(
     return;
   }
   options.nodeConfig = { ...(options.nodeConfig ?? {}), effort: preset.effort };
-}
-
-interface ResolvedModelRequest {
-  provider: string;
-  model: string | undefined;
-  preset?: ModelAliasPreset;
-  /** When `modelRef` was a tier: which tier in the fallback chain matched. */
-  matchedTier?: TierName;
-}
-
-function resolveModelRequest(
-  aiProfile: ReturnType<typeof buildAiProfile>,
-  modelRef: string,
-  fallbackProvider: string
-): ResolvedModelRequest {
-  if (isTierName(modelRef)) {
-    const { preset, matchedTier } = resolveTierWithFallback(aiProfile, modelRef);
-    return { provider: preset.provider, model: preset.model, preset, matchedTier };
-  }
-  const spec = resolveModelSpec(aiProfile, modelRef);
-  if (isLiteralSpec(spec)) {
-    return { provider: fallbackProvider, model: spec.literal };
-  }
-  return { provider: spec.provider, model: spec.model, preset: spec };
-}
-
-/**
- * Resolve the model request for the MAIN chat turn (#1998).
- *
- * Model precedence (chat call-site only — workflows keep resolving `large`):
- *   1. per-user `default_model` — applied only when the user's
- *      `default_provider` matches the effective provider (a stale pin must
- *      never ride a different provider). Routed through resolveModelRequest so
- *      `@alias` and tier refs keep working; an unresolvable ref (e.g. deleted
- *      alias) degrades to the tier path with a warning instead of failing chat.
- *   2. tier `large` from CONFIGURED tiers (user > repo > global).
- *   3. install `assistants.<p>.model` — outranks the BUILT-IN tier default
- *      only, never a configured tier ('inherit' means "SDK default", skip).
- *   4. built-in tier default.
- *
- * Title generation is NOT routed through this — it keeps the `small` tier.
- * With no user prefs and no `assistants.<p>.model`, this reduces byte-for-byte
- * to the previous `resolveModelRequest(aiProfile, 'large', provider)` call.
- * Exported for tests.
- */
-export function resolveChatModelRequest(
-  aiProfile: ReturnType<typeof buildAiProfile>,
-  configuredProviderKey: string,
-  userAiPrefs: UserAiPrefs,
-  config: Pick<MergedConfig, 'assistants' | 'tiers'>
-): ResolvedModelRequest {
-  if (
-    userAiPrefs.defaultModel !== undefined &&
-    userAiPrefs.defaultProvider === configuredProviderKey
-  ) {
-    try {
-      return resolveModelRequest(aiProfile, userAiPrefs.defaultModel, configuredProviderKey);
-    } catch (err) {
-      getLog().warn(
-        { err: err as Error, defaultModel: userAiPrefs.defaultModel },
-        'orchestrator.user_default_model_invalid'
-      );
-    }
-  }
-  const request = resolveModelRequest(aiProfile, 'large', configuredProviderKey);
-  if (request.matchedTier === undefined) return request;
-
-  const tierConfigured =
-    config.tiers?.[request.matchedTier] !== undefined ||
-    userAiPrefs.tiers?.[request.matchedTier] !== undefined;
-  if (tierConfigured) return request;
-
-  const installModel = config.assistants[request.provider]?.model;
-  if (typeof installModel === 'string' && installModel !== '' && installModel !== 'inherit') {
-    return { ...request, model: installModel };
-  }
-  return request;
 }
 
 /** A resolved title-generation request: which provider to call, with fully resolved options. */
@@ -462,23 +385,6 @@ async function resolveUserProviderEnvForChat(userId: string): Promise<Record<str
  * state — a server restart re-nudging once per conversation is acceptable.
  */
 const tierFallbackNudgedConversations = new Set<string>();
-
-/**
- * Resolve the user's personal AI prefs (tiers / aliases / default assistant)
- * for a direct-chat turn (Phase 3). Folded into `buildAiProfile` as the
- * highest-precedence layer.
- *
- * NEVER THROWS — returns `{}` on any failure so model resolution falls back
- * to install-wide config exactly as before.
- */
-async function resolveUserAiPrefsForChat(userId: string): Promise<UserAiPrefs> {
-  try {
-    return await getUserAiPrefs(userId);
-  } catch (err) {
-    getLog().warn({ err: err as Error, userId }, 'orchestrator.user_ai_prefs_resolve_failed');
-    return {};
-  }
-}
 
 /**
  * Find a codebase by exact name or by last path segment (e.g., "repo" matches "owner/repo").
@@ -2185,6 +2091,7 @@ export async function handleMessage(
             store,
             runChatCommand: (chatCommand, chatArgs) =>
               handleTelegramChatCommand({ command: chatCommand, args: chatArgs, chatId, store }),
+            chatModel: createChatModelControls(conversationId, userId),
           });
           if (reply !== null) {
             // `/start` and `/menu` read nothing after themselves, and a
@@ -2561,39 +2468,11 @@ export async function handleMessage(
         'orchestrator.execution_identity_creator_fallback'
       );
     }
-    // Per-user AI prefs (Phase 3): the user's tiers/aliases/default-assistant
-    // override install config (highest precedence). `{}` (no identity, no row,
-    // or DB failure) keeps config-only behavior byte-for-byte.
-    const userAiPrefs = executionUserId ? await resolveUserAiPrefsForChat(executionUserId) : {};
-    let configuredProviderKey = userAiPrefs.defaultProvider ?? conversation.ai_assistant_type;
-    let aiProfile: ReturnType<typeof buildAiProfile>;
-    try {
-      aiProfile = buildAiProfile(configuredProviderKey, {
-        repoTiers: config.tiers,
-        repoAliases: config.aliases,
-        userTiers: userAiPrefs.tiers,
-        userAliases: userAiPrefs.aliases,
-      });
-    } catch (profileErr) {
-      // Structurally invalid STORED prefs (corrupt DB row) must not break the
-      // user's chat — degrade to config-only. A broken config layer still
-      // fails fast: the rebuild rethrows the same error.
-      getLog().error(
-        { err: profileErr as Error, userId: executionUserId },
-        'orchestrator.user_ai_prefs_profile_invalid'
-      );
-      configuredProviderKey = conversation.ai_assistant_type;
-      aiProfile = buildAiProfile(configuredProviderKey, {
-        repoTiers: config.tiers,
-        repoAliases: config.aliases,
-      });
-    }
-    // Main chat model: per-user default_model > configured `large` tier >
-    // install assistants.<p>.model > built-in tier default (#1998).
-    const chatRequest = resolveChatModelRequest(aiProfile, configuredProviderKey, userAiPrefs, {
-      assistants: config.assistants,
-      tiers: config.tiers,
-    });
+    const { chatRequest, aiProfile, configuredProviderKey } = await resolveChatTurnModel(
+      conversation,
+      executionUserId,
+      config
+    );
     // Tier-fallback nudge (mirrors dag.model_provider_conflict): chat asks for
     // 'large'; when that tier is unset and a sibling preset answered, tell the
     // user ONCE PER CONVERSATION, non-blocking — the dedup Set below is what
@@ -2802,6 +2681,21 @@ export async function handleMessage(
           },
         }),
       ];
+    }
+
+    // Which provider and model this turn runs on, from the very options handed
+    // to the provider — the surfaces display it, so it must be what is sent.
+    // A decoration: failing to deliver it must never fail the turn.
+    if (platform.sendStructuredEvent) {
+      await platform
+        .sendStructuredEvent(conversationId, {
+          type: 'model_info',
+          provider: providerKey,
+          ...(requestOptions.model !== undefined ? { model: requestOptions.model } : {}),
+        })
+        .catch((err: unknown) => {
+          getLog().warn({ err: toError(err), conversationId }, 'orchestrator.model_info_failed');
+        });
     }
 
     const mode = platform.getStreamingMode();

@@ -478,6 +478,8 @@ describe('SqliteAdapter', () => {
       const conversationCols = raw_pragma(dbPath, 'remote_agent_conversations');
       expect(conversationCols).toContain('hidden');
       expect(conversationCols).toContain('deleted_at');
+      // Additive, nullable: a pre-existing conversation carries no pin.
+      expect(conversationCols).toContain('model_override');
 
       const workflowRunCols = raw_pragma(dbPath, 'remote_agent_workflow_runs');
       expect(workflowRunCols).toContain('parent_conversation_id');

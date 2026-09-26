@@ -3,6 +3,8 @@ import { useState, type ReactElement } from 'react';
 interface WorkingIndicatorProps {
   /** Latest tool/activity name for the current turn, if any. */
   activity?: string | null;
+  /** Which provider and model the turn runs on (`claude · opus`), once the turn says. */
+  model?: string | null;
   /** Whether the inline tool trace is currently revealed. */
   expanded: boolean;
   onToggle: () => void;
@@ -27,6 +29,7 @@ interface WorkingIndicatorProps {
  */
 export function WorkingIndicator({
   activity,
+  model,
   expanded,
   onToggle,
   onStop,
@@ -50,6 +53,11 @@ export function WorkingIndicator({
           }}
         />
         <span className="font-medium">Agent is working</span>
+        {model !== null && model !== undefined && model !== '' ? (
+          <span className="font-mono text-[11px] text-text-secondary" title="Provider · model">
+            · {model}
+          </span>
+        ) : null}
         {activity !== null && activity !== undefined && activity !== '' ? (
           <span className="font-mono text-[11px] text-text-tertiary">· {activity}</span>
         ) : null}

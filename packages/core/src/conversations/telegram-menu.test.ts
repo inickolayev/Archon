@@ -14,6 +14,7 @@ import {
   isMenuCommand,
   isStopCommand,
   parseAction,
+  buildModelMenu,
   STOP_COMMAND,
 } from './telegram-menu';
 import {
@@ -21,6 +22,11 @@ import {
   type TelegramChatRow,
   type TelegramChatStore,
 } from './telegram-chats';
+import type {
+  ChatModelChoices,
+  ChatModelControls,
+  ChatModelPinOutcome,
+} from '../orchestrator/chat-model-override';
 
 const CHAT = '123456789';
 
@@ -66,7 +72,13 @@ function fakeStore(initial: TelegramChatRow[]): TelegramChatStore & {
 
 describe('advertised commands', () => {
   test('only the few worth typing are published to Telegram', () => {
-    expect(ADVERTISED_COMMANDS.map(c => c.command)).toEqual(['start', 'help', 'menu', 'stop']);
+    expect(ADVERTISED_COMMANDS.map(c => c.command)).toEqual([
+      'start',
+      'help',
+      'menu',
+      'stop',
+      'model',
+    ]);
   });
 
   test('start and menu are handled as menu commands', () => {
@@ -176,7 +188,14 @@ describe('keyboards', () => {
 
   test('the main menu offers both lists and keeps the persistent keyboard', () => {
     const menu = buildMainMenu();
-    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual(['l:c', 'l:p', 'n', 'x', 'lk']);
+    expect(menu.keyboard.inline?.flat().map(b => b.action)).toEqual([
+      'l:c',
+      'l:p',
+      'n',
+      'x',
+      'mo',
+      'lk',
+    ]);
     expect(menu.keyboard.persistent?.flat()).toEqual(['☰ Menu', '⏹ Stop']);
   });
 
@@ -492,6 +511,7 @@ describe('the menu is one tap away', () => {
       'Projects',
       '+ New chat',
       '⏹ Stop the agent',
+      'Model',
       'Link this chat to my account',
     ]);
     expect(reply?.keyboard?.persistent?.flat()).toContain('☰ Menu');
@@ -628,5 +648,157 @@ describe('a new chat is a new chat, not a new context', () => {
     // Points at itself — there is no earlier conversation, and the DB layer
     // finds nothing to copy rather than inventing a parent.
     expect(store.inherited).toEqual([CHAT]);
+  });
+});
+
+describe('picking the chat model', () => {
+  const state = (over: Partial<ChatModelChoices['effective']> = {}): ChatModelChoices => ({
+    effective: {
+      provider: 'claude',
+      model: 'claude-opus-4-7',
+      override: null,
+      conversationProvider: 'claude',
+      ...over,
+    },
+    choices: ['claude-opus-4-7', 'claude-haiku-4-5'],
+  });
+
+  /** Controls that record pins and answer with a fixed screen state. */
+  function fakeControls(
+    current: ChatModelChoices | null,
+    outcome: ChatModelPinOutcome = { ok: true }
+  ): ChatModelControls & { pins: (string | null)[] } {
+    const pins: (string | null)[] = [];
+    return {
+      pins,
+      describe: async () => current,
+      pin: async model => {
+        pins.push(model);
+        return outcome;
+      },
+    };
+  }
+
+  const labels = (menu: { keyboard?: { inline?: readonly (readonly { label: string }[])[] } }) =>
+    menu.keyboard?.inline?.flat().map(b => b.label) ?? [];
+
+  test('the screen names the model in effect and offers the live list, the pin marked', () => {
+    const menu = buildModelMenu(state({ override: 'claude-haiku-4-5', model: 'claude-haiku-4-5' }));
+
+    expect(menu.text).toContain('claude · claude-haiku-4-5');
+    expect(menu.text).toContain('Pinned: claude-haiku-4-5');
+    expect(labels(menu)).toEqual([
+      'claude-opus-4-7',
+      '✓ claude-haiku-4-5',
+      'Reset to default',
+      '☰ Menu',
+    ]);
+  });
+
+  test('no reset button when nothing is pinned', () => {
+    expect(labels(buildModelMenu(state()))).not.toContain('Reset to default');
+  });
+
+  test('a pin that another provider outranks is shown as not in effect', () => {
+    const menu = buildModelMenu(
+      state({ provider: 'codex', model: 'gpt-5.5', override: 'claude-haiku-4-5' })
+    );
+    expect(menu.text).toContain('not in effect');
+  });
+
+  test('an id too long for a button is counted, not dropped in silence', () => {
+    const long = `claude-${'x'.repeat(70)}`;
+    const menu = buildModelMenu({ ...state(), choices: ['claude-opus-4-7', long] });
+
+    expect(labels(menu)).not.toContain(long);
+    expect(menu.text).toContain('1 model id(s) are too long');
+    for (const button of menu.keyboard.inline?.flat() ?? []) {
+      expect(Buffer.byteLength(button.action, 'utf8')).toBeLessThanOrEqual(64);
+    }
+  });
+
+  test('a provider without a live list is told to type the id', () => {
+    const menu = buildModelMenu({ ...state(), choices: null });
+    expect(menu.text).toContain('/model <model id>');
+  });
+
+  test('the model tokens round-trip', () => {
+    expect(parseAction(encodeAction({ kind: 'model' }))).toEqual({ kind: 'model' });
+    expect(parseAction(encodeAction({ kind: 'model-reset' }))).toEqual({ kind: 'model-reset' });
+    expect(parseAction(encodeAction({ kind: 'model-pick', model: 'claude-haiku-4-5' }))).toEqual({
+      kind: 'model-pick',
+      model: 'claude-haiku-4-5',
+    });
+    expect(parseAction('md:')).toBeNull();
+  });
+
+  test('tapping a model pins it and confirms', async () => {
+    const controls = fakeControls(state({ override: 'claude-haiku-4-5' }));
+    const reply = await handleTelegramCallback({
+      data: encodeAction({ kind: 'model-pick', model: 'claude-haiku-4-5' }),
+      chatId: CHAT,
+      store: fakeStore([]),
+      chatModel: controls,
+    });
+
+    expect(controls.pins).toEqual(['claude-haiku-4-5']);
+    expect(reply?.text).toContain('Pinned claude-haiku-4-5');
+    expect(reply?.toast).toBe('Model set');
+  });
+
+  test('reset clears the pin', async () => {
+    const controls = fakeControls(state());
+    const reply = await handleTelegramCallback({
+      data: encodeAction({ kind: 'model-reset' }),
+      chatId: CHAT,
+      store: fakeStore([]),
+      chatModel: controls,
+    });
+
+    expect(controls.pins).toEqual([null]);
+    expect(reply?.toast).toBe('Reset');
+  });
+
+  test('a refused pin is shown, not swallowed', async () => {
+    const controls = fakeControls(state(), {
+      ok: false,
+      message: 'Could not check the claude model list: claude binary not found',
+    });
+    const reply = await handleTelegramCallback({
+      data: encodeAction({ kind: 'model-pick', model: 'claude-haiku-4-5' }),
+      chatId: CHAT,
+      store: fakeStore([]),
+      chatModel: controls,
+    });
+
+    expect(reply?.text).toContain('Not changed: Could not check the claude model list');
+    expect(reply?.toast).toBe('Not changed');
+  });
+
+  test('/model shows the screen; /model <id> pins it', async () => {
+    const controls = fakeControls(state());
+    const base = { chatId: CHAT, store: fakeStore([]), runChatCommand: async () => '' };
+
+    const shown = await handleTelegramMenuCommand({
+      ...base,
+      command: 'model',
+      args: [],
+      chatModel: controls,
+    });
+    expect(shown?.text).toContain('This chat runs on claude · claude-opus-4-7');
+    expect(controls.pins).toEqual([]);
+
+    await handleTelegramMenuCommand({
+      ...base,
+      command: 'model',
+      args: ['anthropic/claude-haiku-4-5'],
+      chatModel: controls,
+    });
+    expect(controls.pins).toEqual(['anthropic/claude-haiku-4-5']);
+  });
+
+  test('a build without model controls says so instead of failing', async () => {
+    const reply = await handleTelegramCallback({ data: 'mo', chatId: CHAT, store: fakeStore([]) });
+    expect(reply?.text).toContain('not available');
   });
 });

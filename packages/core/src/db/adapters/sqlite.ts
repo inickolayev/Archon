@@ -336,6 +336,9 @@ export class SqliteAdapter implements IDatabase {
           'ALTER TABLE remote_agent_conversations ADD COLUMN user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL'
         );
       }
+      if (!colNames.has('model_override')) {
+        this.db.run('ALTER TABLE remote_agent_conversations ADD COLUMN model_override TEXT');
+      }
       // Indexes must be created here, not in createSchema(): these columns don't
       // exist on older databases until the ALTER TABLE statements above run, and
       // CREATE INDEX on a missing column aborts the entire createSchema()
@@ -702,6 +705,7 @@ export class SqliteAdapter implements IDatabase {
         deleted_at TEXT,
         hidden INTEGER DEFAULT 0,
         user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL,
+        model_override TEXT,
         created_at TEXT DEFAULT (datetime('now')),
         updated_at TEXT DEFAULT (datetime('now')),
         last_activity_at TEXT DEFAULT (datetime('now')),

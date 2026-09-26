@@ -178,6 +178,18 @@ export interface IPlatformAdapter {
   emitRetract?(conversationId: string): Promise<void>;
 
   /**
+   * Optional: follow a workflow dispatched in the background from
+   * `parentConversationId` and show its progress there. The non-web
+   * counterpart of `IWebPlatformAdapter.setupEventBridge`: the dispatcher calls
+   * the returned cleanup when the run's execution returns, so the adapter never
+   * has to guess when the run is over.
+   */
+  watchDispatchedWorkflow?(
+    parentConversationId: string,
+    dispatch: { workerConversationId: string; workflowName: string }
+  ): () => void;
+
+  /**
    * Optional: Append a small footer summarising cost / token usage / stop reason
    * after a direct-chat assistant turn. Implemented by adapters that surface
    * usage info in-band (e.g. Slack posts an italic context line). No-op for
@@ -198,7 +210,11 @@ export interface IPlatformAdapter {
 export interface IWebPlatformAdapter extends IPlatformAdapter {
   sendStructuredEvent(conversationId: string, event: MessageChunk): Promise<void>;
   setConversationDbId(platformConversationId: string, dbId: string): void;
-  setupEventBridge(workerConversationId: string, parentConversationId: string): () => void;
+  setupEventBridge(
+    workerConversationId: string,
+    parentConversationId: string,
+    workflowName: string
+  ): () => void;
   emitLockEvent(conversationId: string, locked: boolean, queuePosition?: number): Promise<void>;
   registerOutputCallback(conversationId: string, callback: (text: string) => void): void;
   removeOutputCallback(conversationId: string): void;

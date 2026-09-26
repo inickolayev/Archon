@@ -79,6 +79,16 @@ The steps come from the same tool-call stream the console's trace is built from,
 and the wording is chosen from the tool name -- a file's name may appear, an
 absolute path never does.
 
+Once the turn knows which provider and model it runs on, the line names them
+underneath the activity (`claude · claude-sonnet-4-5`) -- the same value that is
+sent to the provider, not a guess.
+
+A workflow the chat dispatches in the background gets a line of its own, because
+the turn that started it ends at once: `⏳ Running workflow nightly-audit (node: lint)…`
+with the running node's provider and model underneath (absent for bash and
+script nodes). It is taken down when the run's execution returns, including when
+the run pauses at an approval gate.
+
 ```ini
 TELEGRAM_STATUS_ENABLED=true       # false for silence until the answer lands
 TELEGRAM_STATUS_THROTTLE_MS=3000   # shortest gap between rewrites (min 1000)
@@ -89,6 +99,20 @@ has not changed. Both are treated as ordinary outcomes: identical text is never
 re-sent, rewrites are throttled, and a failed update -- or a delete Telegram
 refuses, which falls back to editing the line to `✓ Done.` -- can never fail the
 turn it is decorating.
+
+## Choosing the chat model
+
+**☰ Menu → Model** (or `/model`) shows which provider and model this chat runs on
+and offers the models its provider lists right now; tap one to pin it for this
+chat, or **Reset to default** to remove the pin. `/model <model id>` pins an id
+directly -- the way in for providers without a live model list, and for ids too
+long for a button. The pin is the same one the web console's chat header sets,
+and it is validated the same way: a model the provider does not offer is refused
+with the reason, and so is any pin while the provider's list cannot be read.
+
+A pin applies to the chat's own provider only. If your personal default provider
+is a different one, the chat runs on that and `/model` says the pin is not in
+effect. Workflow nodes are never affected -- they keep their own models.
 
 ## Further Reading
 

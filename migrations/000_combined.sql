@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_conversations (
   title VARCHAR(255),
   deleted_at TIMESTAMP WITH TIME ZONE,
   hidden BOOLEAN DEFAULT FALSE,
+  model_override VARCHAR(255),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -322,6 +323,11 @@ ALTER TABLE remote_agent_workflow_runs
     REFERENCES remote_agent_conversations(id) ON DELETE SET NULL;
 ALTER TABLE remote_agent_conversations
   ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT FALSE;
+
+-- Per-conversation chat model pin. Pairs with the row's own ai_assistant_type
+-- (the pin is a model, never a provider); NULL means no pin.
+ALTER TABLE remote_agent_conversations
+  ADD COLUMN IF NOT EXISTS model_override VARCHAR(255);
 
 -- From migration 016: ended_reason on sessions
 ALTER TABLE remote_agent_sessions

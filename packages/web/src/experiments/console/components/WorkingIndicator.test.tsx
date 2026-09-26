@@ -37,3 +37,27 @@ describe('WorkingIndicator — calling the agent off', () => {
     expect(html.match(/<button/g)?.length).toBe(1);
   });
 });
+
+describe('WorkingIndicator — which model is working', () => {
+  test('names the provider and model beside the activity', () => {
+    const html = renderToStaticMarkup(
+      <WorkingIndicator
+        activity="Bash"
+        model="claude · claude-sonnet-4-5"
+        expanded={false}
+        onToggle={() => undefined}
+      />
+    );
+
+    expect(html).toContain('claude · claude-sonnet-4-5');
+    expect(html).toContain('Bash');
+  });
+
+  test('says nothing about a model before the turn has named one', () => {
+    const html = renderToStaticMarkup(
+      <WorkingIndicator activity={null} model={null} expanded={false} onToggle={() => undefined} />
+    );
+
+    expect(html).not.toContain('Provider · model');
+  });
+});

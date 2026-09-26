@@ -512,10 +512,20 @@ async function dispatchBackgroundWorkflowOwned(
     webAdapter.setConversationDbId(workerPlatformId, workerConv.id);
   }
 
-  // 6. Set up event bridge (worker events → parent SSE stream)
+  // 6. Set up event bridge (worker events → parent SSE stream, or the
+  // platform's own progress surface for adapters that have one)
   let unsubscribeBridge: (() => void) | undefined;
   if (webAdapter) {
-    unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformId, ctx.conversationId);
+    unsubscribeBridge = webAdapter.setupEventBridge(
+      workerPlatformId,
+      ctx.conversationId,
+      workflow.name
+    );
+  } else if (ctx.platform.watchDispatchedWorkflow) {
+    unsubscribeBridge = ctx.platform.watchDispatchedWorkflow(ctx.conversationId, {
+      workerConversationId: workerPlatformId,
+      workflowName: workflow.name,
+    });
   }
 
   const workflowDeps = createWorkflowDeps();
@@ -561,6 +571,8 @@ async function dispatchBackgroundWorkflowOwned(
     // Reclaim before returning: this branch is the console's default dispatch path, and
     // leaving the tree behind here leaks one capture per failed dispatch.
     getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+    // Nothing will run, so nothing will reach the bridge's usual cleanup below.
+    unsubscribeBridge?.();
     await ctx.platform.sendMessage(
       ctx.conversationId,
       `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +

@@ -20,6 +20,8 @@ export const conversationRowSchema = z.object({
   cwd: z.string().nullable(),
   isolation_env_id: z.string().nullable(),
   ai_assistant_type: z.string(),
+  /** Per-conversation chat model pin for `ai_assistant_type`; null = no pin. */
+  model_override: z.string().nullable(),
   title: z.string().nullable(),
   hidden: z.boolean(),
   deleted_at: z.date().nullable(),

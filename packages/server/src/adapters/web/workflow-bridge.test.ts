@@ -280,3 +280,48 @@ describe('mapWorkflowEvent — container_lifecycle (Phase B)', () => {
     expect(payload).not.toHaveProperty('containerId');
   });
 });
+
+describe('mapWorkflowEvent — dag_node model visibility', () => {
+  test('a started node carries its provider, model, tier, effort and the bridged workflow name', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'node_started',
+      runId: 'run-1',
+      nodeId: 'lint',
+      nodeName: 'lint',
+      provider: 'claude',
+      model: 'claude-haiku-4-5',
+      tier: 'small',
+      effort: 'low',
+    };
+
+    expect(JSON.parse(mapWorkflowEvent(event, 'nightly-audit') ?? '{}')).toMatchObject({
+      type: 'dag_node',
+      status: 'running',
+      name: 'lint',
+      provider: 'claude',
+      model: 'claude-haiku-4-5',
+      tier: 'small',
+      effort: 'low',
+      workflowName: 'nightly-audit',
+    });
+  });
+
+  test('a completed node repeats no model (it is not running on one any more)', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'node_completed',
+      runId: 'run-1',
+      nodeId: 'lint',
+      nodeName: 'lint',
+      duration: 10,
+    };
+
+    const payload = JSON.parse(mapWorkflowEvent(event, 'nightly-audit') ?? '{}') as Record<
+      string,
+      unknown
+    >;
+    expect(payload.status).toBe('completed');
+    expect(payload.provider).toBeUndefined();
+    expect(payload.model).toBeUndefined();
+    expect(payload.workflowName).toBe('nightly-audit');
+  });
+});

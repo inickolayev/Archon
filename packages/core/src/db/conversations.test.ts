@@ -23,6 +23,7 @@ import {
   listConversationsForChat,
   markConversationActive,
   updateConversation,
+  setConversationModelOverride,
   findConversationByPlatformId,
 } from './conversations';
 import type { Conversation } from '../types';
@@ -51,6 +52,7 @@ describe('conversations', () => {
       platform_type: 'telegram',
       platform_conversation_id: 'chat-456',
       ai_assistant_type: 'claude',
+      model_override: null,
       codebase_id: null,
       cwd: null,
       isolation_env_id: null,
@@ -356,6 +358,7 @@ describe('conversations', () => {
       platform_type: 'cli',
       platform_conversation_id: 'cli-1234-abc',
       ai_assistant_type: 'claude',
+      model_override: null,
       codebase_id: null,
       cwd: null,
       isolation_env_id: null,
@@ -404,6 +407,38 @@ describe('conversations', () => {
       expect(mockQuery).toHaveBeenCalledWith(
         'SELECT * FROM remote_agent_conversations WHERE platform_conversation_id = $1',
         ['tg-chat-999']
+      );
+    });
+  });
+
+  describe('setConversationModelOverride', () => {
+    test('writes the pin', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await setConversationModelOverride('conv-123', 'claude-haiku-4-5');
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'UPDATE remote_agent_conversations SET model_override = $1, updated_at = NOW() WHERE id = $2',
+        ['claude-haiku-4-5', 'conv-123']
+      );
+    });
+
+    test('null clears the pin', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await setConversationModelOverride('conv-123', null);
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'UPDATE remote_agent_conversations SET model_override = $1, updated_at = NOW() WHERE id = $2',
+        [null, 'conv-123']
+      );
+    });
+
+    test('throws ConversationNotFoundError when no row matched', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(setConversationModelOverride('missing', 'x')).rejects.toBeInstanceOf(
+        ConversationNotFoundError
       );
     });
   });
@@ -495,6 +530,7 @@ describe('getOrAdoptConversation', () => {
     platform_type: 'telegram',
     platform_conversation_id: '123456789:2',
     ai_assistant_type: 'claude',
+    model_override: null,
     codebase_id: null,
     cwd: null,
     isolation_env_id: null,

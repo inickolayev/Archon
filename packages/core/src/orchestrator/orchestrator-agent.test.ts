@@ -73,6 +73,7 @@ const mockGetOrCreateConversation = mock<typeof ConversationDb.getOrCreateConver
     cwd: null,
     isolation_env_id: null,
     ai_assistant_type: 'claude',
+    model_override: null,
     title: null,
     hidden: false,
     deleted_at: null,
@@ -584,10 +585,10 @@ mock.module('../db/user-ai-prefs-store', () => ({
 import {
   parseOrchestratorCommands,
   handleMessage,
-  resolveChatModelRequest,
   resolveTitleRequest,
   continueResolvedGateRun,
 } from './orchestrator-agent';
+import { resolveChatModelRequest } from './chat-model-resolution';
 import { isTurnRunning, stopTurn, TURN_STOPPED_NOTICE } from './turn-control';
 import { buildAiProfile } from '@archon/workflows/model-validation';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
@@ -1304,6 +1305,7 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
     cwd: null,
     isolation_env_id: null,
     ai_assistant_type: 'claude',
+    model_override: null,
     title: 'Test Conversation',
     hidden: false,
     deleted_at: null,
@@ -1706,6 +1708,27 @@ describe('discoverAllWorkflows — remote sync', () => {
       preset: 'claude_code',
       append: 'orchestrator system append',
     });
+  });
+
+  test('emits one model_info event carrying the model actually sent to the provider', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(
+      Promise.resolve(makeConversation({ model_override: 'claude-haiku-4-5' }))
+    );
+    const sendStructuredEvent = mock<NonNullable<IPlatformAdapter['sendStructuredEvent']>>(() =>
+      Promise.resolve()
+    );
+    const platform = { ...makePlatform(), sendStructuredEvent };
+
+    await handleMessage(platform, 'conv-1', 'Hello');
+
+    const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
+    expect(requestOptions.model).toBe('claude-haiku-4-5');
+    const modelInfo = sendStructuredEvent.mock.calls
+      .map(call => call[1])
+      .filter(event => event.type === 'model_info');
+    expect(modelInfo).toEqual([
+      { type: 'model_info', provider: 'claude', model: 'claude-haiku-4-5' },
+    ]);
   });
 
   test('passes plain string systemPrompt for non-claude provider', async () => {
@@ -6407,10 +6430,69 @@ describe('trailing text after a command', () => {
 describe('resolveChatModelRequest', () => {
   // Minimal MergedConfig slice: both built-in providers present (AssistantDefaults).
   const emptyConfig = { assistants: { claude: {}, codex: {} }, tiers: undefined };
+  const noPin = { id: 'conv-1', ai_assistant_type: 'claude', model_override: null };
+  const pinned = (provider: string, model: string) => ({
+    id: 'conv-1',
+    ai_assistant_type: provider,
+    model_override: model,
+  });
+
+  test('the conversation pin outranks the tier default', () => {
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      {},
+      emptyConfig,
+      pinned('claude', 'claude-haiku-4-5')
+    );
+    expect(req).toEqual({ provider: 'claude', model: 'claude-haiku-4-5' });
+  });
+
+  test('the conversation pin outranks the per-user default_model', () => {
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      { defaultProvider: 'claude', defaultModel: 'sonnet' },
+      emptyConfig,
+      pinned('claude', 'claude-haiku-4-5')
+    );
+    expect(req.model).toBe('claude-haiku-4-5');
+  });
+
+  test('the conversation pin is ignored when the effective provider is not the conversation one', () => {
+    // The user's default_provider (codex) outranks the conversation's claude,
+    // so a claude model id must not ride along to codex.
+    const profile = buildAiProfile('codex');
+    const req = resolveChatModelRequest(
+      profile,
+      'codex',
+      { defaultProvider: 'codex' },
+      emptyConfig,
+      pinned('claude', 'claude-haiku-4-5')
+    );
+    expect(req.provider).toBe('codex');
+    expect(req.model).toBe(profile.aliases.large?.model);
+  });
+
+  test('a pin that looks like a tier is still a literal (never re-routes the provider)', () => {
+    const profile = buildAiProfile('claude', {
+      userTiers: { small: { provider: 'codex', model: 'gpt-5.5' } },
+    });
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      {},
+      emptyConfig,
+      pinned('claude', 'small')
+    );
+    expect(req).toEqual({ provider: 'claude', model: 'small' });
+  });
 
   test('no user prefs and no install model → plain built-in large tier (solo path unchanged)', () => {
     const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(profile, 'claude', {}, emptyConfig);
+    const req = resolveChatModelRequest(profile, 'claude', {}, emptyConfig, noPin);
     expect(req.provider).toBe('claude');
     expect(req.model).toBe('opus');
     expect(req.matchedTier).toBe('large');
@@ -6422,7 +6504,8 @@ describe('resolveChatModelRequest', () => {
       profile,
       'claude',
       { defaultProvider: 'claude', defaultModel: 'sonnet' },
-      emptyConfig
+      emptyConfig,
+      noPin
     );
     expect(req.provider).toBe('claude');
     expect(req.model).toBe('sonnet');
@@ -6436,7 +6519,8 @@ describe('resolveChatModelRequest', () => {
       profile,
       'codex',
       { defaultProvider: 'claude', defaultModel: 'sonnet' },
-      emptyConfig
+      emptyConfig,
+      noPin
     );
     expect(req.provider).toBe('codex');
     expect(req.model).toBe(profile.aliases.large?.model); // built-in codex large tier
@@ -6445,7 +6529,13 @@ describe('resolveChatModelRequest', () => {
 
   test('user default_model set without default_provider is ignored', () => {
     const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(profile, 'claude', { defaultModel: 'sonnet' }, emptyConfig);
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      { defaultModel: 'sonnet' },
+      emptyConfig,
+      noPin
+    );
     expect(req.model).toBe('opus');
   });
 
@@ -6457,7 +6547,8 @@ describe('resolveChatModelRequest', () => {
       profile,
       'claude',
       { defaultProvider: 'claude', defaultModel: '@fast' },
-      emptyConfig
+      emptyConfig,
+      noPin
     );
     expect(req.provider).toBe('codex');
     expect(req.model).toBe('gpt-5.5');
@@ -6469,7 +6560,8 @@ describe('resolveChatModelRequest', () => {
       profile,
       'claude',
       { defaultProvider: 'claude', defaultModel: '@deleted-alias' },
-      emptyConfig
+      emptyConfig,
+      noPin
     );
     expect(req.provider).toBe('claude');
     expect(req.model).toBe('opus');
@@ -6485,7 +6577,8 @@ describe('resolveChatModelRequest', () => {
       {
         assistants: { claude: { model: 'sonnet' }, codex: {} },
         tiers: undefined,
-      }
+      },
+      noPin
     );
     expect(req.provider).toBe('claude');
     expect(req.model).toBe('sonnet');
@@ -6501,7 +6594,8 @@ describe('resolveChatModelRequest', () => {
       {
         assistants: { claude: { model: 'sonnet' }, codex: {} },
         tiers,
-      }
+      },
+      noPin
     );
     expect(req.model).toBe('claude-opus-4-7');
   });
@@ -6516,7 +6610,8 @@ describe('resolveChatModelRequest', () => {
       {
         assistants: { claude: { model: 'sonnet' }, codex: {} },
         tiers: undefined,
-      }
+      },
+      noPin
     );
     expect(req.model).toBe('haiku');
   });
@@ -6530,7 +6625,8 @@ describe('resolveChatModelRequest', () => {
       {
         assistants: { claude: { model: 'inherit' }, codex: {} },
         tiers: undefined,
-      }
+      },
+      noPin
     );
     expect(req.model).toBe('opus');
   });
@@ -6542,7 +6638,8 @@ describe('resolveChatModelRequest', () => {
       profile,
       'claude',
       { defaultProvider: 'claude', defaultModel: 'sonnet' },
-      { assistants: { claude: {}, codex: {} }, tiers }
+      { assistants: { claude: {}, codex: {} }, tiers },
+      noPin
     );
     expect(req.model).toBe('sonnet');
   });

@@ -56,6 +56,28 @@ export const updateConversationBodySchema = z
   .object({ title: z.string().min(1).optional() })
   .openapi('UpdateConversationBody');
 
+/**
+ * GET/PUT /api/conversations/:id/model response: which provider and model the
+ * next chat turn runs on, resolved by the same function the turn uses.
+ */
+export const conversationChatModelSchema = z
+  .object({
+    provider: z.string(),
+    /** Absent when the provider's own default applies. */
+    model: z.string().optional(),
+    /** The conversation's pinned model, whether or not it is the one in effect. */
+    override: z.string().nullable(),
+    /** The conversation's own provider — the one a pin applies to. */
+    conversationProvider: z.string(),
+  })
+  .openapi('ConversationChatModel');
+
+/** PUT /api/conversations/:id/model request body. `null` clears the pin. */
+export const updateConversationChatModelBodySchema = z
+  .object({ model: z.string().min(1).nullable() })
+  .strict()
+  .openapi('UpdateConversationChatModelBody');
+
 /** Generic success response. */
 export const successResponseSchema = z.object({ success: z.boolean() }).openapi('SuccessResponse');
 

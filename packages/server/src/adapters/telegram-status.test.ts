@@ -168,6 +168,45 @@ describe('withTurnStatus', () => {
     expect(transport.removed).toHaveLength(1);
   });
 
+  test('the model a turn runs on is shown under the activity', async () => {
+    const transport = new FakeTransport();
+    const status = new TurnStatus(transport, { throttleMs: 20 });
+    const adapter: IPlatformAdapter = withTurnStatus(new FakeAdapter(), status);
+
+    status.begin();
+    await tick(5);
+    await adapter.sendStructuredEvent?.('4242', {
+      type: 'model_info',
+      provider: 'claude',
+      model: 'claude-sonnet-4-5',
+    });
+    await tick(50);
+
+    expect(transport.edited).toEqual(['⏳ Thinking…\nclaude · claude-sonnet-4-5']);
+  });
+
+  test('a dispatched workflow gets a line of its own, taken down by the cleanup', async () => {
+    const turnTransport = new FakeTransport();
+    const workflowTransport = new FakeTransport();
+    const adapter: IPlatformAdapter = withTurnStatus(
+      new FakeAdapter(),
+      new TurnStatus(turnTransport, { throttleMs: 20 }),
+      () => new TurnStatus(workflowTransport, { throttleMs: 20 })
+    );
+
+    const cleanup = adapter.watchDispatchedWorkflow?.('4242', {
+      workerConversationId: 'worker-1',
+      workflowName: 'nightly-audit',
+    });
+    await tick(5);
+    cleanup?.();
+    await tick(5);
+
+    expect(turnTransport.sent).toHaveLength(0);
+    expect(workflowTransport.sent).toEqual(['⏳ Running workflow nightly-audit…']);
+    expect(workflowTransport.removed).toEqual([1]);
+  });
+
   test('a non-tool event is left alone', async () => {
     const transport = new FakeTransport();
     const status = new TurnStatus(transport, { throttleMs: 20 });

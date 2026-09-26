@@ -7,6 +7,8 @@ export { TurnStatus } from './turn-status';
 export type { StatusTransport, TurnStatusOptions } from './turn-status';
 export {
   describeTool,
+  describeWorkflowNode,
+  formatModelLabel,
   STATUS_FINISHED,
   STATUS_QUEUED,
   STATUS_THINKING,

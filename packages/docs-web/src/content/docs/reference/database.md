@@ -85,6 +85,7 @@ The database has 18 tables, all prefixed with `remote_agent_`:
    - Linked to codebase via foreign key
    - AI assistant type locked at creation
    - Nullable `user_id` records the first user who created the conversation (first-user-wins; later replies in the same thread are attributed on the workflow_run, not here)
+   - Nullable `model_override` pins the chat model for this conversation — always a literal model id for the conversation's own AI assistant type (validated against the provider's live model list when it has one). It outranks the per-user `default_model` and the `large` tier, applies only when the conversation's assistant is the effective chat provider, and never affects workflow nodes. `NULL` = no pin
 
 3. **`remote_agent_sessions`** - AI session management
    - Active session flag (one per conversation)
@@ -185,4 +186,4 @@ The database has 18 tables, all prefixed with `remote_agent_`:
 | `022_workflow_node_sessions.sql` | Per-node provider session persistence |
 | `023_add_default_branch_to_codebases.sql` | Detected default branch on codebases |
 
-> The `remote_agent_codebases.kind` column (project `'repo'` | `'folder'` discriminator, commented "From migration 024"), the `remote_agent_users.role` column, and the four `remote_agent_auth_*` Better Auth tables (opt-in web login) are applied inline in `000_combined.sql` rather than as numbered migrations, and converge on startup via the idempotent schema apply.
+> The `remote_agent_codebases.kind` column (project `'repo'` | `'folder'` discriminator, commented "From migration 024"), the `remote_agent_users.role` column, the `remote_agent_conversations.model_override` column, and the four `remote_agent_auth_*` Better Auth tables (opt-in web login) are applied inline in `000_combined.sql` rather than as numbered migrations, and converge on startup via the idempotent schema apply.

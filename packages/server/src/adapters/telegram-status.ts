@@ -25,7 +25,9 @@ import { z } from 'zod';
 import { createLogger } from '@archon/paths';
 import type { IPlatformAdapter } from '@archon/core';
 import type { MessageChunk } from '@archon/providers/types';
-import { TurnStatus, describeTool, type StatusTransport } from '@archon/adapters';
+import { TurnStatus, describeTool, formatModelLabel, type StatusTransport } from '@archon/adapters';
+import { getWorkflowEventEmitter } from '@archon/workflows/event-emitter';
+import { watchWorkflowOnTelegram } from './telegram-workflow-bridge';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -98,16 +100,34 @@ export function createTurnStatus(
  */
 export function withTurnStatus<T extends IPlatformAdapter>(
   primary: T,
-  status: TurnStatus | null
+  status: TurnStatus | null,
+  /**
+   * A fresh line for a workflow this turn dispatches. Separate from `status`:
+   * the turn ends right after dispatching, the run does not.
+   */
+  openWorkflowStatus: () => TurnStatus | null = () => null
 ): T {
   if (status === null) return primary;
   return new Proxy(primary, {
     get(target, prop, _receiver): unknown {
+      if (prop === 'watchDispatchedWorkflow') {
+        return (
+          _parentConversationId: string,
+          dispatch: { workerConversationId: string; workflowName: string }
+        ): (() => void) => {
+          const workflowStatus = openWorkflowStatus();
+          if (workflowStatus === null) return () => undefined;
+          return watchWorkflowOnTelegram(getWorkflowEventEmitter(), workflowStatus, dispatch);
+        };
+      }
       if (prop === 'sendStructuredEvent') {
         return async (conversationId: string, event: MessageChunk): Promise<void> => {
           // Synchronous and self-guarding: `step` only records what to say
           // next, so nothing here can delay or fail the turn's own work.
           if (event.type === 'tool') status.step(describeTool(event.toolName, event.toolInput));
+          if (event.type === 'model_info') {
+            status.showModel(formatModelLabel(event.provider, event.model));
+          }
           // Forwarded when the wrapped adapter has one of its own, so this
           // stays a decoration on the chain rather than a hole in it.
           const forward = Reflect.get(target, prop, target) as unknown;

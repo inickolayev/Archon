@@ -39,6 +39,22 @@ const mockHandleMessage = mock(
     _context?: unknown
   ) => {}
 );
+class InvalidModelOverrideError extends Error {}
+class ModelOverrideCatalogUnavailableError extends Error {
+  constructor(
+    readonly provider: string,
+    readonly reason: string
+  ) {
+    super(`Could not check the ${provider} model list: ${reason}`);
+  }
+}
+const mockSetChatModelOverride = mock(async (_id: string, _model: string | null) => {});
+const mockResolveEffectiveChatModel = mock(async (_id: string, _userId?: string) => ({
+  provider: 'claude',
+  model: 'claude-haiku-4-5',
+  override: 'claude-haiku-4-5' as string | null,
+  conversationProvider: 'claude',
+}));
 /** The orchestrator's registry of running turns, as the stop route sees it. */
 const mockStopTurn = mock((_conversationId: string) => true);
 mock.module('@archon/core', () => ({
@@ -63,6 +79,10 @@ mock.module('@archon/core', () => ({
   },
   generateAndSetTitle: mockGenerateAndSetTitle,
   resolveTitleRequest: mockResolveTitleRequest,
+  setChatModelOverride: mockSetChatModelOverride,
+  resolveEffectiveChatModel: mockResolveEffectiveChatModel,
+  InvalidModelOverrideError,
+  ModelOverrideCatalogUnavailableError,
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   createLogger: () => ({
     fatal: mock(() => undefined),
@@ -303,6 +323,100 @@ describe('PATCH /api/conversations/:id', () => {
     expect(response.status).toBe(200);
     const lastCall = mockUpdateConversationTitle.mock.calls.at(-1) as [string, string];
     expect(lastCall[1].length).toBe(255);
+  });
+});
+
+describe('/api/conversations/:id/model', () => {
+  const put = (app: OpenAPIHono, body: unknown): Promise<Response> =>
+    Promise.resolve(
+      app.request('/api/conversations/web-test-abc/model', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    );
+  const makeApp = (): OpenAPIHono => {
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    return app;
+  };
+
+  test('GET answers the effective model for the internal conversation id', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+
+    const response = await makeApp().request('/api/conversations/web-test-abc/model');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      provider: 'claude',
+      model: 'claude-haiku-4-5',
+      override: 'claude-haiku-4-5',
+      conversationProvider: 'claude',
+    });
+    expect(mockResolveEffectiveChatModel.mock.calls.at(-1)?.[0]).toBe('internal-uuid-123');
+  });
+
+  test('PUT pins the model and answers the new effective model', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+
+    const response = await put(makeApp(), { model: 'claude-haiku-4-5' });
+
+    expect(response.status).toBe(200);
+    expect(mockSetChatModelOverride).toHaveBeenLastCalledWith(
+      'internal-uuid-123',
+      'claude-haiku-4-5'
+    );
+    expect(((await response.json()) as { model: string }).model).toBe('claude-haiku-4-5');
+  });
+
+  test('PUT null clears the pin', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+
+    const response = await put(makeApp(), { model: null });
+
+    expect(response.status).toBe(200);
+    expect(mockSetChatModelOverride).toHaveBeenLastCalledWith('internal-uuid-123', null);
+  });
+
+  test('PUT answers 400 for a model the provider does not offer', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockSetChatModelOverride.mockImplementationOnce(async () => {
+      throw new InvalidModelOverrideError("'gpt-5.5' is not a claude model");
+    });
+
+    const response = await put(makeApp(), { model: 'gpt-5.5' });
+
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toContain('gpt-5.5');
+  });
+
+  test('PUT answers 503 with the reason when the model list cannot be read', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockSetChatModelOverride.mockImplementationOnce(async () => {
+      throw new ModelOverrideCatalogUnavailableError('claude', 'claude binary not found');
+    });
+
+    const response = await put(makeApp(), { model: 'claude-haiku-4-5' });
+
+    expect(response.status).toBe(503);
+    expect(JSON.stringify(await response.json())).toContain('claude binary not found');
+  });
+
+  test('PUT answers 404 for an unknown conversation', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => null);
+
+    const response = await put(makeApp(), { model: 'claude-haiku-4-5' });
+
+    expect(response.status).toBe(404);
+  });
+
+  test('PUT refuses an empty model id before touching anything', async () => {
+    mockSetChatModelOverride.mockClear();
+
+    const response = await put(makeApp(), { model: '' });
+
+    expect(response.status).toBe(400);
+    expect(mockSetChatModelOverride).not.toHaveBeenCalled();
   });
 });
 

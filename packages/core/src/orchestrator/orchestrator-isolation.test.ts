@@ -360,6 +360,7 @@ function makeConversation(overrides?: Partial<Conversation>): Conversation {
     cwd: '/workspace',
     isolation_env_id: null,
     ai_assistant_type: 'claude',
+    model_override: null,
     title: null,
     hidden: false,
     deleted_at: null,

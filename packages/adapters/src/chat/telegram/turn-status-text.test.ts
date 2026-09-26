@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { describeTool, STATUS_WORKING } from './turn-status-text';
+import {
+  describeTool,
+  describeWorkflowNode,
+  formatModelLabel,
+  STATUS_WORKING,
+} from './turn-status-text';
 
 /**
  * The line an operator reads on a phone. Two things are being checked
@@ -69,5 +74,27 @@ describe('describeTool', () => {
 
   test('a tool nobody has a phrase for is honest rather than special-cased', () => {
     expect(describeTool('SomeFutureTool', { anything: '/Users/op/secret' })).toBe(STATUS_WORKING);
+  });
+});
+
+describe('formatModelLabel', () => {
+  test('provider and model', () => {
+    expect(formatModelLabel('claude', 'claude-sonnet-4-5')).toBe('claude · claude-sonnet-4-5');
+  });
+
+  test('provider alone when its default applies', () => {
+    expect(formatModelLabel('codex')).toBe('codex');
+  });
+});
+
+describe('describeWorkflowNode', () => {
+  test('before any node has started', () => {
+    expect(describeWorkflowNode('nightly-audit')).toBe('⏳ Running workflow nightly-audit…');
+  });
+
+  test('with the running node', () => {
+    expect(describeWorkflowNode('nightly-audit', 'lint')).toBe(
+      '⏳ Running workflow nightly-audit (node: lint)…'
+    );
   });
 });

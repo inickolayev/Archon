@@ -11,6 +11,7 @@ import type { RunCounts } from '../skills/runs';
 import { statusDotClass, runStatusLabel } from '../lib/run-status';
 import { shortRunId, formatElapsed, elapsedSince } from '../lib/format';
 import { RunOutcomeBadge } from './RunOutcomeBadge';
+import type { NodeModelLabels } from '../lib/live-model';
 
 interface FeedData {
   runs: Run[];
@@ -20,6 +21,11 @@ interface FeedData {
 
 interface WorkflowDockProps {
   projectId: string;
+  /**
+   * Which model each running node is on, for the runs this chat dispatched —
+   * live from the chat stream, so other runs in the dock simply show none.
+   */
+  nodeModels?: NodeModelLabels;
 }
 
 function needsApproval(run: Run): boolean {
@@ -41,7 +47,7 @@ function needsApproval(run: Run): boolean {
  *
  * Live via the dashboard SSE (which invalidates the shared runs cache).
  */
-export function WorkflowDock({ projectId }: WorkflowDockProps): ReactElement | null {
+export function WorkflowDock({ projectId, nodeModels }: WorkflowDockProps): ReactElement | null {
   const [expanded, setExpanded] = useState(false);
 
   const { data } = useEntity<FeedData>(K.runs(projectId), () =>
@@ -99,7 +105,7 @@ export function WorkflowDock({ projectId }: WorkflowDockProps): ReactElement | n
           {showRunningCards ? (
             <div className="flex flex-col gap-1.5">
               {running.map(run => (
-                <DockCard key={run.id} run={run} />
+                <DockCard key={run.id} run={run} nodeModels={nodeModels?.get(run.id)} />
               ))}
             </div>
           ) : null}
@@ -140,7 +146,13 @@ function ApprovalDockCard({ run }: { run: Run }): ReactElement {
 }
 
 /** Plain running run — links to the run-detail logs. */
-function DockCard({ run }: { run: Run }): ReactElement {
+function DockCard({
+  run,
+  nodeModels,
+}: {
+  run: Run;
+  nodeModels?: ReadonlyMap<string, string>;
+}): ReactElement {
   const navigate = useNavigate();
   const elapsed = formatElapsed(elapsedSince(run.startedAt));
   const activeNodes = run.activeNodes;
@@ -170,7 +182,13 @@ function DockCard({ run }: { run: Run }): ReactElement {
             <>
               <span aria-hidden>·</span>
               <span className="truncate">
-                {activeNodes.length === 1 ? 'node' : 'nodes'}: {activeNodes.join(', ')}
+                {activeNodes.length === 1 ? 'node' : 'nodes'}:{' '}
+                {activeNodes
+                  .map(name => {
+                    const model = nodeModels?.get(name);
+                    return model === undefined ? name : `${name} (${model})`;
+                  })
+                  .join(', ')}
               </span>
             </>
           ) : null}

@@ -12,7 +12,8 @@
  * loosely coupled to event schemas and avoids partial in-memory mutation.
  */
 
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
+import type { components } from '@/lib/api.generated';
 import { invalidate } from '../store/cache';
 import { K } from './../store/keys';
 import { SSE_BASE_URL } from './http';
@@ -161,19 +162,65 @@ export function useRunStreamSSE(conversationPlatformId: string | null, runId: st
   }, [conversationPlatformId, runId]);
 }
 
+/** Which provider and model a chat turn runs on — sent once as the turn starts. */
+export interface TurnModelInfo {
+  provider: string;
+  /** Absent when the provider's own default applies. */
+  model?: string;
+}
+
+/** A node event of a workflow this chat dispatched, bridged into its stream. */
+export type WorkflowNodeEvent = components['schemas']['DagNodeSseEvent'];
+
+/**
+ * Live, per-turn state the chat shows but never stores: unlike messages it is
+ * not a row to refetch, so it is handed over as it arrives.
+ */
+export interface ConversationLiveHandlers {
+  /** The conversation lock — the composer disables while the agent is responding. */
+  onLockChange?: (locked: boolean) => void;
+  onModelInfo?: (info: TurnModelInfo) => void;
+  onWorkflowNode?: (event: WorkflowNodeEvent) => void;
+}
+
+function toModelInfo(ev: Record<string, unknown>): TurnModelInfo | null {
+  if (typeof ev.provider !== 'string') return null;
+  return typeof ev.model === 'string'
+    ? { provider: ev.provider, model: ev.model }
+    : { provider: ev.provider };
+}
+
+function toWorkflowNode(ev: Record<string, unknown>): WorkflowNodeEvent | null {
+  // The frame is the server's DagNodeSseEvent; check the fields the chat reads
+  // rather than trusting the cast on a malformed one.
+  if (typeof ev.runId !== 'string' || typeof ev.name !== 'string') return null;
+  if (typeof ev.status !== 'string') return null;
+  return ev as unknown as WorkflowNodeEvent;
+}
+
 /**
  * Subscribe to a conversation stream for a pure chat view (no associated run).
  * Identical to {@link useRunStreamSSE} minus the run-detail branches: it only
- * invalidates the message cache on text/tool events, and surfaces the
- * conversation lock so the composer can disable while the agent is responding.
+ * invalidates the message cache on text/tool events, surfaces the
+ * conversation lock so the composer can disable while the agent is responding,
+ * and hands over the live model/workflow state described above.
  *
  *   text / user_message / tool_call / tool_result → messages changed (debounced refetch)
  *   conversation_lock              → onLockChange(locked)
+ *   model_info                     → onModelInfo(provider, model)
+ *   dag_node                       → onWorkflowNode(event) — nodes of a run this chat dispatched
+ *
+ * Handlers are read through a ref, so passing new ones never reconnects the stream.
  */
 export function useConversationSSE(
   conversationPlatformId: string | null,
-  onLockChange?: (locked: boolean) => void
+  handlers: ConversationLiveHandlers = {}
 ): void {
+  const handlersRef = useRef(handlers);
+  useEffect(() => {
+    handlersRef.current = handlers;
+  });
+
   useEffect(() => {
     if (conversationPlatformId === null) return;
 
@@ -198,6 +245,7 @@ export function useConversationSSE(
     es.onmessage = (e: MessageEvent<string>): void => {
       const ev = parse(e.data);
       if (ev?.type === undefined || ev.type === 'heartbeat') return;
+      const fields = ev as Record<string, unknown>;
 
       switch (ev.type) {
         // `user_message` is one somebody sent from another window — Telegram,
@@ -211,9 +259,21 @@ export function useConversationSSE(
           scheduleFlush();
           break;
         case 'conversation_lock':
-          if (typeof ev.locked === 'boolean') onLockChange?.(ev.locked);
+          if (typeof ev.locked === 'boolean') handlersRef.current.onLockChange?.(ev.locked);
           break;
-        // No run-detail cache here; ignore workflow_* and everything else.
+        case 'model_info': {
+          const info = toModelInfo(fields);
+          if (info !== null) handlersRef.current.onModelInfo?.(info);
+          else console.warn('[console-sse] malformed model_info', { conversationPlatformId });
+          break;
+        }
+        case 'dag_node': {
+          const node = toWorkflowNode(fields);
+          if (node !== null) handlersRef.current.onWorkflowNode?.(node);
+          else console.warn('[console-sse] malformed dag_node', { conversationPlatformId });
+          break;
+        }
+        // No run-detail cache here; ignore the other workflow_* events.
         default:
           return;
       }
@@ -229,5 +289,5 @@ export function useConversationSSE(
       if (flushTimer !== null) clearTimeout(flushTimer);
       es.close();
     };
-  }, [conversationPlatformId, onLockChange]);
+  }, [conversationPlatformId]);
 }

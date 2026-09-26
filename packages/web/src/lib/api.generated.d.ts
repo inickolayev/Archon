@@ -1009,6 +1009,127 @@ export interface paths {
     };
     trace?: never;
   };
+  '/api/conversations/{id}/model': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Which provider and model the next chat turn in a conversation runs on */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          id: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Effective chat model */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['ConversationChatModel'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    /**
+     * Pin (or, with null, clear) the conversation's chat model
+     * @description The model must be a model id for the conversation's own provider. Where the provider lists its models live, the id must be one of them (400 otherwise, 503 when the list cannot be read); elsewhere any id is accepted. Answers with the new effective model.
+     */
+    put: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          id: string;
+        };
+        cookie?: never;
+      };
+      requestBody: {
+        content: {
+          'application/json': components['schemas']['UpdateConversationChatModelBody'];
+        };
+      };
+      responses: {
+        /** @description Effective chat model after the change */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['ConversationChatModel'];
+          };
+        };
+        /** @description Not a model the provider accepts */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Provider model list unavailable */
+        503: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/conversations/{id}/messages': {
     parameters: {
       query?: never;
@@ -3314,6 +3435,13 @@ export interface components {
       error?: string;
       reason?: components['schemas']['NodeSkipReason'];
       cause?: components['schemas']['SkipCause'];
+      provider?: string;
+      model?: string;
+      /** @enum {string} */
+      tier?: 'small' | 'medium' | 'large';
+      /** @enum {string} */
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
+      workflowName?: string;
       timestamp: number;
     };
     /** @enum {string} */
@@ -3491,6 +3619,7 @@ export interface components {
       cwd: string | null;
       isolation_env_id: string | null;
       ai_assistant_type: string;
+      model_override: string | null;
       title: string | null;
       hidden: boolean;
       /** Format: date-time */
@@ -3517,6 +3646,15 @@ export interface components {
     };
     UpdateConversationBody: {
       title?: string;
+    };
+    ConversationChatModel: {
+      provider: string;
+      model?: string;
+      override: string | null;
+      conversationProvider: string;
+    };
+    UpdateConversationChatModelBody: {
+      model: string | null;
     };
     MessageListResponse: components['schemas']['Message'][];
     Message: {

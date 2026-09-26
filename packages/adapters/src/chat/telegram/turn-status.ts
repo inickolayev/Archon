@@ -92,6 +92,10 @@ export class TurnStatus {
   #written: string | null = null;
   /** The text we want shown; equal to `#written` once things go quiet. */
   #wanted: string | null = null;
+  /** What the work is doing now — the part `step` replaces. */
+  #activity: string | null = null;
+  /** Which provider/model the work runs on, shown under the activity once known. */
+  #modelLabel: string | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #lastWriteAt = 0;
   /** Set by `clear`. Nothing is written afterwards, ever. */
@@ -110,7 +114,8 @@ export class TurnStatus {
    */
   #open(text: string): void {
     if (this.#over || this.#wanted !== null) return;
-    this.#wanted = text;
+    this.#activity = text;
+    this.#wanted = this.#compose();
     this.#lastWriteAt = Date.now();
     this.#enqueue(() => this.#write());
   }
@@ -172,7 +177,33 @@ export class TurnStatus {
    * interval costs one edit showing the fifth, not five edits ending there.
    */
   step(text: string): void {
-    if (this.#over || text === this.#wanted) return;
+    if (this.#over) return;
+    this.#activity = text;
+    this.#want(this.#compose());
+  }
+
+  /**
+   * Name the provider and model the work runs on.
+   *
+   * Kept apart from the activity so each `step` replaces only what the agent
+   * is doing, and the model stays put underneath. Does not open a line by
+   * itself — a label with no activity above it says nothing is happening.
+   * `null` takes the label away, for work that runs on no model at all.
+   */
+  showModel(label: string | null): void {
+    if (this.#over) return;
+    this.#modelLabel = label;
+    if (this.#activity !== null) this.#want(this.#compose());
+  }
+
+  #compose(): string {
+    const activity = this.#activity ?? '';
+    return this.#modelLabel === null ? activity : `${activity}\n${this.#modelLabel}`;
+  }
+
+  /** Identical text is dropped here, so neither half can cost an edit on its own. */
+  #want(text: string): void {
+    if (text === this.#wanted) return;
     this.#wanted = text;
     this.#schedule();
   }

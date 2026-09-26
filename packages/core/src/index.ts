@@ -100,6 +100,15 @@ export {
 } from './orchestrator/orchestrator-agent';
 export type { TitleRequest } from './orchestrator/orchestrator-agent';
 export {
+  setChatModelOverride,
+  resolveEffectiveChatModel,
+  InvalidModelOverrideError,
+  ModelOverrideCatalogUnavailableError,
+  createChatModelControls,
+  type EffectiveChatModel,
+  type ChatModelControls,
+} from './orchestrator/chat-model-override';
+export {
   isTurnRunning,
   stopTurn,
   NOTHING_RUNNING_NOTICE,

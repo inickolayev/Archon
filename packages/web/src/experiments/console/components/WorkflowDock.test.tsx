@@ -57,4 +57,36 @@ describe('WorkflowDock', () => {
       invalidate(cacheKey);
     }
   });
+
+  test('names the model a node dispatched from this chat is running on', () => {
+    const cacheKey = K.runs('project-parallel');
+    set(cacheKey, {
+      runs: [parallelRun],
+      counts: {
+        all: 1,
+        running: 1,
+        paused: 0,
+        failed: 0,
+        completed: 0,
+        cancelled: 0,
+        pending: 0,
+      },
+      total: 1,
+    });
+
+    try {
+      const html = renderToStaticMarkup(
+        <MemoryRouter>
+          <WorkflowDock
+            projectId="project-parallel"
+            nodeModels={new Map([['run-parallel', new Map([['parallel-a', 'claude · haiku']])]])}
+          />
+        </MemoryRouter>
+      );
+
+      expect(html).toContain('parallel-a (claude · haiku), parallel-b');
+    } finally {
+      invalidate(cacheKey);
+    }
+  });
 });

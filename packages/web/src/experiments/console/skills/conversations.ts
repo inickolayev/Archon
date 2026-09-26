@@ -1,3 +1,4 @@
+import type { components } from '@/lib/api.generated';
 import { requestJson, HttpError } from '../lib/http';
 import { toConversationSummary, type ConversationSummary } from '../primitives/conversation';
 
@@ -80,4 +81,33 @@ export async function sendMessage(
     const path = new URL(url, window.location.origin).pathname;
     throw new HttpError(res.status, path, msg);
   }
+}
+
+/**
+ * Which provider and model the next turn of a chat runs on — resolved by the
+ * server with the same function the turn itself uses — plus its pinned model.
+ */
+export type ConversationChatModel = components['schemas']['ConversationChatModel'];
+
+export function getConversationModel(
+  conversationPlatformId: string
+): Promise<ConversationChatModel> {
+  return requestJson<ConversationChatModel>(
+    `/api/conversations/${encodeURIComponent(conversationPlatformId)}/model`
+  );
+}
+
+/**
+ * Pin a model for the chat (or clear the pin with `null`). Throws HttpError 400
+ * when the provider does not offer the model, 503 when its list cannot be read.
+ */
+export function setConversationModel(
+  conversationPlatformId: string,
+  model: string | null
+): Promise<ConversationChatModel> {
+  const body: components['schemas']['UpdateConversationChatModelBody'] = { model };
+  return requestJson<ConversationChatModel>(
+    `/api/conversations/${encodeURIComponent(conversationPlatformId)}/model`,
+    { method: 'PUT', body: JSON.stringify(body) }
+  );
 }

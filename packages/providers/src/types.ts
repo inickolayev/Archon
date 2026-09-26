@@ -366,7 +366,11 @@ export type MessageChunk =
       outcome: 'success' | 'error' | 'cancelled';
       exitCode?: number;
     }
-  | { type: 'workflow_dispatch'; workerConversationId: string; workflowName: string };
+  | { type: 'workflow_dispatch'; workerConversationId: string; workflowName: string }
+  // The provider and model a chat turn runs on, emitted once before the
+  // provider is called. `model` is absent when the provider's own default
+  // applies (nothing was requested, so there is no id to show).
+  | { type: 'model_info'; provider: string; model?: string };
 
 /**
  * System prompt input accepted by all providers. Mirrors the Claude Agent SDK

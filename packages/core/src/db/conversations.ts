@@ -427,6 +427,25 @@ export async function updateConversationTitle(id: string, title: string): Promis
 }
 
 /**
+ * Persist (or, with `null`, clear) the conversation's chat model pin.
+ * Storage only — the model is validated against the conversation's provider by
+ * `setChatModelOverride`, which is the one caller that should reach this.
+ */
+export async function setConversationModelOverride(
+  id: string,
+  model: string | null
+): Promise<void> {
+  const dialect = getDialect();
+  const result = await pool.query(
+    `UPDATE remote_agent_conversations SET model_override = $1, updated_at = ${dialect.now()} WHERE id = $2`,
+    [model, id]
+  );
+  if (result.rowCount === 0) {
+    throw new ConversationNotFoundError(id);
+  }
+}
+
+/**
  * Soft delete a conversation (sets deleted_at timestamp)
  */
 export async function softDeleteConversation(id: string): Promise<void> {

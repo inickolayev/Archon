@@ -20,6 +20,7 @@ import {
   type TelegramChatCommand,
   type TelegramChatStore,
 } from './telegram-chats';
+import type { ChatModelChoices, ChatModelControls } from '../orchestrator/chat-model-override';
 
 /** One inline button: what it says, and the opaque token it sends back. */
 export interface MenuButton {
@@ -116,6 +117,7 @@ export const ADVERTISED_COMMANDS: readonly { command: string; description: strin
   { command: 'help', description: 'What the buttons do' },
   { command: 'menu', description: 'Chats and projects' },
   { command: STOP_COMMAND, description: 'Call off what the agent is doing' },
+  { command: 'model', description: 'Which model this chat runs on' },
 ];
 
 // --- callback tokens --------------------------------------------------------
@@ -138,7 +140,13 @@ export type CallbackAction =
   | { readonly kind: 'new' }
   | { readonly kind: 'project'; readonly name: string }
   | { readonly kind: 'link' }
-  | { readonly kind: 'stop' };
+  | { readonly kind: 'stop' }
+  | { readonly kind: 'model' }
+  | { readonly kind: 'model-pick'; readonly model: string }
+  | { readonly kind: 'model-reset' };
+
+/** Prefix of a model-pick token; the model id follows verbatim. */
+const MODEL_PICK_PREFIX = 'md:';
 
 export function encodeAction(action: CallbackAction): string {
   switch (action.kind) {
@@ -158,6 +166,14 @@ export function encodeAction(action: CallbackAction): string {
       return 'lk';
     case 'stop':
       return 'x';
+    case 'model':
+      return 'mo';
+    case 'model-pick':
+      // Verbatim, never truncated: a cut-off id would pin a different model.
+      // Ids that do not fit are left off the keyboard (see buildModelMenu).
+      return `${MODEL_PICK_PREFIX}${action.model}`;
+    case 'model-reset':
+      return 'mr';
   }
 }
 
@@ -174,6 +190,14 @@ export function parseAction(data: string): CallbackAction | null {
   if (data === 'n') return { kind: 'new' };
   if (data === 'lk') return { kind: 'link' };
   if (data === 'x') return { kind: 'stop' };
+  if (data === 'mo') return { kind: 'model' };
+  if (data === 'mr') return { kind: 'model-reset' };
+  if (data.startsWith(MODEL_PICK_PREFIX)) {
+    // Checked against the provider's model list by the pin itself; the id is
+    // never used for anything else.
+    const model = data.slice(MODEL_PICK_PREFIX.length);
+    return model.trim().length > 0 ? { kind: 'model-pick', model } : null;
+  }
   const switchMatch = /^s:(\d{1,4})$/.exec(data);
   if (switchMatch) {
     const index = Number(switchMatch[1]);
@@ -293,12 +317,101 @@ export function buildMainMenu(): { text: string; keyboard: MenuKeyboard } {
           { label: 'Projects', action: encodeAction({ kind: 'projects' }) },
         ],
         [{ label: '+ New chat', action: encodeAction({ kind: 'new' }) }],
-        [{ label: '⏹ Stop the agent', action: encodeAction({ kind: 'stop' }) }],
+        [
+          { label: '⏹ Stop the agent', action: encodeAction({ kind: 'stop' }) },
+          { label: 'Model', action: encodeAction({ kind: 'model' }) },
+        ],
         [{ label: 'Link this chat to my account', action: encodeAction({ kind: 'link' }) }],
       ],
       persistent: MAIN_KEYBOARD.persistent,
     },
   };
+}
+
+function fitsCallback(action: string): boolean {
+  return Buffer.byteLength(action, 'utf8') <= MAX_CALLBACK_BYTES;
+}
+
+function modelLabelOf(provider: string, model: string | undefined): string {
+  return model === undefined ? `${provider} (its default model)` : `${provider} · ${model}`;
+}
+
+/**
+ * The /model screen: what this chat runs on, and one button per model the
+ * provider offers (the pinned one marked), plus a way back to the default.
+ *
+ * `lead` replaces the first line — a confirmation or a refusal after a tap.
+ */
+export function buildModelMenu(
+  state: ChatModelChoices | null,
+  lead?: string
+): { text: string; keyboard: MenuKeyboard } {
+  if (state === null) {
+    return {
+      text: 'This chat has no conversation yet — send a message first, then pick its model.',
+      keyboard: { inline: [[MENU_BUTTON]] },
+    };
+  }
+  const { effective, choices, choicesError } = state;
+  const lines = [lead ?? `This chat runs on ${modelLabelOf(effective.provider, effective.model)}.`];
+  if (effective.override === null) {
+    lines.push('No model is pinned: the configured default applies.');
+  } else if (effective.provider === effective.conversationProvider) {
+    lines.push(`Pinned: ${effective.override}.`);
+  } else {
+    // The operator's own default provider outranks this chat's, so the pin is
+    // stored but not what runs. Saying so beats a pin that silently does nothing.
+    lines.push(
+      `Pinned: ${effective.override} — for ${effective.conversationProvider}, but this chat ` +
+        `currently runs on ${effective.provider} (your default provider), so the pin is not in effect.`
+    );
+  }
+
+  const offered = (choices ?? []).map(model => ({
+    model,
+    action: encodeAction({ kind: 'model-pick', model }),
+  }));
+  const fitting = offered.filter(o => fitsCallback(o.action));
+  if (choicesError !== undefined) {
+    lines.push(`Could not list ${effective.conversationProvider} models: ${choicesError}`);
+  } else if (choices === null) {
+    lines.push(
+      `${effective.conversationProvider} does not list its models here. ` +
+        'Pin one by typing /model <model id>.'
+    );
+  } else if (fitting.length < offered.length) {
+    lines.push(
+      `${String(offered.length - fitting.length)} model id(s) are too long for a button — ` +
+        'type /model <model id> to pin one of those.'
+    );
+  }
+
+  const rows: MenuButton[][] = fitting.map(o => [
+    { label: `${o.model === effective.override ? '✓ ' : ''}${o.model}`, action: o.action },
+  ]);
+  const last: MenuButton[] = [];
+  if (effective.override !== null) {
+    last.push({ label: 'Reset to default', action: encodeAction({ kind: 'model-reset' }) });
+  }
+  last.push(MENU_BUTTON);
+  return { text: lines.join('\n'), keyboard: { inline: [...rows, last] } };
+}
+
+/** Pin (or clear) the model, then show the screen with the outcome on top. */
+async function pinAndDescribe(
+  controls: ChatModelControls,
+  model: string | null
+): Promise<TelegramCommandReply & { readonly toast: string }> {
+  const outcome = await controls.pin(model);
+  const state = await controls.describe();
+  if (!outcome.ok) {
+    return { ...buildModelMenu(state, `Not changed: ${outcome.message}`), toast: 'Not changed' };
+  }
+  const lead =
+    model === null
+      ? 'Pin removed — the next message uses the default model.'
+      : `Pinned ${model} — the next message runs on it.`;
+  return { ...buildModelMenu(state, lead), toast: model === null ? 'Reset' : 'Model set' };
 }
 
 /** Label of a chat button, used in confirmations. */
@@ -329,6 +442,12 @@ export interface TelegramCallbackInput {
    * lives with the process that started them, not with this keyboard.
    */
   readonly stopTurn?: () => Promise<string>;
+  /**
+   * The model controls of this chat's active conversation. Injected for the
+   * same reason as the rest: resolving and validating a model is the core's
+   * business, and a build without it should not offer the button.
+   */
+  readonly chatModel?: ChatModelControls;
   readonly now?: number;
 }
 
@@ -367,6 +486,14 @@ export async function handleTelegramCallback(
     // that swallowed the menu would cost them a tap to get it back.
     const menu = buildMainMenu();
     return { text: await input.stopTurn(), keyboard: menu.keyboard, toast: 'Stopped' };
+  }
+
+  if (action.kind === 'model' || action.kind === 'model-pick' || action.kind === 'model-reset') {
+    if (input.chatModel === undefined) {
+      return { text: 'Choosing a model is not available on this install.' };
+    }
+    if (action.kind === 'model') return buildModelMenu(await input.chatModel.describe());
+    return pinAndDescribe(input.chatModel, action.kind === 'model-pick' ? action.model : null);
   }
 
   if (action.kind === 'link') {
@@ -473,7 +600,7 @@ export async function handleTelegramCallback(
  * The visible command set. Everything else still works when typed — it is just
  * not advertised, and the operator reaches it by tapping.
  */
-export const MENU_COMMANDS = ['start', 'menu'] as const;
+export const MENU_COMMANDS = ['start', 'menu', 'model'] as const;
 
 export function isMenuCommand(command: string): boolean {
   return (MENU_COMMANDS as readonly string[]).includes(command);
@@ -508,6 +635,8 @@ export async function handleTelegramMenuCommand(input: {
     command: TelegramChatCommand,
     args: readonly string[]
   ) => Promise<string>;
+  /** Present when this chat can pick its model; `/model` says so otherwise. */
+  readonly chatModel?: ChatModelControls;
 }): Promise<TelegramCommandReply | null> {
   const { command, args, chatId, store } = input;
 
@@ -522,6 +651,19 @@ export async function handleTelegramMenuCommand(input: {
   if (command === 'menu') {
     const menu = buildMainMenu();
     return { text: menu.text, keyboard: menu.keyboard };
+  }
+  if (command === 'model') {
+    if (input.chatModel === undefined) {
+      return { text: 'Choosing a model is not available on this install.' };
+    }
+    // `/model <id>` pins directly — the way in for ids that do not fit a
+    // button, and for providers that do not list their models.
+    const model = args.join(' ').trim();
+    if (model.length > 0) {
+      const { text, keyboard } = await pinAndDescribe(input.chatModel, model);
+      return { text, keyboard };
+    }
+    return buildModelMenu(await input.chatModel.describe());
   }
   if (!isTelegramChatCommand(command)) return null;
 

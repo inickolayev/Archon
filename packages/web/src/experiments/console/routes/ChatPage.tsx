@@ -5,10 +5,12 @@ import { ChatComposer } from '../components/ChatComposer';
 import { ChatPicker } from '../components/ChatPicker';
 import { ProjectViewTabs } from '../components/ProjectViewTabs';
 import { WorkingIndicator } from '../components/WorkingIndicator';
+import { ConversationModelPicker } from '../components/ConversationModelPicker';
+import { applyWorkflowNodeEvent, formatModelLabel, type NodeModelLabels } from '../lib/live-model';
 import { WorkflowDock } from '../components/WorkflowDock';
 import { EmptyState } from '../components/EmptyState';
 import { StreamContextProvider } from '../lib/stream-context';
-import { useConversationSSE } from '../lib/sse';
+import { useConversationSSE, type TurnModelInfo, type WorkflowNodeEvent } from '../lib/sse';
 import { useEntity, invalidate } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
@@ -153,6 +155,11 @@ export function ChatPage(): ReactElement {
     activeConvIdRef.current = activeConvId;
   }, [activeConvId]);
 
+  // Live, never stored: which model the running turn is on, and which model
+  // each node of a workflow this chat dispatched is on.
+  const [turnModel, setTurnModel] = useState<string | null>(null);
+  const [nodeModels, setNodeModels] = useState<NodeModelLabels>(() => new Map());
+
   // End of a turn, from either detector. The refetch matters: the recovery poll
   // stops the moment `busy` clears, and the lock can be released a beat after
   // the reply row is written — a poll that raced ahead of that write would
@@ -164,6 +171,8 @@ export function ChatPage(): ReactElement {
       settleTimerRef.current = null;
     }
     setBusy(false);
+    // The model belongs to the turn; the next one says its own.
+    setTurnModel(null);
     const id = activeConvIdRef.current;
     if (id !== null) invalidate(K.messages(id));
   }, []);
@@ -180,7 +189,17 @@ export function ChatPage(): ReactElement {
     },
     [finishTurn]
   );
-  useConversationSSE(activeConvId, onLockChange);
+  // A turn announcing its model also means the header's "next turn runs on"
+  // may have moved on (a default changed elsewhere), so it is re-asked.
+  const onModelInfo = useCallback((info: TurnModelInfo): void => {
+    setTurnModel(formatModelLabel(info.provider, info.model));
+    const id = activeConvIdRef.current;
+    if (id !== null) invalidate(K.conversationModel(id));
+  }, []);
+  const onWorkflowNode = useCallback((event: WorkflowNodeEvent): void => {
+    setNodeModels(prev => applyWorkflowNodeEvent(prev, event));
+  }, []);
+  useConversationSSE(activeConvId, { onLockChange, onModelInfo, onWorkflowNode });
 
   // Derive turn state from the trailing message: a user message means a reply
   // is pending; once an assistant reply lands and stays stable for SETTLE_MS the
@@ -243,6 +262,8 @@ export function ChatPage(): ReactElement {
     setError(null);
     setNotice(null);
     setReplyTo(null);
+    setTurnModel(null);
+    setNodeModels(new Map());
   }, [activeConvId]);
 
   // Recovery poll: while a reply is pending, refetch messages on a cadence so a
@@ -390,6 +411,7 @@ export function ChatPage(): ReactElement {
             </h1>
             <p className="text-xs text-text-tertiary">{project?.path ?? 'Loading…'}</p>
           </div>
+          {activeConvId !== null ? <ConversationModelPicker conversationId={activeConvId} /> : null}
           <ChatPicker
             conversations={projectConversations}
             activeId={activeConvId}
@@ -437,6 +459,7 @@ export function ChatPage(): ReactElement {
                 {busy ? (
                   <WorkingIndicator
                     activity={currentActivity}
+                    model={turnModel}
                     expanded={showTools}
                     onToggle={() => {
                       setShowTools(v => !v);
@@ -461,7 +484,7 @@ export function ChatPage(): ReactElement {
         ) : null}
       </div>
 
-      <WorkflowDock projectId={projectId} />
+      <WorkflowDock projectId={projectId} nodeModels={nodeModels} />
 
       {notice !== null ? (
         <div className="shrink-0 border-t border-warning/30 bg-warning/[0.06] px-6 py-2 font-mono text-[11px] text-warning">
