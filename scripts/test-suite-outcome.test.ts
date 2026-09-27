@@ -23,7 +23,7 @@ describe('Test Suite aggregate outcome', () => {
   test('reads the gated jobs from test.yml; jobs that run for every event are not gated', () => {
     expect(GATED.has('test')).toBe(true);
     expect(GATED.has('static')).toBe(true);
-    expect(GATED.has('workflow-fixtures-windows')).toBe(true);
+    // No workflow-fixtures-windows in this fork: Windows is out of scope (ADR 0008).
     expect(GATED.has('workflow-fixtures')).toBe(false);
     expect(GATED.has('changes')).toBe(false);
   });
