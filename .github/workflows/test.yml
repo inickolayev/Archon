@@ -79,7 +79,11 @@ jobs:
       # required check.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ChessWin fork: Windows is out of scope (ADR 0008 in chesswin-factory). The Factory runs
+        # on Linux and macOS only, and our own features parse POSIX paths. A permanently red leg
+        # would cost us the one thing the nightly catch-up depends on — a CI result that means
+        # something. Upstream's own CI still covers Windows.
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -131,7 +135,9 @@ jobs:
   workflow-fixtures-windows:
     name: workflow-fixtures (windows-latest)
     needs: changes
-    if: needs.changes.outputs.run-tests == 'true'
+    # Switched off in the ChessWin fork, with the Windows tests above (ADR 0008). Kept rather
+    # than deleted so upstream's edits to it keep merging cleanly.
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -347,7 +353,8 @@ jobs:
         static,
         test,
         workflow-fixtures,
-        workflow-fixtures-windows,
+        # workflow-fixtures-windows is switched off in this fork (ADR 0008); the outcome script
+        # fails the check on an unexpected `skipped`, so it must not be needed here either.
         schema-upgrade,
         postgres-parity,
         docker-build,

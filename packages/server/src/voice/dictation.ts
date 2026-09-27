@@ -22,10 +22,7 @@ import { readFile } from 'node:fs/promises';
 import { createLogger } from '@archon/paths';
 import type { AttachedFile } from '@archon/core';
 import { formatDictatedMessage } from '@archon/core/messaging/dictation';
-import {
-  formatQuotedMessage,
-  parseQuotedMessage,
-} from '@archon/core/messaging/quoted-context';
+import { formatQuotedMessage, parseQuotedMessage } from '@archon/core/messaging/quoted-context';
 import { isVoiceUpload } from './audio-format';
 import { cleanTranscript } from './clean-transcript';
 import { voiceConfig } from './config';

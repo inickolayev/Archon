@@ -122,7 +122,9 @@ describe('a recording this install cannot transcribe', () => {
   test('a recording that cannot be read back is a note, not a lost message', async () => {
     const dictated = await dictationFor({
       typed: '',
-      files: [{ path: '/nowhere/at/all/voice.ogg', name: 'voice.ogg', mimeType: 'audio/ogg', size: 1 }],
+      files: [
+        { path: '/nowhere/at/all/voice.ogg', name: 'voice.ogg', mimeType: 'audio/ogg', size: 1 },
+      ],
       assistantType: 'claude',
     });
 

@@ -62,7 +62,10 @@ export function yandexFormatOf(mimeType: string, fileName: string): YandexAudioF
     return 'oggopus';
   }
   if (mime === 'audio/mpeg' || mime === 'audio/mp3' || ext === '.mp3') return 'mp3';
-  if (['audio/wav', 'audio/x-wav', 'audio/wave', 'audio/vnd.wave'].includes(mime) || ext === '.wav') {
+  if (
+    ['audio/wav', 'audio/x-wav', 'audio/wave', 'audio/vnd.wave'].includes(mime) ||
+    ext === '.wav'
+  ) {
     return 'lpcm';
   }
   return null;
@@ -89,7 +92,12 @@ export function parseWav(bytes: Uint8Array): PcmAudio | null {
   if (bytes.byteLength < 44) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const tag = (offset: number): string =>
-    String.fromCharCode(bytes[offset] ?? 0, bytes[offset + 1] ?? 0, bytes[offset + 2] ?? 0, bytes[offset + 3] ?? 0);
+    String.fromCharCode(
+      bytes[offset] ?? 0,
+      bytes[offset + 1] ?? 0,
+      bytes[offset + 2] ?? 0,
+      bytes[offset + 3] ?? 0
+    );
   if (tag(0) !== 'RIFF' || tag(8) !== 'WAVE') return null;
 
   let sampleRate = 0;

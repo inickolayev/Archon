@@ -168,10 +168,7 @@ async function recognizeOnce(audio: Uint8Array, opts: YandexSttOptions): Promise
  * at once do not march back in lockstep, and an aborted signal ends the wait
  * rather than sleeping through a cancellation.
  */
-export async function recognizeShort(
-  audio: Uint8Array,
-  opts: YandexSttOptions
-): Promise<string> {
+export async function recognizeShort(audio: Uint8Array, opts: YandexSttOptions): Promise<string> {
   const maxAttempts = (opts.retryAttempts ?? 2) + 1;
   const initialDelay = opts.retryInitialDelayMs ?? 500;
 

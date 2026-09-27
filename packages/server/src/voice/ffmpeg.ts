@@ -123,10 +123,7 @@ const PROBE_ARGS = (inputPath: string): string[] => [
   inputPath,
 ];
 
-async function probeDurationSec(
-  inputPath: string,
-  runner: FfmpegRunner
-): Promise<number | null> {
+async function probeDurationSec(inputPath: string, runner: FfmpegRunner): Promise<number | null> {
   try {
     const out = await runner.run('ffprobe', PROBE_ARGS(inputPath));
     const parsed = JSON.parse(Buffer.from(out).toString('utf8')) as {
@@ -140,10 +137,7 @@ async function probeDurationSec(
   }
 }
 
-async function withTempFile<T>(
-  input: Uint8Array,
-  fn: (path: string) => Promise<T>
-): Promise<T> {
+async function withTempFile<T>(input: Uint8Array, fn: (path: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), 'archon-voice-'));
   const file = join(dir, `${randomUUID()}.bin`);
   await writeFile(file, input);
@@ -171,7 +165,8 @@ export async function splitIntoOggChunks(
 ): Promise<AudioChunks> {
   return withTempFile(input, async inputPath => {
     const probed = await probeDurationSec(inputPath, runner);
-    const effectiveTotal = probed === null ? options.maxTotalSeconds : Math.min(probed, options.maxTotalSeconds);
+    const effectiveTotal =
+      probed === null ? options.maxTotalSeconds : Math.min(probed, options.maxTotalSeconds);
     const truncated = probed !== null && probed > options.maxTotalSeconds;
 
     const chunks: Uint8Array[] = [];

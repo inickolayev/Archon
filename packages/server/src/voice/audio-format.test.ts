@@ -9,7 +9,10 @@ import {
 } from './audio-format';
 
 /** A WAV header the console's recorder produces: mono, 16 kHz, 16-bit. */
-function wav(sampleBytes: number, options: { channels?: number; rate?: number; bits?: number } = {}): Uint8Array {
+function wav(
+  sampleBytes: number,
+  options: { channels?: number; rate?: number; bits?: number } = {}
+): Uint8Array {
   const channels = options.channels ?? 1;
   const rate = options.rate ?? 16_000;
   const bits = options.bits ?? 16;
@@ -126,7 +129,7 @@ describe('cutting PCM into requests', () => {
     expect(total).toBe(60 * ONE_SECOND_BYTES);
   });
 
-  test("a chunk never exceeds one request, whatever the configuration says", () => {
+  test('a chunk never exceeds one request, whatever the configuration says', () => {
     // 28 s of 16 kHz PCM16 is 896 000 bytes — under the megabyte. Ask for more
     // and the request limit, not the setting, decides.
     const cut = lpcmChunks(pcm(120), 60, 600);

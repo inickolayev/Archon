@@ -2813,7 +2813,9 @@ export async function handleMessage(
     } else {
       getLog().error({ err, conversationId }, 'orchestrator_message_failed');
     }
-    const userMessage = stopHandle.wasStopped() ? TURN_STOPPED_NOTICE : classifyAndFormatError(err, platform);
+    const userMessage = stopHandle.wasStopped()
+      ? TURN_STOPPED_NOTICE
+      : classifyAndFormatError(err, platform);
     try {
       await platform.sendMessage(conversationId, userMessage);
     } catch (sendError) {
