@@ -12,15 +12,19 @@ import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from '.
 import * as archonPaths from '@archon/paths';
 import {
   liveSourceRoots,
+  packagedWorkflowDirectory,
   workflowSourceConfigForRoots,
   type WorkflowSourceRoots,
 } from './workflow-source';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
+import { bundledDefaultCommandPath, bundlesPackagedResources } from './defaults/bundle-inventory';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import type { LoadCommandResult } from './schemas';
+import type { ProviderFailure } from '@archon/provider-contract';
+import type { NodeFailureKind } from './schemas/node-execution';
 import { substituteInputRefs, type JsonValue } from './output-ref';
-import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
+import { parsePackagedResourceReference } from './packaged-workflow';
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -129,7 +133,7 @@ export function isRateLimitError(error: string): boolean {
 }
 
 /**
- * Delay before retry attempt N for a failed attempt with this error message.
+ * Delay before retry attempt N for a failed attempt of this retry class.
  *
  * Rate-limit failures back off FLAT at ~45s ±50% jitter: providers shedding load
  * recover on a minutes-scale window with no retry-after signal (#2706), so exponential
@@ -138,11 +142,11 @@ export function isRateLimitError(error: string): boolean {
  * Everything else keeps the caller's base × 2^attempt exponential shape.
  */
 export function getRetryDelayMs(
-  errorMessage: string,
+  retryClass: RetryClass,
   attempt: number,
   baseDelayMs: number
 ): number {
-  if (isRateLimitError(errorMessage)) {
+  if (retryClass === 'rate_limited') {
     return Math.round(RATE_LIMIT_RETRY_DELAY_MS * (0.5 + Math.random()));
   }
   return baseDelayMs * Math.pow(2, attempt);
@@ -172,24 +176,69 @@ export function extractQuotaResetAt(error: string, now = new Date()): Date | nul
   return null;
 }
 
+/** The failure kinds a provider error can have. Each one decides retry by itself. */
+export type RetryClass = Extract<
+  NodeFailureKind,
+  'fatal' | 'transient' | 'rate_limited' | 'unknown'
+>;
+
 /**
- * Map the retry-oriented {@link ErrorType} to the telemetry wire enum. The
- * telemetry event carries ONLY this fixed-enum class — never error text.
+ * Failure kind of an untyped provider error, classified once from its text. This is the
+ * fallback for providers that do not report a typed `ProviderFailure` yet; a typed failure
+ * goes through {@link nodeFailureKindOf} instead.
  */
-export function toTelemetryErrorClass(errorType: ErrorType): archonPaths.WorkflowErrorClass {
+export function providerFailureKind(error: Error): RetryClass {
+  const errorType = classifyError(error);
   switch (errorType) {
     case 'FATAL':
       return 'fatal';
     case 'TRANSIENT':
-      return 'transient';
+      return isRateLimitError(error.message) ? 'rate_limited' : 'transient';
     case 'UNKNOWN':
       return 'unknown';
     default: {
-      // Exhaustiveness guard: a future ErrorType variant fails compilation
-      // here instead of silently sending `undefined` to the telemetry wire.
       const exhaustive: never = errorType;
       return exhaustive;
     }
+  }
+}
+
+/** The node failure kind a provider's typed failure class maps to. */
+export function nodeFailureKindOf(failure: ProviderFailure): RetryClass {
+  switch (failure.class) {
+    case 'auth':
+    case 'quota_exhausted':
+    case 'budget_exceeded':
+      return 'fatal';
+    case 'rate_limited':
+    case 'transient':
+    case 'unknown':
+      return failure.class;
+    default: {
+      const exhaustive: never = failure.class;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * How retry treats a failed attempt. A provider-error kind recorded at the failure site is
+ * the answer. Engine-detected kinds (timeout, exec_failed, config and the rest) and records
+ * without a kind still classify their error text, as they did before provider failures were
+ * typed: giving each engine kind its own retry rule is a separate decision.
+ */
+export function retryClassOf(failure: {
+  failureKind?: NodeFailureKind;
+  error: string;
+}): RetryClass {
+  switch (failure.failureKind) {
+    case 'fatal':
+    case 'transient':
+    case 'rate_limited':
+    case 'unknown':
+      return failure.failureKind;
+    default:
+      return providerFailureKind(new Error(failure.error));
   }
 }
 
@@ -430,7 +479,12 @@ export async function loadCommandPrompt(
   const packaged = parsePackagedResourceReference(commandName);
   if (packaged !== null) {
     if (packaged.owner.source === 'bundled') {
-      if (!loadDefaultCommands) {
+      if (
+        !loadDefaultCommands ||
+        (roots.kind === 'live' &&
+          !isBinaryBuild() &&
+          !(await bundlesPackagedResources(packaged.owner.pack)))
+      ) {
         return {
           success: false,
           reason: 'not_found',
@@ -459,25 +513,15 @@ export async function loadCommandPrompt(
       }
     }
 
-    let workflowsRoot: string;
-    if (packaged.owner.source === 'project') {
-      if (roots.project === null) {
-        return {
-          success: false,
-          reason: 'not_found',
-          message: `Packaged command not found (no project source): ${packaged.name}.md`,
-        };
-      }
-      workflowsRoot = join(roots.project, '.archon', 'workflows');
-    } else if (packaged.owner.source === 'global') {
-      workflowsRoot = roots.globalWorkflows;
-    } else {
-      workflowsRoot = roots.bundledWorkflows;
+    const workflowDir = await packagedWorkflowDirectory(roots, packaged.owner);
+    if (workflowDir === null) {
+      return {
+        success: false,
+        reason: 'not_found',
+        message: `Packaged command not found (no ${packaged.owner.source} source): ${packaged.name}.md`,
+      };
     }
-    const filePath = join(
-      getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
-      `${packaged.name}.md`
-    );
+    const filePath = join(workflowDir, 'commands', `${packaged.name}.md`);
     try {
       const content = await readFile(filePath, 'utf-8');
       if (!content.trim()) {
@@ -580,13 +624,19 @@ export async function loadCommandPrompt(
       }
       getLog().debug({ commandName }, 'command_bundled_not_found');
     } else {
-      // Bun (or any captured run): load from the bundled-commands root, walking 1 level
-      // deep so `defaults/archon-*.md` resolves.
+      // Live defaults are the flat files the index selects, so they resolve by direct
+      // path. Old captures retain whatever command layout they froze — subfolders
+      // included — so they keep the basename walk, independently of the current index.
       const appDefaultsPath = roots.bundledCommands;
-      const entries = await archonPaths.findCommandFiles(appDefaultsPath);
-      const match = entries.find(e => e.commandName === commandName);
-      if (match) {
-        const filePath = join(appDefaultsPath, match.relativePath);
+      let filePath: string | null;
+      if (roots.kind === 'captured') {
+        const entries = await archonPaths.findCommandFiles(appDefaultsPath);
+        const match = entries.find(e => e.commandName === commandName);
+        filePath = match ? join(appDefaultsPath, match.relativePath) : null;
+      } else {
+        filePath = await bundledDefaultCommandPath(appDefaultsPath, commandName);
+      }
+      if (filePath !== null) {
         try {
           const content = await readFile(filePath, 'utf-8');
           if (!content.trim()) {
@@ -664,6 +714,8 @@ export const CONTEXT_VAR_PATTERN_STR =
  * - $ADOPTED_RUN_DIR (#2747) - The adopted run's artifact directory, resolved
  *   through its persisted `output_root`. Read-only by contract; throws if
  *   referenced without an adoption active.
+ * - $TYPED_ARTIFACTS_FILE - This invocation's typed-artifact listing (JSON). Throws
+ *   if referenced by a context that never materialized one (see below).
  * - $BASE_BRANCH - The base branch (from config or auto-detected)
  * - $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT - GitHub issue/PR context (if available)
  * - $DOCS_DIR - Documentation directory path (configured or default 'docs/')
@@ -697,6 +749,13 @@ export function substituteWorkflowVariables(
     inputs?: Record<string, JsonValue>;
     /** Adopted run's artifact directory (#2747). Undefined = no adoption active. */
     adoptedRunDir?: string;
+    /**
+     * This invocation's typed-artifact listing path. Undefined means the caller never
+     * supplied one (a coordination node, or a wiring bug) and a prompt that references
+     * `$TYPED_ARTIFACTS_FILE` throws. An explicit `''` is a caller stating it has no
+     * listing — the dry-run preview — and substitutes empty without throwing.
+     */
+    typedArtifactsFile?: string;
   }
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
@@ -731,6 +790,19 @@ export function substituteWorkflowVariables(
     );
   }
 
+  // $TYPED_ARTIFACTS_FILE is delivered by every executable invocation context (bash,
+  // script, agent prompt, loop attempt). A context that never supplied one must fail
+  // loudly: substituting '' would read as "no typed artifacts", which is the exact
+  // silent-empty lookup this contract exists to remove. An explicit empty string is
+  // different — a caller that knows it has no listing (the dry-run preview) says so.
+  if (options?.typedArtifactsFile === undefined && prompt.includes('$TYPED_ARTIFACTS_FILE')) {
+    throw new Error(
+      '$TYPED_ARTIFACTS_FILE is referenced but this invocation has no typed-artifact listing. ' +
+        'It is available inside bash, script, agent, loop, and approval-rework nodes; ' +
+        'if you are seeing this from one of those, please report it as a bug.'
+    );
+  }
+
   // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
   const resolvedDocsDir = docsDir || 'docs/';
 
@@ -744,6 +816,9 @@ export function substituteWorkflowVariables(
     // or `bash:`/`script:` bodies would never see it.
     .replace(/\$STATE_DIR/g, options?.stateDir ?? '')
     .replace(/\$ADOPTED_RUN_DIR/g, options?.adoptedRunDir ?? currentAdoptedRunDir() ?? '')
+    // Also engine-controlled; the same path is delivered as TYPED_ARTIFACTS_FILE to
+    // exec subprocesses, so a shell body resolves it either way.
+    .replace(/\$TYPED_ARTIFACTS_FILE/g, options?.typedArtifactsFile ?? '')
     .replace(/\$BASE_BRANCH/g, baseBranch)
     .replace(/\$DOCS_DIR/g, resolvedDocsDir);
 
@@ -801,7 +876,8 @@ export function substituteWorkflowVariables(
  * @param issueContext - Optional GitHub issue/PR context to substitute or append
  * @param logLabel - Human-readable label for logging (e.g., 'workflow step prompt')
  * @param options - Forwarded to {@link substituteWorkflowVariables}; carries `stateDir`
- *   for `$STATE_DIR`, which throws when referenced without one.
+ *   for `$STATE_DIR` and `typedArtifactsFile` for `$TYPED_ARTIFACTS_FILE`, each of
+ *   which throws when referenced without one.
  * @returns The final prompt with variables substituted and context optionally appended
  */
 export function buildPromptWithContext(
@@ -813,7 +889,12 @@ export function buildPromptWithContext(
   docsDir: string,
   issueContext: string | undefined,
   logLabel: string,
-  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, JsonValue> }
+  options?: {
+    shellSafe?: boolean;
+    stateDir?: string;
+    inputs?: Record<string, JsonValue>;
+    typedArtifactsFile?: string;
+  }
 ): string {
   const { prompt, contextSubstituted } = substituteWorkflowVariables(
     template,

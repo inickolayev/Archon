@@ -3,6 +3,15 @@
 // HARD RULE: This file must never import SDK packages.
 
 import type { EffortRung } from '@archon/paths/effort';
+import type {
+  ProviderCapabilities,
+  ProviderResult,
+  ResolvedModel,
+  TokenUsage,
+} from '@archon/provider-contract';
+
+// The contract package owns these shapes; they are re-exported so existing imports keep one type.
+export type { ProviderCapabilities, ProviderResult, ResolvedModel, TokenUsage };
 
 // ─── Provider Config Defaults ──────────────────────────────────────────────
 // Canonical definitions — @archon/core/config/config-types.ts imports from here.
@@ -159,36 +168,25 @@ export interface OpencodeProviderDefaults {
 /** Generic per-provider defaults bag used by config surfaces and UI. */
 export type ProviderDefaults = Record<string, unknown>;
 
-/** Strict parser for an explicitly selected, run-scoped provider config layer. */
-export type ProviderRunConfigParser = (raw: ProviderDefaults) => ProviderDefaults;
+/**
+ * Which authored surface a strict provider-config parse is validating.
+ *
+ * `install` is `assistants.<provider>` in a global or repository
+ * `.archon/config.yaml`; `run` is an explicitly selected per-run layer. They
+ * share one parser so both paths reject the same bad values, and the scope
+ * lets a provider refuse a key whose consumer owns process-lifetime state and
+ * therefore cannot be re-decided per run.
+ */
+export type ProviderConfigScope = 'install' | 'run';
+
+/** Strict parser for an authored provider config layer. */
+export type ProviderConfigParser = (
+  raw: ProviderDefaults,
+  scope: ProviderConfigScope
+) => ProviderDefaults;
 
 /** Provider-keyed defaults map. Built-ins may refine individual entries. */
 export type ProviderDefaultsMap = Record<string, ProviderDefaults>;
-
-/**
- * Token usage statistics from AI provider responses.
- */
-export interface TokenUsage {
-  /** Gross prompt input, including cache reads and writes reported separately. */
-  input: number;
-  output: number;
-  /** Provider-reported cached input. Absent means unsupported or unknown; zero is known. */
-  cacheRead?: number;
-  /** Provider-reported cache-creation input. Absent means unsupported or unknown; zero is known. */
-  cacheWrite?: number;
-  /**
-   * Set only by aggregation ({@link mergeTokenUsage}), never by a provider. When true the
-   * cache axes on this usage are a FLOOR: at least one contributing usage did not report
-   * that axis, so true cache use is at least the reported total and
-   * `input - cacheRead - cacheWrite` is an UPPER bound on full-price input rather than an
-   * exact figure. Absent means the cache totals are complete, or that no axis is present
-   * at all (#2662).
-   */
-  cachePartial?: true;
-  /** Total of gross input, output, and any provider-reported reasoning tokens. */
-  total?: number;
-  cost?: number;
-}
 
 /**
  * Sum usages into one aggregate, keeping every cache figure that was actually reported.
@@ -226,11 +224,6 @@ export function mergeTokenUsage(usages: readonly TokenUsage[]): TokenUsage | und
   return merged;
 }
 
-/** Concrete model identifier reported by a provider after a request completes. */
-export interface ResolvedModel {
-  id: string;
-}
-
 /**
  * Message chunk from AI assistant.
  * Discriminated union with per-type required fields for type safety.
@@ -247,31 +240,7 @@ export type MessageChunk =
     }
   | { type: 'system'; content: string }
   | { type: 'thinking'; content: string }
-  | {
-      type: 'result';
-      sessionId?: string;
-      tokens?: TokenUsage;
-      structuredOutput?: unknown;
-      isError?: boolean;
-      errorSubtype?: string;
-      /** SDK-provided error detail strings. Populated when isError is true. */
-      errors?: string[];
-      cost?: number;
-      stopReason?: string;
-      numTurns?: number;
-      /** Concrete model reported by the provider; omitted when its SDK does not expose one. */
-      resolvedModel?: ResolvedModel;
-      /**
-       * Outcome of a session-resume attempt, so a failed resume is observable
-       * instead of silently continuing with a fresh (cold) session:
-       *   - `true`   a resume was requested and the prior session was restored
-       *   - `false`  a resume was requested but the provider fell back to fresh
-       *   - omitted  no resume was requested
-       * Set only when `resumeSessionId` was passed. Consumers (the dag-executor)
-       * use `false` to surface a warning rather than swallow the loss.
-       */
-      resumed?: boolean;
-    }
+  | ({ type: 'result' } & ProviderResult)
   | { type: 'rate_limit'; rateLimitInfo: Record<string, unknown> }
   | {
       type: 'tool';
@@ -520,21 +489,58 @@ export interface AgentRequestOptions {
 }
 
 /**
+ * One property on a native tool's input object. `kind` is the discriminant the
+ * provider converters switch on; each variant maps to exactly one SDK schema
+ * form. `values` is a non-empty tuple, so an enum with no options is a compile
+ * error rather than a provider-side runtime throw.
+ */
+export type NativeToolProperty =
+  | { kind: 'string'; description?: string }
+  | { kind: 'enum'; values: readonly [string, ...string[]]; description?: string }
+  | { kind: 'boolean'; description?: string };
+
+/**
+ * The closed input shape a native tool may declare: a flat object of string /
+ * string-enum / boolean properties, plus the names of the required ones. Every
+ * provider maps this to its SDK's schema form, so the supported subset lives
+ * here once instead of being re-derived by each converter.
+ */
+export interface NativeToolInputSchema {
+  properties: Record<string, NativeToolProperty>;
+  required: readonly string[];
+}
+
+/**
+ * Build a NativeToolInputSchema while tying `required` to the property keys: a
+ * name that is not a declared property is a compile error, where the erased
+ * interface alone would accept any string. Returns the erased shape so
+ * `NativeTool` stays non-generic — a `keyof P` constraint on the interface
+ * itself would make the schema invariant in `P` and break assignment to
+ * `SendQueryOptions.nativeTools`.
+ */
+export function defineNativeToolInputSchema<P extends Record<string, NativeToolProperty>>(input: {
+  properties: P;
+  required: readonly (keyof P & string)[];
+}): NativeToolInputSchema {
+  return input;
+}
+
+/**
  * A provider-neutral in-process tool. The handler runs in the host process and
  * closes over whatever live context it needs (DB, operations, conversation), so
  * `@archon/providers` never imports `@archon/core` — the tool crosses the
  * boundary as data + a function on the request options.
  *
- * `inputSchema` is canonical JSON Schema (object). Each provider converts it to
- * its SDK's schema form. The handler is expected to return a text result rather
- * than throw — provider adapters add no safety net, so an uncaught throw would
+ * `inputSchema` is the closed typed shape each provider maps to its SDK's
+ * schema form. The handler is expected to return a text result rather than
+ * throw — provider adapters add no safety net, so an uncaught throw would
  * surface into the agent loop. (core's `buildManageRunTool` guarantees this with
  * an outer try/catch around its dispatch.)
  */
 export interface NativeTool {
   name: string;
   description: string;
-  inputSchema: Record<string, unknown>;
+  inputSchema: NativeToolInputSchema;
   handler: (input: Record<string, unknown>) => Promise<string>;
 }
 
@@ -619,7 +625,36 @@ export interface NodeConfig {
  * The orchestrator path uses base AgentRequestOptions fields only.
  * The workflow path additionally passes nodeConfig and assistantConfig.
  */
+/**
+ * The install-wide provider slot held by the current `sendQuery` call. Archon core
+ * sets it only when the operator configured a cap for this provider; a provider with
+ * no internal retry loop can ignore it, because core already releases the slot when
+ * the `sendQuery` stream closes.
+ */
+export interface ProviderAttemptAdmission {
+  /**
+   * Release the slot for a provider-internal retry backoff, run `wait`, then wait for
+   * a slot again before the next attempt. Rejects when the request is aborted while
+   * waiting for the slot, leaving no slot held.
+   */
+  releaseDuring(wait: () => Promise<void>): Promise<void>;
+}
+
+/** Typed admission transitions for one capped provider attempt. */
+export interface ProviderAdmissionEvent {
+  state: 'waiting' | 'admitted' | 'released';
+  /** Provider registration ID. */
+  provider: string;
+  /** Slot holder ID; stable from `waiting` through `released` for one attempt. */
+  attemptId: string;
+  capacity: number;
+}
+
 export interface SendQueryOptions extends AgentRequestOptions {
+  /** Set by Archon core admission; callers do not supply it. */
+  admission?: ProviderAttemptAdmission;
+  /** Observer for capped-provider admission transitions (queue visibility, #2817). */
+  onAdmission?: (event: ProviderAdmissionEvent) => void;
   /** Raw YAML node config — provider translates internally to SDK-specific options. */
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
@@ -634,77 +669,6 @@ export interface SendQueryOptions extends AgentRequestOptions {
    * value can never reach a provider that cannot honor it.
    */
   execContext?: ExecutionContext;
-}
-
-/**
- * Provider capability flags. The dag-executor uses these for capability warnings
- * when a node specifies features the target provider doesn't support.
- */
-export interface ProviderCapabilities {
-  sessionResume: boolean;
-  /**
-   * Given a session ID, create a new session containing the source history
-   * while leaving the source unchanged. Omission means unsupported.
-   */
-  sessionFork?: boolean;
-  mcp: boolean;
-  hooks: boolean;
-  skills: boolean;
-  /** Whether the provider supports inline sub-agent definitions (Claude SDK's options.agents). */
-  agents: boolean;
-  toolRestrictions: boolean;
-  /**
-   * Built-in tool-name vocabulary for advisory validation of
-   * `allowed_tools`/`denied_tools` entries. When present, workflow validation
-   * warns (never errors) on entries not in this list — after stripping a
-   * `Tool(specifier)` suffix and skipping `mcp__*` names, which are dynamic
-   * per-install. When absent, the check is skipped entirely: providers without
-   * a stable audited vocabulary opt out simply by not declaring one, keeping
-   * their tool names out of the shared schema.
-   */
-  knownToolNames?: readonly string[];
-  /**
-   * Old tool name → current tool name, for tools the provider's SDK has
-   * renamed (e.g. Claude's `Task` → `Agent`). Lets validation give a precise
-   * "renamed" hint instead of a generic unknown-name warning, since a stale
-   * name is a silent no-op at runtime.
-   */
-  renamedTools?: Readonly<Record<string, string>>;
-  /**
-   * Structured-output guarantee tier for `output_format`:
-   *  - `'enforced'`    — SDK/backend grammar-constrains decoding (Claude, Codex,
-   *    OpenCode). The request path is native; Archon still validates post-parse
-   *    as a net for the refusal / `max_tokens`-truncation edges.
-   *  - `'best-effort'` — prompt-augmentation + repair + post-parse validate (Pi,
-   *    Copilot). No backend grammar; on a validation miss the executor re-asks up
-   *    to 3× (prompt + schema errors), then fails the node.
-   *  - `false`         — the provider cannot produce structured output at all.
-   */
-  structuredOutput: 'enforced' | 'best-effort' | false;
-  envInjection: boolean;
-  costControl: boolean;
-  effortControl: boolean;
-  fallbackModel: boolean;
-  sandbox: boolean;
-  /**
-   * Whether the provider honors the per-node `settingSources` override (which
-   * filesystem setting sources the agent loads: CLAUDE.md, skills, commands,
-   * agents). `true` for Claude only — the Claude Agent SDK's `settingSources`
-   * option; other providers have no equivalent knob.
-   */
-  settingSources: boolean;
-  /** Whether the provider can register in-process `NativeTool`s for a turn. */
-  nativeTools: boolean;
-  /**
-   * Whether the provider can execute inside the folder-project container backend
-   * (`execContext.kind === 'container'`) — i.e. it knows how to spawn its CLI via
-   * `docker exec` rather than a local process. `true` for Claude
-   * (`spawnClaudeCodeProcess` hook). The engine's pre-dispatch fail-fast rejects
-   * a container run whose resolved provider has this `false`, so an unsupported
-   * provider can never silently downgrade to running on the host. Codex/Pi/
-   * community providers set `false` until they implement their in-container path.
-   */
-  containerExec: boolean;
 }
 
 /**
@@ -777,11 +741,12 @@ export interface ProviderRegistration {
   credentials: ProviderCredentialCatalog;
 
   /**
-   * Validate and normalize provider defaults selected for one workflow run.
-   * Ordinary config remains defensive and tolerant; explicit run config must
-   * reject values the provider would otherwise silently discard.
+   * Validate and normalize authored provider defaults, for `.archon/config.yaml`
+   * and for a per-run config layer alike. Execution-time parsing stays defensive
+   * and tolerant; an authored setting must reject values the provider would
+   * otherwise silently discard.
    */
-  parseRunConfig: ProviderRunConfigParser;
+  parseConfig: ProviderConfigParser;
 
   /**
    * Ask the agent runtime which models it currently offers. Present only for

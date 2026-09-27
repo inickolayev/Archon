@@ -78,7 +78,18 @@ describe('workflows database', () => {
     parent_run_id: null,
     adopted_from_run_id: null,
     output_root: null,
+    checkout_baseline: null,
   };
+
+  function mockTerminalSnapshot(
+    status: 'completed' | 'failed' | 'cancelled',
+    id = mockWorkflowRun.id
+  ): void {
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([{ ...mockWorkflowRun, id, status, completed_at: new Date() }])
+    );
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+  }
 
   describe('createWorkflowRun', () => {
     test('creates a new workflow run', async () => {
@@ -707,6 +718,7 @@ describe('workflows database', () => {
 
     test('fails only the exact paused attention cursor after notification loss', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('failed');
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       const attentionWait = {
         owner: 'loop_group' as const,
@@ -739,7 +751,7 @@ describe('workflows database', () => {
         'pause',
         4,
       ]);
-      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(mockQuery.mock.calls[3]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
     });
 
     test('leaves a replaced attention cursor untouched', async () => {
@@ -917,7 +929,7 @@ describe('workflows database', () => {
           stepName: 'await-ci',
           result: { status: 'satisfied', waited_ms: 1000 },
         })
-      ).resolves.toEqual({ cleared: true });
+      ).resolves.toMatchObject({ cleared: true });
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("metadata - 'wait'");
       expect(query).toContain("status = 'running'");
@@ -945,7 +957,7 @@ describe('workflows database', () => {
           stepName: 'rerun-ci',
           result: { status: 'satisfied', waited_ms: 1000 },
         })
-      ).resolves.toEqual({ cleared: true });
+      ).resolves.toMatchObject({ cleared: true });
 
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("metadata->'wait'->>'waitingSince' = $3");
@@ -1005,6 +1017,7 @@ describe('workflows database', () => {
   describe('completeWorkflowRun', () => {
     test('marks workflow run as completed', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('completed');
 
       await completeWorkflowRun('workflow-run-123', { duration_ms: 123 });
 
@@ -1017,10 +1030,13 @@ describe('workflows database', () => {
       expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining("AND status = 'running'"), [
         'workflow-run-123',
       ]);
-      const [eventQuery, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      const [eventQuery, eventParams] = mockQuery.mock.calls[3] as [string, unknown[]];
       expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
       expect(eventParams[2]).toBe('workflow_completed');
-      expect(JSON.parse(eventParams[5] as string)).toEqual({ duration_ms: 123 });
+      expect(JSON.parse(eventParams[5] as string)).toMatchObject({
+        duration_ms: 123,
+        terminal_record: expect.any(Object),
+      });
     });
 
     test('throws when rowCount is 0', async () => {
@@ -1034,6 +1050,7 @@ describe('workflows database', () => {
 
     test('merges metadata when provided', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('completed');
       const metadata = { node_counts: { completed: 3, failed: 1, skipped: 0, total: 4 } };
 
       await completeWorkflowRun('workflow-run-123', { duration_ms: 123 }, metadata);
@@ -1046,6 +1063,7 @@ describe('workflows database', () => {
 
     test('uses simple query without metadata merge when no metadata provided', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('completed');
 
       await completeWorkflowRun('workflow-run-123', { duration_ms: 123 });
 
@@ -1056,6 +1074,7 @@ describe('workflows database', () => {
 
     test('does not commit completion when its audit insert fails', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('completed');
       mockQuery.mockRejectedValueOnce(new Error('audit unavailable'));
 
       await expect(completeWorkflowRun('workflow-run-123', { duration_ms: 123 })).rejects.toThrow(
@@ -1067,6 +1086,7 @@ describe('workflows database', () => {
   describe('failWorkflowRun', () => {
     test('marks workflow run as failed with error', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('failed');
 
       await failWorkflowRun('workflow-run-123', 'Step not found: missing.md');
 
@@ -1078,10 +1098,11 @@ describe('workflows database', () => {
         expect.stringContaining('completed_at = NOW()'),
         expect.any(Array)
       );
-      const [eventQuery, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      const [eventQuery, eventParams] = mockQuery.mock.calls[3] as [string, unknown[]];
       expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
       expect(eventParams[2]).toBe('workflow_failed');
-      expect(JSON.parse(eventParams[5] as string)).toEqual({
+      expect(JSON.parse(eventParams[5] as string)).toMatchObject({
+        terminal_record: expect.any(Object),
         error: 'Step not found: missing.md',
       });
       expect(mockQuery).toHaveBeenCalledWith(
@@ -1094,6 +1115,7 @@ describe('workflows database', () => {
 
     test('stores error in metadata', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('failed');
 
       await failWorkflowRun('workflow-run-123', 'Timeout exceeded');
 
@@ -1104,6 +1126,7 @@ describe('workflows database', () => {
     test('stores a quota continuation in the same transition to failed', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('failed');
       const scheduled = {
         reason: 'quota' as const,
         resumeAt: '2026-08-25T10:00:00.000Z',
@@ -1112,7 +1135,7 @@ describe('workflows database', () => {
         maxAttempts: 2,
       };
 
-      await failWorkflowRun('workflow-run-123', 'Quota exhausted', scheduled);
+      await failWorkflowRun('workflow-run-123', 'Quota exhausted', { scheduledResume: scheduled });
 
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("SET status = 'failed'");
@@ -1129,9 +1152,49 @@ describe('workflows database', () => {
         attempt: 1,
         max_attempts: 2,
       });
-      const [, terminalEventParams] = mockQuery.mock.calls[2] as [string, unknown[]];
+      const [, terminalEventParams] = mockQuery.mock.calls[4] as [string, unknown[]];
       expect(terminalEventParams[2]).toBe('workflow_failed');
-      expect(JSON.parse(terminalEventParams[5] as string)).toEqual({ error: 'Quota exhausted' });
+      expect(JSON.parse(terminalEventParams[5] as string)).toMatchObject({
+        error: 'Quota exhausted',
+        terminal_record: expect.any(Object),
+      });
+    });
+
+    test('records the stop reason and its signal on the run row', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('failed');
+
+      await failWorkflowRun('workflow-run-123', 'Process terminated (SIGINT)', {
+        exitReason: 'process_terminated',
+        signal: 'SIGINT',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(JSON.parse(params[1] as string)).toEqual({
+        error: 'Process terminated (SIGINT)',
+        stop_reason: { reason: 'process_terminated', signal: 'SIGINT' },
+      });
+      // Written wholesale: a previous failure's copy is removed before the merge, so
+      // SQLite's recursive json_patch cannot leave its signal under a new reason.
+      expect(query).toContain("metadata - 'scheduled_resume' - 'stop_reason'");
+      // The terminal event's bare `exit_reason` string is a shipped persisted value the
+      // telemetry reader parses; the row's structured copy does not replace it.
+      const [eventQuery, eventParams] = mockQuery.mock.calls[3] as [string, unknown[]];
+      expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(eventParams[2]).toBe('workflow_failed');
+      expect(JSON.parse(eventParams[5] as string)).toMatchObject({
+        exit_reason: 'process_terminated',
+      });
+    });
+
+    test('omits the stop reason when the caller gave no exit reason', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('failed');
+
+      await failWorkflowRun('workflow-run-123', 'Bash node failed');
+
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(JSON.parse(params[1] as string)).toEqual({ error: 'Bash node failed' });
     });
 
     test('does not complete the quota transition when its audit insert fails', async () => {
@@ -1140,11 +1203,13 @@ describe('workflows database', () => {
 
       await expect(
         failWorkflowRun('workflow-run-123', 'Quota exhausted', {
-          reason: 'quota',
-          resumeAt: '2026-08-25T10:00:00.000Z',
-          deadlineAt: '2026-08-26T10:00:00.000Z',
-          attempt: 1,
-          maxAttempts: 2,
+          scheduledResume: {
+            reason: 'quota',
+            resumeAt: '2026-08-25T10:00:00.000Z',
+            deadlineAt: '2026-08-26T10:00:00.000Z',
+            attempt: 1,
+            maxAttempts: 2,
+          },
         })
       ).rejects.toThrow('audit unavailable');
     });
@@ -1152,11 +1217,13 @@ describe('workflows database', () => {
     test('rejects an invalid quota continuation before writing the failed row', async () => {
       await expect(
         failWorkflowRun('workflow-run-123', 'Quota exhausted', {
-          reason: 'quota',
-          resumeAt: '2026-08-27T10:00:00.000Z',
-          deadlineAt: '2026-08-26T10:00:00.000Z',
-          attempt: 3,
-          maxAttempts: 2,
+          scheduledResume: {
+            reason: 'quota',
+            resumeAt: '2026-08-27T10:00:00.000Z',
+            deadlineAt: '2026-08-26T10:00:00.000Z',
+            attempt: 3,
+            maxAttempts: 2,
+          },
         })
       ).rejects.toThrow();
       expect(mockQuery).not.toHaveBeenCalled();
@@ -1173,6 +1240,7 @@ describe('workflows database', () => {
 
     test('does not commit failure when its terminal audit insert fails', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('failed');
       mockQuery.mockRejectedValueOnce(new Error('audit unavailable'));
 
       await expect(failWorkflowRun('workflow-run-123', 'some error')).rejects.toThrow(
@@ -1438,14 +1506,16 @@ describe('workflows database', () => {
       const failed = { ...mockWorkflowRun, id: 'run-c', status: 'failed' as const };
       mockQuery
         .mockResolvedValueOnce(createQueryResult([paused, running, failed]))
-        .mockResolvedValueOnce(createQueryResult([], 2))
-        .mockResolvedValueOnce(createQueryResult([], 1))
-        .mockResolvedValueOnce(createQueryResult([], 1));
+        .mockResolvedValueOnce(createQueryResult([], 2));
+      for (const id of ['run-a', 'run-c']) {
+        mockTerminalSnapshot('cancelled', id);
+        mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      }
 
       const result = await cancelResumableRunsForConversation('conv-1');
 
       expect(result).toEqual([paused, failed]);
-      expect(mockQuery).toHaveBeenCalledTimes(4);
+      expect(mockQuery).toHaveBeenCalledTimes(8);
       const [selectSql, selectParams] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(selectSql).toContain('SELECT * FROM remote_agent_workflow_runs');
       expect(selectSql).toContain('conversation_id = $1 OR parent_conversation_id = $2');
@@ -1458,7 +1528,7 @@ describe('workflows database', () => {
       expect(updateSql).not.toContain('RETURNING');
       expect(updateParams).toEqual(['conv-1', 'conv-1']);
       for (const [index, runId] of ['run-a', 'run-c'].entries()) {
-        const [eventSql, eventParams] = mockQuery.mock.calls[index + 2] as [string, unknown[]];
+        const [eventSql, eventParams] = mockQuery.mock.calls[index * 3 + 4] as [string, unknown[]];
         expect(eventSql).toContain('INSERT INTO remote_agent_workflow_events');
         expect(eventParams[1]).toBe(runId);
         expect(eventParams[2]).toBe('workflow_cancelled');
@@ -1758,7 +1828,7 @@ describe('workflows database', () => {
       expect(result.completed_at).toBeNull();
       // First call: the row-pinning read of the error the CAS is about to clear.
       const [priorQuery, priorParams] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(priorQuery).toContain('SELECT status, metadata');
+      expect(priorQuery).toContain('SELECT w.status, w.metadata, q.resource_key');
       // Postgres row lock — without it the value read is not guaranteed to be the
       // value the CAS clears, so the preserved error could be stale (#2348).
       expect(priorQuery).toContain('FOR UPDATE');
@@ -1773,7 +1843,7 @@ describe('workflows database', () => {
       expect(updateParams).toEqual([
         'workflow-run-123',
         1,
-        JSON.stringify({ error: null, continuation_retry_at: null }),
+        JSON.stringify({ error: null, stop_reason: null, continuation_retry_at: null }),
       ]);
       // Third call: SELECT
       const [selectQuery, selectParams] = mockQuery.mock.calls[2] as [string, unknown[]];
@@ -1820,7 +1890,7 @@ describe('workflows database', () => {
       expect(updateParams).toEqual([
         'workflow-run-123',
         1,
-        JSON.stringify({ error: null, continuation_retry_at: null }),
+        JSON.stringify({ error: null, stop_reason: null, continuation_retry_at: null }),
       ]);
     });
 
@@ -2012,9 +2082,9 @@ describe('workflows database', () => {
 
   describe('cancelWorkflowRun', () => {
     test('cancels a non-terminal run and reports { cancelled: true }', async () => {
-      mockQuery
-        .mockResolvedValueOnce(createQueryResult([], 1))
-        .mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('cancelled');
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
       const result = await cancelWorkflowRun('workflow-run-123', {
         step_name: 'halt',
@@ -2022,21 +2092,24 @@ describe('workflows database', () => {
       });
 
       expect(result).toEqual({ cancelled: true });
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(mockQuery).toHaveBeenCalledTimes(4);
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'cancelled'");
       // Must not re-cancel / re-stamp completed_at on an already-finished run.
       expect(query).toContain("status NOT IN ('completed', 'cancelled')");
       expect(params).toEqual(['workflow-run-123']);
-      const [eventQuery, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      const [eventQuery, eventParams] = mockQuery.mock.calls[3] as [string, unknown[]];
       expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
-      expect(eventParams.slice(1)).toEqual([
+      expect(eventParams.slice(1, 5)).toEqual([
         'workflow-run-123',
         'workflow_cancelled',
         null,
         'halt',
-        JSON.stringify({ reason: 'operator requested' }),
       ]);
+      expect(JSON.parse(eventParams[5] as string)).toMatchObject({
+        reason: 'operator requested',
+        terminal_record: expect.any(Object),
+      });
     });
 
     test('reports { cancelled: false } when the run is already terminal (no throw)', async () => {
@@ -2058,15 +2131,15 @@ describe('workflows database', () => {
 
   describe('cancelFanOutRun', () => {
     test('persists the engine reason and cancelled status in one update', async () => {
-      mockQuery
-        .mockResolvedValueOnce(createQueryResult([], 1))
-        .mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockTerminalSnapshot('cancelled');
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
       await expect(cancelFanOutRun('workflow-run-123', 'fan_out_orphan')).resolves.toEqual({
         cancelled: true,
       });
 
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(mockQuery).toHaveBeenCalledTimes(4);
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'cancelled'");
       expect(query).toContain('metadata =');
@@ -2075,15 +2148,18 @@ describe('workflows database', () => {
         'workflow-run-123',
         JSON.stringify({ cancelled_reason: 'fan_out_orphan' }),
       ]);
-      const [eventQuery, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      const [eventQuery, eventParams] = mockQuery.mock.calls[3] as [string, unknown[]];
       expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
-      expect(eventParams.slice(1)).toEqual([
+      expect(eventParams.slice(1, 5)).toEqual([
         'workflow-run-123',
         'workflow_cancelled',
         null,
         null,
-        JSON.stringify({ reason: 'fan_out_orphan' }),
       ]);
+      expect(JSON.parse(eventParams[5] as string)).toMatchObject({
+        reason: 'fan_out_orphan',
+        terminal_record: expect.any(Object),
+      });
     });
 
     test('does not tag an already-terminal run', async () => {

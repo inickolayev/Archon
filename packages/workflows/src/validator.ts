@@ -9,25 +9,29 @@
  * REST API can use it.
  */
 
-import { dirname, join, resolve, isAbsolute } from 'path';
+import { join, resolve, isAbsolute } from 'path';
 import { access, readFile, stat } from 'fs/promises';
 import {
   createLogger,
   getCommandFolderSearchPaths,
   getDefaultCommandsPath,
-  getDefaultWorkflowsPath,
   getHomeCommandsPath,
-  getHomeWorkflowsPath,
   findCommandFiles,
 } from '@archon/paths';
 import { execFileAsync } from '@archon/git';
 import { BUNDLED_COMMANDS, BUNDLED_WORKFLOWS, isBinaryBuild } from './defaults/bundled-defaults';
+import {
+  bundledDefaultCommandPath,
+  bundlesPackagedResources,
+  listBundledDefaultCommands,
+} from './defaults/bundle-inventory';
 import { isValidCommandName } from './command-validation';
 import { levenshtein, findSimilar } from './utils/fuzzy-match';
 import {
   claudeSkillSearchRoots,
   compileOutputSchema,
   findInstalledSkillNames,
+  findRequiredPropertyGaps,
   getProviderCapabilities,
   isRegisteredProvider,
   skillSearchRoots,
@@ -46,6 +50,7 @@ import {
   isLoopGroupNode,
   isIncludeDirective,
   isOutputFormatEnforced,
+  isWaitNode,
   isWorkflowNode,
 } from './schemas';
 import { parseWorkflow, workflowNodeOutputFormatError } from './loader';
@@ -57,7 +62,8 @@ import type { ScriptRuntime } from './script-discovery';
 import { discoverScriptsForCwd } from './script-discovery';
 import { isInlineScript } from './executor-shared';
 import { buildAiProfile, isLiteralSpec, resolveModelSpec } from './model-validation';
-import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
+import { parsePackagedResourceReference } from './packaged-workflow';
+import { liveSourceRoots, packagedWorkflowDirectory } from './workflow-source';
 import type { RawAliasesConfig, RawTiersConfig, ResolvedAiProfile } from './model-validation';
 
 // =============================================================================
@@ -179,10 +185,8 @@ export async function discoverAvailableCommands(
         if (parsePackagedResourceReference(name) === null) names.add(name);
       }
     } else {
-      const defaultsPath = getDefaultCommandsPath();
-      const files = await findCommandFiles(defaultsPath);
-      for (const { commandName } of files) {
-        names.add(commandName);
+      for (const name of await listBundledDefaultCommands(getDefaultCommandsPath())) {
+        names.add(name);
       }
     }
   }
@@ -226,19 +230,11 @@ async function resolveCommand(
       if (isBinaryBuild()) {
         return commandName in BUNDLED_COMMANDS ? `[bundled:${commandName}]` : null;
       }
+      if (!(await bundlesPackagedResources(packaged.owner.pack))) return null;
     }
-    let workflowsRoot: string;
-    if (packaged.owner.source === 'project') {
-      workflowsRoot = join(cwd, '.archon', 'workflows');
-    } else if (packaged.owner.source === 'global') {
-      workflowsRoot = getHomeWorkflowsPath();
-    } else {
-      workflowsRoot = dirname(getDefaultWorkflowsPath());
-    }
-    const path = join(
-      getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
-      `${packaged.name}.md`
-    );
+    const workflowDir = await packagedWorkflowDirectory(liveSourceRoots(cwd), packaged.owner);
+    if (workflowDir === null) return null;
+    const path = join(workflowDir, 'commands', `${packaged.name}.md`);
     try {
       return (await stat(path)).isFile() ? path : null;
     } catch (error) {
@@ -281,8 +277,21 @@ async function resolveCommand(
         return `[bundled:${commandName}]`;
       }
     } else {
-      const defaultsResolved = await resolveCommandInDir(getDefaultCommandsPath(), commandName);
-      if (defaultsResolved) return defaultsResolved;
+      const path = await bundledDefaultCommandPath(getDefaultCommandsPath(), commandName);
+      // A miss is ENOENT; any other stat failure belongs to the caller, not to a silent null.
+      if (path !== null) {
+        try {
+          if ((await stat(path)).isFile()) return path;
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          if (err.code !== 'ENOENT') {
+            getLog().error({ err, path, commandName }, 'bundled_default_command_inspection_failed');
+            throw new Error(`Cannot inspect bundled default '${commandName}': ${err.message}`, {
+              cause: err,
+            });
+          }
+        }
+      }
     }
   }
 
@@ -393,7 +402,9 @@ export async function validateWorkflowResources(
   const issues: ValidationIssue[] = [];
   const availableCommands = await discoverAvailableCommands(cwd, config);
   const requiresPortableModelRefs =
-    config?.workflowSource === 'bundled' || config?.workflowSource === 'global';
+    config?.workflowSource === 'bundled' ||
+    config?.workflowSource === 'global' ||
+    config?.workflowSource === 'installed';
   const modelProfileProvider = config?.assistant ?? defaultProvider ?? 'claude';
   let aiProfile: ResolvedAiProfile | undefined;
 
@@ -448,20 +459,30 @@ export async function validateWorkflowResources(
     }
   }
 
-  // Flatten top-level nodes plus every loop_group body (recursing into nested
-  // loop_groups) so resource checks (commands, mcp, skills, scripts) validate
-  // body nodes too. ID-uniqueness/cycle checks are the loader's job; the validator
-  // only checks referenced resources exist, so flattening is safe here.
-  const allNodes: (DagNode | IncludeDirective)[] = [];
-  const collectNodes = (nodes: readonly (DagNode | IncludeDirective)[]): void => {
-    for (const n of nodes) {
-      allNodes.push(n);
-      if (!isIncludeDirective(n) && isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
+  // Flatten top-level nodes plus every loop_group body while carrying the provider
+  // scope execution gives each group. Body nodes inherit the group's resolved
+  // provider/model unless they override it themselves.
+  const allNodes: {
+    node: DagNode | IncludeDirective;
+    provider: string | undefined;
+  }[] = [];
+  const collectNodes = (
+    nodes: readonly (DagNode | IncludeDirective)[],
+    inheritedProvider: string | undefined
+  ): void => {
+    for (const node of nodes) {
+      const provider = isIncludeDirective(node)
+        ? inheritedProvider
+        : resolveValidationProvider(node, inheritedProvider, defaultProvider, aiProfile);
+      allNodes.push({ node, provider });
+      if (!isIncludeDirective(node) && isLoopGroupNode(node)) {
+        collectNodes(node.loop_group.nodes, provider);
+      }
     }
   };
-  collectNodes(workflow.nodes);
+  collectNodes(workflow.nodes, effectiveWorkflowProvider);
 
-  for (const node of allNodes) {
+  for (const { node, provider } of allNodes) {
     // Include directives carry no resources to check — the target workflow is resolved
     // and inlined at DISCOVERY time (see include-expander.ts), so discovery-fed
     // validation (CLI `validate workflows`) sees the already-expanded nodes and checks
@@ -501,14 +522,36 @@ export async function validateWorkflowResources(
       }
     }
 
-    const provider = resolveValidationProvider(
-      node,
-      effectiveWorkflowProvider,
-      defaultProvider,
-      aiProfile
-    );
     const providerCaps =
       provider && isRegisteredProvider(provider) ? getProviderCapabilities(provider) : undefined;
+
+    // --- Strict-schema required coverage (#2945) ---
+    // A schema whose declared properties are not fully covered by 'required' is
+    // rejected by a provider that enforces OpenAI strict mode (Codex) at the
+    // first turn with HTTP 400 invalid_json_schema. Report it at validation time
+    // so `archon validate workflows` catches it before a live run burns setup
+    // costs. The set of provider-invoking kinds is the same one the launch
+    // preflight uses: every node kind that both enforces output_format
+    // (isOutputFormatEnforced) AND sends the schema to a provider (agent and
+    // loop; not exec/bash/script, and not a wait's engine-injected schema).
+    if (
+      ownershipError === null &&
+      !isExecNode(node) &&
+      !isWaitNode(node) &&
+      isOutputFormatEnforced(node) &&
+      node.output_format !== undefined &&
+      providerCaps?.requiresAllPropertiesRequired
+    ) {
+      for (const gap of findRequiredPropertyGaps(node.output_format, 'output_format')) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'output_format',
+          message: `Node '${node.id}' declares properties not in 'required' at '${gap.schemaPath}': ${gap.missing.join(', ')}. Provider '${provider}' enforces OpenAI strict mode and will reject this schema (HTTP 400 invalid_json_schema).`,
+          hint: 'List every property key in the required array. Express optionality inside the type (e.g. a ["string","null"] union or an enum sentinel like "none").',
+        });
+      }
+    }
 
     if (requiresPortableModelRefs && 'model' in node && node.model?.startsWith('@')) {
       issues.push({

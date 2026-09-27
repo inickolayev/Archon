@@ -63,6 +63,8 @@ Workflows live in `.archon/workflows/` relative to the working directory:
 
 The two directories form a fixed package boundary: `.archon/workflows/<pack>/<workflow>/`. A packaged workflow contains exactly one YAML definition; bare `command:` and named `script:` references resolve only from its own `commands/` and `scripts/` directories, with no shared or cross-scope fallback. Included workflows retain their own resource folder, so two workflows may reuse names such as `review.md` without collisions.
 
+Scripts from different workflows in one pack can import modules from `<pack>/.shared/`. That directory is reserved for modules, not workflow definitions or `script:` targets. Bun and Python use the same pack-relative layout in source checkouts and binary builds. See [Share code within a pack](/guides/script-nodes/#share-code-within-a-pack) for import examples.
+
 The same tree works under `~/.archon/workflows/` for home-scoped workflows. Existing flat `.archon/workflows/foo.yaml`, one-level grouped YAML, shared `.archon/commands/`, and shared `.archon/scripts/` remain supported for compatibility.
 
 > **Global workflows:** For workflows that apply to every project, place them in `~/.archon/workflows/`. Global workflows are overridden by same-named repo workflows. See [Global Workflows](/guides/global-workflows/).
@@ -187,7 +189,7 @@ nodes:
   - id: implement
     command: implement-changes
     depends_on: [investigate, plan]
-    trigger_rule: none_failed_min_one_success  # Run if at least one dep succeeded
+    trigger_rule: none_failed_min_one_success  # Join successful and condition-skipped branches
 
   - id: inline-node
     prompt: "Summarize the changes made in $implement.output"  # Inline prompt (no command file)
@@ -402,8 +404,17 @@ nodes:
 |-------|----------|
 | `all_success` | Run only if all upstream deps completed successfully (default) |
 | `one_success` | Run if at least one upstream dep completed successfully |
-| `none_failed_min_one_success` | Run if no deps failed AND at least one succeeded (skipped deps are ok) |
+| `none_failed_min_one_success` | Run if at least one dependency succeeded and none failed or skipped because of an upstream failure (`upstream_failed`) |
 | `all_done` | Run when all deps are in a terminal state (completed, failed, or skipped) |
+
+`none_failed_min_one_success` blocks failure-cascade skips by default, including
+across dependency chains and includes. The skipped join retains the original failed
+node in its `upstream_failed` cause. Condition skips and optional timeout
+skips (`on_timeout: skip`) remain admissible when another dependency succeeds.
+
+`all_success`, `one_success`, and `all_done` keep their existing behavior.
+`if_skipped` supplies a value for a skipped output binding; it does not make a
+blocked node eligible to run or permit binding a failed output.
 
 :::note[`trigger_rule` is not `fan_out.join`]
 They share value names and have **different defaults**, so it is worth keeping straight:
@@ -571,6 +582,8 @@ status=$emit.output.status
 Use `output_format` to enforce JSON output from an AI node. For Claude, the schema is passed via the SDK's `outputFormat` option and `structured_output` is used directly. For Codex (v0.116.0+), the schema is passed via `TurnOptions.outputSchema` and the agent's inline JSON response is used. Both ensure clean JSON for `when:` conditions and `$nodeId.output` substitution:
 
 > **Codex strict-mode normalization.** OpenAI's Structured Outputs validator rejects any object schema that doesn't set `additionalProperties: false`. Archon normalizes Codex schemas before sending them, injecting `additionalProperties: false` on every object node automatically — so write portable schemas and you won't notice. One caveat: an open-record `additionalProperties: { type: 'string' }` (or `additionalProperties: true`) is **replaced** with `false`, closing the object. OpenAI would reject the open form regardless, but the rewrite is logged (`codex.output_format_open_record_closed`) so it isn't silent. Open-record maps aren't supported for Codex structured output.
+>
+> **Codex strict-mode `required` coverage.** OpenAI's Structured Outputs validator also rejects any object schema where a key declared in `properties` is absent from `required`. Unlike `additionalProperties`, Archon does NOT normalize this for you — doing so would silently change an optional field into a required one. Instead, the launch preflight and `archon validate workflows` report the violation before any run starts. Include every property key in `required`. To express an *optional* field, give its type an absent-value form: a `["string","null"]` union, or an enum with a sentinel like `"none"` — the field is then always "present" in the output, carrying the sentinel when not applicable.
 
 ```yaml
 nodes:
@@ -585,7 +598,7 @@ nodes:
         severity:
           type: string
           enum: [low, medium, high]
-      required: [type]
+      required: [type, severity]
 ```
 
 - The output is captured as a JSON string and available via `$classify.output` (full JSON) or `$classify.output.type` (field access)
@@ -660,7 +673,7 @@ Both sources coexist — inline agents and on-disk agents are both available to 
 
 ## Durable waits
 
-A `wait:` node records its condition in the workflow run, changes the run to `paused`, and returns the worker slot. Time and event waits carry an absolute deadline; the server resumes them through the ordinary DAG resume path. An action-required wait has no deadline and resumes only when an operator explicitly resumes the run. Restarting Archon preserves either kind.
+A `wait:` node records its condition in the workflow run, changes the run to `paused`, and returns the worker slot. Time and event waits carry an absolute deadline and resume through the ordinary DAG resume path when it arrives, enforced by the process that owns the run (see below). An action-required wait has no deadline and resumes only when an operator explicitly resumes the run. Restarting Archon preserves either kind.
 
 Declare exactly one condition:
 
@@ -705,7 +718,9 @@ curl -X POST http://localhost:3090/api/workflows/runs/<run-id>/signal \
   -d '{"event":"checks.complete","resumeAt":"<metadata.wait.resumeAt>","payload":{"conclusion":"success"}}'
 ```
 
-Use a Better Auth session cookie instead of `X-Archon-User` when browser authentication is enabled. The header is only for a trusted reverse proxy or loopback client; an auth-disabled local install can omit it. The event name must match the run's open wait. The signal and its audit event are committed together; duplicate or wrong-run signals do nothing. The server must be running for scheduled or event-driven continuation. If it is offline when a deadline passes, the persisted run resumes on the next scan after startup.
+Use a Better Auth session cookie instead of `X-Archon-User` when browser authentication is enabled. The header is only for a trusted reverse proxy or loopback client; an auth-disabled local install can omit it. The event name must match the run's open wait. The signal and its audit event are committed together; duplicate or wrong-run signals do nothing.
+
+The process that owns the run enforces a `duration_ms`/`until`/`event` deadline itself: a foreground `archon workflow run` and the child started by `--detach` stay alive through the wait and re-execute the run when its deadline arrives, so a CLI-only install needs no server. `archon serve`'s continuation scan additionally resumes due waits for runs whose owner is gone — one dispatched by the server, or one whose process died mid-wait. A run can always be advanced by hand with `archon workflow resume <run-id>`; the `/signal` endpoint above still requires the server.
 
 Read `metadata.wait.resumeAt` from the run before sending the signal and pass it back unchanged. It identifies the open wait occurrence, so a delayed retry from an earlier loop iteration cannot satisfy a later wait for the same event.
 
@@ -768,6 +783,8 @@ Archon classifies errors into three buckets before deciding whether to retry:
 | **TRANSIENT** | Process crashed (`exited with code`), rate limit, network timeout | Yes |
 | **UNKNOWN** | Unrecognised error messages | No (unless `on_error: all`) |
 
+A provider that reports a typed failure class on its result decides the bucket itself, whatever its error message says: `auth`, `quota_exhausted` and `budget_exceeded` are FATAL, `transient` and `rate_limited` are TRANSIENT (rate limits get a longer retry budget and backoff), and `unknown` is UNKNOWN. The message examples in the table above apply only to errors a provider has not classified.
+
 ### Retry Notifications
 
 Before each retry the platform receives a message like:
@@ -803,7 +820,7 @@ When a `nodes:` (DAG) workflow fails, the prior run stays in the database as a c
 
 - **CLI**: `archon workflow run <name> --resume` resumes the most recent failed run for `(workflow_name, cwd)`. Or `archon workflow resume <run-id>` to target a specific run.
 - **Chat**: Approving or rejecting a _paused_ workflow continues it from where it left off (the platform already knows the run id). For a prior **failed** (or stale `running`) run, `/workflow run <name>` does **not** silently resume — it shows a prompt offering three choices: resume it, abandon it and run fresh, or start fresh anyway. Pass `--force` to skip the prompt: `/workflow run <name> --force <args>` always starts a fresh run.
-- **Web UI**: Resume button on the workflow card.
+- **Web UI**: Open the failed run in the console and use **Resume** in the run detail action bar.
 
 **What happens on resume:**
 
@@ -813,11 +830,11 @@ When a `nodes:` (DAG) workflow fails, the prior run stays in the database as a c
 
 > **Why opt-in?** Earlier versions silently auto-resumed on plain `archon workflow run`, which caused state from prior failed runs (e.g. cached node outputs with stale inputs) to bleed into new invocations of the same workflow at the same path. See #1392 for the bug; now resume is always a user-driven decision.
 
-**Crashed servers / orphaned runs**: Archon does **not** auto-fail `running` rows on server startup — that would kill workflows actively executing in another process (CLI, adapter). If a server crash leaves a row stuck as `running`, it remains visible in the dashboard (the Dashboard nav tab shows a count of running workflows). Transition it to a terminal status explicitly:
+**Crashed servers / orphaned runs**: Archon does **not** auto-fail `running` rows on server startup — that would kill workflows actively executing in another process (CLI, adapter). If a server crash leaves a row stuck as `running`, it remains visible in the console run list. Transition it to a terminal status explicitly:
 
-- **Web UI**: click Abandon on the workflow card to mark the row `cancelled` and keep completed-node history.
+- **Web UI**: open the run and use **Cancel** in the run detail action bar. When no owner answers, Cancel refuses, shows what the run recorded, and offers **Abandon**; use it after verifying the owner is gone.
 - **CLI orphan cleanup**: after verifying the owner is gone, use `archon workflow abandon <run-id>`.
-- **Live detached CLI run**: use `archon workflow cancel <run-id>` to terminate the exact run's host process tree before marking it `cancelled`.
+- **Live detached CLI run**: use `archon workflow cancel <run-id>` (or Cancel on any surface) to terminate the exact run's host process tree before marking it `cancelled`.
 
 Once the row reaches a terminal status, you can resume it explicitly via the paths above. Plain `archon workflow run` never resumes implicitly.
 
@@ -899,7 +916,7 @@ The resolved provider must declare `sessionResume: true` in its capabilities. Th
 
 `persist_session` applies to `command:` and `prompt:` nodes only. Other node types skip it:
 
-- **`bash:` / `script:`** — never invoke a provider, so the field is meaningless. Setting it produces a warning at load time and is ignored.
+- **`bash:` / `script:`** — never invoke a provider, so the field is meaningless. Setting it produces a parse warning (shown by `archon validate workflows`) and is ignored.
 - **`approval:` / `cancel:`** — same: no AI call, no session to persist.
 - **`loop:` / `loop_group:`** — have their own per-iteration session threading. Cross-run persistence isn't wired for them in this release; the field is warn-and-dropped on loop and loop_group nodes. Use a `prompt:` node if you need cross-run memory.
 
@@ -1043,6 +1060,39 @@ Bindings carry *values*. For documents — a plan, a findings report, a diff —
 artifact chain below; a path in a binding plus a file on disk is still the right shape for
 anything big enough to have structure of its own.
 
+### Reading where a node started: `$node.execution.checkoutStart`
+
+The engine observes the checkout when each invocation of a prompt, command, bash, script,
+or loop node starts, and records it on that node's execution record. A binding can read the
+observation of an upstream node's invocation:
+
+```yaml
+  - id: assert-changed
+    script: assert-changed
+    runtime: bun
+    depends_on: [implement]
+    with:
+      baseline: "$implement.execution.checkoutStart"   # arrives as INPUTS_BASELINE (JSON)
+```
+
+The value is the checkout observation from the start of `implement`'s invocation: the
+commit, that commit's tree, and whether the worktree was clean. A dirty start also names a
+manifest under `$ARTIFACTS_DIR` listing each path that differed from the commit with Git's
+blob id of its content, its mode, and its type. Retries and the turns of a `loop:` node keep
+their invocation's first observation; the next invocation (for example, the next iteration
+of an enclosing `loop_group`) records a new one. A resumed run reads the same recorded
+value. Observation never changes the checkout: no stash, no index write, no `git add`.
+The recorded commit is the one `git status` reported comparing the worktree against; if
+HEAD keeps moving while the checkout is read, the observation is `unavailable` rather than a
+guess.
+
+The reference is valid only as the whole value of a `command:` or `script:` binding, and
+only for a producer that executes against the checkout. Anything else is a load error.
+Every `bash:` and `script:` node also receives its own execution identity, including this
+attempt's observation, as JSON in the `ARCHON_NODE_EXECUTION` environment variable. The
+implement workflow compares these two observations to decide whether an invocation
+changed anything since it started.
+
 ---
 
 ## The Artifact Chain
@@ -1103,6 +1153,32 @@ cannot alias another execution. Metadata keeps the readable provenance as
 load-time `<include>__<node>` ID in metadata and as the sanitized body suffix.
 
 This works on **every** node type (`bash`/`script` produce typed outputs too, just without a `sessionId`). The write is **best-effort** — if it fails, the node still succeeds and a warning is logged; the typed sidecar may simply be absent. `output_type` is an open set of labels (`plan`, `findings`, `code`, `summary`, …) — pick a convention and keep casing consistent, since lookup is case-sensitive.
+
+#### Reading typed artifacts by type
+
+Every executable invocation receives a typed-artifact listing at `$TYPED_ARTIFACTS_FILE`: a JSON file inside the run's artifact directory, recreated before the node runs. It has the shape `{ "runId", "artifactsByType": { "<outputType>": [ …metadata ] }, "errors": [ … ] }`, so a script or agent selects a type without knowing `nodes/`, sidecar names, or loop filename rules. Each entry is the same metadata the sidecar holds (`nodeId`, `outputType`, `path`, `runId`, `producedAt`, `size`, and optional `loopGroupPath`/`sessionId`), and `path` is relative to `$ARTIFACTS_DIR`.
+
+```ts
+// A script: read the listing the same way in host or container runs.
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const listing = JSON.parse(readFileSync(process.env.TYPED_ARTIFACTS_FILE!, 'utf8'));
+if (listing.runId !== process.env.WORKFLOW_ID) throw new Error('listing is for another run');
+for (const error of listing.errors) console.error(`unreadable: ${error.path} (${error.kind})`);
+for (const gate of listing.artifactsByType['green-gate'] ?? []) {
+  const body = readFileSync(join(process.env.ARTIFACTS_DIR!, gate.path), 'utf8');
+  console.log(gate.nodeId, body);
+}
+```
+
+In an agent prompt, point at the listing rather than the layout: "Read `$TYPED_ARTIFACTS_FILE`, select `artifactsByType["plan"]`, and open each entry's `path` under `$ARTIFACTS_DIR`."
+
+Properties worth knowing:
+
+- **Observation, not a ledger.** Entries of a type are ordered by `producedAt` ascending, with ties broken by content path. The listing freezes which artifacts existed when the invocation started (each attempt, loop iteration, and `until_bash` check gets its own) and their metadata; it is not an execution history or a completion-order log, and re-running the same node owner overwrites its sidecar. An invocation sees artifacts published **before it started**, never a running sibling's — declare `depends_on` to order a producer ahead of its consumer. A `loop_group`'s `until_bash` runs after its body, so it sees what that iteration's body published.
+- **Failures stay visible.** `errors` lists every record the read could not turn into an artifact (malformed or foreign-run sidecar, unsafe path, missing or unreadable content). A corrupt sidecar has no trustworthy type, so it never disappears into an empty type list. An absent key means no matching readable metadata; `runId` lets a consumer reject a listing handed to it out of scope.
+- **Everywhere an invocation runs.** The path is delivered in `bash:` and `script:` nodes (as both `$TYPED_ARTIFACTS_FILE` and the `TYPED_ARTIFACTS_FILE` environment variable), agent prompts, loop attempts, and approval rework. A prompt that references it in a context with no listing fails rather than substituting an empty string. A `--dry-run` preview has no artifacts and substitutes an empty string instead, so it cannot detect a reference made from a context that never receives a listing.
 
 Successful bash stdout is retained by default on the completed run as a bounded audit preview in `node_completed.data.node_output`. Output over 32 KiB (32,768 UTF-8 bytes) ends with a truncation marker, and the event also includes `node_output_truncated: true` plus `node_output_original_bytes`. Because stdout is persisted, never print secrets or credentials from bash nodes. This preview is separate from `output_type`: declaring `output_type` opts into a best-effort file sidecar that may contain the full output and is not required for ordinary bash audit retention.
 
@@ -1773,7 +1849,11 @@ provider itself reported. JSONL `node_complete.cost_usd` and persisted
 successful run's totals as `cost_usd` and `tokens`; a DAG-owned terminal `workflow_error`
 carries the same aggregate when work reported usage before failure. These match run metadata
 `total_cost_usd` and `total_tokens_*`. An absent `cost_usd` means the provider reported no
-cost — Codex reports none — while `0` means it reported zero. A run that spent nothing on AI,
+cost — Codex reports none — while `0` means it reported zero. Claude reports a session's
+running total, so Archon subtracts the total it last saw for the session a node resumes or
+forks. When that session was created by an earlier Archon process, for example before
+`archon workflow resume` or across `persist_session` invocations, the earlier total is
+unknown and the node's `cost_usd` is absent rather than over-counted. A run that spent nothing on AI,
 such as a bash-only workflow, carries no `cost_usd` rather than `0`. Successful loop nodes and
 governance nodes do not yet have complete terminal transcript-row coverage, so read usage from
 the rows that exist rather than treating an absent row as zero spend.
@@ -2301,6 +2381,26 @@ result.
 A malformed schema is a **load error**. `archon validate workflows` and every run compile
 each declared `output_format` before a provider is called, so a contract can never silently
 stop being enforced after the money is spent.
+
+### Inspecting a terminal run
+
+The engine records terminal facts even when failure skips your reporting node. Use
+[`archon workflow get <run-id> --json`](/reference/cli/#workflow-get) to read
+`terminal_record`, or read `run.terminal_record` from `GET /api/workflows/runs/:runId`.
+The record preserves execution status, authored outcome, node states and skip causes,
+the selected `returns:` value when available, and an artifact manifest. Execution
+status and authored outcome remain independent; the engine does not infer a delivery
+verdict from filenames or output prose. Runs created before this support may have no
+record. Resumed active runs expose `null` until their next terminal transition.
+
+The manifest contains file metadata, not content previews. Its `limitations` identify
+incomplete observations. Cancellation can record pending or running nodes and files
+that are still changing; terminalization does not make the filesystem snapshot atomic.
+You do not need a new YAML field or collector node to obtain these facts.
+
+Workflow-pack adoption remains separate: [#3127](https://github.com/coleam00/Archon/issues/3127)
+owns typed discovery and failure-cause consumption and completion-only outcome formatting.
+A consumer must still depend on the producers whose artifacts it needs.
 
 ### A deterministic producer owns the same contract
 
@@ -3008,10 +3108,10 @@ When the workflow reaches `review-gate`, it pauses and notifies you. Approve or 
 - **Explicit command**: `/workflow approve <run-id>` or `/workflow reject <run-id>` — deterministic; resolves and continues the run
 - **CLI**: `bun run cli workflow approve <run-id>` or `bun run cli workflow reject <run-id>` — resolves and continues (`--json` records the decision only)
 - **Chat**: tell the agent what you want ("looks good, ship it" / "no, stop") — it resolves the gate and the run continues. An ambiguous message resolves nothing and the agent asks; a plain message is **not** an automatic approval
-- **Web UI**: Click the Approve/Reject buttons on the dashboard card — auto-resumes for Web-UI-dispatched runs; the Reject dialog includes an optional reason field that flows to `$REJECTION_REASON`
+- **Web UI**: Open the paused run in the console. Use **Continue** with an optional comment, or **Reject** and enter the required feedback that flows to `$REJECTION_REASON`. When the gate continues execution, Web-dispatched and headless CLI runs can auto-resume; the gate's rejection rules can instead cancel the run.
 - **API**: `POST /api/workflows/runs/<run-id>/approve` or `/reject`
 
-Every path continues the workflow from the next node. The user's approval comment is available as `$review-gate.output` in downstream nodes only when `capture_response: true` is set on the approval node. Cross-platform caveat: Web-UI approvals on Slack / Telegram / GitHub-dispatched runs record the decision but do not auto-resume — re-run from the originating platform to continue.
+Every path applies the gate's approval or rejection rules. The user's approval comment is available as `$review-gate.output` in downstream nodes only when `capture_response: true` is set on the approval node. Cross-platform caveat: Web UI decisions on runs with Slack, Telegram, or GitHub parents record the decision but do not auto-resume when the gate continues execution. Use `archon workflow resume <run-id>` or resume it from the originating conversation to continue the same run.
 
 Without `on_reject`: rejecting cancels the workflow.
 With `on_reject`: rejecting triggers an AI rework prompt and re-pauses for re-review.

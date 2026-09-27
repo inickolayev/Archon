@@ -3,6 +3,7 @@
  * detection, and resume logic.  These run before DAG dispatch and are exercised
  * with minimal DAG workflow fixtures.
  */
+import type { CheckoutObservation } from './schemas/checkout-observation';
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -60,6 +61,7 @@ mock.module('./dag-executor', () => ({
 
 mock.module('./logger', () => ({
   logWorkflowStart: mock(async () => {}),
+  logWorkflowResume: mock(async () => {}),
   logWorkflowError: mock(async () => {}),
 }));
 
@@ -96,6 +98,10 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     findChildRuns: mock(async () => []),
     getRunAncestry: mock(async () => []),
     createWorkflowRun: mock(async () => makeRun()),
+    claimPendingWorkflowRun: mock(async () => makeRun()),
+    recordWorkflowRunCheckoutBaseline: mock(
+      async (_id: string, baseline: CheckoutObservation) => baseline
+    ),
     updateWorkflowRun: mock(async () => {}),
     failWorkflowRun: mock(async () => {}),
     getWorkflowRun: mock(async () => ({ ...makeRun(), status: 'completed' as const })),
@@ -120,7 +126,17 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     pauseWorkflowRun: mock(async () => {}),
     pauseWorkflowRunForWait: mock(async () => {}),
     failPausedAttentionWait: mock(async () => ({ failed: true })),
-    clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
+    clearWorkflowWaitContext: mock(
+      async (id: string, _wait: unknown, completion: { stepName: string }) => ({
+        cleared: true as const,
+        nodeEvent: {
+          workflow_run_id: id,
+          event_type: 'node_completed' as const,
+          step_name: completion.stepName,
+          data: {},
+        },
+      })
+    ),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
@@ -187,6 +203,7 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     user_id: null,
     parent_run_id: null,
     output_root: null,
+    checkout_baseline: null,
     adopted_from_run_id: null,
     ...overrides,
   };

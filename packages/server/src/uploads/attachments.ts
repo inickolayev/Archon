@@ -9,9 +9,9 @@
  */
 
 import { mkdir, unlink, writeFile } from 'fs/promises';
-import { basename, join, sep } from 'path';
+import { basename, join } from 'path';
 import { randomUUID } from 'crypto';
-import { getArchonHome, createLogger } from '@archon/paths';
+import { getArchonHome, createLogger, isPathInside } from '@archon/paths';
 import type { AttachedFile } from '@archon/core';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -208,7 +208,7 @@ export async function persistUploadedFiles(
 
   const archonHome = getArchonHome();
   const uploadDir = uploadDirFor(conversationId);
-  if (!uploadDir.startsWith(archonHome + sep)) {
+  if (!isPathInside(archonHome, uploadDir, { lexical: true })) {
     return { ok: false, status: 400, error: 'Invalid conversation ID' };
   }
 

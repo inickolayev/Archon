@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 const DOCS_DIRECTORY = 'packages/docs-web/';
 const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
 
@@ -15,6 +17,9 @@ const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
  *     compiled into the CLI itself (`check:bundled-skill`).
  *   - `provider-capabilities.md` is generated from the providers' `capabilities.ts`
  *     (`check:capability-matrix`), and lives under the docs site without being prose.
+ *   - `adding-a-community-provider.mdx` is read by
+ *     `packages/providers/src/community/_template/capabilities.test.ts`, which asserts the page
+ *     renders the capabilities template by reference instead of a hand-copied snapshot.
  *   - The docs manifest is copied by the Docker dependency layer.
  */
 const BUILD_INPUTS = [
@@ -22,6 +27,7 @@ const BUILD_INPUTS = [
   '.archon/workflows/',
   '.claude/skills/',
   'packages/docs-web/src/content/docs/reference/provider-capabilities.md',
+  'packages/docs-web/src/content/docs/contributing/adding-a-community-provider.mdx',
   'packages/docs-web/package.json',
 ];
 
@@ -101,7 +107,7 @@ export function changedFilesBetween(base: string, head: string, repo = process.c
  * an unnecessary run costs minutes, a wrong skip merges unchecked code. The cause goes to stderr
  * so the job log explains why the suite ran.
  *
- * Only the scan is caught. A bad argument is a wiring bug with no safe answer, so it stays a
+ * Only the scan is caught. A bad event is a wiring bug with no safe answer, so it stays a
  * throw and takes the step down with it.
  */
 function decideFromDiff(base: string, head: string): boolean {
@@ -114,20 +120,61 @@ function decideFromDiff(base: string, head: string): boolean {
   }
 }
 
+/** The parts of a GitHub event payload this reads. Every leaf is checked before use. */
+export interface EventPayload {
+  before?: unknown;
+  after?: unknown;
+  pull_request?: { base?: { sha?: unknown }; head?: { sha?: unknown } } | null;
+}
+
+/** The commits to compare, or `null` when there is nothing to compare and the suite runs. */
+export type DiffRange = { base: string; head: string } | null;
+
+function requireSha(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value === '') {
+    throw new Error(`The GitHub event payload has no ${field}`);
+  }
+  return value;
+}
+
+/**
+ * Which commits decide the run, read from the event payload rather than chosen in the workflow.
+ *
+ * A pull request is judged on its whole diff: PR base to PR head, which the merge-base diff
+ * turns into "everything this branch changes". Never on the previous push alone: a
+ * `synchronize` payload also carries `before`, the previous push's head, and judging by it let a
+ * docs-only push cancel the run a code push had started (the workflow's concurrency group
+ * cancels the older run) and then skip the suite, leaving the PR head untested.
+ *
+ * A push is judged on what it added, `before` to `after`. A push that creates a branch has an
+ * all-zero `before`, so there is nothing to compare.
+ */
+export function diffRange(eventName: string, event: EventPayload): DiffRange {
+  if (eventName === 'workflow_dispatch') return null;
+  if (eventName === 'pull_request') {
+    return {
+      base: requireSha(event.pull_request?.base?.sha, 'pull_request.base.sha'),
+      head: requireSha(event.pull_request?.head?.sha, 'pull_request.head.sha'),
+    };
+  }
+  if (eventName === 'push') {
+    const base = requireSha(event.before, 'before');
+    if (base === EMPTY_GIT_SHA) return null;
+    return { base, head: requireSha(event.after, 'after') };
+  }
+  throw new Error(`Unsupported GitHub event: ${eventName}`);
+}
+
+/** Reads the event GitHub Actions names in `GITHUB_EVENT_NAME` and `GITHUB_EVENT_PATH`. */
 function main(): void {
-  const [eventName, base, head] = process.argv.slice(2);
-  if (eventName === 'workflow_dispatch') {
-    console.log('true');
-    return;
+  const eventName = process.env.GITHUB_EVENT_NAME;
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventName || !eventPath) {
+    throw new Error('GITHUB_EVENT_NAME and GITHUB_EVENT_PATH must both be set');
   }
-  if ((eventName !== 'push' && eventName !== 'pull_request') || !base || !head) {
-    throw new Error(`Unsupported GitHub event: ${eventName ?? '(missing)'}`);
-  }
-  if (base === EMPTY_GIT_SHA) {
-    console.log('true');
-    return;
-  }
-  console.log(decideFromDiff(base, head));
+  const event: EventPayload = JSON.parse(readFileSync(eventPath, 'utf8'));
+  const range = diffRange(eventName, event);
+  console.log(range === null ? true : decideFromDiff(range.base, range.head));
 }
 
 if (import.meta.main) main();

@@ -32,7 +32,7 @@ import { readdir, realpath, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
-import { createLogger, getArchonTempPath } from '@archon/paths';
+import { createLogger, getArchonTempPath, isPathInside } from '@archon/paths';
 import { execFileAsync } from '@archon/git';
 import {
   RESERVED_FIXTURE_KEYS,
@@ -52,6 +52,10 @@ import {
   type WorkflowSourceConfig,
   type WorkflowSourceRoots,
 } from './workflow-source';
+import { FIXTURE_SUFFIX, FIXTURES_DIR } from './fixture-layout';
+
+/** Compares text the checkout may have converted to CRLF against a fixture's LF expectation. */
+const withLfEndings = (text: string): string => text.replaceAll('\r\n', '\n');
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -128,8 +132,6 @@ export function parseFixtureFile(text: string, path: string): ParsedFixtureFile 
   return { declaration, execCode, stubs: stubsResult.data };
 }
 
-const FIXTURES_DIR = 'fixtures';
-const FIXTURE_SUFFIX = '.stubs.yaml';
 // Discovery walks user directories. This is a hang-guard margin for a pathological
 // tree, not a mirror of discovery's cap (MAX_DISCOVERY_DEPTH is 1, and the catalog
 // reaches one packaged-scanner level deeper): fixtures below the catalog's reach are
@@ -395,18 +397,21 @@ async function withExecWorkspace<T>(
   cwd: string,
   fn: (workspace: string) => Promise<T>
 ): Promise<T> {
-  try {
-    await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd });
-  } catch {
-    throw new Error(
-      `Exec-code fixtures require a git checkout to isolate execution; '${cwd}' is not inside a git repository`
-    );
-  }
   // git worktree add creates the workspace path's leading directories itself.
   const workspace = join(getArchonTempPath(), `fixture-exec-${randomUUID()}`);
   try {
     await execFileAsync('git', ['worktree', 'add', '--detach', workspace, 'HEAD'], { cwd });
   } catch (error) {
+    // Successful creation already proves checkout eligibility. Only diagnose a failure:
+    // a separate preflight adds a git process to every fixture, while interpreting git's
+    // error prose would make the distinction depend on its version or locale.
+    try {
+      await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd });
+    } catch {
+      throw new Error(
+        `Exec-code fixtures require a git checkout to isolate execution; '${cwd}' is not inside a git repository`
+      );
+    }
     throw new Error(
       `Exec-code fixture could not create an isolated execution workspace from HEAD: ${(error as Error).message}`
     );
@@ -487,7 +492,7 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
       fixture =>
         (targetIsLoadedWorkflow && fixture.workflowNames.includes(targetName)) ||
         fixture.dirs.includes(targetName) ||
-        fixture.path.startsWith(targetReal + sep)
+        isPathInside(targetReal, fixture.path, { lexical: true })
     );
     if (selected.length === 0) {
       // Suggest only workflows a discovered fixture actually targets AND that the catalog
@@ -649,7 +654,20 @@ async function checkFixture(
           failureReason = `expected resolved text for node '${nodeId}', but it was not reached`;
           break;
         }
-        if (!traceEntries.some(entry => entry.resolvedText?.includes(expectedText) === true)) {
+        // Line endings belong to the checkout, not to the workflow. A command file is read as
+        // raw text, so `* text=auto` gives a Windows clone CRLF inside it, while a fixture
+        // spells its expectation with `\n` escapes that stay LF everywhere. This declaration is
+        // about interpolated content, so it compares on LF alone rather than passing on Linux
+        // and failing on Windows for the same workflow. (Workflow YAML is immune: the parser
+        // normalizes line breaks in its own scalars.)
+        const expected = withLfEndings(expectedText);
+        if (
+          !traceEntries.some(
+            entry =>
+              entry.resolvedText !== undefined &&
+              withLfEndings(entry.resolvedText).includes(expected)
+          )
+        ) {
           failureReason = `expected node '${nodeId}' resolved text to contain ${JSON.stringify(expectedText)}`;
           break;
         }

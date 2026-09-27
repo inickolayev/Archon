@@ -17,6 +17,7 @@ import {
 import {
   existsSync,
   appendFileSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -24,10 +25,11 @@ import {
   truncateSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { getArchonHome, isDocker } from '@archon/paths';
-import { removeTempTree } from '@archon/paths/test-utils';
+import { getArchonHome, isDocker, RUN_ARTIFACTS_ENGINE_SUBDIR } from '@archon/paths';
+import { removeTempTree, trackTempRoots } from '@archon/paths/test-utils';
 import {
   getProjectStoragePaths as getProjectStoragePathsReal,
   getRunArtifactsDirForRoot as getRunArtifactsDirForRootReal,
@@ -37,9 +39,10 @@ import {
   resolveRunStorageRoot as resolveRunStorageRootReal,
 } from '@archon/paths/archon-paths';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
+import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import type * as WorkflowDiscovery from '@archon/workflows/workflow-discovery';
 import type * as WorkflowExecutor from '@archon/workflows/executor';
-import type * as DetachedRunControl from '../utils/detached-run-control';
+import type * as RunOwnerStop from '@archon/core/services/run-owner-stop';
 import {
   makeTestComposedWorkflow,
   makeTestResolvedWorkflow,
@@ -70,6 +73,7 @@ import {
   resolveDetachedRunEncryptionEnv,
   maybePrintTierNotice,
   resolveContainerBackendConfig,
+  pendingDurableWait,
   hasUnresolvedWriteback,
   buildNodeSummaries,
   resolveCliExitCode,
@@ -97,8 +101,8 @@ const mockLogger = {
 const mockDetachedTargetStop = mock((): Promise<void> => Promise.resolve());
 const mockDetachedTargetRelease = mock((): undefined => undefined);
 const mockReclaimContainerEnv = mock((): Promise<void> => Promise.resolve());
-const mockRequestDetachedRunStop = mock<typeof DetachedRunControl.requestDetachedRunStop>(() =>
-  Promise.resolve({ stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
+const mockRequestDetachedRunStop = mock<typeof RunOwnerStop.requestDetachedRunStop>(() =>
+  Promise.resolve({ pid: 4242, stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
 );
 const mockRunLiveOwnerClose = mock((): Promise<void> => Promise.resolve());
 const mockAssertDetachedRunProcessOwner = mock((): undefined => undefined);
@@ -121,16 +125,31 @@ mock.module(
   (): {
     assertDetachedRunProcessOwner: typeof mockAssertDetachedRunProcessOwner;
     DETACHED_RUN_OWNER_ENV: string;
-    requestDetachedRunStop: typeof mockRequestDetachedRunStop;
   } => ({
     assertDetachedRunProcessOwner: mockAssertDetachedRunProcessOwner,
     DETACHED_RUN_OWNER_ENV: 'ARCHON_DETACHED_RUN_OWNER',
-    requestDetachedRunStop: mockRequestDetachedRunStop,
   })
 );
 
+// Capture the real class before mock.module replaces the module, so the mock
+// can re-export it without a hand-declared copy that would silently drift.
+import { DetachedRunOwnerUnavailableError as RealDetachedRunOwnerUnavailableError } from '@archon/core/services/run-owner-stop';
+mock.module('@archon/core/services/run-owner-stop', () => ({
+  requestDetachedRunStop: mockRequestDetachedRunStop,
+  DetachedRunOwnerUnavailableError: RealDetachedRunOwnerUnavailableError,
+}));
+/** Abandon's owner probe when nothing listens at the run's endpoint. */
+function noOwnerAnswers(): Promise<never> {
+  return Promise.reject(new RealDetachedRunOwnerUnavailableError('run-1', 'ENOENT', 'unreachable'));
+}
+
+/** Whether a sub-run's root owner answers; cancel asks when the sub-run's own is silent. */
+const mockIsRunOwnerAnswering = mock((_runId: string) => Promise.resolve(false));
 mock.module('@archon/core/services/run-live-owner', () => ({
   startRunLiveOwner: mockStartRunLiveOwner,
+  // The CLI never executes the run it cancels: cancel is a separate process.
+  isRunOwnedByThisProcess: () => false,
+  isRunOwnerAnswering: mockIsRunOwnerAnswering,
 }));
 
 mock.module(
@@ -156,6 +175,7 @@ mock.module('@archon/core/services/run-attention-watch', () => ({
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockPersistWorkflowEvent = mock(() => Promise.resolve());
 const mockFolderBackendPrepare = mock(() =>
   Promise.resolve({
     cwd: '/test/path',
@@ -206,7 +226,10 @@ mock.module('@archon/paths', () => ({
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
 mock.module('@archon/isolation', () => ({
   configureIsolation: mock(() => undefined),
-  classifyIsolationError: (error: Error) => error.message,
+  // Marked rather than reimplemented: these tests prove a failure path routes
+  // through the classifier, while what the real one produces is the isolation
+  // package's own test.
+  classifyIsolationError: (error: Error) => `classified: ${error.message}`,
   getIsolationProvider: mock(() => ({
     create: mock(() =>
       Promise.resolve({
@@ -251,7 +274,10 @@ mock.module('@archon/core', () => ({
   generateAndSetTitle: mock(() => Promise.resolve()),
   loadRepoConfig: mock(() => Promise.resolve(null)),
   getUserAiPrefs: mock(() => Promise.resolve({})),
-  createWorkflowStore: mock(() => ({ createWorkflowEvent: mockCreateWorkflowEvent })),
+  createWorkflowStore: mock(() => ({
+    createWorkflowEvent: mockCreateWorkflowEvent,
+    persistWorkflowEvent: mockPersistWorkflowEvent,
+  })),
   // requires: [github] gate. Default to a solo-install posture (disabled) so the
   // gate is a no-op for every existing test; the gate-specific tests below flip
   // isPerUserGitHubEnabled on per-invocation.
@@ -297,6 +323,7 @@ const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
   globalScripts: '/test/capture/global/scripts',
   bundledWorkflows: '/test/capture/bundled/workflows',
   bundledCommands: '/test/capture/bundled/commands/defaults',
+  installed: { kind: 'captured', captureRoot: '/test/capture' },
   kind: 'captured',
   anchor: {
     root: '/test/capture',
@@ -457,7 +484,13 @@ mock.module('@archon/core/db/conversations', () => ({
   getOrCreateConversation: mock(() =>
     Promise.resolve({ id: 'conv-123', platform_type: 'cli', platform_conversation_id: 'cli-123' })
   ),
-  getConversationById: mock(() => Promise.resolve(null)),
+  getConversationById: mock(() =>
+    Promise.resolve({
+      id: 'conv-123',
+      platform_type: 'cli',
+      platform_conversation_id: 'cli-123',
+    })
+  ),
   updateConversation: mock(() => Promise.resolve()),
 }));
 
@@ -526,6 +559,7 @@ mock.module('@archon/core/db/workflows', () => ({
   failWorkflowRun: mock(() => Promise.resolve()),
   cancelWorkflowRun: mock(() => Promise.resolve({ cancelled: true })),
   findChildRuns: mock(() => Promise.resolve([])),
+  getRunAncestry: mock(() => Promise.resolve([])),
   findResumableRun: mock(() => Promise.resolve(null)),
   resumeWorkflowRun: mock(() => Promise.resolve(null)),
   getWorkflowRun: mock(() => Promise.resolve(null)),
@@ -2293,12 +2327,15 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
       workflows: [makeTestWorkflowWithSource({ name: 'review-block', description: 'edited' })],
       errors: [],
     });
-    mockResolveContinuationWorkflow.mockResolvedValueOnce({
+    const frozenContinuation = {
       workflow: frozen,
       roots: CAPTURED_SOURCE_ROOTS,
-      workflows: [{ workflow: frozen, source: 'project' }],
+      workflows: [{ workflow: frozen, source: 'project' as const }],
       errors: [],
-    });
+    };
+    mockResolveContinuationWorkflow
+      .mockResolvedValueOnce(frozenContinuation)
+      .mockResolvedValueOnce(frozenContinuation);
     (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-prior',
       working_path: null,
@@ -2329,8 +2366,8 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
 
     // Live discovery never even runs: the continuation carries the discovery it paid for.
     expect(discoverMock).not.toHaveBeenCalled();
-    // The row is resolved before discovery and handed to the shared entry point...
-    expect(mockResolveContinuationWorkflow).toHaveBeenCalledTimes(1);
+    // Host preparation and engine admission both resolve this run's recorded source.
+    expect(mockResolveContinuationWorkflow).toHaveBeenCalledTimes(2);
     const continuedRun = mockResolveContinuationWorkflow.mock.calls[0]?.[1] as unknown as {
       id: string;
     };
@@ -2533,7 +2570,7 @@ describe('workflowRunCommand', () => {
     await workflowRunCommand('/repo/root', 'assist', 'hello', { noWorktree: true });
 
     expect(consoleSpy).toHaveBeenCalledWith(
-      'Discovery: root=/repo/root workflows=3 bundled=1 global=1 project=1'
+      'Discovery: root=/repo/root workflows=3 bundled=1 global=1 project=1 installed=0'
     );
   });
 
@@ -2562,7 +2599,7 @@ describe('workflowRunCommand', () => {
       expect.objectContaining({ project: '/test/capture/project' })
     );
     expect(consoleSpy).toHaveBeenCalledWith(
-      'Discovery: root=/repo/source workflows=1 bundled=0 global=0 project=1'
+      'Discovery: root=/repo/source workflows=1 bundled=0 global=0 project=1 installed=0'
     );
   });
 
@@ -3360,6 +3397,38 @@ describe('workflowRunCommand', () => {
     const findActiveCallsAfter = (isolationDb.findActiveByWorkflow as ReturnType<typeof mock>).mock
       .calls.length;
     expect(findActiveCallsAfter).toBe(findActiveCallsBefore);
+  });
+
+  it('surfaces a classified worktree creation failure, not the raw error', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const isolation = await import('@archon/isolation');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-123',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-123',
+      default_cwd: '/test/path',
+    });
+    // A setup failure whose rollback left a directory behind carries the leftover
+    // note beside its message; only the classifier reads it (#3448).
+    const failure = Object.assign(new Error('Submodule initialization failed: no network'), {
+      cleanupFailure: 'The incomplete workspace at /test/path/wt was left behind',
+    });
+    (isolation.getIsolationProvider as ReturnType<typeof mock>).mockReturnValueOnce({
+      create: mock(() => Promise.reject(failure)),
+      healthCheck: mock(() => Promise.resolve(true)),
+    });
+
+    await expect(workflowRunCommand('/test/path', 'assist', 'hello', {})).rejects.toThrow(
+      /^classified: Submodule initialization failed/
+    );
   });
 
   it('skips isolation when --no-worktree flag is set', async () => {
@@ -5123,6 +5192,7 @@ describe('workflowGetCommand', () => {
 
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-pw',
+      checkout_baseline: null,
       workflow_name: 'gated',
       working_path: '/repo',
       status: 'completed',
@@ -5155,6 +5225,7 @@ describe('workflowGetCommand', () => {
 
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-pw',
+      checkout_baseline: null,
       workflow_name: 'gated',
       working_path: '/repo',
       status: 'completed',
@@ -5185,6 +5256,7 @@ describe('workflowGetCommand', () => {
 
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-skip-cause',
+      checkout_baseline: null,
       workflow_name: 'deliver',
       working_path: '/repo',
       status: 'failed',
@@ -5211,12 +5283,54 @@ describe('workflowGetCommand', () => {
     expect(consoleSpy).toHaveBeenCalledWith('    - publish (upstream failed: validate)');
   });
 
+  // #3488 acceptance: the stored failure is command-free, so the CLI writes the abandon
+  // command in the spelling its own operator can type.
+  it('renders the abandon command for a fan-out node blocked on a live child', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const workflowEventsDb = await import('@archon/core/db/workflow-events');
+
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-fanout-blocked',
+      checkout_baseline: null,
+      workflow_name: 'deliver',
+      working_path: '/repo',
+      status: 'failed',
+      started_at: new Date(),
+      metadata: {},
+    });
+    (workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>).mockResolvedValueOnce([
+      {
+        id: 'fanout-failed',
+        workflow_run_id: 'run-fanout-blocked',
+        event_type: 'node_failed',
+        step_name: 'work',
+        step_index: 1,
+        data: {
+          error: "fan_out node 'work': child 0 (run c9d8e7f6) may still be running.",
+          blocked_on_child_run_id: 'c9d8e7f6-1111-2222-3333-444455556666',
+        },
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    await workflowGetCommand('run-fanout-blocked', false, true);
+
+    const printed: string = consoleSpy.mock.calls
+      .map((call: unknown[]) => String(call[0]))
+      .join('\n');
+    expect(printed).toContain(
+      'Abandon: archon workflow abandon c9d8e7f6-1111-2222-3333-444455556666'
+    );
+    expect(printed).not.toContain('/workflow ');
+  });
+
   it('renders a persisted timeout skip cause in workflow get', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const workflowEventsDb = await import('@archon/core/db/workflow-events');
 
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-timeout-skip',
+      checkout_baseline: null,
       workflow_name: 'deliver',
       working_path: '/repo',
       status: 'completed',
@@ -5262,6 +5376,7 @@ describe('workflowGetCommand', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-xyz',
+      checkout_baseline: null,
       workflow_name: 'implement',
       status: 'failed',
       working_path: '/tmp/wt',
@@ -5275,12 +5390,166 @@ describe('workflowGetCommand', () => {
     expect(consoleSpy).toHaveBeenCalledWith('  Name:   implement');
     expect(consoleSpy).toHaveBeenCalledWith('  Status: failed');
     expect(consoleSpy).toHaveBeenCalledWith('  Error:  Step failed: build');
+    expect(consoleSpy).toHaveBeenCalledWith('  Start:  (not recorded)');
+  });
+
+  it('names the interrupt and its signal above the error line', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-interrupted',
+      checkout_baseline: null,
+      workflow_name: 'implement',
+      status: 'failed',
+      working_path: '/tmp/wt',
+      started_at: new Date(),
+      metadata: {
+        error: 'Process terminated (SIGINT)',
+        stop_reason: { reason: 'process_terminated', signal: 'SIGINT' },
+      },
+    });
+
+    await workflowGetCommand('run-interrupted');
+
+    expect(consoleSpy).toHaveBeenCalledWith('  Stopped: interrupted by the operator (SIGINT)');
+    // The error stays: it is the run's persisted failure record, and every other surface
+    // shows it. The new line says what the error text cannot claim on its own.
+    expect(consoleSpy).toHaveBeenCalledWith('  Error:  Process terminated (SIGINT)');
+  });
+
+  it('does not attribute a SIGTERM to the operator', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-signalled',
+      checkout_baseline: null,
+      workflow_name: 'implement',
+      status: 'failed',
+      working_path: '/tmp/wt',
+      started_at: new Date(),
+      metadata: {
+        error: 'Process terminated (SIGTERM)',
+        stop_reason: { reason: 'process_terminated', signal: 'SIGTERM' },
+      },
+    });
+
+    await workflowGetCommand('run-signalled');
+
+    expect(consoleSpy).toHaveBeenCalledWith('  Stopped: interrupted by a signal (SIGTERM)');
+  });
+
+  it('prints no Stopped line for a run that genuinely failed', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-broken',
+      checkout_baseline: null,
+      workflow_name: 'implement',
+      status: 'failed',
+      working_path: '/tmp/wt',
+      started_at: new Date(),
+      metadata: { error: 'Bash node failed', stop_reason: { reason: 'node_error' } },
+    });
+
+    await workflowGetCommand('run-broken');
+
+    expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Stopped:'));
+    expect(consoleSpy).toHaveBeenCalledWith('  Error:  Bash node failed');
+  });
+
+  it('prints no Stopped line once an interrupted run is no longer failed', async () => {
+    // Abandoning a failed run cancels it without clearing metadata, so the key outlives
+    // the stop it described.
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-abandoned',
+      checkout_baseline: null,
+      workflow_name: 'implement',
+      status: 'cancelled',
+      working_path: '/tmp/wt',
+      started_at: new Date(),
+      metadata: {
+        error: 'Process terminated (SIGINT)',
+        stop_reason: { reason: 'process_terminated', signal: 'SIGINT' },
+      },
+    });
+
+    await workflowGetCommand('run-abandoned');
+
+    expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Stopped:'));
+  });
+
+  it('carries the stop reason through --json', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-interrupted-json',
+      checkout_baseline: null,
+      workflow_name: 'implement',
+      status: 'failed',
+      working_path: '/tmp/wt',
+      started_at: new Date(),
+      metadata: {
+        error: 'Process terminated (SIGINT)',
+        stop_reason: { reason: 'process_terminated', signal: 'SIGINT' },
+      },
+    });
+
+    await workflowGetCommand('run-interrupted-json', true);
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      status: string;
+      metadata: { stop_reason?: unknown };
+    };
+    expect(parsed.status).toBe('failed');
+    expect(parsed.metadata.stop_reason).toEqual({
+      reason: 'process_terminated',
+      signal: 'SIGINT',
+    });
+  });
+
+  it('prints the checkout the run started from', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-start',
+      checkout_baseline: {
+        kind: 'git',
+        sampledAt: '2026-09-23T10:00:00.000Z',
+        commit: 'a'.repeat(40),
+        tree: 'b'.repeat(40),
+        worktree: {
+          status: 'dirty',
+          content: 'complete',
+          staged: 1,
+          unstaged: 2,
+          untracked: 3,
+          manifest: {
+            pointer: {
+              type: 'archon_artifact',
+              run_id: 'run-start',
+              path: '.archon/checkout/x.json',
+            },
+            sha256: 'c'.repeat(64),
+            entries: 6,
+          },
+        },
+        cutFromCommit: 'd'.repeat(40),
+      },
+      workflow_name: 'implement',
+      status: 'completed',
+      working_path: '/tmp/wt',
+      started_at: new Date(),
+      metadata: {},
+    });
+
+    await workflowGetCommand('run-start');
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      `  Start:  ${'a'.repeat(40)} (dirty: 1 staged, 2 unstaged, 3 untracked, branch cut from ${'d'.repeat(40)})`
+    );
   });
 
   it('prints contradictory status and authored outcome as separate fields', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-contradictory',
+      checkout_baseline: null,
       workflow_name: 'review',
       status: 'completed',
       outcome: 'failed',
@@ -5299,6 +5568,7 @@ describe('workflowGetCommand', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-json',
+      checkout_baseline: null,
       workflow_name: 'implement',
       status: 'completed',
       working_path: '/tmp/wt',
@@ -5333,6 +5603,7 @@ describe('workflowGetCommand', () => {
         started_at: new Date(),
         metadata: {},
         output_root: outputRoot,
+        checkout_baseline: null,
         codebase_id: 'cb-1',
       });
 
@@ -5362,6 +5633,7 @@ describe('workflowGetCommand', () => {
         started_at: new Date(),
         metadata: {},
         output_root: '/old-machine/.archon/workspaces/old/name',
+        checkout_baseline: null,
         codebase_id: 'cb-relocated',
       });
       // Both readers in workflow get consult the codebase row; the resolver
@@ -5401,12 +5673,16 @@ describe('workflowGetCommand', () => {
       started_at: new Date(),
       metadata: {},
       output_root: null,
+      checkout_baseline: null,
       codebase_id: null,
     });
 
     const code = await workflowGetCommand('run-legacy', true);
 
-    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({ transcript_path: null });
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      transcript_path: null,
+      terminal_record: null,
+    });
     expect(code).toBe(0);
   });
 
@@ -5433,6 +5709,7 @@ describe('workflowGetCommand', () => {
         started_at: new Date(),
         metadata: {},
         output_root: decoyRoot,
+        checkout_baseline: null,
         codebase_id: null,
       });
 
@@ -5481,6 +5758,7 @@ describe('workflowGetCommand', () => {
         // current ARCHON_HOME via the run's codebase row, not walk the original
         // path.
         output_root: '/old-machine/.archon/workspaces/old/name',
+        checkout_baseline: null,
         codebase_id: 'cb-relocated-artifact',
       });
       // Both readers in workflow get consult the codebase row; the resolver
@@ -5524,6 +5802,7 @@ describe('workflowGetCommand', () => {
         started_at: new Date(),
         metadata: {},
         output_root: outputRoot,
+        checkout_baseline: null,
         codebase_id: 'cb-1',
       });
 
@@ -5539,6 +5818,210 @@ describe('workflowGetCommand', () => {
       await removeTempTree(archonHome);
     }
   });
+
+  // #3450 — the engine writes one typed-artifact listing per node invocation
+  // under `$ARTIFACTS_DIR/.archon/`, so a pack run buries its reports under
+  // dozens of uuid files and the display cap can drop them entirely. The
+  // leave-behind list is what the archon-cli skill reads to find a run's
+  // results, so it carries operator-facing files only — with a count of what it
+  // left out, never a silent drop.
+  it('keeps engine-internal artifact files out of the leave-behind list and counts them (#3450)', async () => {
+    const previousHome = process.env.ARCHON_HOME;
+    const archonHome = join(tmpdir(), 'archon-get-artifact-internal-home');
+    process.env.ARCHON_HOME = archonHome;
+    const runId = 'run-artifact-internal';
+    const outputRoot = join(archonHome, 'workspaces', 'acme', 'widget');
+    const artifactsDir = join(outputRoot, 'artifacts', 'runs', runId);
+    const reports = ['plan.md', 'validation.md', 'pr-action.md'];
+    mkdirSync(join(artifactsDir, 'review'), { recursive: true });
+    for (const report of reports) writeFileSync(join(artifactsDir, report), 'report');
+    writeFileSync(join(artifactsDir, 'review', 'report.md'), 'report');
+    // A workflow's own dotfile is its output: only the engine's child is hidden,
+    // by the rule the console's artifacts route shares.
+    writeFileSync(join(artifactsDir, '.pr-number'), '42');
+    // Typed-artifact sidecars are real content, so they stay listed — but they
+    // sort ahead of most reports and outnumber the 20-line human preview, so a
+    // depth-first walk would still hide every report behind them.
+    mkdirSync(join(artifactsDir, 'nodes'), { recursive: true });
+    for (let i = 0; i < 30; i++) {
+      writeFileSync(join(artifactsDir, 'nodes', `node-${String(i).padStart(2, '0')}.md`), 'output');
+    }
+    // More listings than the display cap: before the fix they consumed it and
+    // the reports never appeared at all.
+    const listingsDir = join(artifactsDir, RUN_ARTIFACTS_ENGINE_SUBDIR, 'typed-artifacts');
+    mkdirSync(listingsDir, { recursive: true });
+    const internalFiles = 240;
+    for (let i = 0; i < internalFiles; i++) {
+      writeFileSync(join(listingsDir, `${randomUUID()}.json`), '{}');
+    }
+    try {
+      const workflowDb = await import('@archon/core/db/workflows');
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'completed',
+        working_path: '/tmp/wt',
+        started_at: new Date(),
+        metadata: {},
+        output_root: outputRoot,
+        checkout_baseline: null,
+        codebase_id: 'cb-1',
+      });
+
+      await workflowGetCommand(runId, true);
+
+      const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+        leave_behind?: {
+          artifactFiles?: string[];
+          artifactFilesOmitted?: {
+            internalFiles: number;
+            truncated: boolean;
+            unreadable: string[];
+          };
+        };
+      };
+      // A run's own reports sit at the top level, so they lead the list and the
+      // cap falls on nested content instead of on them.
+      expect(parsed.leave_behind?.artifactFiles?.slice(0, reports.length + 1)).toEqual([
+        '.pr-number',
+        'plan.md',
+        'pr-action.md',
+        'validation.md',
+      ]);
+      expect(parsed.leave_behind?.artifactFiles).toContain('review/report.md');
+      expect(parsed.leave_behind?.artifactFiles).toHaveLength(reports.length + 32);
+      expect(
+        parsed.leave_behind?.artifactFiles?.some(file =>
+          file.startsWith(`${RUN_ARTIFACTS_ENGINE_SUBDIR}/`)
+        )
+      ).toBe(false);
+      expect(parsed.leave_behind?.artifactFilesOmitted).toEqual({
+        internalFiles,
+        truncated: false,
+        unreadable: [],
+      });
+
+      // Human output draws from the same filtered list and says what it omitted.
+      await workflowGetCommand(runId);
+      const printed = consoleSpy.mock.calls.map((call: unknown[]) => String(call[0])).join('\n');
+      for (const report of reports) expect(printed).toContain(`- ${report}`);
+      expect(printed).not.toContain(RUN_ARTIFACTS_ENGINE_SUBDIR);
+      expect(printed).toContain(`Engine-internal artifact files (not listed): ${internalFiles}`);
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      await removeTempTree(archonHome);
+    }
+  });
+
+  it('reports a truncated leave-behind artifact list rather than dropping files silently (#3450)', async () => {
+    const previousHome = process.env.ARCHON_HOME;
+    const archonHome = join(tmpdir(), 'archon-get-artifact-truncated-home');
+    process.env.ARCHON_HOME = archonHome;
+    const runId = 'run-artifact-truncated';
+    const outputRoot = join(archonHome, 'workspaces', 'acme', 'widget');
+    const artifactsDir = join(outputRoot, 'artifacts', 'runs', runId);
+    mkdirSync(artifactsDir, { recursive: true });
+    for (let i = 0; i < 205; i++) {
+      writeFileSync(join(artifactsDir, `report-${String(i).padStart(3, '0')}.md`), 'report');
+    }
+    try {
+      const workflowDb = await import('@archon/core/db/workflows');
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'completed',
+        working_path: '/tmp/wt',
+        started_at: new Date(),
+        metadata: {},
+        output_root: outputRoot,
+        checkout_baseline: null,
+        codebase_id: 'cb-1',
+      });
+
+      await workflowGetCommand(runId, true);
+
+      const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+        leave_behind?: {
+          artifactFiles?: string[];
+          artifactFilesOmitted?: {
+            internalFiles: number;
+            truncated: boolean;
+            unreadable: string[];
+          };
+        };
+      };
+      expect(parsed.leave_behind?.artifactFiles).toHaveLength(200);
+      expect(parsed.leave_behind?.artifactFilesOmitted?.truncated).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      await removeTempTree(archonHome);
+    }
+  });
+
+  // A directory the walk cannot read hides everything inside it. ENOENT means
+  // the directory is simply gone and dropped nothing an operator could open;
+  // anything else is a real omission that has to reach the operator. Mode 000
+  // cannot make a directory unreadable on Windows or to root, which bypasses it.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'names an artifact directory it could not read rather than skipping it silently (#3450)',
+    async () => {
+      const previousHome = process.env.ARCHON_HOME;
+      const archonHome = join(tmpdir(), 'archon-get-artifact-unreadable-home');
+      process.env.ARCHON_HOME = archonHome;
+      const runId = 'run-artifact-unreadable';
+      const outputRoot = join(archonHome, 'workspaces', 'acme', 'widget');
+      const artifactsDir = join(outputRoot, 'artifacts', 'runs', runId);
+      const lockedDir = join(artifactsDir, 'review');
+      mkdirSync(lockedDir, { recursive: true });
+      writeFileSync(join(artifactsDir, 'plan.md'), 'report');
+      writeFileSync(join(lockedDir, 'report.md'), 'report');
+      chmodSync(lockedDir, 0o000);
+      try {
+        const workflowDb = await import('@archon/core/db/workflows');
+        (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+          id: runId,
+          workflow_name: 'implement',
+          status: 'completed',
+          working_path: '/tmp/wt',
+          started_at: new Date(),
+          metadata: {},
+          output_root: outputRoot,
+          checkout_baseline: null,
+          codebase_id: 'cb-1',
+        });
+
+        await workflowGetCommand(runId, true);
+
+        const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+          leave_behind?: {
+            artifactFiles?: string[];
+            artifactFilesOmitted?: {
+              internalFiles: number;
+              truncated: boolean;
+              unreadable: string[];
+            };
+          };
+        };
+        expect(parsed.leave_behind?.artifactFiles).toEqual(['plan.md']);
+        expect(parsed.leave_behind?.artifactFilesOmitted).toEqual({
+          internalFiles: 0,
+          truncated: false,
+          unreadable: ['review'],
+        });
+
+        await workflowGetCommand(runId);
+        const printed = consoleSpy.mock.calls.map((call: unknown[]) => String(call[0])).join('\n');
+        expect(printed).toContain('Unreadable artifact directory: review');
+      } finally {
+        chmodSync(lockedDir, 0o700);
+        if (previousHome === undefined) delete process.env.ARCHON_HOME;
+        else process.env.ARCHON_HOME = previousHome;
+        await removeTempTree(archonHome);
+      }
+    }
+  );
 
   it('emits the full metadata.approval (incl. completionSignaled) in --json for a paused interactive_loop run (#2074 E)', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
@@ -5575,6 +6058,7 @@ describe('workflowGetCommand', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-gate-human',
+      checkout_baseline: null,
       workflow_name: 'validate',
       status: 'paused',
       working_path: '/tmp/wt',
@@ -5603,6 +6087,7 @@ describe('workflowGetCommand', () => {
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>)
       .mockResolvedValueOnce({
         id: 'run-wait-human',
+        checkout_baseline: null,
         workflow_name: 'validate',
         status: 'paused',
         working_path: '/tmp/wt',
@@ -5620,6 +6105,7 @@ describe('workflowGetCommand', () => {
       })
       .mockResolvedValueOnce({
         id: 'run-quota-human',
+        checkout_baseline: null,
         workflow_name: 'deliver',
         status: 'failed',
         working_path: '/tmp/wt',
@@ -5651,6 +6137,7 @@ describe('workflowGetCommand', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-action-human',
+      checkout_baseline: null,
       workflow_name: 'deliver',
       status: 'paused',
       working_path: '/tmp/wt',
@@ -5685,6 +6172,7 @@ describe('workflowGetCommand', () => {
     const eventsDb = await import('@archon/core/db/workflow-events');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-v',
+      checkout_baseline: null,
       workflow_name: 'implement',
       status: 'running',
       working_path: '/tmp/wt',
@@ -5710,11 +6198,45 @@ describe('workflowGetCommand', () => {
     expect(parsed.transcript_path).toBeNull();
   });
 
+  it('reads attribution and observed duration from a terminal row without a start-row join', async () => {
+    const { startNodeExecution, finishNodeExecution, newNodeInvocation } =
+      await import('@archon/workflows/node-execution');
+    const { serializeNodeStateRecord } =
+      await import('@archon/workflows/node-record-serialization');
+    const completed = finishNodeExecution(
+      startNodeExecution({
+        runId: 'terminal-only',
+        path: 'work',
+        node: { id: 'work', kind: 'agent', source: { kind: 'inline', prompt: 'work' } },
+        invocation: newNodeInvocation(),
+        provider: 'codex',
+        model: 'requested-model',
+      }),
+      { status: 'completed' },
+      { durationMs: 17, resolvedModel: 'observed-model', costUsd: 0, output: { text: 'done' } }
+    );
+    const summaries = buildNodeSummaries([
+      {
+        ...serializeNodeStateRecord(completed),
+        id: 'terminal-row',
+        step_index: null,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+    expect(summaries[0]?.durationMs).toBe(17);
+    expect(summaries[0]?.execution?.binding.model?.resolved).toEqual({
+      source: 'provider',
+      value: 'observed-model',
+    });
+    expect(summaries[0]?.execution?.spend.costUsd).toEqual({ source: 'provider', value: 0 });
+  });
+
   it('emits raw events in verbose JSON when events=true', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const eventsDb = await import('@archon/core/db/workflow-events');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-v',
+      checkout_baseline: null,
       workflow_name: 'implement',
       status: 'running',
       working_path: '/tmp/wt',
@@ -5737,11 +6259,12 @@ describe('workflowGetCommand', () => {
     expect(parsed.transcript_path).toBeNull();
   });
 
-  it('degrades a raw verbose JSON event-query failure to an empty events payload', async () => {
+  it('fails explicitly when a raw verbose JSON event query fails', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const eventsDb = await import('@archon/core/db/workflow-events');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-v',
+      checkout_baseline: null,
       workflow_name: 'implement',
       status: 'running',
       working_path: '/tmp/wt',
@@ -5752,10 +6275,14 @@ describe('workflowGetCommand', () => {
       new Error('events unavailable')
     );
 
-    await workflowGetCommand('run-v', true, true, undefined, true);
+    const code = await workflowGetCommand('run-v', true, true, undefined, true);
 
-    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { events: unknown[] };
-    expect(parsed.events).toEqual([]);
+    expect(code).toBe(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
+      ok: false,
+      runId: 'run-v',
+      error: 'workflow_events_unavailable',
+    });
   });
 });
 
@@ -5786,6 +6313,7 @@ describe('workflowLogsCommand', () => {
     parent_run_id: null,
     adopted_from_run_id: null,
     output_root: projectRoot,
+    checkout_baseline: null,
   });
 
   const stdoutText = (): string =>
@@ -5858,6 +6386,7 @@ describe('workflowLogsCommand', () => {
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       ...run('completed'),
       output_root: '/previous/archon/home/workspaces/acme/widget',
+      checkout_baseline: null,
     });
     (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'cb-1',
@@ -5965,6 +6494,9 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockClear();
     mockCreateWorkflowEvent.mockClear();
+    mockPersistWorkflowEvent.mockClear();
+    mockRequestDetachedRunStop.mockReset();
+    mockRequestDetachedRunStop.mockImplementation(noOwnerAnswers);
   });
 
   afterEach(() => {
@@ -6127,7 +6659,9 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
 
     await workflowAbandonCommand('0b1ee8da', true, '/repo');
 
-    expect(workflowDb.cancelWorkflowRun).toHaveBeenCalledWith(FULL_ID);
+    expect(workflowDb.cancelWorkflowRun).toHaveBeenCalledWith(FULL_ID, {
+      cancel_reason: 'operator',
+    });
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       ok: boolean;
       runId: string;
@@ -6218,6 +6752,27 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     expect(consoleSpy).toHaveBeenCalledWith(
       `Event submitted (best-effort): workflow_started for run ${FULL_ID}`
     );
+  });
+
+  it('persists node-state events before reporting success', async () => {
+    const data = { node_output: 'done' };
+    await workflowEventEmitCommand(FULL_ID, 'node_completed', data);
+    expect(mockPersistWorkflowEvent).toHaveBeenCalledWith({
+      workflow_run_id: FULL_ID,
+      event_type: 'node_completed',
+      data,
+    });
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    expect(consoleSpy).toHaveBeenCalledWith(`Event persisted: node_completed for run ${FULL_ID}`);
+  });
+
+  it('propagates a node-state persistence failure without reporting success', async () => {
+    mockPersistWorkflowEvent.mockRejectedValueOnce(new Error('database unavailable'));
+    await expect(
+      workflowEventEmitCommand(FULL_ID, 'node_failed', { error: 'producer failed' })
+    ).rejects.toThrow('database unavailable');
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    expect(consoleSpy).not.toHaveBeenCalled();
   });
 
   it('resolves an event prefix from a workspace-scoped worktree', async () => {
@@ -6604,6 +7159,8 @@ describe('write command --json output', () => {
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
     stdoutSpy = spyOnJsonStdout();
+    mockRequestDetachedRunStop.mockReset();
+    mockRequestDetachedRunStop.mockImplementation(noOwnerAnswers);
   });
 
   afterEach(() => {
@@ -6617,6 +7174,8 @@ describe('write command --json output', () => {
       id: 'run-ab',
       workflow_name: 'implement',
       status: 'running',
+      last_activity_at: new Date('2026-09-20T10:00:00.000Z'),
+      metadata: { execution_owner: { host: 'build-box', pid: 4242 } },
     });
     (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       cancelled: true,
@@ -6631,6 +7190,14 @@ describe('write command --json output', () => {
       action: 'abandon',
       status: 'cancelled',
       workflowName: 'implement',
+      owner: {
+        outcome: 'no_owner_answered',
+        thisHost: hostname(),
+        recordedHost: 'build-box',
+        recordedPid: 4242,
+        recordedUid: null,
+        lastActivityAt: '2026-09-20T10:00:00.000Z',
+      },
     });
   });
 
@@ -7417,7 +7984,8 @@ describe('workflowRunCommand — detach', () => {
 
     expect(workflowDb.failWorkflowRun).toHaveBeenCalledWith(
       'run-detached-created',
-      expect.stringContaining('Detached launch failed')
+      expect.stringContaining('Detached launch failed'),
+      { exitReason: 'launch_failed' }
     );
     expect(consoleSpy).not.toHaveBeenCalledWith("Started 'assist' in the background.");
   });
@@ -7655,7 +8223,8 @@ describe('workflowRunCommand — detached child adopts the pre-created run (#287
 
     expect(workflowDb.failWorkflowRun).toHaveBeenCalledWith(
       'run-precreated',
-      expect.stringContaining('Detached run failed to start')
+      expect.stringContaining('Detached run failed to start'),
+      { exitReason: 'launch_failed' }
     );
   });
 
@@ -7738,6 +8307,77 @@ describe('workflowRunCommand — detached child adopts the pre-created run (#287
         conversationId: 'cli-123',
       })
     ).rejects.toThrow(/cannot find the run 'run-vanished'/);
+  });
+});
+
+describe('pendingDurableWait — which pauses this process owns', () => {
+  const run = (status: WorkflowRunStatus, metadata: Record<string, unknown>): WorkflowRun =>
+    ({ id: 'run-wait', status, metadata }) as unknown as WorkflowRun;
+
+  it('reads the cursor for a time wait', () => {
+    expect(
+      pendingDurableWait(
+        run('paused', {
+          wait: {
+            owner: 'node',
+            kind: 'time',
+            nodeId: 'cooldown',
+            waitingSince: '2026-01-01T00:00:00.000Z',
+            resumeAt: '2026-01-01T00:01:00.000Z',
+          },
+        })
+      )
+    ).toEqual({
+      stepName: 'cooldown',
+      resumeAt: '2026-01-01T00:01:00.000Z',
+      signaled: false,
+    });
+  });
+
+  it('marks a signaled event wait and names a loop-owned body wait', () => {
+    expect(
+      pendingDurableWait(
+        run('paused', {
+          wait: {
+            owner: 'loop_group',
+            nodeId: 'poll',
+            bodyWaitId: 'checks',
+            iteration: 2,
+            sessionId: null,
+            sessionProvider: null,
+            kind: 'event',
+            event: 'checks.complete',
+            waitingSince: '2026-01-01T00:00:00.000Z',
+            resumeAt: '2026-01-01T00:05:00.000Z',
+            signaledAt: '2026-01-01T00:00:30.000Z',
+          },
+        })
+      )
+    ).toEqual({
+      stepName: 'poll.checks',
+      resumeAt: '2026-01-01T00:05:00.000Z',
+      signaled: true,
+    });
+  });
+
+  it('returns nothing for a running run, an attention wait, or an approval gate', () => {
+    expect(pendingDurableWait(run('running', {}))).toBeUndefined();
+    expect(
+      pendingDurableWait(
+        run('paused', {
+          wait: {
+            owner: 'node',
+            kind: 'attention',
+            nodeId: 'await-operator',
+            waitingSince: '2026-01-01T00:00:00.000Z',
+            message: 'Do the outside action',
+          },
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      pendingDurableWait(run('paused', { approval: { nodeId: 'gate', message: 'ok?' } }))
+    ).toBeUndefined();
   });
 });
 
@@ -8134,7 +8774,10 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
     try {
       await expect(
         workflowApproveCommand('run-123', undefined, undefined, undefined, true)
-      ).rejects.toThrow('Approve or reject the child run instead: /workflow approve c-9');
+      ).rejects.toThrow(
+        'Approve or reject the child run instead. Approve it by run id: ' +
+          '`archon workflow approve c-9`'
+      );
       expect(spawnSpy.mock.calls.length).toBe(0);
     } finally {
       spawnSpy.mockRestore();
@@ -8229,7 +8872,10 @@ describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand
     try {
       await expect(
         workflowRejectCommand('run-123', undefined, undefined, undefined, true)
-      ).rejects.toThrow('Reject the child run instead: /workflow reject c-9');
+      ).rejects.toThrow(
+        'Reject the child run instead, or abandon this run to discard the whole tree. ' +
+          'Reject it by run id: `archon workflow reject c-9`'
+      );
       expect(spawnSpy.mock.calls.length).toBe(0);
     } finally {
       spawnSpy.mockRestore();
@@ -8455,6 +9101,7 @@ describe('resolveDetachedRunEncryptionEnv', () => {
       ARCHON_DOCKER: '',
       WORKSPACE_PATH: '',
       HOME: '',
+      USERPROFILE: '',
     });
     expect(
       resolveDetachedRunEncryptionEnv(
@@ -8467,6 +9114,7 @@ describe('resolveDetachedRunEncryptionEnv', () => {
       ARCHON_DOCKER: '',
       WORKSPACE_PATH: '',
       HOME: '',
+      USERPROFILE: '',
     });
     expect(resolveDetachedRunEncryptionEnv({ ARCHON_HOME: '~/.archon-custom' }, '/parent')).toEqual(
       {
@@ -8475,6 +9123,7 @@ describe('resolveDetachedRunEncryptionEnv', () => {
         ARCHON_DOCKER: '',
         WORKSPACE_PATH: '',
         HOME: '',
+        USERPROFILE: '',
       }
     );
     const dockerHandoff = resolveDetachedRunEncryptionEnv(
@@ -8487,6 +9136,7 @@ describe('resolveDetachedRunEncryptionEnv', () => {
       ARCHON_DOCKER: 'true',
       WORKSPACE_PATH: '',
       HOME: '',
+      USERPROFILE: '',
     });
     expect(isDocker(dockerHandoff)).toBe(true);
     expect(getArchonHome(dockerHandoff)).toBe('/.archon');
@@ -8811,6 +9461,45 @@ describe('workflowApproveCommand', () => {
     );
   });
 
+  // #3488: the refusal core throws names no command, so the CLI adds its own spelling
+  // on both of its error surfaces — propagation (human) and the --json envelope.
+  it('spells the child-run redirect for the CLI on both error surfaces', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const blockedParent = {
+      id: 'run-blocked',
+      workflow_name: 'implement',
+      status: 'paused',
+      user_message: 'add auth',
+      working_path: '/tmp/test-worktree',
+      codebase_id: 'cb-existing',
+      metadata: {
+        approval: {
+          nodeId: 'sub',
+          message: 'blocked',
+          type: 'child_workflow',
+          childRunId: 'child-42',
+        },
+      },
+    };
+
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce(blockedParent);
+    await expect(workflowApproveCommand('run-blocked')).rejects.toThrow(
+      'Approve it by run id: `archon workflow approve child-42`'
+    );
+
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce(blockedParent);
+    const stdoutSpy = spyOnJsonStdout();
+    try {
+      await workflowApproveCommand('run-blocked', undefined, true);
+      const payload = JSON.parse(firstJsonPayload(stdoutSpy)) as { ok: boolean; error: string };
+      expect(payload.ok).toBe(false);
+      expect(payload.error).toContain('archon workflow approve child-42');
+      expect(payload.error).not.toContain('/workflow ');
+    } finally {
+      stdoutSpy.mockRestore();
+    }
+  });
+
   it('should pass codebase_id from run record to workflowRunCommand', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
@@ -9030,6 +9719,8 @@ describe('workflowAbandonCommand', () => {
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    mockRequestDetachedRunStop.mockReset();
+    mockRequestDetachedRunStop.mockImplementation(noOwnerAnswers);
   });
 
   afterEach(() => {
@@ -9071,8 +9762,85 @@ describe('workflowAbandonCommand', () => {
 
     await workflowAbandonCommand('run-1');
 
-    expect(workflowDb.cancelWorkflowRun).toHaveBeenCalledWith('run-1');
+    expect(workflowDb.cancelWorkflowRun).toHaveBeenCalledWith('run-1', {
+      cancel_reason: 'operator',
+    });
     expect(consoleSpy).toHaveBeenCalledWith('Abandoned workflow run: run-1');
+  });
+
+  it('stops a live owner before recording cancelled and says so', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const order: string[] = [];
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-1',
+      workflow_name: 'implement',
+      status: 'running',
+    });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockReset();
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockImplementation(async () => {
+      order.push('cancel-state');
+      return { cancelled: true };
+    });
+    mockRequestDetachedRunStop.mockImplementationOnce(async () => ({
+      pid: 42,
+      stop: async () => {
+        order.push('terminate');
+      },
+      release: mockDetachedTargetRelease,
+    }));
+
+    await workflowAbandonCommand('run-1');
+
+    expect(order).toEqual(['terminate', 'cancel-state']);
+    expect(consoleSpy).toHaveBeenCalledWith("Stopped the run's live owner process (pid 42) first.");
+    expect(consoleSpy).toHaveBeenCalledWith('Abandoned workflow run: run-1');
+  });
+
+  it('prints the recorded owner facts when no owner answers', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-1',
+      workflow_name: 'implement',
+      status: 'running',
+      last_activity_at: new Date('2026-09-20T10:00:00.000Z'),
+      metadata: { execution_owner: { host: 'build-box', pid: 4242 } },
+    });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      cancelled: true,
+    });
+
+    await workflowAbandonCommand('run-1');
+
+    const printed = (consoleSpy.mock.calls as unknown[][]).map(call => String(call[0]));
+    expect(printed).toContain('Recorded owner: host build-box, pid 4242.');
+    expect(printed).toContain('Last activity: 2026-09-20T10:00:00.000Z.');
+    expect(printed.some(line => line.startsWith('The recorded owner is on another host'))).toBe(
+      true
+    );
+    // The facts come before the cancellation line.
+    expect(printed.indexOf('Recorded owner: host build-box, pid 4242.')).toBeLessThan(
+      printed.indexOf('Abandoned workflow run: run-1')
+    );
+  });
+
+  it('fails with the reason and leaves the run when the owner cannot be stopped', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-1',
+      workflow_name: 'implement',
+      status: 'running',
+    });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockClear();
+    mockRequestDetachedRunStop.mockImplementationOnce(async () => ({
+      pid: 42,
+      stop: () => Promise.reject(new Error('process still exists')),
+      release: mockDetachedTargetRelease,
+    }));
+
+    await expect(workflowAbandonCommand('run-1')).rejects.toThrow(
+      'Could not stop the live owner of run run-1 (pid 42): process still exists. The run was not changed.'
+    );
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
   });
 });
 
@@ -9086,6 +9854,7 @@ describe('workflowCancelCommand', () => {
     stdoutSpy = spyOnJsonStdout();
     mockRequestDetachedRunStop.mockReset();
     mockRequestDetachedRunStop.mockResolvedValue({
+      pid: 4242,
       stop: mockDetachedTargetStop,
       release: mockDetachedTargetRelease,
     });
@@ -9121,6 +9890,7 @@ describe('workflowCancelCommand', () => {
     mockRequestDetachedRunStop.mockImplementation(async () => {
       order.push('owner');
       return {
+        pid: 4242,
         stop: async () => {
           order.push('terminate');
         },
@@ -9179,7 +9949,7 @@ describe('workflowCancelCommand', () => {
     expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
       ok: false,
       action: 'cancel',
-      error: 'process still exists',
+      error: expect.stringContaining('(pid 4242): process still exists. The run was not changed.'),
     });
   });
 
@@ -9309,11 +10079,6 @@ describe('workflowCancelCommand', () => {
       .mockResolvedValueOnce({
         id: runId,
         workflow_name: 'implement',
-        status: 'running',
-      })
-      .mockResolvedValueOnce({
-        id: runId,
-        workflow_name: 'implement',
         status: 'completed',
       });
     (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
@@ -9341,10 +10106,55 @@ describe('workflowCancelCommand', () => {
     });
 
     await expect(workflowCancelCommand(runId)).rejects.toThrow(
-      "Cannot actively cancel run with status 'cancelled'"
+      "Cannot cancel run with status 'cancelled'"
     );
     expect(mockRequestDetachedRunStop).not.toHaveBeenCalled();
     expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('points at abandon, with the recorded owner facts, when no owner answers', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+      last_activity_at: null,
+      metadata: { execution_owner: { host: 'build-box', pid: 4242 } },
+    });
+    mockRequestDetachedRunStop.mockImplementation(noOwnerAnswers);
+
+    await workflowCancelCommand(runId, true);
+
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    const { error } = JSON.parse(firstJsonPayload(stdoutSpy)) as { error: string };
+    expect(error).toContain('Recorded owner: host build-box, pid 4242.');
+    expect(error).toContain(`Abandon it: archon workflow abandon ${runId}`);
+  });
+
+  it("cancels cooperatively a sub-run with no owner of its own whose root's owner answers", async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+      parent_run_id: 'root-run',
+    });
+    (workflowDb.getRunAncestry as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: 'root-run', status: 'running', parent_run_id: null },
+    ]);
+    mockRequestDetachedRunStop.mockImplementation(noOwnerAnswers);
+    mockIsRunOwnerAnswering.mockResolvedValueOnce(true);
+
+    await workflowCancelCommand(runId, true);
+
+    expect(mockRequestDetachedRunStop).toHaveBeenCalledWith(runId);
+    expect(mockIsRunOwnerAnswering).toHaveBeenCalledWith('root-run');
+    expect(workflowDb.cancelWorkflowRun).toHaveBeenCalledWith(runId, { cancel_reason: 'operator' });
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: true,
+      status: 'cancelled',
+      processStopped: false,
+    });
   });
 });
 
@@ -10066,6 +10876,30 @@ describe('workflowRespondCommand', () => {
     expect(resolveGateSpy).not.toHaveBeenCalled();
   });
 
+  it('spells the child-run redirect for the CLI', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-blocked',
+      workflow_name: 'guided',
+      status: 'paused',
+      user_message: 'go',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'child_workflow',
+          nodeId: 'sub',
+          message: 'blocked',
+          childRunId: 'child-55',
+        },
+      },
+    });
+
+    await expect(
+      workflowRespondCommand('run-respond-blocked', 'revise', 'needs more detail')
+    ).rejects.toThrow('Approve it by run id: `archon workflow approve child-55`');
+  });
+
   it('--detach validates read-only via assertRespondable before forking', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
@@ -10479,6 +11313,27 @@ describe('workflowRunCommand — progress rendering', () => {
     );
   });
 
+  it('should render a prior-success replay as a prior_success skip', async () => {
+    setupWorkflowMocks();
+
+    const { executeWorkflow } = require('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce(async () => {
+      if (capturedSubscribeHandler) {
+        capturedSubscribeHandler({
+          type: 'node_skipped_prior_success',
+          runId: 'run-1',
+          nodeId: 'plan',
+          nodeName: 'plan',
+        });
+      }
+      return { success: true, workflowRunId: 'run-1' };
+    });
+
+    await workflowRunCommand('/test/path', 'plan', 'hello', {});
+
+    expect(stderrSpy).toHaveBeenCalledWith('[plan] Skipped (prior_success)\n');
+  });
+
   it('should render a timeout node_skipped event to stderr', async () => {
     setupWorkflowMocks();
 
@@ -10838,7 +11693,8 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
 
     expect(workflowsDb.failWorkflowRun).toHaveBeenCalledWith(
       'test-run-id',
-      'Process terminated (SIGTERM)'
+      'Process terminated (SIGTERM)',
+      { exitReason: 'process_terminated', signal: 'SIGTERM' }
     );
     expect(shutdownOrder).toEqual(['owner-close', 'exit']);
     expect(exitSpy).toHaveBeenCalledWith(1);
@@ -10923,7 +11779,8 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
 
     expect(workflowsDb.failWorkflowRun).toHaveBeenCalledWith(
       'test-run-id',
-      'Process terminated (SIGTERM)'
+      'Process terminated (SIGTERM)',
+      { exitReason: 'process_terminated', signal: 'SIGTERM' }
     );
     expect(workflowsDb.getActiveWorkflowRun).not.toHaveBeenCalled();
     expect(exitSpy).toHaveBeenCalledWith(1);
@@ -11224,6 +12081,9 @@ describe('workflowTestCommand', () => {
   beforeEach(async () => {
     stdoutSpy = spyOnJsonStdout();
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const gitModule = await import('@archon/git');
+    (gitModule.findRepoRoot as ReturnType<typeof mock>).mockReset().mockResolvedValue(null);
+    mockDiscoverWorkflowsWithConfig.mockClear();
     const fixtureRunner = await import('@archon/workflows/fixture-runner');
     (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockClear();
     (fixtureRunner.formatFixtureReport as ReturnType<typeof mock>).mockClear();
@@ -11270,7 +12130,9 @@ describe('workflowTestCommand', () => {
     expect(payload.results[0]).toMatchObject({ fixture: 'sdlc/plan/fixtures/ready.stubs.yaml' });
   });
 
-  it('keeps the invoking directory for relative fixture path targets', async () => {
+  it('discovers workflows at the repository root while resolving targets from the invoking directory', async () => {
+    const gitModule = await import('@archon/git');
+    (gitModule.findRepoRoot as ReturnType<typeof mock>).mockResolvedValueOnce('/test/repository');
     const fixtureRunner = await import('@archon/workflows/fixture-runner');
     (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockResolvedValue({
       results: [],
@@ -11278,10 +12140,13 @@ describe('workflowTestCommand', () => {
       failed: 0,
     });
 
-    await workflowTestCommand('/test/repository', 'local-pack', {
-      targetCwd: '/test/repository/tools',
-    });
+    await workflowTestCommand('/test/repository/tools', '../.archon/workflows/local-pack');
 
+    expect(gitModule.findRepoRoot).toHaveBeenCalledWith('/test/repository/tools');
+    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledWith(
+      '/test/repository',
+      expect.any(Function)
+    );
     expect(fixtureRunner.runFixtures).toHaveBeenCalledWith(
       expect.objectContaining({ cwd: '/test/repository', targetCwd: '/test/repository/tools' })
     );
@@ -11499,6 +12364,7 @@ describe('workflowTestCommand', () => {
 
 describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  const trackTempRoot = trackTempRoots();
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
@@ -11563,6 +12429,47 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
       adoptedRun: { id: 'run-old' },
       lane,
     });
+  }
+
+  // Keep source-capture I/O real: equal run IDs replace one physical directory.
+  // This exposes cleanup deleting the replacement even with the executor mocked.
+  async function stageRealCapture(
+    tempRoot: string,
+    opts: { sourceRoot: string; runId?: string }
+  ): Promise<WorkflowExecutor.PreparedWorkflowSource> {
+    const runId = opts.runId ?? randomUUID();
+    const captureRoot = join(tempRoot, 'staged-source', runId);
+    await removeTempTree(captureRoot);
+    mkdirSync(captureRoot, { recursive: true });
+    const anchor = {
+      root: captureRoot,
+      digest: `digest-${opts.sourceRoot}`,
+      config: { load_default_workflows: true, load_default_commands: true },
+    };
+    const manifest = {
+      version: 1 as const,
+      engine_version: 'test',
+      origin: opts.sourceRoot,
+      captured_at: new Date().toISOString(),
+      digest: anchor.digest,
+      file_count: 0,
+      byte_count: 0,
+      scopes: [],
+      source_config: anchor.config,
+    };
+    writeFileSync(join(captureRoot, 'manifest.json'), JSON.stringify(manifest));
+    const roots: WorkflowExecutor.WorkflowSourceRoots = {
+      project: join(captureRoot, 'project'),
+      globalWorkflows: join(captureRoot, 'global', 'workflows'),
+      globalCommands: join(captureRoot, 'global', 'commands'),
+      globalScripts: join(captureRoot, 'global', 'scripts'),
+      bundledWorkflows: join(captureRoot, 'bundled', 'workflows'),
+      bundledCommands: join(captureRoot, 'bundled', 'commands', 'defaults'),
+      installed: { kind: 'captured', captureRoot },
+      kind: 'captured',
+      anchor,
+    };
+    return { runId, origin: opts.sourceRoot, manifest, anchor, roots };
   }
 
   it('adopts a normal run from a unique short run id prefix', async () => {
@@ -11689,6 +12596,44 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     expect(opts.adoptedFromRunId).toBe('run-old');
   });
 
+  it('preserves an explicit source when adoption recreates the prior branch checkout', async () => {
+    setupAdoptMocks({
+      kind: 'checkout-branch',
+      taskBranch: { kind: 'existing', branch: 'feature/live-pr' },
+    });
+    const isolation = await import('@archon/isolation');
+    const { executeWorkflow, prepareWorkflowSource } = await import('@archon/workflows/executor');
+    (isolation.getIsolationProvider as ReturnType<typeof mock>).mockReturnValueOnce({
+      create: mock(() =>
+        Promise.resolve({
+          provider: 'worktree' as const,
+          id: '/wt/recreated',
+          workingPath: '/wt/recreated',
+          branchName: 'feature/live-pr',
+          status: 'active' as const,
+          createdAt: new Date(),
+          metadata: { adopted: true },
+        })
+      ),
+      healthCheck: mock(() => Promise.resolve(true)),
+    });
+
+    // Explicit selection matters even when it names the invoking checkout.
+    await workflowRunCommand('/test/path', 'assist', 'hello', {
+      adoptRunId: 'run-old',
+      discoveryCwd: '/test/path',
+    });
+
+    expect(prepareWorkflowSource).toHaveBeenCalledTimes(1);
+    expect(prepareWorkflowSource).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ sourceRoot: '/test/path' })
+    );
+    const executed = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1) as unknown[];
+    expect(executed[3]).toBe('/wt/recreated');
+    expect((executed[4] as { description: string }).description).toBe('Parent vintage');
+  });
+
   it('re-judges the declared-input gate against the branch vintage after recapture', async () => {
     // The parent checkout's YAML declares no inputs, so the invocation gate on entry
     // passes an input-less call; only the adopted branch's YAML requires one.
@@ -11718,6 +12663,95 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
       workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: 'run-old' })
     ).rejects.toThrow(/requires input/);
     expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it(
+    'preserves the replacement capture when a detached child recaptures onto its own ' +
+      'pre-created run id (real files, #3217)',
+    async () => {
+      // Both capture calls use the detached child's pre-created run ID.
+      setupAdoptMocks();
+      const workflowDb = await import('@archon/core/db/workflows');
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        id: 'run-detached-child',
+        workflow_name: 'assist',
+        status: 'pending',
+      });
+      const { prepareWorkflowSource } = await import('@archon/workflows/executor');
+      const prepareMock = prepareWorkflowSource as ReturnType<typeof mock>;
+
+      const tempRoot = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-recapture-same-root-')));
+      // Matches the mocked DETACHED_RUN_OWNER_ENV value the SUT reads from
+      // '../utils/detached-run-control' (mocked at the top of this file).
+      const ownerEnvVar = 'ARCHON_DETACHED_RUN_OWNER';
+      const previousOwnerEnv = process.env[ownerEnvVar];
+      process.env[ownerEnvVar] = '1';
+      try {
+        prepareMock
+          .mockImplementationOnce((_deps: unknown, opts: { sourceRoot: string; runId?: string }) =>
+            stageRealCapture(tempRoot, opts)
+          )
+          .mockImplementationOnce((_deps: unknown, opts: { sourceRoot: string; runId?: string }) =>
+            stageRealCapture(tempRoot, opts)
+          );
+
+        await workflowRunCommand('/test/path', 'assist', 'hello', {
+          adoptRunId: 'run-old',
+          detachedRunId: 'run-detached-child',
+        });
+
+        const calls = prepareMock.mock.calls;
+        expect(calls).toHaveLength(2);
+        expect((calls[0][1] as { runId?: string }).runId).toBe('run-detached-child');
+        expect((calls[1][1] as { runId?: string }).runId).toBe('run-detached-child');
+
+        const replacementRoot = join(tempRoot, 'staged-source', 'run-detached-child');
+        const manifestPath = join(replacementRoot, 'manifest.json');
+        // The assertion the old code fails: the recapture's own cleanup deleted this
+        // file right after writing it, because stale.anchor.root === replacement's.
+        expect(existsSync(manifestPath)).toBe(true);
+        const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { origin: string };
+        expect(manifest.origin).toBe('/wt/adopted');
+      } finally {
+        if (previousOwnerEnv === undefined) delete process.env[ownerEnvVar];
+        else process.env[ownerEnvVar] = previousOwnerEnv;
+      }
+    }
+  );
+
+  it('still cleans up the superseded staged capture when the replacement lands at a different root', async () => {
+    // Ordinary adoption uses separate roots and must reclaim the first capture.
+    setupAdoptMocks();
+    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
+    const prepareMock = prepareWorkflowSource as ReturnType<typeof mock>;
+
+    const tempRoot = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-recapture-distinctroot-')));
+    const capturedRoots: string[] = [];
+    prepareMock
+      .mockImplementationOnce(
+        async (_deps: unknown, opts: { sourceRoot: string; runId?: string }) => {
+          const prepared = await stageRealCapture(tempRoot, opts);
+          capturedRoots.push(prepared.anchor.root);
+          return prepared;
+        }
+      )
+      .mockImplementationOnce(
+        async (_deps: unknown, opts: { sourceRoot: string; runId?: string }) => {
+          const prepared = await stageRealCapture(tempRoot, opts);
+          capturedRoots.push(prepared.anchor.root);
+          return prepared;
+        }
+      );
+
+    await workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: 'run-old' });
+
+    expect(capturedRoots).toHaveLength(2);
+    const [originalRoot, replacementRoot] = capturedRoots;
+    expect(originalRoot).not.toBe(replacementRoot);
+    // The superseded original is reclaimed...
+    expect(existsSync(originalRoot as string)).toBe(false);
+    // ...and the replacement it was superseded BY survives.
+    expect(existsSync(join(replacementRoot as string, 'manifest.json'))).toBe(true);
   });
 });
 
@@ -12303,5 +13337,48 @@ describe('workflowWaitCommand', () => {
     await expect(workflowWaitCommand(FULL_ID, undefined, '/repo')).rejects.toThrow(
       'Failed to wait for workflow run: database unreachable'
     );
+  });
+});
+
+describe('workflowRunCommand — continuation conversation lookup', () => {
+  it('refuses before opening a new conversation when the lookup fails', async () => {
+    const { hydrateResumableRun } = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const workflowDiscovery = await import('@archon/workflows/workflow-discovery');
+
+    (
+      workflowDiscovery.discoverWorkflowsWithConfig as ReturnType<typeof mock>
+    ).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'resume-thread' })],
+      errors: [],
+    });
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-prior',
+      working_path: null,
+      workflow_name: 'resume-thread',
+      conversation_id: 'conv-prior',
+    });
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { id: 'run-prior', workflow_name: 'resume-thread' },
+      priorCompletedNodes: new Map([['node-a', 'done']]),
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-resume',
+      default_cwd: '/repo/root',
+      default_branch: 'develop',
+    });
+    (conversationDb.getConversationById as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('database busy')
+    );
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockClear();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'resume-thread', 'go', { resume: true })
+    ).rejects.toThrow(
+      "Failed to load conversation 'conv-prior' for workflow run 'run-prior': database busy"
+    );
+    expect(conversationDb.getOrCreateConversation).not.toHaveBeenCalled();
   });
 });

@@ -3,7 +3,9 @@ import { createMockLogger } from '../test/mocks/logger';
 import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
 import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { removeTempTree } from '@archon/paths/test-utils';
+import { NODE_STATE_EVENT_TYPES, type NodeStateEventType } from '@archon/workflows/store';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -66,7 +68,7 @@ describe('workflow-events', () => {
 
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
-        event_type: 'node_started',
+        event_type: 'loop_iteration_started',
         step_index: 0,
         step_name: 'plan',
         data: { duration: 100 },
@@ -78,7 +80,7 @@ describe('workflow-events', () => {
         [
           expect.any(String), // generated UUID
           'run-456',
-          'node_started',
+          'loop_iteration_started',
           0,
           'plan',
           JSON.stringify({ duration: 100 }),
@@ -110,7 +112,7 @@ describe('workflow-events', () => {
       // Should NOT throw — fire-and-forget logs error internally
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
-        event_type: 'node_started',
+        event_type: 'loop_iteration_started',
       });
     });
   });
@@ -307,6 +309,7 @@ describe('workflow-events', () => {
           'run-b',
           'run-c',
           'node_started',
+          'node_suspended',
           'node_completed',
           'node_failed',
           'node_skipped',
@@ -1059,7 +1062,7 @@ describe('workflow-events', () => {
       });
 
       afterEach(async () => {
-        await rm(spillDir, { recursive: true, force: true });
+        await removeTempTree(spillDir);
       });
 
       test('reads the full spilled content instead of the truncated preview', async () => {
@@ -1084,7 +1087,7 @@ describe('workflow-events', () => {
 
         const result = await getDagResumeSnapshot('run-spill');
 
-        expect(result.completedNodeOutputs.get('big-node')?.output).toBe(fullOutput);
+        expect(result.completedNodeOutputs.get('big-node')).toEqual({ output: fullOutput });
         expect(result.completedNodeOutputs.get('big-node')?.output.length).toBe(50_000);
       });
 
@@ -1111,6 +1114,9 @@ describe('workflow-events', () => {
         expect(snapshot.completedNodeOutputs.get('orphaned-node')?.output).toBe(
           'preview text' + '\n\n… [truncated; original output was 99999 bytes]'
         );
+        expect(snapshot.completedNodeOutputs.get('orphaned-node')).toMatchObject({
+          outputTruncation: { originalBytes: 99_999, spillPath: missingPath },
+        });
         expect(mockLogger.warn).toHaveBeenCalledWith(
           expect.objectContaining({ spillPath: missingPath }),
           'db.workflow_dag_node_output_spill_read_failed'
@@ -1145,6 +1151,9 @@ describe('workflow-events', () => {
         expect(snapshot.completedNodeOutputs.get('racy-node')?.output).toBe(
           'preview text' + '\n\n… [truncated; original output was 50000 bytes]'
         );
+        expect(snapshot.completedNodeOutputs.get('racy-node')).toMatchObject({
+          outputTruncation: { originalBytes: 50_000, spillPath },
+        });
         expect(mockLogger.warn).toHaveBeenCalledWith(
           expect.objectContaining({
             spillPath,
@@ -1153,6 +1162,48 @@ describe('workflow-events', () => {
           }),
           'db.workflow_dag_node_output_spill_stale'
         );
+      });
+
+      test('retains truncated provenance when the spill cannot be read and keeps the logical value', async () => {
+        // A directory is deterministically unreadable as file content on supported runtimes.
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'structured-node',
+              event_type: 'node_skipped_prior_success',
+              data: {
+                node_output: 'preview',
+                structured_output: { findings: ['durable'] },
+                node_output_truncated: true,
+                node_output_original_bytes: 40_000,
+                node_output_spill_path: spillDir,
+              },
+            },
+          ])
+        );
+        const snapshot = await getDagResumeSnapshot('run-unreadable-spill');
+        expect(snapshot.completedNodeOutputs.get('structured-node')).toEqual({
+          output: 'preview',
+          structuredOutput: { findings: ['durable'] },
+          outputTruncation: { originalBytes: 40_000, spillPath: spillDir },
+        });
+      });
+
+      test('keeps explicit truncation even when no original spill provenance was persisted', async () => {
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'preview-node',
+              event_type: 'node_completed',
+              data: { node_output: 'preview', node_output_truncated: true },
+            },
+          ])
+        );
+        const snapshot = await getDagResumeSnapshot('run-preview-only');
+        expect(snapshot.completedNodeOutputs.get('preview-node')).toEqual({
+          output: 'preview',
+          outputTruncation: { originalBytes: null, spillPath: null },
+        });
       });
 
       test('does not attempt a spill read when no spill path is recorded', async () => {
@@ -1173,6 +1224,44 @@ describe('workflow-events', () => {
       });
     });
 
+    test.each([...NODE_STATE_EVENT_TYPES])(
+      'honors latest %s when hydrating earlier success',
+      async eventType => {
+        const expected = {
+          node_started: { cached: false, active: true },
+          node_suspended: { cached: false, active: true },
+          node_completed: { cached: true, active: false },
+          node_failed: { cached: false, active: false },
+          node_skipped: { cached: false, active: false },
+          node_skipped_prior_success: { cached: true, active: false },
+          node_prior_cache_invalidated: { cached: false, active: false },
+          node_always_run_reset: { cached: false, active: false },
+        } satisfies Record<NodeStateEventType, { cached: boolean; active: boolean }>;
+        const rows = [
+          {
+            step_name: 'consumer',
+            event_type: 'node_completed',
+            data: { node_output: 'old', tokens: { input: 10, output: 1 }, cost_usd: 2 },
+          },
+          { step_name: 'consumer', event_type: 'node_started', data: {} },
+          { step_name: 'consumer', event_type: eventType, data: { node_output: 'latest' } },
+        ];
+        // Model the real SQL selection: returning every mocked row would miss an omitted kind.
+        mockQuery.mockImplementationOnce(async (_sql, params) =>
+          createQueryResult(
+            rows.filter(row => Array.isArray(params) && params.includes(row.event_type))
+          )
+        );
+        const snapshot = await getDagResumeSnapshot('run-node-state-fold');
+        expect(snapshot.completedNodeOutputs.get('consumer')).toEqual(
+          expected[eventType].cached ? { output: 'latest' } : undefined
+        );
+        expect(snapshot.unresolvedNodeStarts.has('consumer')).toBe(expected[eventType].active);
+        expect(snapshot.tokens).toEqual({ input: 10, output: 1 });
+        expect(snapshot.costUsd).toBe(2);
+      }
+    );
+
     test('returns an empty snapshot when no events exist', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
@@ -1183,6 +1272,116 @@ describe('workflow-events', () => {
       expect(result.costUsd).toBe(0);
       expect(result.fanOutSnapshots.size).toBe(0);
       expect(result.unresolvedNodeStarts.size).toBe(0);
+    });
+
+    test('refuses to resume through a corrupt typed completion instead of replaying its effects', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'publish',
+            event_type: 'node_completed',
+            data: { node_output: 'published', invocation: { id: 'incomplete' } },
+          },
+        ])
+      );
+      await expect(getDagResumeSnapshot('run-corrupt')).rejects.toThrow(
+        "Invalid node execution record for 'publish'"
+      );
+    });
+
+    test('retains unfinished typed invocations by path and loop lineage', async () => {
+      const typed = (invocationId: string, iteration: number) => ({
+        node: { id: 'worker', kind: 'exec', runtime: 'sh' },
+        invocation: {
+          id: invocationId,
+          startedAt: '2026-09-22T10:00:00Z',
+          loopPath: [{ groupId: 'group', iteration }],
+        },
+        attempt: { id: `${invocationId}-attempt`, startedAt: '2026-09-22T10:00:00Z' },
+        binding: {},
+        timing: { startedAt: '2026-09-22T10:00:00Z' },
+        spend: {
+          tokens: { source: 'unavailable', reason: 'not_applicable' },
+          costUsd: { source: 'unavailable', reason: 'not_applicable' },
+          stopReason: { source: 'unavailable', reason: 'not_applicable' },
+          numTurns: { source: 'unavailable', reason: 'not_applicable' },
+        },
+        accounting: 'node',
+      });
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { step_name: 'group.worker', event_type: 'node_started', data: typed('first', 0) },
+          {
+            step_name: 'group.worker',
+            event_type: 'node_completed',
+            data: { ...typed('first', 0), node_output: 'done' },
+          },
+          { step_name: 'group.worker', event_type: 'node_started', data: typed('second', 1) },
+          {
+            step_name: 'group.worker',
+            event_type: 'node_suspended',
+            data: { ...typed('second', 1), suspend_point: 'wait' },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-invocations');
+
+      expect(result.unfinishedInvocations?.size).toBe(1);
+      expect([...result.unfinishedInvocations!.values()][0]).toMatchObject({
+        runId: 'run-invocations',
+        path: 'group.worker',
+        invocation: { id: 'second', loopPath: [{ groupId: 'group', iteration: 1 }] },
+        lifecycle: { status: 'suspended', point: 'wait' },
+      });
+    });
+
+    test('a reusable output keeps its completion facts across prior-success replays', async () => {
+      const checkoutStart = {
+        kind: 'git',
+        sampledAt: '2026-09-22T10:00:00Z',
+        commit: 'a'.repeat(40),
+        tree: 'b'.repeat(40),
+        worktree: { status: 'clean' },
+      };
+      const completed = {
+        node: { id: 'implement', kind: 'loop' },
+        invocation: {
+          id: 'impl-1',
+          startedAt: '2026-09-22T10:00:00Z',
+          loopPath: [],
+          checkoutStart,
+        },
+        attempt: { id: 'impl-1-attempt', startedAt: '2026-09-22T10:00:00Z', checkoutStart },
+        binding: {},
+        timing: { startedAt: '2026-09-22T10:00:00Z' },
+        spend: {
+          tokens: { source: 'unavailable', reason: 'not_applicable' },
+          costUsd: { source: 'unavailable', reason: 'not_applicable' },
+          stopReason: { source: 'unavailable', reason: 'not_applicable' },
+          numTurns: { source: 'unavailable', reason: 'not_applicable' },
+        },
+        accounting: 'node',
+        node_output: 'done',
+      };
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { step_name: 'implement', event_type: 'node_completed', data: completed },
+          // A first resume replayed it; the replay row carries no execution facts itself.
+          {
+            step_name: 'implement',
+            event_type: 'node_skipped_prior_success',
+            data: { node: { id: 'implement', kind: 'loop' }, node_output: 'done' },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-replayed');
+
+      expect(result.completedNodeOutputs.get('implement')?.execution).toMatchObject({
+        path: 'implement',
+        invocation: { id: 'impl-1', checkoutStart },
+      });
     });
 
     test('keeps the first valid fan-out instance snapshot authoritative', async () => {

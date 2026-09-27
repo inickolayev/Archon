@@ -20,7 +20,12 @@ import {
   readComposedBindings,
   type LoopWithCompiledCommand,
 } from './compiled-command';
-import { declaredFieldsFromSchema, canonicalValueText, type JsonValue } from './output-ref';
+import {
+  declaredFieldsFromSchema,
+  canonicalValueText,
+  parseWholeExecutionCheckoutRef,
+  type JsonValue,
+} from './output-ref';
 import { discoverScriptsForCwd } from './script-discovery';
 import {
   describeUnmetCompletion,
@@ -45,6 +50,9 @@ import {
 } from './workflow-source';
 import { defaultRunInputs } from './workflow-inputs';
 import { buildExecNodeEnvironment } from './exec-environment';
+import { observeCheckout } from './checkout-observation';
+import { executionMetadata, newNodeInvocation, startNodeExecution } from './node-execution';
+import type { NodeExecutionMetadata } from './schemas/node-execution';
 import {
   inputEnvKey,
   isGateNode,
@@ -220,6 +228,58 @@ function stubSatisfiesNode(node: DagNode, stub: DryRunStubValue): boolean {
     return loopIterationCompletes(node.loop, completedOutput(node, stub)).kind !== 'incomplete';
   }
   return true;
+}
+
+/**
+ * An authored stub stands in for a node's real output, so it owes the same contract.
+ *
+ * The generated-scaffold route already validates its placeholder against
+ * `output_format` (`generatedStubFor` throws on a schema it cannot satisfy); this is
+ * that check for a value a fixture wrote by hand, which otherwise reached
+ * `completedOutput` unexamined. Without it a fixture keeps passing while the schema it
+ * stands in for moves, and the suite's green stops meaning the real run would certify.
+ * Throwing here is what the surrounding catch turns into a failed node, so the fixture
+ * reports the schema errors rather than a downstream symptom.
+ *
+ * Called from `stubFor`, the single point an authored stub enters a simulation, so a
+ * new consumer cannot forget it. It sat at the two hydration sites first and one of
+ * them was missed — the loop one, which is the one that matters most: `loop:` is how
+ * a workflow declares an iterated verdict, so its schema is usually the contract a
+ * composition is built on.
+ */
+function assertAuthoredStubSatisfiesSchema(node: DagNode, stub: DryRunStubValue): void {
+  if (node.output_format === undefined) return;
+  // A string stub stands in for what the node PRINTS, which the engine parses before
+  // it validates; a non-string stub already is the structured value. Parse the first
+  // the way `certifyExecOutput` does, so a fixture may keep writing either form and
+  // both are held to the same contract.
+  let value: unknown = stub;
+  if (typeof stub === 'string') {
+    try {
+      value = JSON.parse(stub);
+    } catch {
+      throw new Error(
+        `Stub for node '${node.id}' declares output_format but is not one JSON document: ` +
+          stub.slice(0, 120)
+      );
+    }
+  }
+  let compileError: string | undefined;
+  const validation = validateStructuredOutput(value, node.output_format, message => {
+    compileError = message;
+  });
+  if (compileError !== undefined) {
+    throw new Error(
+      `Stub for node '${node.id}' cannot be checked: its output_format could not be ` +
+        `compiled (${compileError})`
+    );
+  }
+  if (!validation.valid) {
+    throw new Error(
+      `Stub for node '${node.id}' does not satisfy its output_format: ` +
+        validation.errors.join('; ')
+    );
+  }
 }
 
 function collectsStub(node: DagNode): boolean {
@@ -475,6 +535,8 @@ interface DryRunContext {
    */
   sourceRoots: WorkflowSourceRoots;
   stubs: DryRunStubs;
+  /** Nodes whose execution record some binding reads (`$<node>.execution.checkoutStart`). */
+  checkoutProducers: ReadonlySet<string>;
   /**
    * The run's EFFECTIVE `$INPUTS` map — declared defaults layered under caller-supplied
    * values, the same merge a real run performs at executor.ts (`defaultRunInputs`).
@@ -552,7 +614,10 @@ function resolveText(
     undefined,
     undefined,
     loopPrevOutput,
-    { shellSafe, stateDir: ctx.stateDir, ...(inputs ? { inputs } : {}) }
+    // A dry run never writes typed artifacts, so it has no listing to point at. Pass
+    // an explicit empty value: the preview substitutes '' rather than throwing the way
+    // a real invocation that forgot to materialize a listing does.
+    { shellSafe, stateDir: ctx.stateDir, typedArtifactsFile: '', ...(inputs ? { inputs } : {}) }
   ).prompt;
   return substituteNodeOutputRefs(substituted, outputs, escapeNodeOutputs);
 }
@@ -662,7 +727,8 @@ async function executeCodeNode(
   ctx: DryRunContext,
   /** Resolved node-local `with:` bindings (#2637) — the nearest env source, layered
    *  over run inputs exactly like the executor's `inputEnvVars` third tier. */
-  nodeBindings?: Record<string, JsonValue>
+  nodeBindings?: Record<string, JsonValue>,
+  execution?: NodeExecutionMetadata
 ): Promise<{ output: string } | { error: string }> {
   try {
     let command: string;
@@ -717,6 +783,7 @@ async function executeCodeNode(
       timeout: node.timeout ?? 300_000,
       env: {
         ...process.env,
+        PYTHONDONTWRITEBYTECODE: '1',
         PWD: ctx.execWorkspace,
         OLDPWD: ctx.execWorkspace,
         ...inputEnv,
@@ -731,6 +798,9 @@ async function executeCodeNode(
           loopPrevOutput: '',
           rejectionReason: '',
           issueContext: '',
+          // No artifacts are written in a dry run, so there is no listing to point at.
+          typedArtifactsFile: '',
+          nodeExecution: execution ?? null,
         }),
       },
     });
@@ -752,7 +822,11 @@ const TOLERATED_STUB_REASON =
 function stubFor(node: DagNode, ctx: DryRunContext): DryRunStubValue | undefined {
   if (Object.hasOwn(ctx.stubs, node.id)) {
     ctx.consumedStubs.add(node.id);
-    return ctx.stubs[node.id];
+    const authored = ctx.stubs[node.id];
+    // The one place an authored stub enters a simulation, so the one place that can
+    // hold its contract by construction rather than by each caller remembering to.
+    if (authored !== undefined) assertAuthoredStubSatisfiesSchema(node, authored);
+    return authored;
   }
   if (ctx.defaultStubs && !(isExecNode(node) && ctx.execCode)) {
     return generatedStubFor(node);
@@ -959,10 +1033,36 @@ async function simulateLoopGroup(
   if (!isLoopGroupNode(node)) return;
   const bodyNodes = resolvedBodyNodes(node.loop_group);
   const bodyPlan = planGraph(bodyNodes);
+  // The executor builds the body's per-iteration context from the group's OWN resolved
+  // provider and model (dag-executor.ts), so the body must simulate against those rather
+  // than the enclosing workflow's scope. Everything the executor leaves alone — the
+  // workflow-level effort and options — stays as it is. Reporting fields that describe
+  // where the inherited model came from travel with it, or a body node would be
+  // attributed to a tier it did not resolve through.
+  const groupResolution = resolveNodeModel(node, ctx.scope, ctx.assistantModels, ctx.aiProfile);
+  const bodyScope: WorkflowModelScope = {
+    ...ctx.scope,
+    provider: groupResolution.provider,
+    model: groupResolution.model,
+    preset: groupResolution.preset,
+    tier: groupResolution.tier,
+    providerOrigin: groupResolution.providerOrigin,
+  };
+  // Swap the scope on the context the body is given rather than handing it a copy.
+  // `halted` is the one scalar a nested simulation writes back — a gate inside the body
+  // sets it — so a spread copy would swallow a pause and let the run continue past it.
+  // Restoring in `finally` keeps the group's own trace entry on the enclosing scope and
+  // nests correctly when a body contains another loop_group.
+  const outerScope = ctx.scope;
   let lastOutput = '';
   for (let current = 1; current <= node.loop_group.max_iterations; current++) {
     const bodyOutputs = new Map(outputs);
-    await simulateNodes(bodyPlan, bodyOutputs, ctx, current);
+    ctx.scope = bodyScope;
+    try {
+      await simulateNodes(bodyPlan, bodyOutputs, ctx, current);
+    } finally {
+      ctx.scope = outerScope;
+    }
     lastOutput =
       bodyPlan.sinks
         .map(bodyId => bodyOutputs.get(bodyId))
@@ -1009,7 +1109,8 @@ async function simulateNode(
   node: DagNode,
   outputs: Map<string, NodeOutput>,
   ctx: DryRunContext,
-  iteration?: number
+  iteration?: number,
+  execution?: NodeExecutionMetadata
 ): Promise<void> {
   const boundaryDecision = checkComposedBlockBoundaries(node, outputs, ctx.inputs);
   if (boundaryDecision.decision === 'skip') {
@@ -1176,7 +1277,7 @@ async function simulateNode(
           );
     const stub = stubFor(node, ctx);
     if (stub === undefined && isExecNode(node) && ctx.execCode) {
-      const executed = await executeCodeNode(node, resolvedText, ctx, nodeBindings);
+      const executed = await executeCodeNode(node, resolvedText, ctx, nodeBindings, execution);
       if ('error' in executed) {
         recordFailed(node, outputs, ctx, executed.error, resolvedText, iteration);
       } else {
@@ -1246,9 +1347,67 @@ async function simulateNodes(
   for (const layer of plan.layers) {
     for (const node of layer) {
       if (ctx.halted) return;
-      await simulateNode(node, outputs, ctx, iteration);
+      const execution = await simulatedExecution(node, ctx);
+      await simulateNode(node, outputs, ctx, iteration, execution);
+      const result = outputs.get(node.id);
+      if (execution !== undefined && result !== undefined && result.state !== 'skipped') {
+        outputs.set(node.id, { ...result, execution });
+      }
     }
   }
+}
+
+/**
+ * The execution record a real run would give this node, when anything in the simulation
+ * reads it: a node another binds with `$<node>.execution.checkoutStart`, or an exec node
+ * that actually executes and receives `ARCHON_NODE_EXECUTION`. The checkout it observes
+ * is the one executed code runs in. Stubbed nodes change nothing, so their start is the
+ * checkout as the simulation reaches them.
+ */
+async function simulatedExecution(
+  node: DagNode,
+  ctx: DryRunContext
+): Promise<NodeExecutionMetadata | undefined> {
+  const executes = isExecNode(node) && ctx.execCode && !Object.hasOwn(ctx.stubs, node.id);
+  if (!executes && !ctx.checkoutProducers.has(node.id)) return undefined;
+  if (!isExecNode(node) && !isAgentNode(node) && !isLoopNode(node)) return undefined;
+  const checkoutStart = await observeCheckout(
+    ctx.execWorkspace,
+    { kind: 'host' },
+    { runId: 'dry-run', artifactsDir: ctx.artifactsDir }
+  );
+  return executionMetadata(
+    startNodeExecution({
+      runId: 'dry-run',
+      path: node.id,
+      node,
+      invocation: { ...newNodeInvocation(), checkoutStart },
+      checkoutStart,
+    })
+  );
+}
+
+/** Producers some node binds with `$<node>.execution.checkoutStart`, at any depth. */
+function collectCheckoutProducers(
+  nodes: readonly DagNode[],
+  into = new Set<string>()
+): Set<string> {
+  for (const node of nodes) {
+    if (isLoopGroupNode(node)) collectCheckoutProducers(node.loop_group.nodes as DagNode[], into);
+    const nodeWith = isExecNode(node)
+      ? node.with
+      : isAgentNode(node)
+        ? node.source.kind === 'command'
+          ? node.source.with
+          : readComposedBindings(node)
+        : undefined;
+    for (const value of Object.values(nodeWith ?? {})) {
+      const producer =
+        typeof value === 'string' ? parseWholeExecutionCheckoutRef(value) : undefined;
+      if (producer !== undefined) into.add(producer);
+    }
+  }
+  return into;
 }
 
 function resolveDryRunAuthoredOutcome(
@@ -1328,6 +1487,7 @@ export async function dryRunWorkflow(options: {
     execWorkspace: options.execWorkspace ?? options.cwd,
     sourceRoots: options.sourceRoots ?? liveSourceRoots(options.cwd),
     stubs: options.stubs ?? {},
+    checkoutProducers: collectCheckoutProducers(options.workflow.nodes),
     ...(inputs ? { inputs } : {}),
     artifactsDir: join(tempRoot, 'artifacts'),
     stateDir: join(tempRoot, 'state'),

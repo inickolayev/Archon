@@ -130,7 +130,7 @@ const mockCreateWorkflowRun = mock<IWorkflowStore['createWorkflowRun']>(() => {
     conversation_id: 'worker-conv-1',
     parent_conversation_id: 'parent-conv',
     codebase_id: 'cb-1',
-    status: 'running',
+    status: 'pending',
     outcome: null,
     user_message: 'run it',
     metadata: {},
@@ -142,6 +142,7 @@ const mockCreateWorkflowRun = mock<IWorkflowStore['createWorkflowRun']>(() => {
     parent_run_id: null,
     adopted_from_run_id: null,
     output_root: null,
+    checkout_baseline: null,
   });
 });
 const mockFailWorkflowRun = mock<IWorkflowStore['failWorkflowRun']>(() => Promise.resolve());
@@ -260,6 +261,7 @@ const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSo
         globalScripts: '/capture/global/scripts',
         bundledWorkflows: '/capture/bundled/workflows',
         bundledCommands: '/capture/bundled/commands/defaults',
+        installed: { kind: 'captured', captureRoot: '/capture' },
         kind: 'captured',
         anchor: {
           root: '/capture',
@@ -290,6 +292,10 @@ mock.module('@archon/workflows/executor', () => ({
   withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
     withObservableCapturedSource(capturedSourceOwnerCalls, body)
   ),
+  // Statically imported (transitively, via `InProcessWorkflowEngine`) by the dispatch
+  // path; a named import must link even when these tests never exercise
+  // the resume path.
+  hydrateResumableRun: mock(() => Promise.resolve(null)),
 }));
 mock.module('@archon/workflows/router', () => ({
   findWorkflow: mock(() => undefined),
@@ -710,7 +716,9 @@ describe('dispatchBackgroundWorkflow', () => {
     await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
     await flushBackgroundExecution();
 
-    expect(mockFailWorkflowRun).toHaveBeenCalledWith('run-1', 'invalid run config provider');
+    expect(mockFailWorkflowRun).toHaveBeenCalledWith('run-1', 'invalid run config provider', {
+      exitReason: 'unhandled_error',
+    });
   });
 
   test('default policy still resolves isolation for the worker', async () => {
@@ -735,6 +743,34 @@ describe('dispatchBackgroundWorkflow', () => {
     );
 
     await flushBackgroundExecution();
+  });
+
+  test('hands the executor the cut-from commit of a branch this dispatch created', async () => {
+    mockResolve.mockResolvedValueOnce(
+      resolvedIsolation(
+        { type: 'created', cutFromCommit: 'c'.repeat(40) },
+        makeEnvRow({ working_path: '/worktrees/bg-1', branch_name: 'bg-1' })
+      )
+    );
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), makeWorkflow());
+    await flushBackgroundExecution();
+
+    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.cutFromCommit).toBe('c'.repeat(40));
+  });
+
+  test('a reused worktree carries no cut-from commit', async () => {
+    mockResolve.mockResolvedValueOnce(
+      resolvedIsolation(
+        { type: 'workflow_reuse' },
+        makeEnvRow({ working_path: '/worktrees/bg-1', branch_name: 'bg-1' })
+      )
+    );
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), makeWorkflow());
+    await flushBackgroundExecution();
+
+    expect(mockExecuteWorkflow.mock.calls[0]?.[7]).not.toHaveProperty('cutFromCommit');
   });
 
   test('missing-worktree adoption materializes the exact branch for a background run', async () => {

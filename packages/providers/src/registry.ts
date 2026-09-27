@@ -16,8 +16,8 @@ import type {
 } from './types';
 import { ClaudeProvider } from './claude/provider';
 import { CodexProvider } from './codex/provider';
-import { parseClaudeRunConfig } from './claude/config';
-import { parseCodexRunConfig } from './codex/config';
+import { parseClaudeConfigStrict } from './claude/config';
+import { parseCodexConfigStrict } from './codex/config';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
 import { listClaudeModels } from './claude/models';
@@ -92,7 +92,7 @@ export function getProviderCapabilities(id: string): ProviderCapabilities {
 
 /** Validate and normalize a run-owned model through the provider's strict parser. */
 export function parseProviderRunModel(id: string, model: string): string {
-  const parsed = getRegistration(id).parseRunConfig({ model });
+  const parsed = getRegistration(id).parseConfig({ model }, 'run');
   if (typeof parsed.model !== 'string' || parsed.model.trim().length === 0) {
     throw new InvalidProviderRunConfigError('model', 'provider did not accept the model');
   }
@@ -169,8 +169,8 @@ export function registerBuiltinProviders(): void {
       factory: () => new ClaudeProvider(),
       capabilities: CLAUDE_CAPABILITIES,
       builtIn: true,
-      parseRunConfig: parseClaudeRunConfig,
       listModels: listClaudeModels,
+      parseConfig: parseClaudeConfigStrict,
       credentials: {
         kind: 'static',
         specs: [
@@ -188,8 +188,8 @@ export function registerBuiltinProviders(): void {
       factory: () => new CodexProvider(),
       capabilities: CODEX_CAPABILITIES,
       builtIn: true,
-      parseRunConfig: parseCodexRunConfig,
       listModels: listCodexModels,
+      parseConfig: parseCodexConfigStrict,
       credentials: {
         kind: 'static',
         specs: [

@@ -87,27 +87,23 @@ export interface HandleMessageContext {
   readonly workflowSupersedesRunId?: string;
 }
 
+export type WorkflowRequest =
+  | {
+      kind: 'start';
+      definition: ResolvedWorkflow;
+      args: string;
+      force?: boolean;
+      /** Keys the engine dropped from this workflow's YAML (#2213). */
+      parseWarnings?: readonly string[];
+    }
+  | { kind: 'resume'; run: WorkflowRun };
+
 export interface CommandResult {
   success: boolean;
   message: string;
   modified?: boolean; // Indicates if conversation state was modified
-  workflow?: {
-    // If set, orchestrator should execute this workflow
-    definition: ResolvedWorkflow;
-    args: string;
-    force?: boolean;
-    resumeRunId?: string;
-    resumeRun?: WorkflowRun;
-    /**
-     * The continuation graph already resolved from that run's recorded source.
-     *
-     * Carried so dispatch does not repeat the digest verification and discovery the
-     * handler just paid for. A value, not a flag: it cannot claim work it did not do.
-     */
-    resolvedContinuation?: ResolvedWorkflow;
-    /** Keys the engine dropped from this workflow's YAML (#2213). */
-    parseWarnings?: readonly string[];
-  };
+  /** If set, orchestrator should execute this workflow request. */
+  workflow?: WorkflowRequest;
 }
 
 /**
@@ -130,6 +126,8 @@ export interface MessageMetadata {
   workflowDispatch?: { workerConversationId: string; workflowName: string };
   workflowResult?: { workflowName: string; runId: string };
 }
+
+export { toPersistedMessageMetadata } from './message-metadata';
 
 export interface IPlatformAdapter {
   /**
@@ -176,6 +174,13 @@ export interface IPlatformAdapter {
 
   /** Retract previously streamed text (used when workflow routing intercepts) */
   emitRetract?(conversationId: string): Promise<void>;
+
+  /**
+   * Optional: how an operator types a workflow command on this surface, given the
+   * command after the verb prefix (`cancel <id>`). Absent means the chat grammar the
+   * core command handler parses, `/workflow <command>`.
+   */
+  formatWorkflowCommand?(command: string): string;
 
   /**
    * Optional: Append a small footer summarising cost / token usage / stop reason

@@ -37,7 +37,7 @@ This chapter collects every CLI command, variable, and YAML option in one place.
 | `archon isolation list` | List all active worktrees |
 | `archon isolation cleanup` | Remove stale worktrees (older than 7 days) |
 | `archon isolation cleanup <days>` | Remove stale worktrees older than N days |
-| `archon isolation cleanup --merged` | Remove worktrees whose branches merged into main |
+| `archon isolation cleanup --merged` | Remove worktrees whose branches merged into the base branch |
 | `archon isolation cleanup --merged --include-closed` | Also remove worktrees with closed (abandoned) PRs |
 
 ### `archon complete`
@@ -183,8 +183,12 @@ All nodes share these base fields:
 |-------|----------|
 | `all_success` | Run only if all upstream nodes succeeded (default) |
 | `one_success` | Run if at least one upstream node succeeded |
-| `none_failed_min_one_success` | Run if no upstream failed and at least one succeeded |
+| `none_failed_min_one_success` | Run if at least one dependency succeeded and none failed or skipped because of an upstream failure (`upstream_failed`) |
 | `all_done` | Run after all upstream nodes complete, regardless of result |
+
+Failure-cascade skips block `none_failed_min_one_success` by default. Condition
+skips and optional timeout skips (`on_timeout: skip`) remain admissible with a successful
+dependency. `if_skipped` does not override trigger eligibility.
 
 ### Loop Node Options
 

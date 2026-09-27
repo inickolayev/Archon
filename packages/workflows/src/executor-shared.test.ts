@@ -1,3 +1,4 @@
+import { providerFailureClassSchema } from '@archon/provider-contract';
 import { describe, it, expect, mock } from 'bun:test';
 
 // Mock logger before importing module under test
@@ -37,7 +38,9 @@ import {
   RATE_LIMIT_PATTERNS,
   RATE_LIMIT_RETRY_DELAY_MS,
   TRANSIENT_PATTERNS,
-  toTelemetryErrorClass,
+  providerFailureKind,
+  nodeFailureKindOf,
+  retryClassOf,
   safeSendMessage,
   type UnknownErrorTracker,
 } from './executor-shared';
@@ -131,6 +134,82 @@ describe('substituteWorkflowVariables', () => {
         'docs/'
       )
     ).toThrow(/did not adopt a prior run/);
+  });
+
+  it("replaces $TYPED_ARTIFACTS_FILE with this invocation's listing", () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Read $TYPED_ARTIFACTS_FILE',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { typedArtifactsFile: '/tmp/artifacts/.archon/typed-artifacts/list.json' }
+    );
+    expect(prompt).toBe('Read /tmp/artifacts/.archon/typed-artifacts/list.json');
+  });
+
+  it('replaces $TYPED_ARTIFACTS_FILE even under shellSafe (engine-controlled)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'cat "$TYPED_ARTIFACTS_FILE"',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { shellSafe: true, typedArtifactsFile: '/listings/l.json' }
+    );
+    expect(prompt).toBe('cat "/listings/l.json"');
+  });
+
+  it('throws when $TYPED_ARTIFACTS_FILE is referenced without a materialized listing', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Read $TYPED_ARTIFACTS_FILE',
+        'run-1',
+        'msg',
+        '/tmp/artifacts',
+        'main',
+        'docs/'
+      )
+    ).toThrow(/has no typed-artifact listing/);
+  });
+
+  it('treats an explicit empty listing as a caller stating it has none (dry run)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Read [$TYPED_ARTIFACTS_FILE]',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { typedArtifactsFile: '' }
+    );
+    expect(prompt).toBe('Read []');
+  });
+
+  it('leaves the INPUTS_ variable of an input named typed_artifacts_file alone', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Use $INPUTS_TYPED_ARTIFACTS_FILE',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Use $INPUTS_TYPED_ARTIFACTS_FILE');
   });
 
   it('throws when $STATE_DIR is referenced but no state dir was resolved', () => {
@@ -989,12 +1068,12 @@ describe('classifyError', () => {
 
   it('backs off flat + jitter on rate limits, exponential otherwise — #2706', () => {
     for (let i = 0; i < 20; i++) {
-      const delay = getRetryDelayMs('429 too many requests', i, 3000);
+      const delay = getRetryDelayMs('rate_limited', i, 3000);
       expect(delay).toBeGreaterThanOrEqual(RATE_LIMIT_RETRY_DELAY_MS / 2);
       expect(delay).toBeLessThanOrEqual((RATE_LIMIT_RETRY_DELAY_MS * 3) / 2);
     }
-    expect(getRetryDelayMs('econnreset', 0, 3000)).toBe(3000);
-    expect(getRetryDelayMs('econnreset', 2, 3000)).toBe(12000);
+    expect(getRetryDelayMs('transient', 0, 3000)).toBe(3000);
+    expect(getRetryDelayMs('transient', 2, 3000)).toBe(12000);
   });
 
   it('parses only unambiguous quota reset timestamps', () => {
@@ -1030,23 +1109,36 @@ describe('classifyError', () => {
   });
 });
 
-describe('toTelemetryErrorClass', () => {
-  it('maps FATAL to fatal', () => {
-    expect(toTelemetryErrorClass('FATAL')).toBe('fatal');
+describe('providerFailureKind', () => {
+  it('maps the retry classification onto the provider failure kinds', () => {
+    expect(providerFailureKind(new Error('401 unauthorized'))).toBe('fatal');
+    expect(providerFailureKind(new Error('rate limit: 429'))).toBe('rate_limited');
+    expect(providerFailureKind(new Error('socket hang up'))).toBe('transient');
+    expect(providerFailureKind(new Error('mystery'))).toBe('unknown');
+  });
+});
+
+describe('typed provider failures decide retry — #3520', () => {
+  it('maps every failure class onto a retry kind', () => {
+    const kinds = providerFailureClassSchema.options.map(cls =>
+      nodeFailureKindOf({ class: cls, evidence: 'x' })
+    );
+    expect(kinds).toEqual(['fatal', 'fatal', 'fatal', 'rate_limited', 'transient', 'unknown']);
   });
 
-  it('maps TRANSIENT to transient', () => {
-    expect(toTelemetryErrorClass('TRANSIENT')).toBe('transient');
+  it('a recorded provider kind wins over text that reads the other way', () => {
+    expect(retryClassOf({ failureKind: 'transient', error: '401 unauthorized' })).toBe('transient');
+    expect(retryClassOf({ failureKind: 'fatal', error: 'socket hang up' })).toBe('fatal');
+    expect(retryClassOf({ failureKind: 'rate_limited', error: 'mystery' })).toBe('rate_limited');
+    expect(retryClassOf({ failureKind: 'unknown', error: '503' })).toBe('unknown');
   });
 
-  it('maps UNKNOWN to unknown', () => {
-    expect(toTelemetryErrorClass('UNKNOWN')).toBe('unknown');
-  });
-
-  it('round-trips classifyError output for every ErrorType', () => {
-    expect(toTelemetryErrorClass(classifyError(new Error('401 unauthorized')))).toBe('fatal');
-    expect(toTelemetryErrorClass(classifyError(new Error('rate limit: 429')))).toBe('transient');
-    expect(toTelemetryErrorClass(classifyError(new Error('mystery')))).toBe('unknown');
+  it('engine kinds and unkinded records keep the text classification', () => {
+    expect(retryClassOf({ failureKind: 'exec_failed', error: 'curl: econnrefused' })).toBe(
+      'transient'
+    );
+    expect(retryClassOf({ error: '429 too many requests' })).toBe('rate_limited');
+    expect(retryClassOf({ failureKind: 'config', error: 'bad input' })).toBe('unknown');
   });
 });
 

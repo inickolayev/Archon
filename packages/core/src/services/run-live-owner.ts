@@ -48,14 +48,66 @@ export interface RunLiveOwnerStopLease {
 
 type StopResponse = { kind: 'unsupported' } | { kind: 'detached'; pid: number };
 
+/**
+ * Why a stop request got no termination lease.
+ *
+ * - `unreachable`: nothing accepted the connection, so no owner answered on this host.
+ * - `not_detached`: a live owner answered, but it is not a detached CLI process.
+ * - `unproven`: something holds the endpoint but did not complete the handshake.
+ *
+ * Only `unreachable` is an absence of an owner; the other two are a live endpoint.
+ */
+export type RunLiveOwnerStopRefusal = 'unreachable' | 'not_detached' | 'unproven';
+
 export class RunLiveOwnerStopUnavailableError extends Error {
   constructor(
     readonly runId: string,
-    readonly detail: string
+    readonly detail: string,
+    readonly reason: RunLiveOwnerStopRefusal
   ) {
     super(`Run ${runId} has no live detached owner: ${detail}`);
     this.name = 'RunLiveOwnerStopUnavailableError';
   }
+}
+
+/**
+ * Connection errors that prove nothing is listening at the endpoint: no socket or pipe
+ * exists, or a socket file is left over from an owner that is gone. Any other failure
+ * leaves an owner possible, so it is not proof of absence.
+ */
+const NO_LISTENER_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ECONNREFUSED']);
+
+/**
+ * Another live process already owns this run's endpoint. Thrown where ownership is
+ * claimed, so a caller that raced another owner can stop instead of dying on a
+ * string it had to match.
+ */
+export class RunLiveOwnerAlreadyOwnedError extends Error {
+  constructor(readonly endpointPath: string) {
+    super(`Run live-owner endpoint is already owned: ${endpointPath}`);
+    this.name = 'RunLiveOwnerAlreadyOwnedError';
+  }
+}
+
+/** Runs whose live-owner endpoint this process published and has not closed yet. */
+const ownedByThisProcess = new Set<string>();
+
+/**
+ * True while this process owns execution of `runId`: it published the run's live-owner
+ * endpoint and has not closed it. Lets a server tell a run it executes itself, which it
+ * cancels cooperatively, from one another process owns.
+ */
+export function isRunOwnedByThisProcess(runId: string): boolean {
+  return ownedByThisProcess.has(runId);
+}
+
+/**
+ * True when a live process on this host answers for `runId`: this process owns it, or
+ * something accepts a connection at its endpoint. It only proves an owner is listening;
+ * stopping one goes through {@link requestRunLiveOwnerStop}.
+ */
+export async function isRunOwnerAnswering(runId: string): Promise<boolean> {
+  return isRunOwnedByThisProcess(runId) || canConnectToRunLiveOwner(runLiveOwnerPath(runId));
 }
 
 function endpointToken(runId: string): string {
@@ -150,7 +202,7 @@ async function listenWithoutReplacingOwner(server: Server, path: string): Promis
   }
 
   if (await canConnectToRunLiveOwner(path)) {
-    throw new Error(`Run live-owner endpoint is already owned: ${path}`);
+    throw new RunLiveOwnerAlreadyOwnedError(path);
   }
 
   // A crashed Unix owner can leave a socket pathname behind. Refusal, not age,
@@ -168,13 +220,13 @@ async function acquireOwnerLock(runId: string, endpointPath: string): Promise<nu
   }
 
   if (await canConnectToRunLiveOwner(endpointPath)) {
-    throw new Error(`Run live-owner endpoint is already owned: ${endpointPath}`);
+    throw new RunLiveOwnerAlreadyOwnedError(endpointPath);
   }
   // The lock is created immediately before listen. Give that startup window one
   // chance to become reachable before treating both paths as crash residue.
   await new Promise<void>(resolve => setTimeout(resolve, STARTUP_RECHECK_MS));
   if (await canConnectToRunLiveOwner(endpointPath)) {
-    throw new Error(`Run live-owner endpoint is already owned: ${endpointPath}`);
+    throw new RunLiveOwnerAlreadyOwnedError(endpointPath);
   }
 
   rmSync(lockPath, { force: true });
@@ -296,6 +348,7 @@ export async function startRunLiveOwner(
     releaseOwnerLock(lockPath, lockFd);
     throw error;
   }
+  ownedByThisProcess.add(runId);
 
   let closePromise: Promise<void> | undefined;
   return {
@@ -327,6 +380,7 @@ export async function startRunLiveOwner(
             })
           );
         }
+        ownedByThisProcess.delete(runId);
         if (process.platform !== 'win32') rmSync(path, { force: true });
         releaseOwnerLock(lockPath, lockFd);
       })();
@@ -433,16 +487,28 @@ function parseStopResponse(runId: string, raw: string): StopResponse {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid response');
+    throw new RunLiveOwnerStopUnavailableError(
+      runId,
+      'owner returned an invalid response',
+      'unproven'
+    );
   }
   if (typeof parsed !== 'object' || parsed === null || !('kind' in parsed)) {
-    throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid response');
+    throw new RunLiveOwnerStopUnavailableError(
+      runId,
+      'owner returned an invalid response',
+      'unproven'
+    );
   }
   if (parsed.kind === 'unsupported') {
     return { kind: 'unsupported' };
   }
   if (parsed.kind !== 'detached') {
-    throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid response');
+    throw new RunLiveOwnerStopUnavailableError(
+      runId,
+      'owner returned an invalid response',
+      'unproven'
+    );
   }
   if (
     !('pid' in parsed) ||
@@ -450,7 +516,7 @@ function parseStopResponse(runId: string, raw: string): StopResponse {
     !Number.isInteger(parsed.pid) ||
     parsed.pid <= 0
   ) {
-    throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid PID');
+    throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid PID', 'unproven');
   }
   return { kind: 'detached', pid: parsed.pid };
 }
@@ -462,11 +528,12 @@ export function requestRunLiveOwnerStop(runId: string): Promise<RunLiveOwnerStop
     const socket = new Socket();
     let response = '';
     let settled = false;
-    const fail = (detail: string): void => {
+    let connected = false;
+    const fail = (detail: string, reason: RunLiveOwnerStopRefusal = 'unproven'): void => {
       if (settled) return;
       settled = true;
       socket.destroy();
-      reject(new RunLiveOwnerStopUnavailableError(runId, detail));
+      reject(new RunLiveOwnerStopUnavailableError(runId, detail, reason));
     };
     const onEnd = (): void => {
       fail('owner ended before identifying itself');
@@ -480,11 +547,18 @@ export function requestRunLiveOwnerStop(runId: string): Promise<RunLiveOwnerStop
       fail('owner did not respond');
     });
     socket.once('error', error => {
-      fail((error as NodeJS.ErrnoException).code ?? error.message);
+      const code = (error as NodeJS.ErrnoException).code;
+      fail(
+        code ?? error.message,
+        !connected && code !== undefined && NO_LISTENER_CODES.has(code) ? 'unreachable' : 'unproven'
+      );
     });
     socket.once('end', onEnd);
     socket.once('close', onClose);
-    socket.once('connect', () => socket.write(STOP_REQUEST));
+    socket.once('connect', () => {
+      connected = true;
+      socket.write(STOP_REQUEST);
+    });
     socket.on('data', chunk => {
       if (settled) return;
       response += chunk;
@@ -497,7 +571,11 @@ export function requestRunLiveOwnerStop(runId: string): Promise<RunLiveOwnerStop
       try {
         const stopResponse = parseStopResponse(runId, response.slice(0, newline));
         if (stopResponse.kind === 'unsupported') {
-          throw new RunLiveOwnerStopUnavailableError(runId, 'the live owner is not a detached CLI');
+          throw new RunLiveOwnerStopUnavailableError(
+            runId,
+            'the live owner is not a detached CLI',
+            'not_detached'
+          );
         }
         settled = true;
         socket.off('end', onEnd);

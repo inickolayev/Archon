@@ -49,7 +49,7 @@ import * as db from '../db/conversations';
 import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
-import { executeWorkflow } from '@archon/workflows/executor';
+import { InProcessWorkflowEngine } from '@archon/workflows/in-process-engine';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
@@ -88,7 +88,13 @@ import { startRunLiveOwner } from '../services/run-live-owner';
 
 type IsolationResolution =
   | { status: 'existing'; cwd: string; env: IsolationEnvironmentRow }
-  | { status: 'new'; cwd: string; env: IsolationEnvironmentRow }
+  | {
+      status: 'new';
+      cwd: string;
+      env: IsolationEnvironmentRow;
+      /** The commit a branch created by this resolution was cut from. */
+      cutFromCommit?: string;
+    }
   | { status: 'none'; cwd: string; env: null };
 
 // Lazy resolver singleton
@@ -216,10 +222,16 @@ export async function validateAndResolveIsolation(
           });
         }
       }
+      if (result.method.type === 'existing') {
+        return { status: 'existing', cwd: result.cwd, env: result.env };
+      }
       return {
-        status: result.method.type === 'existing' ? 'existing' : 'new',
+        status: 'new',
         cwd: result.cwd,
         env: result.env,
+        ...(result.method.type === 'created' && result.method.cutFromCommit !== undefined
+          ? { cutFromCommit: result.method.cutFromCommit }
+          : {}),
       };
     }
 
@@ -389,6 +401,7 @@ async function dispatchBackgroundWorkflowOwned(
   // worktrees, each background workflow gets its own worktree — and isolation failure
   // is then fatal (never fall back to running in a shared/parent worktree).
   let workerCwd: string;
+  let workerCutFromCommit: string | undefined;
   let codebaseBaseBranch: string | undefined;
   // Per-child isolation resolver (#2121 slice 2, PR-A): a `workflow:` node with
   // `isolation: 'worktree'` gets its own worktree per child. Built for git-repo
@@ -472,6 +485,7 @@ async function dispatchBackgroundWorkflowOwned(
         ctx.userId
       );
       workerCwd = result.cwd;
+      if (result.status === 'new') workerCutFromCommit = result.cutFromCommit;
       await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
         getLog().warn(
           { err: toError(e), workerPlatformId },
@@ -519,6 +533,7 @@ async function dispatchBackgroundWorkflowOwned(
   }
 
   const workflowDeps = createWorkflowDeps();
+  const engine = new InProcessWorkflowEngine(workflowDeps);
 
   // Freeze this run's executable source, then re-resolve the workflow FROM the frozen
   // copy so the definition executed and the commands and scripts beside it are one
@@ -631,15 +646,14 @@ async function dispatchBackgroundWorkflowOwned(
         // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
         // executor adopts for us there (see #2690). Until then a rename failure leaves
         // the staged directory un-adopted so the wrap reclaims it on the way out.
-        const result = await executeWorkflow(
-          workflowDeps,
-          ctx.platform,
-          workerPlatformId,
-          workerCwd,
+        const result = await engine.submit({
+          platform: ctx.platform,
+          conversationId: workerPlatformId,
+          cwd: workerCwd,
           workflow,
-          ctx.originalMessage,
-          workerConv.id,
-          {
+          userMessage: ctx.originalMessage,
+          conversationDbId: workerConv.id,
+          options: {
             codebaseId: ctx.codebaseId,
             issueContext: ctx.issueContext,
             isolationContext,
@@ -652,6 +666,7 @@ async function dispatchBackgroundWorkflowOwned(
             resolveChildIsolation,
             preparedSource,
             capturedSourceOwner: backgroundOwner,
+            ...(workerCutFromCommit !== undefined ? { cutFromCommit: workerCutFromCommit } : {}),
             // Only consumed when `preCreatedRun` is undefined (pre-creation failed and
             // the executor creates the row itself); otherwise the row above already
             // carries them.
@@ -668,8 +683,8 @@ async function dispatchBackgroundWorkflowOwned(
               ? { modelOverrideLayer: { kind: 'raw' as const, overrides: ctx.modelOverrides } }
               : {}),
             ...(ctx.runConfig ? { runConfig: ctx.runConfig } : {}),
-          }
-        );
+          },
+        });
         await closeRunLiveOwner();
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {
@@ -719,12 +734,14 @@ async function dispatchBackgroundWorkflowOwned(
         // with a second failWorkflowRun over the write channel that just failed, and do
         // not tell the user the workflow "failed" — its real outcome is unknown.
         if (preCreatedRun && !terminalWriteFailed) {
-          await workflowDeps.store.failWorkflowRun(preCreatedRun.id, err.message).catch(dbError => {
-            getLog().error(
-              { err: toError(dbError), workflowRunId: preCreatedRun.id },
-              'background_workflow_fail_db_record_failed'
-            );
-          });
+          await workflowDeps.store
+            .failWorkflowRun(preCreatedRun.id, err.message, { exitReason: 'unhandled_error' })
+            .catch(dbError => {
+              getLog().error(
+                { err: toError(dbError), workflowRunId: preCreatedRun.id },
+                'background_workflow_fail_db_record_failed'
+              );
+            });
         }
         getLog().error(
           {

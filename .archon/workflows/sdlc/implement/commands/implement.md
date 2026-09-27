@@ -19,6 +19,7 @@ Whichever carries it, the work may be:
 - **a plan** — a path to a plan file (read it completely) or an inline plan; execute its tasks in dependency order
 - **review findings** — fix every Critical and Important finding; if you can prove a finding invalid, record that proof in your report instead of "fixing" it
 - **a CI failure** — reproduce it, fix the cause, prove the fix
+- **an existing pull request** — findings for, or a request to repair, a pull request named by number; this run must already be on its branch (see below)
 - **a description** — a plain statement of what to build or change
 
 ## Reading the sources
@@ -28,6 +29,10 @@ Prose is a claim; the code is the fact. An issue body, a comment, a linked discu
 Weigh by source and recency. The operator's request in this run is the most current statement of intent. A tracked item's body and its comments are older, may predate the code in front of you, and vary in how much their author verified before writing. Read them; do not inherit them. A confident claim is still a claim.
 
 When the work or the request names a tracked item — an issue, a ticket, a document, whatever your tools can reach — read it before editing, along with the comments and linked items that can still change the outcome, its constraints, or an earlier decision. Stop following links once they no longer change what you would do.
+
+## When the work names an existing pull request
+
+This run must already be on that pull request's branch, or for a pull request from a fork, on the run's review branch at the pull request's head — launched onto it with `--adopt`, or from the pull request itself. Confirm that before editing with `gh pr view <number> --repo "$REPO_PATH" --json headRefName,headRefOid,isCrossRepository,maintainerCanModify`, where `REPO_PATH` is the `owner/repo` of `origin` — in a clone of a fork the CLI's default resolution targets the fork's upstream parent, and the check would read the wrong pull request. For a same-repository pull request, `git branch --show-current` must equal `headRefName`. For a fork (`isCrossRepository: true`), `git rev-parse HEAD` must equal `headRefOid` at the start of the run, and `maintainerCanModify` must be true: that flag is the author's permission for this run to push to their branch, and without it the work has nowhere to go. If either check fails, stop with `done: true, green: false` and say which check failed; never switch branches, fetch the pull request's head into this checkout, or start a replacement branch — the run's estate is fixed at launch, and work done anywhere else is invisible to it. On a match, work and commit on the current branch as usual; the pull request stays the one public surface, and later nodes push to its head and read it back by its number.
 
 ## How to work
 
@@ -52,7 +57,7 @@ Write no file when there is no proved discovery. Never add speculative filler, a
 
 ## Not your job
 
-Do not open pull requests. Do not push or comment unless the work item explicitly directs it. For an existing-PR repair already on its branch, commit here without creating or switching branches; `pr` owns publication and reuse. Validate your work without reviewing beyond it. Leave unrelated debt alone, recording only proved discoveries as described above. Do not merge or rebase.
+Do not open pull requests. Do not push, or comment on a pull request, unless the work item explicitly directs it. Do not review beyond validating your own work. Do not fix unrelated debt you notice — preserve only proved work through the discovery record above. Do not merge or rebase.
 
 ## If you cannot do the work
 
@@ -64,10 +69,10 @@ No one is watching this run: nothing you print survives unless it lands in this 
 
 ## Declare where things stand (every turn)
 
-- `done` — true when another iteration would not help: the work is complete and green, or you are definitively blocked
-- `green` — true only when the work is complete AND every applicable project check you ran this turn passes
-- `red_cause` — why the checks are red, required whenever a check you ran failed. `introduced`: your change caused it. `inherited`: the same check was already failing at this run's starting commit. `environment`: the machine this run is on caused it, not any code — a database or port a parallel process holds, a missing credential, a network fault. Always declared: use the empty string `""` when `green` is true, and when you are declaring a blocker without having run checks at all
-- `summary` — a few sentences: what you did, what stands, what (if anything) blocks
+- `done` — true when another iteration would not help: the work is complete and green, or you are definitively blocked. Never with `red_cause: incomplete`: the next iteration is how the checks finish, and delivery refuses an unfinished validation
+- `green` — true only when the work is complete AND every applicable project check ran this turn and passed
+- `red_cause` — why the verdict is not green. When a check you ran failed: `introduced`, your change caused it; `inherited`, the same check was already failing at this run's starting commit; `environment`, the machine this run is on caused it, not any code — a database or port a parallel process holds, a missing credential, a network fault. `incomplete` when you validated the work, no check you ran failed, but not every applicable check ran — you were stopped partway (a usage limit, a killed process). A check that ran and failed takes its own cause even when others never ran. Always declared: use the empty string `""` when `green` is true, and when you are declaring a blocker on the work itself without having run checks at all
+- `summary` — a few sentences: what you did, what stands, what (if anything) blocks. For `incomplete`, what stopped validation and which checks ran and passed
 
 `inherited` and `environment` let delivery continue on red, so neither is the comfortable answer — declaring one commits you to evidence. Name the exact failing check and the concrete reason your change cannot have caused it: that check already red at the starting commit, a failure inside a subsystem your diff never touches, a resource another process holds. Put that evidence in `summary` and in your report. Without it the cause is `introduced`. Never relabel a red check to get past a gate; the pull request's real CI checks the same thing again, so a false claim buys nothing and costs a round.
 

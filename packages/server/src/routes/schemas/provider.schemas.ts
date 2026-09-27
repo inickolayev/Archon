@@ -3,32 +3,14 @@
  */
 import { z } from '@hono/zod-openapi';
 import { EFFORT_LADDER } from '@archon/paths/effort';
-
-/** Provider capability flags. */
-const providerCapabilitiesSchema = z
-  .object({
-    sessionResume: z.boolean(),
-    sessionFork: z.boolean().optional(),
-    mcp: z.boolean(),
-    hooks: z.boolean(),
-    skills: z.boolean(),
-    toolRestrictions: z.boolean(),
-    // Mirrors ProviderCapabilities.structuredOutput: 'enforced' | 'best-effort' | false.
-    structuredOutput: z.union([z.literal('enforced'), z.literal('best-effort'), z.literal(false)]),
-    envInjection: z.boolean(),
-    costControl: z.boolean(),
-    effortControl: z.boolean(),
-    fallbackModel: z.boolean(),
-    sandbox: z.boolean(),
-  })
-  .openapi('ProviderCapabilities');
+import { providerCapabilitiesSchema } from '@archon/provider-contract';
 
 /** A single provider info entry (API-safe projection of ProviderRegistration). */
 export const providerInfoSchema = z
   .object({
     id: z.string(),
     displayName: z.string(),
-    capabilities: providerCapabilitiesSchema,
+    capabilities: providerCapabilitiesSchema.openapi('ProviderCapabilities'),
     builtIn: z.boolean(),
     effortLevels: z.array(z.enum(EFFORT_LADDER)).optional(),
     listsModels: z.boolean(),

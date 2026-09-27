@@ -1,8 +1,8 @@
 import { isRegisteredProvider, registerProvider } from '../../registry';
 
 import { COPILOT_CAPABILITIES } from './capabilities';
-import { parseCopilotRunConfig } from './config';
 import { listCopilotModels } from './models';
+import { parseCopilotConfigStrict } from './config';
 import { CopilotProvider } from './provider';
 
 /**
@@ -22,8 +22,8 @@ export function registerCopilotProvider(): void {
     factory: () => new CopilotProvider(),
     capabilities: COPILOT_CAPABILITIES,
     builtIn: false,
-    parseRunConfig: parseCopilotRunConfig,
     listModels: listCopilotModels,
+    parseConfig: parseCopilotConfigStrict,
     credentials: {
       kind: 'static',
       specs: [

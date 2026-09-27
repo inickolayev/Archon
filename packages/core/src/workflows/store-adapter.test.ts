@@ -85,8 +85,8 @@ mock.module('@archon/providers', () => ({
   getAgentProvider: mock(() => ({})),
   getRegisteredProviders: mock(() => []),
   getRegistration: mock(
-    (): { parseRunConfig: (raw: Record<string, unknown>) => Record<string, unknown> } => ({
-      parseRunConfig: (raw: Record<string, unknown>): Record<string, unknown> => raw,
+    (): { parseConfig: (raw: Record<string, unknown>) => Record<string, unknown> } => ({
+      parseConfig: (raw: Record<string, unknown>): Record<string, unknown> => raw,
     })
   ),
   parseProviderRunModel: mock((_provider: string, model: string): string => model),
@@ -228,7 +228,7 @@ describe('createWorkflowStore', () => {
     await expect(
       store.createWorkflowEvent({
         workflow_run_id: 'run-1',
-        event_type: 'node_started',
+        event_type: 'loop_iteration_started',
         step_index: 0,
         step_name: 'test-step',
       })

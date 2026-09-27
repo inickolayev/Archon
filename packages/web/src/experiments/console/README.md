@@ -1,71 +1,61 @@
-# Console (spike)
+# Console
 
-A greenfield spike of Archon's web UI built around four primitives:
-
-- **Project · Run · Workflow · Worktree**
-
-Mounted at `/console/*`. Not part of the shipped product. Validates the mental model before any migration. If dogfooding succeeds, extract to `packages/console` and begin replacing production surfaces. If it fails, we learn cheaply.
+The console is Archon's only shipped Web application. Its historical directory
+name remains in place to avoid a mechanical move while the builder is changing.
 
 ## Routes
 
-- `/console` → Runs view (scope = `all`)
-- `/console/settings` → Settings (assistant config, system health, GitHub identity) — global
-- `/console/builder` → Workflow builder (project picker + open a workflow) — global
-- `/console/builder/:name` → Workflow builder editing `:name` (deep-link with `?project=<id>`)
-- `/console/p/:projectId` → Runs view scoped to a project
-- `/console/p/:projectId/chat` → Project-scoped agent chat (redirects to the most recent chat)
-- `/console/p/:projectId/chat/:conversationId` → One chat of that project; `new` = an unsent chat, created on first send
-- `/console/p/:projectId/r/:runId` → Run detail
+- `/console` → all runs
+- `/console/settings` → assistant, provider, system, and identity settings
+- `/console/profile` → the signed-in account: display name, linked Telegram,
+  sign out (clears this console's cache, not only the session)
+- `/console/link/:token` → completes a Telegram account link opened from the bot
+- `/console/builder` → experimental workflow builder and project picker
+- `/console/builder/:name` → edit a project workflow selected by
+  `?project=<id>`
+- `/console/r/:runId` → run detail without requiring a project URL
+- `/console/p/:projectId` → project runs
+- `/console/p/:projectId/chat` → project operator chat (redirects to the most
+  recent chat of that project)
+- `/console/p/:projectId/chat/:conversationId` → one chat of that project;
+  `new` is an unsent chat, created on the first send. A project holds as many
+  chats as the operator starts
+- `/console/p/:projectId/r/:runId` → project-scoped run detail
 
-## Chat uploads
+## Ownership
 
-The composer's 📎 attaches files (≤5, ≤10 MB each, type-guarded client-side; the
-server validates authoritatively) and sends them via the existing multipart
-`sendMessage`. **Limitation:** files can't ride the *first* message of a brand-new
-conversation (`createConversation` is JSON-only) — the UI shows a notice to
-re-attach once the chat exists. Drag-drop / paste / optimistic chips are tracked
-in #1913.
+- Console API calls live in `skills/`.
+- Reactive data lives in `store/cache.ts`.
+- Generated API shapes come from `@/lib/api.generated`.
+- Shared application code is limited to authentication, generated API types,
+  node-reference parsing, IDE links, and global styling.
+- The `builder/` subtree remains experimental and keeps its own pure model,
+  validation, editor, and serialization layers.
 
-## Chat user scoping
+## Chat behavior
 
-On multi-user installs (web auth enabled) each signed-in user gets their own
-per-project conversation: the list request passes the non-enforcing `mine=true`
-filter, and the first send lazily creates a conversation attributed to the
-sender. Chat turns execute with the **sender's** per-user credentials and AI
-prefs (the conversation creator is only a fallback when no sender identity
-resolves). Solo installs see no change — without an identity, `mine=true`
-narrows nothing.
+A voice message is transcribed and arrives as text; a reply may carry images,
+which render inline in the transcript. The composer records a clip into the same
+attachment list, so it is sent, removed or replayed like any other attachment.
 
-## Constraints
+The composer accepts up to five files of 10 MB each. A new conversation must be
+created with a text-only first message because conversation creation uses JSON;
+the UI asks the operator to attach files on the next turn.
 
-- **Isolated.** Forbidden imports from `packages/web/src/{components,stores,contexts,routes,hooks}` and `@tanstack/react-query`, `@/lib/api` (function exports). Enforced by ESLint. Type-only imports from `@/lib/api.generated` are allowed.
-- **Skill API is the single mutation surface.** Every UI action calls one skill verb. See `skills/`.
-- **Design tokens reused.** Uses the oklch semantic tokens from `packages/web/src/index.css` (`bg-surface`, `text-text-primary`, `bg-success`, `bg-warning`, `bg-error`, etc.).
-- **Vocabulary.** Only *Project, Run, Workflow, Worktree* appear in user-facing copy. No *Dashboard, Deployment, Infrastructure, Secrets, Activity, Pipeline, Stage*.
+On authenticated installations, the console requests the signed-in user's
+project conversation and sends the active identity with each turn. Solo
+installations operate without an identity.
 
-## Persisted UI state (localStorage)
+## Persisted view preferences
 
-Client-only view preferences. All reads are try/catch-guarded and fall back to the default, so a disabled/over-quota store never breaks rendering.
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `archon.console.detailView` | `log` | Run-detail tab |
+| `archon.console.showToolCalls` | `1` | Show tool calls in the stream |
+| `archon.console.showSystem` | `0` | Show system events |
+| `archon.console.runNodeFilter` | `all` | Filter the run stream by node |
+| `archon.console.railWidth` | unset | Project rail width |
+| `archon.console.lastWorkflow` | unset | Last selected workflow |
+| `archon.console.builderProject` | unset | Builder project selection |
 
-| Key | Default | Set by | Purpose |
-|-----|---------|--------|---------|
-| `archon.console.detailView` | `log` | Run detail | Active tab (`log` / `graph` / `artifacts`) |
-| `archon.console.showToolCalls` | `1` (on) | Run detail | Tool-calls toggle in the stream |
-| `archon.console.showSystem` | `0` (off) | Run detail | System/detail toggle in the stream |
-| `archon.console.runNodeFilter` | `all` | Run detail | Node filter (`all` or a nodeId); auto-resets when the node is absent from the open run |
-| `archon.console.railWidth` | — | Project rail | Persisted sidebar width |
-| `archon.console.lastWorkflow` | — | Chat / dispatch | Last-used workflow |
-| `archon.console.builderProject` | — | Workflow builder | Selected project (`cwd`); also mirrored as `?project=` |
-
-## Status
-
-Active experiment under `/console`. The original milestoned plan (`M1`–`M4`)
-that scaffolded this surface has been completed; ongoing work is driven by
-user feedback during dogfooding rather than a milestone roadmap. Issues and
-ideas land via the PR template's UX Journey section.
-
-The `builder/` subtree (Archon Studio workflow builder): PR-1 (data layer —
-types, variant registry, round-trip model, validation) and PR-2 (the canvas UI)
-are merged; PR-3 wires connected mode (`/console/builder[/:name]`, project
-picker, load/save/rename/delete through the workflow API, dirty + nav guard,
-bundled Save-as) and is in review. See `builder/README.md`.
+Local storage reads are guarded and fall back to these defaults.
