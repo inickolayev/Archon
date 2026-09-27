@@ -77,6 +77,9 @@ const OURS: Record<string, string[]> = {
     'packages/providers/src/codex/models.ts',
     'packages/web/src/experiments/console/components/ModelPickerField.tsx',
   ],
+  'a bare repository can own every checkout': [
+    'packages/core/src/utils/workflow-source-root.test.ts',
+  ],
   'a conversation survives a restart': [
     'packages/core/src/orchestrator/session-recovery.ts',
     'packages/core/src/orchestrator/session-recovery.test.ts',

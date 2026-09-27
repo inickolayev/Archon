@@ -29,6 +29,7 @@ export {
   refreshWorktreeIndex,
   getCanonicalRepoPath,
   getGitCheckoutIdentity,
+  isBareRepository,
   CanonicalRepoPathUnavailableError,
   verifyWorktreeOwnership,
 } from './worktree';

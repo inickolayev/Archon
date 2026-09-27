@@ -406,6 +406,29 @@ export async function getGitCheckoutIdentity(path: string): Promise<GitCheckoutI
   };
 }
 
+/**
+ * Is this Git directory a bare repository — one with no working tree of its own?
+ *
+ * A bare repository can still own linked worktrees (`git clone --bare` followed by a
+ * `git worktree add` per task is how a server keeps one object store and many checkouts).
+ * Such a layout has NO primary checkout by construction, which is a different answer from
+ * "the primary checkout cannot be determined".
+ */
+export async function isBareRepository(gitDir: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '--git-dir',
+      gitDir,
+      'rev-parse',
+      '--is-bare-repository',
+    ]);
+    return stdout.trim() === 'true';
+  } catch {
+    // A directory Git refuses to read is not a bare repository we can reason about.
+    return false;
+  }
+}
+
 async function resolvePrimaryCheckout(
   path: string,
   identity: GitCheckoutIdentity

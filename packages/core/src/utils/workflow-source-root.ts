@@ -13,7 +13,12 @@
  * anything into the worktree. The run then freezes what it found, so later edits do
  * not change a run already in flight.
  */
-import { getCanonicalRepoPath, isWorktreePath } from '@archon/git';
+import {
+  CanonicalRepoPathUnavailableError,
+  getCanonicalRepoPath,
+  isBareRepository,
+  isWorktreePath,
+} from '@archon/git';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -32,6 +37,10 @@ function getLog(): ReturnType<typeof createLogger> {
  * do: swallowing the error returned `undefined`, which callers read as "the cwd IS the
  * authoring root" and then froze the worktree — the source/target confusion this exists to
  * prevent. Not knowing and guessing wrong are different outcomes, so the caller decides.
+ *
+ * One layout answers `undefined` without any guessing: a BARE repository owning linked
+ * worktrees. It has no primary checkout by construction and no working tree to author in, so
+ * the run's own checkout is the only authoring root there is.
  */
 export async function resolveWorkflowSourceRoot(cwd: string): Promise<string | undefined> {
   // A git failure is NOT the same as "this is not a worktree". Swallowing it returned
@@ -45,7 +54,21 @@ export async function resolveWorkflowSourceRoot(cwd: string): Promise<string | u
     );
   });
   if (!isWorktree) return undefined;
-  const canonical = await getCanonicalRepoPath(cwd).catch((error: Error) => {
+  const canonical = await getCanonicalRepoPath(cwd).catch(async (error: Error) => {
+    // A bare repository owning linked worktrees has no primary checkout BY CONSTRUCTION, and
+    // no working tree to author in either: there is no canonical `.archon` to read, so the
+    // checkout the run is in is the only authoring root that exists. Git says this
+    // positively, so it is knowledge, not a guess, and the refusal below does not apply.
+    // Everything else — including an external `--separate-git-dir` whose primary checkout is
+    // merely unrecorded — still refuses, because there the authoring root exists and we would
+    // be guessing which one it is.
+    if (
+      error instanceof CanonicalRepoPathUnavailableError &&
+      (await isBareRepository(error.commonGitDir))
+    ) {
+      getLog().debug({ cwd, gitDir: error.commonGitDir }, 'workflow.source_root_bare_repo');
+      return cwd;
+    }
     throw new Error(
       `Cannot resolve the canonical repository for worktree ${cwd}, so the run's authoring ` +
         `source is unknown: ${error.message}`
