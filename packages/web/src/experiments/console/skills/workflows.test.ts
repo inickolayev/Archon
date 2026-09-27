@@ -1,5 +1,11 @@
 import { describe, test, expect, afterEach } from 'bun:test';
-import { buildWorkflowPath, buildSavePath, getWorkflowGraph, listWorkflows } from './workflows';
+import {
+  buildWorkflowPath,
+  buildSavePath,
+  getWorkflowGraph,
+  listWorkflows,
+  nodeKind,
+} from './workflows';
 
 describe('buildWorkflowPath', () => {
   test('encodes both name and cwd', () => {
@@ -69,6 +75,32 @@ describe('listWorkflows — declared inputs survive the wire mapping (#2554)', (
       { name: 'diff', required: true, default: null, description: null },
       { name: 'style', required: false, default: 'strict', description: null },
     ]);
+  });
+});
+
+describe('nodeKind — the transformed shape the endpoint actually serves', () => {
+  test('a command node is a command, not a prompt', () => {
+    expect(nodeKind({ id: 'write', kind: 'agent', source: { kind: 'command' } })).toBe('command');
+  });
+
+  test('an inline agent node is a prompt', () => {
+    expect(nodeKind({ id: 'ask', kind: 'agent', source: { kind: 'inline' } })).toBe('prompt');
+  });
+
+  test('an exec node with the shell runtime is bash; any other runtime is a script', () => {
+    expect(nodeKind({ id: 'build', kind: 'exec', runtime: 'sh' })).toBe('bash');
+    expect(nodeKind({ id: 'deliver', kind: 'exec', runtime: 'uv' })).toBe('script');
+  });
+
+  test('gate, halt and loop group read as their palette names', () => {
+    expect(nodeKind({ id: 'gate', kind: 'gate' })).toBe('approval');
+    expect(nodeKind({ id: 'stop', kind: 'halt' })).toBe('cancel');
+    expect(nodeKind({ id: 'each', kind: 'loop_group' })).toBe('loop');
+  });
+
+  test('a definition still in authoring shape keeps reading correctly', () => {
+    expect(nodeKind({ id: 'write', command: 'announce' })).toBe('command');
+    expect(nodeKind({ id: 'build', bash: 'make' })).toBe('bash');
   });
 });
 

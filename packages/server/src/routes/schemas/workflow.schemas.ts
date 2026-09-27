@@ -108,6 +108,30 @@ export const commandListResponseSchema = z
   .object({ commands: z.array(commandEntrySchema) })
   .openapi('CommandListResponse');
 
+/**
+ * GET /api/workflows/{name}/nodes/{nodeId}/source response — what one node runs.
+ *
+ * Four shapes, because a node gets its instructions in four ways. A `command` node names a
+ * markdown file and a `script` node a script file: both carry the `path` they were read from
+ * and the `scope` that won resolution, and a script its `runtime`. A `prompt` or a `bash` node
+ * carries its text in the workflow itself, so there is no file and no scope — and a composed
+ * workflow reaches a reader this way too, because static include expansion compiles the
+ * included command's markdown INTO the node it expands.
+ *
+ * `path` is also null for a command a compiled binary carries embedded.
+ */
+export const resourceSourceResponseSchema = z
+  .object({
+    kind: z.enum(['command', 'script', 'prompt', 'bash']),
+    /** The reference the engine resolved — pack-qualified inside a pack. File-backed only. */
+    name: z.string().optional(),
+    scope: workflowSourceSchema.optional(),
+    path: z.string().nullable(),
+    content: z.string(),
+    runtime: z.enum(['bun', 'uv']).optional(),
+  })
+  .openapi('ResourceSourceResponse');
+
 // =========================================================================
 // Workflow run schemas
 // =========================================================================

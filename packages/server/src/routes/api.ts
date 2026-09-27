@@ -101,6 +101,21 @@ import {
   discoverWorkflowsWithConfig,
   isValidWorkflowFolderSegment,
 } from '@archon/workflows/workflow-discovery';
+import { resolveCommandFile, resolveScriptFile } from '@archon/workflows/resource-source';
+import {
+  isAgentNode,
+  isExecNode,
+  isIncludeDirective,
+  isLoopGroupNode,
+  isLoopNode,
+} from '@archon/workflows/schemas/dag-node';
+import type { DagNode } from '@archon/workflows/schemas/dag-node';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import {
+  liveSourceRoots,
+  workflowSourceConfigFrom,
+  type WorkflowSourceRoots,
+} from '@archon/workflows/workflow-source';
 import { FIXTURES_DIR } from '@archon/workflows/fixture-layout';
 import { parseWorkflow } from '@archon/workflows/loader';
 import { resolveWorkflowName } from '@archon/workflows/router';
@@ -309,6 +324,7 @@ import {
   saveWorkflowBodySchema,
   deleteWorkflowResponseSchema,
   commandListResponseSchema,
+  resourceSourceResponseSchema,
   workflowRunListResponseSchema,
   workflowRunDetailSchema,
   workflowRunByWorkerResponseSchema,
@@ -451,6 +467,25 @@ function resolveRunArtifactDir(
 ): string | null {
   const root = resolveRunStorageRoot(run, codebase);
   return root ? getRunArtifactsDirForRoot(root, runId) : null;
+}
+
+/**
+ * One node of a loaded workflow, by id. Descends into loop groups, because a node inside one
+ * is a node a reader can click on in the graph like any other.
+ */
+function findNodeById(
+  nodes: readonly WorkflowDefinition['nodes'][number][],
+  nodeId: string
+): DagNode | undefined {
+  for (const node of nodes) {
+    if (isIncludeDirective(node)) continue;
+    if (node.id === nodeId) return node;
+    if (isLoopGroupNode(node)) {
+      const nested = findNodeById(node.loop_group.nodes, nodeId);
+      if (nested !== undefined) return nested;
+    }
+  }
+  return undefined;
 }
 
 // =========================================================================
@@ -596,6 +631,26 @@ const getCommandsRoute = createRoute({
       description: 'OK',
     },
     400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getNodeSourceRoute = createRoute({
+  method: 'get',
+  path: '/api/workflows/{name}/nodes/{nodeId}/source',
+  tags: ['Workflows'],
+  summary: 'Read the command or script file one node of a workflow runs',
+  request: {
+    params: z.object({ name: z.string(), nodeId: z.string() }),
+    query: cwdQuerySchema,
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: resourceSourceResponseSchema } },
+      description: 'OK',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
     500: jsonError('Server error'),
   },
 });
@@ -1786,6 +1841,37 @@ export function registerApiRoutes(
     return codebases.some(cb =>
       isPathInside(cb.default_cwd, cwd, { includeRoot: true, lexical: true })
     );
+  }
+
+  /**
+   * A caller-supplied `cwd` that is not a registered codebase path. Distinguished from
+   * "no project at all" (`null`), which is legitimate: with no project the bundled and
+   * home scopes still resolve.
+   */
+  const INVALID_CWD = Symbol('invalid-cwd');
+
+  /**
+   * Which project directory a source read happens in: the query's `cwd` when it is a
+   * registered codebase, else the first registered codebase, else none.
+   *
+   * Mirrors what the workflow and command listings do, so a console reading a node's file
+   * looks in the same place the list it came from did.
+   */
+  async function resolveSourceWorkingDir(
+    ctx: Context
+  ): Promise<string | null | typeof INVALID_CWD> {
+    const cwd = ctx.req.query('cwd');
+    if (cwd !== undefined && cwd.length > 0) {
+      return (await validateCwd(cwd)) ? cwd : INVALID_CWD;
+    }
+    const codebases = await codebaseDb.listCodebases();
+    return codebases.length > 0 ? codebases[0].default_cwd : null;
+  }
+
+  /** Live source roots for a project, carrying that repo's own command settings. */
+  async function sourceRootsFor(workingDir: string | null): Promise<WorkflowSourceRoots> {
+    const config = await loadConfig(workingDir ?? undefined);
+    return liveSourceRoots(workingDir, workflowSourceConfigFrom(config));
   }
 
   // CORS for Web UI — allow-all is fine for a single-developer tool.
@@ -4872,6 +4958,97 @@ export function registerApiRoutes(
       const err = error instanceof Error ? error : new Error(String(error));
       getLog().error({ err }, 'commands.list_failed');
       return apiError(c, 500, 'Failed to list commands');
+    }
+  });
+
+  // GET /api/workflows/:name/nodes/:nodeId/source — the file ONE node runs.
+  //
+  // The listing answers which nodes a workflow has; this answers what the node is actually
+  // told to do. A console showing a command node has a name and nothing else, so the prompt
+  // a run is given is otherwise unreadable without shell access to the machine.
+  //
+  // Resolution happens in the WORKFLOW's context on purpose: a workflow that ships inside a
+  // pack refers to `announce`, and only its own pack's `commands/announce.md` answers that —
+  // which is exactly the qualification discovery applies and a bare name cannot carry. So the
+  // node is read from the discovered (qualified) definition, never from the name in the URL,
+  // and then resolved through the same helpers the runtime uses.
+  registerOpenApiRoute(getNodeSourceRoute, async c => {
+    const name = c.req.param('name') ?? '';
+    const nodeId = c.req.param('nodeId') ?? '';
+    if (name.length === 0 || nodeId.length === 0) {
+      return apiError(c, 400, 'Missing workflow name or node id');
+    }
+    const workingDir = await resolveSourceWorkingDir(c);
+    if (workingDir === INVALID_CWD) {
+      return apiError(c, 400, 'Invalid cwd: must match a registered codebase path');
+    }
+
+    try {
+      const { workflows } = await discoverWorkflowsWithConfig(workingDir, loadConfig);
+      const found = workflows.find(entry => entry.workflow.name === name);
+      if (found === undefined) return apiError(c, 404, `Workflow not found: ${name}`);
+
+      const node = findNodeById(found.workflow.nodes, nodeId);
+      if (node === undefined) {
+        return apiError(c, 404, `Node not found in ${name}: ${nodeId}`);
+      }
+
+      // An inline prompt or an inline bash body is the node's OWN text, and in a composed
+      // workflow that is where a command file ends up: static include expansion compiles the
+      // markdown into the node. Returning it is the only way a reader of such a run sees what
+      // the agent was actually told.
+      if (isAgentNode(node) && node.source.kind === 'inline') {
+        return c.json({ kind: 'prompt' as const, path: null, content: node.source.prompt });
+      }
+      if (isExecNode(node) && node.runtime === 'sh') {
+        return c.json({ kind: 'bash' as const, path: null, content: node.script });
+      }
+
+      // A loop runs one prompt per iteration, named the same two ways an agent node names its
+      // own: a command file or inline text.
+      if (isLoopNode(node) && node.loop.prompt !== undefined) {
+        return c.json({ kind: 'prompt' as const, path: null, content: node.loop.prompt });
+      }
+
+      const roots = await sourceRootsFor(workingDir);
+      const commandReference =
+        isAgentNode(node) && node.source.kind === 'command'
+          ? node.source.name
+          : isLoopNode(node)
+            ? node.loop.command
+            : undefined;
+      if (commandReference !== undefined) {
+        const resolved = await resolveCommandFile(roots, commandReference);
+        if (resolved === null) {
+          return apiError(c, 404, `Command file not found: ${commandReference}`);
+        }
+        return c.json({
+          kind: 'command' as const,
+          name: commandReference,
+          scope: resolved.scope,
+          path: resolved.path,
+          content: resolved.content,
+        });
+      }
+      if (isExecNode(node) && node.runtime !== 'sh') {
+        const reference = node.script;
+        const resolved = await resolveScriptFile(roots, reference, workingDir);
+        if (resolved === null) return apiError(c, 404, `Script file not found: ${reference}`);
+        return c.json({
+          kind: 'script' as const,
+          name: reference,
+          scope: resolved.scope,
+          path: resolved.path,
+          content: resolved.content,
+          runtime: resolved.runtime,
+        });
+      }
+      // A gate, a wait, a halt: nothing is run at all, so there is nothing to read.
+      return apiError(c, 404, `Node runs no command or script: ${nodeId}`);
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      getLog().error({ err, name, nodeId }, 'workflows.read_node_source_failed');
+      return apiError(c, 500, 'Failed to read the file this node runs');
     }
   });
 

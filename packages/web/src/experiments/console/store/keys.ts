@@ -15,6 +15,10 @@ export const K = {
   // distinct (cwd, name) pairs collapse to the same cache key.
   workflow: (cwd: string, name: string): string =>
     `workflow:${encodeURIComponent(cwd)}:${encodeURIComponent(name)}`,
+  /** The file one node of a workflow runs. Every part is encoded: a node id and a
+   *  workflow name may both contain `:`. */
+  nodeSource: (cwd: string, workflowName: string, nodeId: string): string =>
+    `node-source:${encodeURIComponent(cwd)}:${encodeURIComponent(workflowName)}:${encodeURIComponent(nodeId)}`,
   worktrees: (projectId: string): string => `worktrees:${projectId}`,
   runs: (scope: Scope): string => `runs:${scopeKey(scope)}`,
   run: (id: string): string => `run:${id}`,

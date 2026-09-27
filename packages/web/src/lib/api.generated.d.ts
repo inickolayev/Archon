@@ -2713,6 +2713,74 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/workflows/{name}/nodes/{nodeId}/source': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read the command or script file one node of a workflow runs */
+    get: {
+      parameters: {
+        query?: {
+          cwd?: string;
+        };
+        header?: never;
+        path: {
+          name: string;
+          nodeId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description OK */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['ResourceSourceResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/runs/{runId}/artifacts': {
     parameters: {
       query?: never;
@@ -4806,6 +4874,16 @@ export interface components {
     CommandEntry: {
       name: string;
       source: components['schemas']['WorkflowSource'];
+    };
+    ResourceSourceResponse: {
+      /** @enum {string} */
+      kind: 'command' | 'script' | 'prompt' | 'bash';
+      name?: string;
+      scope?: components['schemas']['WorkflowSource'];
+      path: string | null;
+      content: string;
+      /** @enum {string} */
+      runtime?: 'bun' | 'uv';
     };
     ListArtifactsResponse: {
       files: components['schemas']['ArtifactFile'][];

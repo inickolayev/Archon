@@ -23,6 +23,12 @@ interface RunStreamProps {
   showSystem: boolean;
   /** `'all'` shows every node; otherwise restrict the stream to one node's entries. */
   selectedNodeId: string;
+  /**
+   * The workflow this run executed and the project it ran in. Given both, each node divider
+   * can open the file that node runs — the command prompt an agent was handed, or a script's
+   * source. Omitted, the dividers stay as they were.
+   */
+  nodeSource?: { workflowName: string; cwd?: string };
 }
 
 /**
@@ -137,6 +143,7 @@ export function RunStream({
   showToolCalls,
   showSystem,
   selectedNodeId,
+  nodeSource,
 }: RunStreamProps): ReactElement {
   // Single source for the folded nodes — consumed by both the timeline (one
   // divider per node) and the node-filter window so they can't drift.
@@ -322,6 +329,7 @@ export function RunStream({
               skipReason={entry.node.skipReason}
               skipExpr={entry.node.skipExpr}
               showDetail={entry.showDetail}
+              source={nodeSource}
             />
           );
         }

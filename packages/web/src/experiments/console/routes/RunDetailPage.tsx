@@ -472,6 +472,7 @@ export function RunDetailPage(): ReactElement {
 
                     <div className="mt-2">
                       <RunStream
+                        nodeSource={{ workflowName: run.workflow, cwd: project?.path }}
                         messages={messageList}
                         events={events}
                         showToolCalls={showToolCalls}

@@ -32,6 +32,19 @@ name remains in place to avoid a mechanical move while the builder is changing.
 - The `builder/` subtree remains experimental and keeps its own pure model,
   validation, editor, and serialization layers.
 
+## What a node runs
+
+A command node names a markdown file and a script node names a script file; neither
+is readable from the definition alone, and inside a workflow pack the name is
+qualified out of recognition. Both surfaces that show nodes can open the file itself:
+the builder's inspector, under the node's own fields, and each node divider in a run
+(`file`). `GET /api/workflows/:name/nodes/:nodeId/source` resolves it in the
+workflow's context — the resolution a run uses — and answers with the text, the path
+it came from and the scope that won. A node carrying its own text (an inline prompt,
+a bash body) answers with that text instead: static include expansion compiles an
+included command's markdown INTO the node, so in a composed run that is where the
+prompt lives.
+
 ## Chat behavior
 
 A voice message is transcribed and arrives as text; a reply may carry images,

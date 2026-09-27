@@ -9,6 +9,7 @@
 
 export * from './projects';
 export * from './workflows';
+export * from './nodeSource';
 export * from './worktrees';
 export * from './runs';
 export * from './startRun';

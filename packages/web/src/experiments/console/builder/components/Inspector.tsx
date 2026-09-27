@@ -5,7 +5,14 @@
  * state of its own (id renames are committed on blur/Enter via a keyed
  * uncontrolled input so half-typed ids don't thrash the graph).
  */
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactElement } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactElement,
+  type ReactNode,
+} from 'react';
 import { NODE_ID_PATTERN } from '@/lib/node-ref';
 import { VARIANT_REGISTRY } from '../variants';
 import type { BaseFields, BuilderNode } from '../types';
@@ -22,6 +29,15 @@ import { WhenBuilder } from './WhenBuilder';
 
 interface InspectorProps {
   node: BuilderNode | null;
+  /**
+   * The file this node runs, already rendered by the caller.
+   *
+   * A command node names a markdown prompt and a script node names a script file; reading
+   * either means a request, and this component is deliberately state-free (see the header).
+   * So the connected route renders that view and hands it in, and the inspector only decides
+   * where on the panel it sits.
+   */
+  sourceView?: ReactNode;
   /** How many nodes are selected (the inspector shows a hint for 0 / >1). */
   selectionCount: number;
   /** Ids the `when:` builder may reference (every other node). */
@@ -122,6 +138,7 @@ function VariantFields({
 
 export function Inspector({
   node,
+  sourceView,
   selectionCount,
   otherIds,
   onPatch,
@@ -206,6 +223,13 @@ export function Inspector({
       </Field>
 
       <VariantFields node={node} onPatch={onPatch} />
+
+      {sourceView === undefined || sourceView === null ? null : (
+        <>
+          <hr className="border-border" />
+          {sourceView}
+        </>
+      )}
 
       <hr className="border-border" />
 

@@ -16,6 +16,7 @@ import {
   variantDataFromDag,
 } from '../variants';
 import { makeIssue } from '../validation/make-issue';
+import { composedNodeKind, toAuthoringNode } from './authoring-shape';
 
 /** A converted workflow plus everything the importer had to flag along the way. */
 export interface ImportResult {
@@ -23,22 +24,37 @@ export interface ImportResult {
   issues: Issue[];
 }
 
-/** Convert a single wire node into a `BuilderNode`, collecting import issues. */
-function nodeFromDag(node: WireWorkflowDefinition['nodes'][number], issues: Issue[]): BuilderNode {
+/**
+ * Convert a single wire node into a `BuilderNode`, collecting import issues.
+ *
+ * The node is first mapped back to the shape its author wrote: what the server serves is the
+ * engine transform's OUTPUT (`kind` + `source`), while every reader below — the partitioner,
+ * the variant detector, the converters — is written against the authoring input. See
+ * `authoring-shape.ts`.
+ */
+function nodeFromDag(
+  servedNode: WireWorkflowDefinition['nodes'][number],
+  issues: Issue[]
+): BuilderNode {
+  const node = toAuthoringNode(servedNode);
   const { id, base, variantSpecific } = partitionNode(node);
 
   const variant = detectVariantOrNull(node);
   if (variant === null) {
-    // No mode field at all (malformed or future-schema input). Surface the
-    // problem and fall back to an empty prompt node so the workflow stays
-    // editable rather than failing the whole import.
+    // Either a composition shape the builder has no variant for (`include:`, a `workflow:`
+    // child, a loop group) — which the node itself names — or a node with no mode field at
+    // all. Both fall back to an empty prompt node so the rest of the workflow stays editable;
+    // the error is what stops that fallback from being saved over the real node.
+    const composed = composedNodeKind(servedNode);
     issues.push(
       makeIssue({
         rule: 'structural.variant.unknown',
         severity: 'error',
         source: 'client-instant',
         message:
-          'cannot determine the node variant (no mode field present); editing as an empty prompt node',
+          composed === null
+            ? 'cannot determine the node variant (no mode field present); editing as an empty prompt node'
+            : `this node composes other work ('${composed}'), which the builder cannot edit yet; it is shown as an empty prompt node and must not be saved over`,
         path: { nodeId: id },
       })
     );

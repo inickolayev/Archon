@@ -17,6 +17,7 @@ import {
   useRef,
   useState,
   type ReactElement,
+  type ReactNode,
 } from 'react';
 import type { ReactFlowInstance } from '@xyflow/react';
 import { useKeymap } from '../lib/keymap';
@@ -54,6 +55,15 @@ interface BuilderPageProps {
    * re-validation never clobbers a server/import issue.
    */
   extraIssues?: readonly Issue[];
+  /**
+   * Render the file the selected node runs (its command's markdown, its script's source).
+   *
+   * A callback rather than a component import, because reading that file is a request and
+   * this surface makes none — the connected route owns the project and the workflow name the
+   * lookup needs. Left out (the fixture route, the preview page), the inspector shows the
+   * node's fields alone.
+   */
+  renderNodeSource?: (node: { id: string; variant: VariantId }) => ReactNode;
 }
 
 const VALIDATION_DEBOUNCE_MS = 300;
@@ -69,6 +79,7 @@ export function BuilderPage({
   initialWorkflow,
   onChange,
   extraIssues,
+  renderNodeSource,
 }: BuilderPageProps): ReactElement {
   const [state, dispatch] = useReducer(editorReducer, initialWorkflow, createEditorState);
   const [issues, setIssues] = useState<Issue[]>(() => runValidation(initialWorkflow));
@@ -383,6 +394,11 @@ export function BuilderPage({
             {rightTab === 'inspect' ? (
               <Inspector
                 node={selectedNode}
+                sourceView={
+                  selectedNode === null
+                    ? null
+                    : renderNodeSource?.({ id: selectedNode.id, variant: selectedNode.variant })
+                }
                 selectionCount={state.selectedNodes.size}
                 otherIds={state.workflow.nodes
                   .filter(n => n.id !== selectedNode?.id)

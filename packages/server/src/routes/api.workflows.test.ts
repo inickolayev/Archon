@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, spyOn } from 'bun:test';
+import { describe, test, expect, mock, spyOn, beforeEach } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -80,6 +80,35 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 }));
 mock.module('@archon/workflows/loader', () => ({
   parseWorkflow: mockParseWorkflow,
+}));
+
+/**
+ * The file resolvers are mocked here on purpose: which file a reference resolves to, across
+ * project/global/bundled, is pinned in `resource-source.test.ts` against a real tree. These
+ * tests are about the ROUTE — which node it reads, and what it returns for each node shape.
+ */
+const mockResolveCommandFile = mock(async (_roots: unknown, reference: string) =>
+  reference === 'missing-command'
+    ? null
+    : {
+        path: `/tmp/project/.archon/commands/${reference}.md`,
+        scope: 'project',
+        content: '# Do it',
+      }
+);
+const mockResolveScriptFile = mock(async (_roots: unknown, reference: string) => ({
+  path: `/tmp/project/.archon/scripts/${reference}.ts`,
+  scope: 'project' as const,
+  runtime: 'bun' as const,
+  content: 'export {};',
+}));
+mock.module('@archon/workflows/resource-source', () => ({
+  resolveCommandFile: mockResolveCommandFile,
+  resolveScriptFile: mockResolveScriptFile,
+}));
+mock.module('@archon/workflows/workflow-source', () => ({
+  liveSourceRoots: mock(() => ({ kind: 'live', project: '/tmp/project' })),
+  workflowSourceConfigFrom: mock(() => ({})),
 }));
 mock.module('@archon/workflows/command-validation', () => {
   const isValidCommandName = (name: string) =>
@@ -1682,4 +1711,142 @@ describe('GET /api/commands', () => {
       }
     }
   );
+});
+
+describe('GET /api/workflows/:name/nodes/:nodeId/source', () => {
+  // An earlier block resets the codebase mock, so this one states its own project: without a
+  // registered codebase every request here would resolve to "no project" and read nothing.
+  beforeEach(() => {
+    mockListCodebases.mockImplementation(async () => [{ default_cwd: '/tmp/project' }]);
+  });
+
+  /** Discovery's answer for one workflow, so the route reads real (transformed) nodes. */
+  function discovers(nodes: unknown[]): void {
+    mockDiscoverWorkflows.mockImplementationOnce(async () => ({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'ship', description: 'Ship it', nodes }, 'project'),
+      ],
+      errors: [],
+    }));
+  }
+
+  test('a command node answers with its file, its scope and the reference that resolved', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    discovers([{ id: 'write', command: 'announce' }]);
+
+    const response = await app.request('/api/workflows/ship/nodes/write/source');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      kind: 'command',
+      name: 'announce',
+      scope: 'project',
+      path: '/tmp/project/.archon/commands/announce.md',
+      content: '# Do it',
+    });
+  });
+
+  test('a script node answers with its file and the runtime it runs under', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    discovers([{ id: 'check', script: 'verdict', runtime: 'bun' }]);
+
+    const response = await app.request('/api/workflows/ship/nodes/check/source');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ kind: 'script', runtime: 'bun' });
+  });
+
+  test("an inline prompt answers with the node's own text — the form a composed workflow arrives in", async () => {
+    // Static include expansion compiles an included command's markdown INTO the node, so in a
+    // composed run this is the only place that text can be read from.
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    discovers([{ id: 'ask', prompt: '# Investigate\n\nFind the cause.' }]);
+
+    const response = await app.request('/api/workflows/ship/nodes/ask/source');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      kind: 'prompt',
+      path: null,
+      content: '# Investigate\n\nFind the cause.',
+    });
+  });
+
+  test('a bash node answers with the body it runs', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    discovers([{ id: 'gate', bash: 'echo \'{"ok":true}\'' }]);
+
+    const response = await app.request('/api/workflows/ship/nodes/gate/source');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      kind: 'bash',
+      path: null,
+      content: 'echo \'{"ok":true}\'',
+    });
+  });
+
+  test('a node inside a loop group is reachable, because the graph shows it like any other', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    discovers([
+      {
+        id: 'each',
+        loop_group: {
+          nodes: [{ id: 'inner', command: 'announce' }],
+          max_iterations: 2,
+          until: 'DONE',
+        },
+      },
+    ]);
+
+    const response = await app.request('/api/workflows/ship/nodes/inner/source');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ kind: 'command', name: 'announce' });
+  });
+
+  test('a gate runs nothing, and says so rather than pretending to have a file', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    discovers([{ id: 'sign-off', approval: { message: 'Ship it?' } }]);
+
+    const response = await app.request('/api/workflows/ship/nodes/sign-off/source');
+    expect(response.status).toBe(404);
+    expect(((await response.json()) as { error: string }).error).toContain('runs no command');
+  });
+
+  test('a command file that is not there is a 404 naming the reference', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    discovers([{ id: 'write', command: 'missing-command' }]);
+
+    const response = await app.request('/api/workflows/ship/nodes/write/source');
+    expect(response.status).toBe(404);
+    expect(((await response.json()) as { error: string }).error).toContain('missing-command');
+  });
+
+  test('an unknown node and an unknown workflow are told apart', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    discovers([{ id: 'write', command: 'announce' }]);
+    const noNode = await app.request('/api/workflows/ship/nodes/nope/source');
+    expect(noNode.status).toBe(404);
+    expect(((await noNode.json()) as { error: string }).error).toContain('Node not found');
+
+    discovers([{ id: 'write', command: 'announce' }]);
+    const noWorkflow = await app.request('/api/workflows/other/nodes/write/source');
+    expect(noWorkflow.status).toBe(404);
+    expect(((await noWorkflow.json()) as { error: string }).error).toContain('Workflow not found');
+  });
+
+  test('a cwd outside every registered codebase is refused before anything is read', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request(
+      '/api/workflows/ship/nodes/write/source?cwd=%2Fetc%2Fsomewhere-else'
+    );
+    expect(response.status).toBe(400);
+  });
 });

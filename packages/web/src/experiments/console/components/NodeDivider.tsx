@@ -1,6 +1,7 @@
-import type { ReactElement } from 'react';
+import { useState, type ReactElement } from 'react';
 import { formatElapsed, formatRelativeToBaseline, formatClock } from '../lib/format';
 import { useStreamContext } from '../lib/stream-context';
+import { NodeSourcePanel } from './NodeSourcePanel';
 
 interface NodeDividerProps {
   /** `step_name` — the scroll-anchor target for the graph panel. */
@@ -21,6 +22,11 @@ interface NodeDividerProps {
   skipExpr?: string | null;
   /** When true, surface skip reason / stop reason inline. */
   showDetail?: boolean;
+  /**
+   * The workflow and project this node ran in. Given them, the divider offers to open the
+   * file the node runs — for an agent node, the very prompt it was handed.
+   */
+  source?: { workflowName: string; cwd?: string };
 }
 
 const STATUS_LABEL: Record<NodeDividerProps['status'], string> = {
@@ -58,8 +64,10 @@ export function NodeDivider({
   skipReason,
   skipExpr,
   showDetail = false,
+  source,
 }: NodeDividerProps): ReactElement {
   const { runStartedAt } = useStreamContext();
+  const [sourceOpen, setSourceOpen] = useState(false);
   const displayed = formatRelativeToBaseline(timestamp, runStartedAt);
   const wallClock = formatClock(timestamp);
   const dur =
@@ -120,7 +128,30 @@ export function NodeDivider({
           {cost}
           {turns}
         </span>
+        {source === undefined ? null : (
+          <button
+            type="button"
+            onClick={(): void => {
+              setSourceOpen(open => !open);
+            }}
+            aria-expanded={sourceOpen}
+            title="The command or script file this node runs"
+            className="shrink-0 font-mono text-[10px] uppercase tracking-[0.1em] text-text-tertiary transition-colors hover:text-text-primary"
+          >
+            {sourceOpen ? 'hide file' : 'file'}
+          </button>
+        )}
       </div>
+      {sourceOpen && source !== undefined ? (
+        <div className="ml-[68px] mt-1">
+          <NodeSourcePanel
+            workflowName={source.workflowName}
+            nodeId={nodeId}
+            cwd={source.cwd}
+            note="as the workflow reads now — an older run may have been given another version"
+          />
+        </div>
+      ) : null}
       {hasStopDetail ? (
         <div className="ml-[68px] flex flex-wrap items-baseline gap-x-2 font-mono text-[10px] text-text-tertiary">
           <span>stop</span>

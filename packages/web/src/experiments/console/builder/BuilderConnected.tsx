@@ -25,6 +25,7 @@ import {
 } from 'react';
 import { useNavigate, useParams, useLocation, useSearchParams } from 'react-router';
 import { BuilderPage } from './BuilderPage';
+import { NodeSourcePanel } from '../components/NodeSourcePanel';
 import { fromWorkflowDefinition, toWorkflowDefinition } from './model';
 import { runValidation } from './validation';
 import { makeIssue } from './validation/make-issue';
@@ -44,6 +45,7 @@ import type {
   BuilderWorkflow,
   BuilderWorkflowDefinition,
   Issue,
+  VariantId,
   WireWorkflowDefinition,
 } from './types';
 import {
@@ -217,6 +219,24 @@ export function BuilderConnected(): ReactElement {
   const extraIssues = useMemo(
     () => [...(imported?.issues ?? []), ...serverIssues],
     [imported, serverIssues]
+  );
+
+  /**
+   * The file the selected node runs, for command and script nodes.
+   *
+   * Only those two name a file; a prompt, a bash body, a gate and a wait carry their own text,
+   * which the inspector already shows. Resolution happens on the server in the SAVED
+   * workflow's context — a node whose command was just retyped therefore still shows the file
+   * the saved node points at, and the panel names the reference it read, so the difference is
+   * visible rather than implied.
+   */
+  const renderNodeSource = useCallback(
+    (node: { id: string; variant: VariantId }): ReactNode => {
+      if (name === undefined || isCreateMode) return null;
+      if (node.variant !== 'command' && node.variant !== 'script') return null;
+      return <NodeSourcePanel workflowName={name} nodeId={node.id} cwd={cwd} />;
+    },
+    [name, cwd, isCreateMode]
   );
 
   const projectQuery = `?project=${encodeURIComponent(projectId ?? '')}`;
@@ -610,6 +630,7 @@ export function BuilderConnected(): ReactElement {
             initialWorkflow={imported.workflow}
             onChange={handleChange}
             extraIssues={extraIssues}
+            renderNodeSource={renderNodeSource}
           />
         ) : (
           <EmptyState>Loading workflow…</EmptyState>

@@ -77,7 +77,8 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     defaultData: defaultCommandData,
     fromDag: commandFromDag,
     toDag: commandToDag,
-    wireKeys: ['command'],
+    // Same as script: the converters carry `with`, so the registry has to admit it.
+    wireKeys: ['command', 'with'],
     capabilities: VARIANT_CAPABILITIES.command,
   },
   bash: {
@@ -93,7 +94,9 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     defaultData: defaultScriptData,
     fromDag: scriptFromDag,
     toDag: scriptToDag,
-    wireKeys: ['script', 'runtime', 'deps', 'timeout'],
+    // `with` is listed because scriptFromDag/scriptToDag carry it (#2637). Leaving it out
+    // made the importer warn that a field it round-trips faithfully "was dropped".
+    wireKeys: ['script', 'runtime', 'deps', 'timeout', 'with'],
     capabilities: VARIANT_CAPABILITIES.script,
   },
   loop: {

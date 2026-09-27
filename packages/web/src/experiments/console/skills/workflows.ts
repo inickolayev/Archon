@@ -9,9 +9,18 @@ import type { WorkflowGraphNode } from '../primitives/workflow-graph';
 import type { BuilderWorkflowDefinition } from '../builder/types';
 import type { WireWorkflowDefinition } from '../builder/types/wire';
 
+/**
+ * A node as the LIST endpoint serves it: the engine's transform has already rewritten what the
+ * author wrote (`command:` → `kind: 'agent'` + `source`, `bash:` → an exec node whose runtime
+ * is the shell). Both forms are declared because the same shape names them — a definition that
+ * has not been through the transform still carries the authoring fields.
+ */
 interface RawNode {
   id: string;
   depends_on?: string[];
+  kind?: string;
+  source?: { kind?: string };
+  runtime?: string;
   prompt?: string;
   bash?: string;
   command?: string;
@@ -58,7 +67,26 @@ export async function listWorkflows(cwd?: string): Promise<WorkflowListResult> {
   return { workflows: res.workflows.map(toWorkflow), recommended: res.recommended ?? [] };
 }
 
-function nodeKind(n: RawNode): WorkflowGraphNode['kind'] {
+export function nodeKind(n: RawNode): WorkflowGraphNode['kind'] {
+  // The transformed form first: it is what the endpoint actually serves, and reading the
+  // authoring fields alone made every command node in the graph render as a prompt.
+  switch (n.kind) {
+    case 'agent':
+      return n.source?.kind === 'command' ? 'command' : 'prompt';
+    case 'exec':
+      return n.runtime === 'sh' ? 'bash' : 'script';
+    case 'gate':
+      return 'approval';
+    case 'wait':
+      return 'wait';
+    case 'halt':
+      return 'cancel';
+    case 'loop':
+    case 'loop_group':
+      return 'loop';
+    default:
+      break;
+  }
   if (n.loop !== undefined) return 'loop';
   if (n.approval !== undefined) return 'approval';
   if (n.wait !== undefined) return 'wait';
