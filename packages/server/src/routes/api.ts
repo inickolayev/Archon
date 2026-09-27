@@ -11,6 +11,7 @@ import { persistUploadedFiles, uploadEntryFromFile } from '../uploads/attachment
 import { isVoiceUpload } from '../voice/audio-format';
 import { dictationFor } from '../voice/dictation';
 import { boundMetadataToolOutputs } from '../adapters/web/truncate';
+import { serializeWorkflowPreservingText } from './workflow-yaml';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { normalize, join, sep, basename, dirname, resolve } from 'path';
@@ -127,6 +128,24 @@ interface RawWorkflowFile {
   filename: string;
   packaged: boolean;
   parsed: ReturnType<typeof parseWorkflow>;
+  /**
+   * The file text as read — what a save edits in place, and the source of the
+   * authored form the builder edits.
+   */
+  content: string;
+}
+
+/**
+ * The workflow as authored: the YAML mapping before the engine's normalizing
+ * transform. The builder edits this shape, and the normalized `workflow` cannot
+ * be sent back (validate rejects it), so GET returns both. Parsed with the same
+ * `Bun.YAML` the loader uses; undefined when the top level is not a mapping.
+ */
+function authoredForm(content: string): Record<string, unknown> | undefined {
+  const raw: unknown = Bun.YAML.parse(content);
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : undefined;
 }
 
 async function tryReadWorkflowAt(dir: string, name: string): Promise<RawWorkflowFile | null> {
@@ -138,7 +157,7 @@ async function tryReadWorkflowAt(dir: string, name: string): Promise<RawWorkflow
       const content = await readFile(absolutePath, 'utf-8');
       const parsed = parseWorkflow(content, filename);
       if (parsed.workflow !== null && !acceptedNames.has(parsed.workflow.name)) continue;
-      return { absolutePath, filename, packaged: false, parsed };
+      return { absolutePath, filename, packaged: false, parsed, content };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
@@ -220,6 +239,7 @@ async function findPackagedWorkflowAt(
         filename: `${pack}/${workflowFolder}/${yamlFilename}`,
         packaged: true,
         parsed,
+        content,
       };
     }
   }
@@ -242,19 +262,20 @@ function isBundledWorkflowsRoot(workflowsRoot: string): boolean {
 
 function findBundledWorkflow(
   name: string
-): { filename: string; parsed: ReturnType<typeof parseWorkflow> } | null {
+): { filename: string; parsed: ReturnType<typeof parseWorkflow>; content: string } | null {
   const direct = BUNDLED_WORKFLOWS[name];
   if (direct !== undefined) {
     const filename = `${name}.yaml`;
     const parsed = parseWorkflow(direct, filename);
     if (parsed.error !== null || parsed.workflow?.name === name) {
-      return { filename, parsed };
+      return { filename, parsed, content: direct };
     }
   }
 
   let match: {
     filename: string;
     parsed: ReturnType<typeof parseWorkflow>;
+    content: string;
   } | null = null;
   for (const [filenameStem, content] of Object.entries(BUNDLED_WORKFLOWS)) {
     if (filenameStem === name) continue;
@@ -262,7 +283,7 @@ function findBundledWorkflow(
     const parsed = parseWorkflow(content, filename);
     if (parsed.workflow?.name !== name) continue;
     if (match !== null) throw new Error(`Multiple bundled workflows declare the name '${name}'`);
-    match = { filename, parsed };
+    match = { filename, parsed, content };
   }
   return match;
 }
@@ -4490,6 +4511,7 @@ export function registerApiRoutes(
             }
             return c.json({
               workflow: result.workflow,
+              authored: authoredForm(hit.content),
               filename: hit.filename,
               source: 'project' as WorkflowSource,
             });
@@ -4511,6 +4533,7 @@ export function registerApiRoutes(
           }
           return c.json({
             workflow: result.workflow,
+            authored: authoredForm(hit.content),
             filename: hit.filename,
             source: 'global' as WorkflowSource,
           });
@@ -4529,6 +4552,7 @@ export function registerApiRoutes(
         }
         return c.json({
           workflow: result.workflow,
+          authored: authoredForm(bundled.content),
           filename: bundled.filename,
           source: 'bundled' as WorkflowSource,
         });
@@ -4546,6 +4570,7 @@ export function registerApiRoutes(
             }
             return c.json({
               workflow: result.workflow,
+              authored: authoredForm(hit.content),
               filename: hit.filename,
               source: 'bundled' as WorkflowSource,
             });
@@ -4594,35 +4619,38 @@ export function registerApiRoutes(
 
     const { definition } = getValidatedBody(c, saveWorkflowBodySchema);
 
-    // Serialize and validate before writing
-    let yamlContent: string;
-    try {
-      yamlContent = Bun.YAML.stringify(definition);
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      getLog().error({ err, name }, 'workflow.serialize_failed');
-      return apiError(c, 400, 'Failed to serialize workflow definition');
-    }
-
-    const parsed = parseWorkflow(yamlContent, `${name}.yaml`);
-    if (parsed.error) {
-      return apiError(c, 400, 'Workflow definition is invalid', parsed.error.error);
-    }
-
     try {
       const source: WorkflowSource = targetSource === 'global' ? 'global' : 'project';
       const dirPath =
         source === 'global'
           ? getHomeWorkflowsPath()
           : join(workingDir, getWorkflowFolderSearchPaths()[0]);
-      await mkdir(dirPath, { recursive: true });
       const existing = await findWorkflowAt(dirPath, name);
       if (existing?.packaged === true && isBundledWorkflowsRoot(dirPath)) {
         return apiError(c, 400, `Cannot overwrite bundled default workflow: ${name}`);
       }
       const filePath = existing?.absolutePath ?? join(dirPath, `${name}.yaml`);
       const filename = existing?.filename ?? `${name}.yaml`;
-      await writeFile(filePath, yamlContent, 'utf-8');
+
+      // Serialize over the file on disk so unchanged parts keep their text and comments
+      let yamlContent: string;
+      try {
+        yamlContent = serializeWorkflowPreservingText(definition, existing?.content);
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        getLog().error({ err, name }, 'workflow.serialize_failed');
+        return apiError(c, 400, 'Failed to serialize workflow definition');
+      }
+
+      const parsed = parseWorkflow(yamlContent, `${name}.yaml`);
+      if (parsed.error) {
+        return apiError(c, 400, 'Workflow definition is invalid', parsed.error.error);
+      }
+
+      if (yamlContent !== existing?.content) {
+        await mkdir(dirname(filePath), { recursive: true });
+        await writeFile(filePath, yamlContent, 'utf-8');
+      }
       return c.json({
         workflow: parsed.workflow,
         filename,

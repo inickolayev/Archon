@@ -4209,6 +4209,9 @@ export interface components {
     };
     GetWorkflowResponse: {
       workflow: components['schemas']['WorkflowDefinition'];
+      authored?: {
+        [key: string]: unknown;
+      };
       filename: string;
       source: components['schemas']['WorkflowSource'];
     };
