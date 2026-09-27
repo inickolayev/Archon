@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import * as skill from '../skills';
+import type { NodeSource } from '../skills/nodeSource';
 import { HttpError } from '../lib/http';
 import { useEntity } from '../store/cache';
 import { K } from '../store/keys';
@@ -24,8 +25,12 @@ interface NodeSourcePanelProps {
 const REMARK_PLUGINS = [remarkGfm];
 const REHYPE_PLUGINS = [rehypeHighlight];
 
-/** What each shape is called on the panel, in the reader's terms rather than the schema's. */
-const LABELS: Record<string, string> = {
+/**
+ * What each shape is called on the panel, in the reader's terms rather than the schema's.
+ * Keyed by the response's own union, so a shape added server-side fails to compile here
+ * instead of rendering an empty heading.
+ */
+const LABELS: Record<NodeSource['kind'], string> = {
   command: 'Prompt file',
   script: 'Script file',
   prompt: 'Prompt',
