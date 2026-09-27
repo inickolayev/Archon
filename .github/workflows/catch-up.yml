@@ -1,0 +1,240 @@
+# Brings this fork level with upstream, one night at a time.
+#
+# Why a night and not a week: upstream lands ~12 commits a day. Twelve merge themselves;
+# eighty-five need a person for a day (we measured, on 2026-09-27, after 234). The whole
+# design is in chesswin-factory `docs/adr/0008-nightly-upstream-catch-up.md` — read that
+# before changing anything here, especially the parts that look redundant.
+#
+# This job does the merging and the proving. It never deploys and never touches the
+# Factory: the Factory has its own nightly job that notices `chesswin` moved ahead of its
+# pin, rolls forward and reports. The two are coupled only through this branch, so each
+# runs with the rights it already has and either can be re-run alone.
+#
+# It lives on `ops` because GitHub fires `schedule:` only from the default branch, and
+# because `ops` never merges into `chesswin` — our automation therefore never conflicts
+# with upstream's.
+name: catch-up
+
+on:
+  schedule:
+    - cron: '30 0 * * *' # 03:30 MSK — after upstream's day, before ours
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Catch up to this upstream commit instead of the newest green one'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+  pull-requests: write
+
+env:
+  UPSTREAM: coleam00/Archon
+  ENGINE_BRANCH: chesswin
+  # How far back to look for a commit of theirs whose own CI passed. Beyond this we are no
+  # longer "keeping up", we are attempting a small migration — which is a person's job.
+  LOOKBACK_COMMITS: 50
+
+jobs:
+  catch-up:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stop while a decision is pending
+        id: block
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # An ideological conflict blocks the next nights on purpose: catching up past a
+          # question nobody answered buries the question. The issue is the state — visible,
+          # arguable, and impossible to lose the way a file in a container would be.
+          open="$(gh issue list -R "${GITHUB_REPOSITORY}" --label sync-block --state open \
+                    --json number --jq 'length')"
+          if [ "${open}" != "0" ]; then
+            gh issue list -R "${GITHUB_REPOSITORY}" --label sync-block --state open \
+              --json number,title --jq '.[] | "blocked by #\(.number): \(.title)"' \
+              | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo 'skip=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'skip=false' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.block.outputs.skip == 'false'
+        with:
+          fetch-depth: 0
+          ref: ${{ env.ENGINE_BRANCH }}
+
+      - name: Choose the newest upstream commit whose own CI passed
+        id: target
+        if: steps.block.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
+          git fetch -q upstream dev
+
+          if [ -n "${REQUESTED}" ]; then
+            echo "sha=${REQUESTED}" >> "${GITHUB_OUTPUT}"
+            echo "Asked for ${REQUESTED}." | tee -a "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          # Their tip is not automatically a safe target: a red commit of theirs would make
+          # us spend the night diagnosing somebody else's breakage. So walk back to the
+          # newest one their own Test Suite accepted.
+          chosen=''
+          while read -r sha; do
+            verdict="$(gh api "repos/${UPSTREAM}/commits/${sha}/check-runs" \
+                        --jq '[.check_runs[] | select(.name == "Test Suite")] | first | .conclusion' \
+                        2>/dev/null || true)"
+            if [ "${verdict}" = "success" ]; then chosen="${sha}"; break; fi
+          done < <(git log --format=%H -n "${LOOKBACK_COMMITS}" upstream/dev)
+
+          if [ -z "${chosen}" ]; then
+            echo "No commit in the last ${LOOKBACK_COMMITS} of upstream/dev has a green Test Suite." \
+              | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo 'sha=' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "sha=${chosen}" >> "${GITHUB_OUTPUT}"
+          echo "Target: ${chosen} ($(git log -1 --format=%s "${chosen}"))" | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Nothing to do?
+        id: need
+        if: steps.block.outputs.skip == 'false' && steps.target.outputs.sha != ''
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor "${{ steps.target.outputs.sha }}" HEAD; then
+            echo "Already contains it — nothing to catch up tonight." | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo 'merge=false' >> "${GITHUB_OUTPUT}"
+          else
+            behind="$(git rev-list --count HEAD..${{ steps.target.outputs.sha }})"
+            echo "Behind by ${behind} commit(s)." | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo 'merge=true' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Merge, and hand conflicts to a person
+        id: merge
+        if: steps.need.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          branch="sync/upstream-$(date -u +%Y-%m-%d)"
+          git config user.name 'catch-up'
+          git config user.email 'noreply@github.com'
+          git checkout -q -B "${branch}"
+          echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+
+          if git merge --no-edit "${TARGET}"; then
+            echo 'conflicts=false' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Conflicts mean git wants help, not that the merge is dangerous — the reverse is
+          # also true and is why this job proves a clean merge instead of trusting it.
+          conflicted="$(git diff --name-only --diff-filter=U)"
+          git merge --abort
+          echo 'conflicts=true' >> "${GITHUB_OUTPUT}"
+          {
+            printf 'Upstream `%s` needs decisions our automation must not make.\n\n' "${TARGET}"
+            printf 'Conflicting files:\n\n```\n%s\n```\n\n' "${conflicted}"
+            printf 'Whose each file is (empty author means upstream only):\n\n'
+            for f in ${conflicted}; do
+              printf -- '- `%s` — %s\n' "${f}" \
+                "$(git log --format='%an' "$(git merge-base HEAD "${TARGET}")..HEAD" -- "${f}" | sort -u | paste -sd, -)"
+            done
+            printf '\nNothing is blocked yet: the next nights keep trying. Add the label '
+            printf '`sync-block` to stop them while this is decided.\n'
+          } > /tmp/issue.md
+          gh issue create -R "${GITHUB_REPOSITORY}" --label needs-agent \
+            --title "catch-up: conflicts against upstream $(git rev-parse --short "${TARGET}")" \
+            --body-file /tmp/issue.md | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Prove it
+        id: prove
+        if: steps.merge.outputs.conflicts == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push -q --force-with-lease origin "HEAD:${BRANCH}"
+          # `test.yml` runs on pushes to main/dev and on pull requests into them, so a branch
+          # aimed at `chesswin` gets no CI by itself. Ask for it by name and wait.
+          gh workflow run test.yml -R "${GITHUB_REPOSITORY}" --ref "${BRANCH}"
+          sleep 20
+          id=''
+          for _ in $(seq 1 10); do
+            id="$(gh run list -R "${GITHUB_REPOSITORY}" --workflow test.yml --branch "${BRANCH}" \
+                    --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            [ -n "${id}" ] && break
+            sleep 10
+          done
+          [ -n "${id}" ] || { echo 'The test run never appeared.' >&2; exit 1; }
+          echo "run=${id}" >> "${GITHUB_OUTPUT}"
+          gh run watch "${id}" -R "${GITHUB_REPOSITORY}" --interval 30 >/dev/null 2>&1 || true
+          verdict="$(gh run view "${id}" -R "${GITHUB_REPOSITORY}" --json conclusion --jq .conclusion)"
+          echo "verdict=${verdict}" >> "${GITHUB_OUTPUT}"
+          echo "Test Suite on ${BRANCH}: ${verdict} — ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${id}" \
+            | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Move the engine branch
+        if: steps.prove.outputs.verdict == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          TARGET: ${{ steps.target.outputs.sha }}
+          PROOF: ${{ steps.prove.outputs.run }}
+        run: |
+          set -euo pipefail
+          # The pull request is the record, not the gate: it carries what was merged and what
+          # proved it, then merges itself. The Factory's own nightly job takes it from here.
+          {
+            printf 'Upstream `%s`, merged with no conflicts and proved green:\n' "${TARGET}"
+            printf '%s/%s/actions/runs/%s\n\n' "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${PROOF}"
+            printf 'Nothing here was read by a person. That is the standing decision in\n'
+            printf 'chesswin-factory ADR 0008: the gates before the deploy and the kept\n'
+            printf 'previous pin are what stands in for a reviewer.\n'
+          } > /tmp/pr.md
+          pr="$(gh pr create -R "${GITHUB_REPOSITORY}" --base "${ENGINE_BRANCH}" --head "${BRANCH}" \
+                  --title "catch-up to upstream $(git rev-parse --short "${TARGET}")" \
+                  --body-file /tmp/pr.md)"
+          gh pr merge -R "${GITHUB_REPOSITORY}" "${pr}" --merge --delete-branch
+          echo "Merged into ${ENGINE_BRANCH}: ${pr}" | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Ask for help when the proof failed
+        if: steps.prove.outputs.verdict != '' && steps.prove.outputs.verdict != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          TARGET: ${{ steps.target.outputs.sha }}
+          PROOF: ${{ steps.prove.outputs.run }}
+          VERDICT: ${{ steps.prove.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          # A clean merge that does not build is the case worth having an agent for: it is
+          # usually a name collision or a test of theirs asserting behaviour we changed, and
+          # both are repairs rather than merges.
+          {
+            printf 'Branch `%s` merged upstream `%s` without conflicts, and the Test Suite\n' \
+              "${BRANCH}" "${TARGET}"
+            printf 'came back `%s`:\n%s/%s/actions/runs/%s\n\n' \
+              "${VERDICT}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${PROOF}"
+            printf 'A conflict-free merge is not a safe one. On 2026-09-27 the only real\n'
+            printf 'breakage arrived exactly this way: both sides declared a variable of the\n'
+            printf 'same name in one scope, and only the type-checker saw it.\n\n'
+            printf 'The engine branch has not moved. The next nights keep trying; add the\n'
+            printf '`sync-block` label to stop them.\n'
+          } > /tmp/issue.md
+          gh issue create -R "${GITHUB_REPOSITORY}" --label needs-agent \
+            --title "catch-up: ${BRANCH} merged cleanly but is not green" \
+            --body-file /tmp/issue.md | tee -a "${GITHUB_STEP_SUMMARY}"
