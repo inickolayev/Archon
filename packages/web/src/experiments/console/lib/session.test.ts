@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { fileURLToPath } from 'node:url';
 import { performSignOut } from './session';
 
 function recorder(): { order: string[]; deps: Parameters<typeof performSignOut>[0] } {
@@ -48,7 +49,7 @@ describe('where signing out lands', () => {
     // painted and 401s where their projects had been. Replacing the document
     // is what makes "no flash of authenticated content" true.
     const { leaveForSignIn } = await import('./session');
-    const source = await Bun.file(new URL('./session.ts', import.meta.url).pathname).text();
+    const source = await Bun.file(fileURLToPath(new URL('./session.ts', import.meta.url))).text();
     expect(typeof leaveForSignIn).toBe('function');
     expect(source).toContain("window.location.replace('/login')");
     // `replace`, so Back does not return to the console you just left.

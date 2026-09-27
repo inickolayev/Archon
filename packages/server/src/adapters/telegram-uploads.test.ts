@@ -1,5 +1,6 @@
-import { describe, expect, test, beforeEach, afterEach, mock } from 'bun:test';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { describe, expect, test, beforeEach, mock } from 'bun:test';
+import { mkdtemp, readFile } from 'fs/promises';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -26,12 +27,11 @@ import { persistTelegramFiles } from './telegram-uploads';
 
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
 
+const trackTempRoot = trackTempRoots();
+
 describe('persistTelegramFiles', () => {
   beforeEach(async () => {
-    mockArchonHome = await mkdtemp(join(tmpdir(), 'archon-tg-uploads-'));
-  });
-  afterEach(async () => {
-    await rm(mockArchonHome, { recursive: true, force: true });
+    mockArchonHome = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-tg-uploads-')));
   });
 
   test('a photo from the phone lands where a browser upload lands', async () => {
