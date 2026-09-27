@@ -109,7 +109,8 @@
       "src/types/message-metadata.test.ts",
       "src/config/config-loader.test.ts",
       "src/config/resolve-assistant.test.ts",
-      "src/state/"
+      "src/state/",
+      "src/utils/workflow-source-root.test.ts"
     ],
     [
       "src/config/run-config.test.ts"

@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { CanonicalRepoPathUnavailableError, getCanonicalRepoPath } from '@archon/git';
 import { resolveWorkflowSourceRoot } from './workflow-source-root';
 
@@ -22,11 +23,14 @@ const exec = promisify(execFile);
 const roots: string[] = [];
 
 afterAll(async () => {
-  await Promise.all(roots.map(root => rm(root, { recursive: true, force: true })));
+  for (const root of roots.splice(0)) await removeTempTree(root);
 });
 
 async function tempRoot(prefix: string): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), prefix));
+  // Resolved, because on macOS the temp directory is reached through a symlink (`/var` →
+  // `/private/var`) and git reports the resolved path — so an unresolved expectation fails
+  // there and nowhere else.
+  const root = await realpath(await mkdtemp(join(tmpdir(), prefix)));
   roots.push(root);
   return root;
 }
