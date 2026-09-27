@@ -11,7 +11,7 @@
  * because a side pass timed out would be the worst outcome available.
  */
 
-import { getAgentProvider } from '@archon/providers';
+import { getAgentProvider } from '@archon/core/services/provider-admission';
 import type { SendQueryOptions } from '@archon/providers/types';
 import { resolveTitleRequest } from '@archon/core';
 import { createLogger, getArchonWorkspacesPath } from '@archon/paths';
