@@ -45,6 +45,22 @@ const LABELS: Record<string, string> = {
  * Markdown is NOT rendered through `MessageMarkdown`: that map resolves local image paths
  * against a chat conversation, which a command file has nothing to do with.
  */
+/**
+ * What the panel has to say before it has a file.
+ *
+ * `undefined` data is always "reading", never "nothing here": the panel starts its own request
+ * the moment it mounts, and the store reports `loading` only once that request is in flight —
+ * so keying the text on `loading` showed "no file" for the first paint of every panel.
+ *
+ * An error is an answer rather than a failure. A 404 is how the server says this node runs no
+ * command or script, or that the file it names is not there; its own message is the most
+ * specific thing anyone can say, so it is shown verbatim.
+ */
+export function pendingMessage(error: Error | undefined): string {
+  if (error === undefined) return 'Reading…';
+  return error instanceof HttpError ? (error.serverError ?? error.bodySnippet) : error.message;
+}
+
 export function NodeSourcePanel({
   workflowName,
   nodeId,
@@ -52,27 +68,14 @@ export function NodeSourcePanel({
   note,
 }: NodeSourcePanelProps): ReactElement {
   const [raw, setRaw] = useState(false);
-  const { data, error, loading } = useEntity(K.nodeSource(cwd ?? '', workflowName, nodeId), () =>
+  const { data, error } = useEntity(K.nodeSource(cwd ?? '', workflowName, nodeId), () =>
     skill.getNodeSource(workflowName, nodeId, cwd)
   );
 
-  if (error !== undefined) {
-    // A 404 is an answer, not a failure: this node runs no file, or the file it names is not
-    // there. Either way the server's own message is the most specific thing anyone can say.
-    const message =
-      error instanceof HttpError ? (error.serverError ?? error.bodySnippet) : error.message;
-    return (
-      <Frame label="File">
-        <p className="font-mono text-[11.5px] text-text-tertiary">{message}</p>
-      </Frame>
-    );
-  }
   if (data === undefined) {
     return (
       <Frame label="File">
-        <p className="font-mono text-[11.5px] text-text-tertiary">
-          {loading ? 'Reading…' : 'No file read yet.'}
-        </p>
+        <p className="font-mono text-[11.5px] text-text-tertiary">{pendingMessage(error)}</p>
       </Frame>
     );
   }

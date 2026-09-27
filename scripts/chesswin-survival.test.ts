@@ -89,6 +89,7 @@ const OURS: Record<string, string[]> = {
     'packages/workflows/src/resource-source.ts',
     'packages/workflows/src/resource-source.test.ts',
     'packages/web/src/experiments/console/components/NodeSourcePanel.tsx',
+    'packages/web/src/experiments/console/components/NodeSourcePanel.test.tsx',
     'packages/web/src/experiments/console/skills/nodeSource.ts',
     'packages/web/src/experiments/console/primitives/resource-ref.ts',
     'packages/web/src/experiments/console/primitives/resource-ref.test.ts',
