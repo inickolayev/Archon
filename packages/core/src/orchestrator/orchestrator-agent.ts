@@ -2002,7 +2002,7 @@ export async function handleMessage(
   // seconds of its own (workspace sync, workflow discovery), and an operator
   // who has already seen the misunderstanding should not have to wait for the
   // model to start before the stop button means anything.
-  const turn = beginTurn(conversationId);
+  const stopHandle = beginTurn(conversationId);
   try {
     getLog().debug({ conversationId, userId }, 'orchestrator_message_received');
 
@@ -2595,7 +2595,7 @@ export async function handleMessage(
       // function. Every provider forwards it to its SDK, which is what
       // actually tears the subprocess down; without it a stop could only hide
       // the answer, not stop the work producing it.
-      abortSignal: turn.signal,
+      abortSignal: stopHandle.signal,
     };
     if (chatRequest.preset) {
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
@@ -2780,7 +2780,7 @@ export async function handleMessage(
     // says so here and stops short of the post-turn work (the unpushed-work
     // reminder, the cost footer, the completed-turn telemetry) that would
     // otherwise describe it as a turn that ran its course.
-    if (turn.wasStopped()) {
+    if (stopHandle.wasStopped()) {
       await platform.sendMessage(conversationId, TURN_STOPPED_NOTICE);
       return;
     }
@@ -2808,12 +2808,12 @@ export async function handleMessage(
     // throws out of the abort — so the difference has to come from the handle,
     // not from the error. Saying "something went wrong" about an abort the
     // operator asked for would be a lie, and one that reads as a bug.
-    if (turn.wasStopped()) {
+    if (stopHandle.wasStopped()) {
       getLog().info({ err, conversationId }, 'orchestrator_message_stopped');
     } else {
       getLog().error({ err, conversationId }, 'orchestrator_message_failed');
     }
-    const userMessage = turn.wasStopped() ? TURN_STOPPED_NOTICE : classifyAndFormatError(err, platform);
+    const userMessage = stopHandle.wasStopped() ? TURN_STOPPED_NOTICE : classifyAndFormatError(err, platform);
     try {
       await platform.sendMessage(conversationId, userMessage);
     } catch (sendError) {
@@ -2822,7 +2822,7 @@ export async function handleMessage(
   } finally {
     // Released before the lock is, so the next message — including one already
     // queued behind this turn — begins a turn of its own with a fresh signal.
-    turn.release();
+    stopHandle.release();
   }
 }
 

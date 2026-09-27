@@ -3759,7 +3759,7 @@ describe('GET /api/artifacts/:runId/* storage-key resolution', () => {
     );
     try {
       const response = await app.request(`/api/artifacts/${runId}/report.md`);
-      expect(read).toHaveBeenCalledWith(resolvedTarget, 'utf-8');
+      expect(read).toHaveBeenCalledWith(resolvedTarget);
       expect(response.status).toBe(status);
       expect(await response.json()).toEqual({
         error: code === 'ENOENT' ? 'Artifact file not found' : 'Failed to read artifact file',
