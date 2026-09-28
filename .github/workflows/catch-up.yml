@@ -17,7 +17,13 @@ name: catch-up
 
 on:
   schedule:
-    - cron: '30 0 * * *' # 03:30 MSK — after upstream's day, before ours
+    # 03:37 MSK — after upstream's day, before ours. The odd minute is deliberate: GitHub
+    # delays scheduled runs under load, and load peaks on the round marks of the hour. On
+    # the night of 2026-09-28 the previous '30 0' did not fire at all (nor did the
+    # Factory's own '15 1'), while manual dispatch worked. This is the documented
+    # mitigation; until a night proves otherwise, assume the catch-up may need starting
+    # by hand.
+    - cron: '37 0 * * *'
   workflow_dispatch:
     inputs:
       target:
