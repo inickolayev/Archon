@@ -10,20 +10,19 @@
 # pin, rolls forward and reports. The two are coupled only through this branch, so each
 # runs with the rights it already has and either can be re-run alone.
 #
-# It lives on `ops` because GitHub fires `schedule:` only from the default branch, and
-# because `ops` never merges into `chesswin` — our automation therefore never conflicts
-# with upstream's.
+# It lives on `ops` because that branch never merges into `chesswin` — our automation
+# therefore never conflicts with upstream's. It used to live there for a second reason,
+# that GitHub fires `schedule:` only from the default branch; that reason is gone with the
+# schedule itself, the first one is not.
 name: catch-up
 
+# Started by the Factory's own machine, not by a clock here. `bin/nightly-catch-up` there is
+# run by a systemd timer at 00:37 UTC, presses this, waits for it, and only then rolls the
+# Factory forward. GitHub's `schedule:` used to start it and is gone on purpose: it is
+# documented as best-effort, and on the night of 2026-09-28 it did not fire at all — neither
+# here nor in the Factory — while manual dispatch has never once failed. The reasoning is
+# chesswin-factory `docs/adr/0008-nightly-upstream-catch-up.md`.
 on:
-  schedule:
-    # 03:37 MSK — after upstream's day, before ours. The odd minute is deliberate: GitHub
-    # delays scheduled runs under load, and load peaks on the round marks of the hour. On
-    # the night of 2026-09-28 the previous '30 0' did not fire at all (nor did the
-    # Factory's own '15 1'), while manual dispatch worked. This is the documented
-    # mitigation; until a night proves otherwise, assume the catch-up may need starting
-    # by hand.
-    - cron: '37 0 * * *'
   workflow_dispatch:
     inputs:
       target:
