@@ -9,6 +9,7 @@ const parallelRun: Run = {
   projectId: null,
   projectName: 'Archon',
   costUsd: null,
+  startedBy: null,
   conversationId: null,
   conversationPlatformId: null,
   workerPlatformId: null,

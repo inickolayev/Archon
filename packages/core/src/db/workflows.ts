@@ -2162,6 +2162,12 @@ export async function listDashboardRuns(
                 c.platform_conversation_id AS worker_platform_id,
                 pc.platform_conversation_id AS parent_platform_id,
                 cb.name AS codebase_name,
+                -- Who asked for this run, by name. The id is already on the row, but a uuid
+                -- answers nobody's question: the reader wants to know whose work they are
+                -- looking at, and on a shared Factory that is the first thing they ask.
+                -- NULL for runs nobody can be named for — every run started from the command
+                -- line, where there is no person to attribute it to.
+                u.display_name AS user_display_name,
                 (SELECT COUNT(*) FROM remote_agent_workflow_events e
                  WHERE e.workflow_run_id = r.id AND e.event_type = 'parallel_agent_completed') AS agents_completed,
                 (SELECT COUNT(*) FROM remote_agent_workflow_events e
@@ -2174,6 +2180,7 @@ export async function listDashboardRuns(
          LEFT JOIN remote_agent_conversations c ON r.conversation_id = c.id
          LEFT JOIN remote_agent_conversations pc ON r.parent_conversation_id = pc.id
          LEFT JOIN remote_agent_codebases cb ON r.codebase_id = cb.id
+         LEFT JOIN remote_agent_users u ON r.user_id = u.id
          ${whereStr}
          ORDER BY r.started_at DESC
          LIMIT ${limitParam} OFFSET ${offsetParam}`,

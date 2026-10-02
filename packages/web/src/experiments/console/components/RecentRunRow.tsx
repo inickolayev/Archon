@@ -116,6 +116,14 @@ export function RecentRunRow({
         <span className="shrink-0 truncate font-mono text-[13px] font-bold text-text-primary">
           {run.workflow}
         </span>
+        {run.startedBy === null ? null : (
+          <span
+            className="shrink-0 truncate font-mono text-[10.5px] text-text-tertiary"
+            title={`Asked for by ${run.startedBy}`}
+          >
+            {run.startedBy}
+          </span>
+        )}
         {run.parentRunId ? (
           <span
             className="shrink-0 rounded-[5px] border border-border/60 px-1.5 py-px font-mono text-[10px] font-semibold uppercase tracking-[0.04em] text-text-tertiary"

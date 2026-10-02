@@ -10,6 +10,12 @@ import { workflowRunSchema, workflowRunStatusSchema } from '@archon/workflows/sc
 
 export const dashboardWorkflowRunSchema = workflowRunSchema.extend({
   codebase_name: z.string().nullable(),
+  /**
+   * Display name of whoever asked for the run; null when nobody can be named (CLI runs).
+   * Optional rather than merely nullable: a caller that builds a dashboard row without going
+   * through the join — a test, a fixture — should not have to name a person to be valid.
+   */
+  user_display_name: z.string().nullish(),
   platform_type: z.string().nullable(),
   worker_platform_id: z.string().nullable(),
   parent_platform_id: z.string().nullable(),

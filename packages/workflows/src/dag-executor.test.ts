@@ -15949,14 +15949,18 @@ describe('executeDagWorkflow -- env var injection', () => {
 
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    // WORKFLOW_ID rides along with the project's own keys: an agent has to be able to tell
+    // that it is inside a run, and on a host run it would otherwise inherit the server's
+    // environment, where no run exists.
     expect(optionsArg?.env).toEqual({
       MY_SECRET: 'abc123',
       ANTHROPIC_API_KEY: 'acting-user-secret',
+      WORKFLOW_ID: 'dag-test-run-id',
     });
     expect(optionsArg?.protectedEnvKeys).toEqual(['ANTHROPIC_API_KEY']);
   });
 
-  it('does not set env on claudeOptions when config.envVars is empty', async () => {
+  it('tells the agent which run it is in even when the project sets no env', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
@@ -15977,7 +15981,33 @@ describe('executeDagWorkflow -- env var injection', () => {
 
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0]?.[3] as Record<string, unknown> | undefined;
-    expect(optionsArg?.env).toBeUndefined();
+    // Used to be `toBeUndefined()`. A harness that must refuse to operate on itself from
+    // inside a run reads this marker, and it cannot be left to each project to remember a
+    // line of config — a forgotten line removes the protection without a sign.
+    expect(optionsArg?.env).toEqual({ WORKFLOW_ID: 'dag-test-run-id' });
+  });
+
+  it('a project cannot shadow the run it is running inside', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('the-real-run');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-env-shadow',
+          nodes: [{ id: 'task', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
+        },
+        workflowRun,
+        config: { ...minimalConfig, envVars: { WORKFLOW_ID: 'a-lie' } },
+      })
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0]?.[3] as Record<string, unknown> | undefined;
+    expect(optionsArg?.env).toEqual({ WORKFLOW_ID: 'the-real-run' });
   });
 });
 

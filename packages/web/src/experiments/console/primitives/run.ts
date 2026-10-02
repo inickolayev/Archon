@@ -47,6 +47,15 @@ export interface Run {
   finishedAt: string | null;
   /** workflow_runs.working_path — used to join against worktrees. */
   workingPath: string | null;
+  /**
+   * Who asked for this run, by name — null when nobody can be named.
+   *
+   * Null is the normal answer for a run started from the command line, where there is no
+   * person to attribute it to, and the UI says nothing rather than inventing one. On a Factory
+   * several people share, "whose work am I looking at" is the first question a list of runs
+   * raises, and until now the answer existed only in the database.
+   */
+  startedBy: string | null;
   userMessage: string;
   activeNodes: string[];
   /** Singular compatibility view, populated only when exactly one node is active. */
@@ -122,6 +131,8 @@ interface RawWorkflowRun {
   metadata?: WorkflowRunMetadata;
   /** Only present on dashboard runs — enriched by server-side join. */
   codebase_name?: string | null;
+  /** Display name of whoever asked for the run; absent/null when nobody can be named. */
+  user_display_name?: string | null;
   platform_type?: string | null;
   active_nodes?: string[];
   current_step_name?: string | null;
@@ -257,6 +268,7 @@ export function toRun(raw: RawWorkflowRun): Run {
     startedAt: raw.started_at,
     finishedAt: raw.completed_at ?? null,
     workingPath: raw.working_path ?? null,
+    startedBy: raw.user_display_name ?? null,
     userMessage: raw.user_message ?? '',
     activeNodes,
     currentNode: activeNodes.length === 1 ? (activeNodes[0] ?? null) : null,

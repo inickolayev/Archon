@@ -1776,9 +1776,17 @@ async function resolveNodeProviderAndModel(
   if (execContext.kind === 'container') {
     baseOptions.execContext = execContext;
   }
-  if (config.envVars && Object.keys(config.envVars).length > 0) {
-    baseOptions.env = config.envVars;
-  }
+  // The run this agent belongs to, delivered the way `bash:`/`script:` nodes already get it
+  // (`exec-environment.ts`). Without it an agent cannot tell it is inside a run at all: on a
+  // host run it inherits the server's own environment, where no run exists — so a harness that
+  // must refuse to operate on itself from inside a run (restarting the container it lives in,
+  // starting a second run of the same task) had no marker to read for the one case that
+  // actually worries it. The alternative was a line in every project's `env:` config, which is
+  // silently forgettable and whose absence removes the protection without a sign.
+  //
+  // Engine-reserved, so it is spread AFTER the project's own keys: a project cannot shadow the
+  // fact that its agent is running inside a run.
+  baseOptions.env = { ...(config.envVars ?? {}), WORKFLOW_ID: workflowRunId };
   if (config.protectedEnvKeys && config.protectedEnvKeys.length > 0) {
     baseOptions.protectedEnvKeys = config.protectedEnvKeys;
   }

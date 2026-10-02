@@ -20,7 +20,7 @@
  * (chesswin-factory ADR 0008).
  */
 import { describe, expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const REPO_ROOT = join(import.meta.dir, '..');
@@ -98,11 +98,53 @@ const OURS: Record<string, string[]> = {
   ],
 };
 
+/**
+ * The other half: ours living INSIDE a file that is upstream's.
+ *
+ * The list above asserts existence, which is the right question for a file we added — it either
+ * survived the merge or it did not. It is the wrong question for a line we added to a file that
+ * will always be there: `dag-executor.ts` is not going to disappear, and a merge that drops our
+ * three lines out of it leaves every path above intact.
+ *
+ * So each entry is a file of theirs plus the smallest fragment of ours that cannot be there by
+ * accident. A fragment, not a behaviour: behaviour is what the ordinary tests are for. And
+ * deliberately not a line number or a whole block — upstream reformats, and a check that breaks
+ * on reformatting teaches people to silence it.
+ *
+ * Feature → [their file, the fragment of ours it must still contain].
+ */
+const OURS_INSIDE_THEIRS: Record<string, [string, string][]> = {
+  'the engine tells an agent which run it is in': [
+    // Without this an agent inherits the server's environment, where no run exists, and the
+    // harness cannot tell a conversation from a run (chesswin-factory ADR 0011, ADR 0007).
+    ['packages/workflows/src/dag-executor.ts', 'WORKFLOW_ID: workflowRunId'],
+  ],
+  'a run says who asked for it': [
+    ['packages/core/src/db/workflows.ts', 'user_display_name'],
+    ['packages/web/src/experiments/console/components/RecentRunRow.tsx', 'run.startedBy'],
+  ],
+};
+
 describe('what this fork adds is still here', () => {
   for (const [feature, paths] of Object.entries(OURS)) {
     test(feature, () => {
       const missing = paths.filter((path): boolean => !existsSync(join(REPO_ROOT, path)));
       expect(missing).toEqual([]);
+    });
+  }
+});
+
+describe('what this fork adds inside upstream files is still there', () => {
+  for (const [feature, pairs] of Object.entries(OURS_INSIDE_THEIRS)) {
+    test(feature, () => {
+      const lost = pairs
+        .filter(([path, fragment]): boolean => {
+          const full = join(REPO_ROOT, path);
+          if (!existsSync(full)) return true;
+          return !readFileSync(full, 'utf-8').includes(fragment);
+        })
+        .map(([path, fragment]): string => `${path} no longer contains "${fragment}"`);
+      expect(lost).toEqual([]);
     });
   }
 });

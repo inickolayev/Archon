@@ -11,6 +11,7 @@ const parallelRun: Run = {
   projectId: 'project-parallel',
   projectName: 'Archon',
   costUsd: null,
+  startedBy: null,
   conversationId: null,
   conversationPlatformId: null,
   workerPlatformId: null,
