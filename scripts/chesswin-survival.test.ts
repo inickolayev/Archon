@@ -134,7 +134,9 @@ const OURS_INSIDE_THEIRS: Record<string, [string, string][]> = {
   ],
   // Upstream owns this file and ships `baseBranch: dev` in it, so a catch-up that takes their
   // version silently points every run in this repository at their branch instead of ours.
-  'worktrees are cut from this fork, not from upstream': [['.archon/config.yaml', 'baseBranch: chesswin']],
+  'worktrees are cut from this fork, not from upstream': [
+    ['.archon/config.yaml', 'baseBranch: chesswin'],
+  ],
 };
 
 describe('what this fork adds is still here', () => {
