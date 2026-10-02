@@ -107,7 +107,7 @@ const mockHandleCommand = mock<typeof CommandHandler.handleCommand>(() =>
   Promise.resolve({ success: true, message: 'ok' })
 );
 const mockSendQuery = mock<IAgentProvider['sendQuery']>(async function* () {
-  yield { type: 'assistant', content: 'test response' };
+  yield { type: 'agent_message_chunk', text: 'test response' };
   yield { type: 'result', sessionId: 'session-1' };
 });
 const mockGetCodebaseEnvVars = mock(() => Promise.resolve({}));
@@ -341,6 +341,7 @@ const DEFAULT_PROVIDER_CAPS: ProviderCapabilities = {
   mcp: false,
   hooks: false,
   skills: false,
+  plugins: false,
   agents: false,
   toolRestrictions: false,
   structuredOutput: false,
@@ -3812,7 +3813,7 @@ describe('paused approval gate routing', () => {
     mockSendQuery.mockImplementationOnce(async function* () {
       const tool = inFlightManageRunTool();
       if (tool) sink.push(await tool.handler(input));
-      yield { type: 'assistant', content: 'done' };
+      yield { type: 'agent_message_chunk', text: 'done' };
       yield { type: 'result', sessionId: 'session-1' };
     });
   }
@@ -4144,7 +4145,7 @@ describe('paused approval gate routing', () => {
       if (tool) {
         toolReplies.push(await tool.handler({ action: 'approve', runId: 'run-1', confirm: true }));
       }
-      yield { type: 'assistant', content: 'Approved.' };
+      yield { type: 'agent_message_chunk', text: 'Approved.' };
       throw new Error('provider subprocess exited unexpectedly');
     });
 
@@ -4895,7 +4896,7 @@ describe('stale session ID clearing on error_during_execution', () => {
       };
     });
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: reply };
+      yield { type: 'agent_message_chunk', text: reply };
       yield { type: 'result', sessionId: 'fresh-session-id' };
     });
   }
@@ -4950,7 +4951,7 @@ describe('stale session ID clearing on error_during_execution', () => {
 
   test('a healthy turn replays nothing — the live session already holds it', async () => {
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: 'still here' };
+      yield { type: 'agent_message_chunk', text: 'still here' };
       yield { type: 'result', sessionId: 'live-session-id' };
     });
     mockTransitionSession.mockResolvedValueOnce(
@@ -4999,6 +5000,36 @@ describe('stale session ID clearing on error_during_execution', () => {
     expect(sent.join('\n')).not.toContain('Session error');
   });
 
+  test.each(['stream', 'batch'] as const)(
+    '%s mode: a typed failure picks the advice from its class, not its words',
+    async mode => {
+      // The evidence reads like a usage limit; the provider classified an auth failure.
+      mockSendQuery.mockImplementationOnce(async function* () {
+        yield {
+          type: 'result',
+          isError: true,
+          errors: ['usage limit reached · resets 4pm'],
+          failure: { class: 'auth', evidence: 'usage limit reached · resets 4pm' },
+        };
+      });
+      mockTransitionSession.mockResolvedValueOnce(
+        makeSession({ id: 'session-1', assistant_session_id: null })
+      );
+
+      const platform = makePlatform();
+      (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue(mode);
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+        (c: unknown[]) => c[1] as string
+      );
+      expect(
+        sentMessages.some(m => m.startsWith('⚠️ The AI provider rejected its credentials'))
+      ).toBe(true);
+      expect(sentMessages.some(m => m.includes('AI usage limit reached'))).toBe(false);
+    }
+  );
+
   test('does NOT surface error to user on stop_sequence success (#1425)', async () => {
     // Regression test for #1425: stop_sequence terminations carry is_error:
     // true + subtype: 'success' under the Claude SDK contract. The Claude
@@ -5008,12 +5039,12 @@ describe('stale session ID clearing on error_during_execution', () => {
     // provider regresses, direct-chat users would once again see "Error:
     // success" surfaced via classifyAndFormatError.
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: 'classified' };
-      // Post-fix shape from claude/provider.ts: isError absent, stopReason set.
+      yield { type: 'agent_message_chunk', text: 'classified' };
+      // Post-fix shape from claude/provider.ts: isError absent; stop_sequence maps to end_turn.
       yield {
         type: 'result',
         sessionId: 'sid-ok',
-        stopReason: 'stop_sequence',
+        stopReason: 'end_turn',
       };
     });
     mockTransitionSession.mockResolvedValueOnce(
@@ -5043,13 +5074,13 @@ describe('stale session ID clearing on error_during_execution', () => {
     // path on subtype === 'success' so a non-Claude provider can't surface a
     // spurious error to the user via direct chat.
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: 'classified' };
+      yield { type: 'agent_message_chunk', text: 'classified' };
       yield {
         type: 'result',
         sessionId: 'sid-ok',
         isError: true,
         errorSubtype: 'success',
-        stopReason: 'stop_sequence',
+        stopReason: 'end_turn',
       };
     });
     mockTransitionSession.mockResolvedValueOnce(
@@ -5106,9 +5137,12 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       args: ['ExampleProject', '/.archon/workspaces/owner/repo/source'],
     });
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: "I'll register the project now.\n\n/register-project " };
-      yield { type: 'assistant', content: 'ExampleProject ' };
-      yield { type: 'assistant', content: '"/.archon/workspaces/owner/repo/source"' };
+      yield {
+        type: 'agent_message_chunk',
+        text: "I'll register the project now.\n\n/register-project ",
+      };
+      yield { type: 'agent_message_chunk', text: 'ExampleProject ' };
+      yield { type: 'agent_message_chunk', text: '"/.archon/workspaces/owner/repo/source"' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5139,9 +5173,12 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       args: ['ExampleProject', '/.archon/workspaces/owner/repo/source'],
     });
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: "I'll register the project now.\n\n/register-project " };
-      yield { type: 'assistant', content: 'ExampleProject ' };
-      yield { type: 'assistant', content: '"/.archon/workspaces/owner/repo/source"' };
+      yield {
+        type: 'agent_message_chunk',
+        text: "I'll register the project now.\n\n/register-project ",
+      };
+      yield { type: 'agent_message_chunk', text: 'ExampleProject ' };
+      yield { type: 'agent_message_chunk', text: '"/.archon/workspaces/owner/repo/source"' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5172,8 +5209,8 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
     );
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: 'Running the workflow now.\n\n/invoke-workflow ' };
-      yield { type: 'assistant', content: 'assist --project my-project' };
+      yield { type: 'agent_message_chunk', text: 'Running the workflow now.\n\n/invoke-workflow ' };
+      yield { type: 'agent_message_chunk', text: 'assist --project my-project' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5191,8 +5228,8 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
     );
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: 'Running the workflow now.\n\n/invoke-workflow ' };
-      yield { type: 'assistant', content: 'assist --project my-project' };
+      yield { type: 'agent_message_chunk', text: 'Running the workflow now.\n\n/invoke-workflow ' };
+      yield { type: 'agent_message_chunk', text: 'assist --project my-project' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5215,10 +5252,10 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     );
     mockSendQuery.mockImplementationOnce(async function* () {
       yield {
-        type: 'assistant',
-        content: 'Running assist.\n\n/invoke-workflow assist --project my-project ',
+        type: 'agent_message_chunk',
+        text: 'Running assist.\n\n/invoke-workflow assist --project my-project ',
       };
-      yield { type: 'assistant', content: '--prompt "synthesized task description"' };
+      yield { type: 'agent_message_chunk', text: '--prompt "synthesized task description"' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5240,10 +5277,10 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     );
     mockSendQuery.mockImplementationOnce(async function* () {
       yield {
-        type: 'assistant',
-        content: 'Running assist.\n\n/invoke-workflow assist --project my-project ',
+        type: 'agent_message_chunk',
+        text: 'Running assist.\n\n/invoke-workflow assist --project my-project ',
       };
-      yield { type: 'assistant', content: '--prompt "synthesized task description"' };
+      yield { type: 'agent_message_chunk', text: '--prompt "synthesized task description"' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5263,7 +5300,7 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       args: ['MyApp', '/path/to/app'],
     });
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: '/register-project MyApp /path/to/app' };
+      yield { type: 'agent_message_chunk', text: '/register-project MyApp /path/to/app' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5290,9 +5327,9 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       args: ['Foo', '/path'],
     });
     mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'assistant', content: 'Registering now:\n' };
-      yield { type: 'assistant', content: '/register-project Foo /path\n' };
-      yield { type: 'assistant', content: ' extra trailing' };
+      yield { type: 'agent_message_chunk', text: 'Registering now:\n' };
+      yield { type: 'agent_message_chunk', text: '/register-project Foo /path\n' };
+      yield { type: 'agent_message_chunk', text: ' extra trailing' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
 
@@ -5324,7 +5361,7 @@ describe('resolveUserProviderEnvForChat — chat env injection', () => {
   beforeEach(() => {
     mockSendQuery.mockReset();
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'ok' };
+      yield { type: 'agent_message_chunk', text: 'ok' };
       yield { type: 'result', sessionId: 'session-1' };
     });
     mockGetOrCreateConversation.mockReset();
@@ -5889,7 +5926,7 @@ describe('chat turn telemetry', () => {
     mockUpdateConversation.mockClear();
     // Restore the default plain-chat AI response
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'test response' };
+      yield { type: 'agent_message_chunk', text: 'test response' };
       yield { type: 'result', sessionId: 'session-1' };
     });
   });
@@ -5927,7 +5964,7 @@ describe('chat turn telemetry', () => {
       })
     );
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: '/invoke-workflow assist --project my-project' };
+      yield { type: 'agent_message_chunk', text: '/invoke-workflow assist --project my-project' };
       yield { type: 'result', sessionId: 'session-1' };
     });
 
@@ -5948,7 +5985,7 @@ describe('chat turn telemetry', () => {
       Promise.resolve(makeConversation({ codebase_id: null }))
     );
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'answer' };
+      yield { type: 'agent_message_chunk', text: 'answer' };
       yield {
         type: 'result',
         sessionId: 'session-1',
@@ -6020,7 +6057,7 @@ describe('chat turn telemetry', () => {
       })
     );
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: '/invoke-workflow assist --project my-project' };
+      yield { type: 'agent_message_chunk', text: '/invoke-workflow assist --project my-project' };
       yield { type: 'result', sessionId: 'session-1' };
     });
     mockUpdateConversation.mockImplementationOnce(() =>
@@ -6043,7 +6080,7 @@ describe('chat turn telemetry', () => {
         Promise.resolve(makeConversation({ codebase_id: null }))
       );
       mockSendQuery.mockImplementation(async function* () {
-        yield { type: 'assistant', content: 'partial' };
+        yield { type: 'agent_message_chunk', text: 'partial' };
         throw new Error('provider subprocess exited');
       });
       const platform = makePlatform();
@@ -6319,7 +6356,7 @@ describe('message persistence for non-web platforms', () => {
     mockGetCodebaseEnvVars.mockImplementation(() => Promise.resolve({}));
     mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'hello back' };
+      yield { type: 'agent_message_chunk', text: 'hello back' };
       yield { type: 'result', sessionId: 'sess-1' };
     });
   });
@@ -7095,7 +7132,7 @@ describe('stopping a turn', () => {
     );
     mockSendQuery.mockReset();
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'test response' };
+      yield { type: 'agent_message_chunk', text: 'test response' };
       yield { type: 'result', sessionId: 'session-1' };
     });
   });
@@ -7120,7 +7157,7 @@ describe('stopping a turn', () => {
     // Stands in for a provider that throws out of its abort, which is what all
     // of them do: the SDK kills the subprocess and the iterator rejects.
     mockSendQuery.mockImplementation(async function* (_p, _cwd, _s, requestOptions) {
-      yield { type: 'assistant', content: 'starting on the wrong thing' };
+      yield { type: 'agent_message_chunk', text: 'starting on the wrong thing' };
       await rejectOnAbort(requestOptions?.abortSignal);
     });
 
@@ -7137,7 +7174,7 @@ describe('stopping a turn', () => {
   test('a provider that ends its stream on abort still gets the stopped note', async () => {
     const platform = makePlatform();
     mockSendQuery.mockImplementation(async function* (_p, _cwd, _s, requestOptions) {
-      yield { type: 'assistant', content: 'partial answer' };
+      yield { type: 'agent_message_chunk', text: 'partial answer' };
       await drainUntil(() => requestOptions?.abortSignal?.aborted === true, 'the signal aborted');
       // No throw: the provider simply stops yielding, as OpenCode's session does.
     });
@@ -7153,7 +7190,7 @@ describe('stopping a turn', () => {
   test('the handle is released, so the next message runs a turn of its own', async () => {
     const platform = makePlatform();
     mockSendQuery.mockImplementation(async function* (_p, _cwd, _s, requestOptions) {
-      yield { type: 'assistant', content: 'first' };
+      yield { type: 'agent_message_chunk', text: 'first' };
       await rejectOnAbort(requestOptions?.abortSignal);
     });
     const stopped = handleMessage(platform, 'conv-1', 'first message');
@@ -7163,7 +7200,7 @@ describe('stopping a turn', () => {
     expect(isTurnRunning('conv-1')).toBe(false);
 
     mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'second answer' };
+      yield { type: 'agent_message_chunk', text: 'second answer' };
       yield { type: 'result', sessionId: 'session-2' };
     });
     const secondPlatform = makePlatform();

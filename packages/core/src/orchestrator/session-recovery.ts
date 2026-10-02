@@ -51,13 +51,16 @@ export function isLostSessionResult(chunk: MessageChunk): boolean {
 /**
  * Whether a chunk is something the operator could already have seen.
  *
- * System chunks are provider warnings the chat handlers drop on the floor, so
- * one arriving ahead of the failure must not be what stops a recovery. Anything
+ * Warnings, status and lifecycle events are not the turn's answer, so one
+ * arriving ahead of the failure must not be what stops a recovery. Anything
  * that renders — text, a tool call, its result — does.
  */
 function isDeliverable(chunk: MessageChunk): boolean {
-  if (chunk.type === 'assistant') return chunk.content.length > 0;
-  return chunk.type === 'tool' || chunk.type === 'tool_result';
+  return (
+    chunk.type === 'agent_message_chunk' ||
+    chunk.type === 'tool_call' ||
+    chunk.type === 'tool_call_update'
+  );
 }
 
 export interface SessionRecoveryInput {

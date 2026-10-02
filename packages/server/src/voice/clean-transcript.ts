@@ -78,7 +78,7 @@ export async function cleanTranscript(
       undefined,
       queryOptions
     )) {
-      if (chunk.type === 'assistant') answer += chunk.content;
+      if (chunk.type === 'agent_message_chunk') answer += chunk.text;
     }
 
     const verdict = acceptCleaned(transcript, answer);

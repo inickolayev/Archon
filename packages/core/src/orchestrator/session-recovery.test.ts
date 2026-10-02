@@ -9,7 +9,7 @@ const LOST: MessageChunk = {
   sessionId: 'gone-abc',
 };
 const OK = (sessionId: string): MessageChunk => ({ type: 'result', sessionId });
-const say = (content: string): MessageChunk => ({ type: 'assistant', content });
+const say = (text: string): MessageChunk => ({ type: 'agent_message_chunk', text });
 
 /** A provider that answers each attempt with a scripted chunk list. */
 function scriptedProvider(scripts: readonly (readonly MessageChunk[])[]): {
@@ -161,7 +161,11 @@ describe('withRecoveredSession', () => {
   });
 
   test('a provider warning ahead of the failure does not block recovery', async () => {
-    const warning: MessageChunk = { type: 'system', content: '⚠️ something' };
+    const warning: MessageChunk = {
+      type: 'warning',
+      code: 'test.something',
+      message: '⚠️ something',
+    };
     const provider = scriptedProvider([
       [warning, LOST],
       [say('recovered'), OK('fresh')],

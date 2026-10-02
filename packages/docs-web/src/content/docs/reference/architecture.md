@@ -102,8 +102,8 @@ export interface IPlatformAdapter {
   // Stop the platform adapter gracefully
   stop(): void;
 
-  // Optional: Send a structured event (e.g., Web UI rich data)
-  sendStructuredEvent?(conversationId: string, event: MessageChunk): Promise<void>;
+  // Optional: Send a structured event (a tool call or its update, a result, a status line or a dispatch)
+  sendStructuredEvent?(conversationId: string, event: PlatformStructuredEvent): Promise<void>;
 
   // Optional: Retract previously streamed text (workflow routing intercept)
   emitRetract?(conversationId: string): Promise<void>;
@@ -244,7 +244,7 @@ async sendMessage(conversationId: string, message: string): Promise<void> {
 }
 
 // Structured events for tool calls, workflow progress, errors
-async sendStructuredEvent(conversationId: string, event: MessageChunk): Promise<void> {
+async sendStructuredEvent(conversationId: string, event: PlatformStructuredEvent): Promise<void> {
   await this.emitSSE(conversationId, JSON.stringify(event));
 }
 ```
@@ -329,36 +329,16 @@ export interface IAgentProvider {
 
 ### MessageChunk Types
 
-`MessageChunk` is a discriminated union. Only the fields for each variant are present:
+`MessageChunk` is `ProviderChunk` from `@archon/provider-contract`: the events a provider streams during a turn, then one `result`, then one `settled`. The events are message and thought text (`agent_message_chunk`, `agent_thought_chunk`), tool calls and their updates (`tool_call`, `tool_call_update`), `warning`, `mcp_server_status`, `compaction`, `subtask`, `hook` and `state_update`. The schemas in `packages/provider-contract/src/events.ts` document every field, and the package README lists the rules a provider follows: whole text blocks, one update closing each tool call, capped tool output and coded warnings.
 
 ```typescript
-export type MessageChunk =
-  | { type: 'assistant'; content: string }
-  | { type: 'system'; content: string }
-  | { type: 'thinking'; content: string }
-  | {
-      type: 'result';
-      sessionId?: string;
-      tokens?: TokenUsage;
-      structuredOutput?: unknown;
-      isError?: boolean;
-      errorSubtype?: string;
-      errors?: string[];
-      cost?: number;
-      stopReason?: string;
-      numTurns?: number;
-      // Concrete provider-reported model. Omitted for providers such as Codex
-      // whose SDK completion events do not expose the resolved model.
-      resolvedModel?: ResolvedModel;
-      // Session-resume outcome: true = restored, false = requested but fell back
-      // to a fresh session, omitted = no resume requested. Set only when
-      // resumeSessionId was passed (stamp it via withResumedOutcome).
-      resumed?: boolean;
-    }
-  | { type: 'rate_limit'; rateLimitInfo: Record<string, unknown> }
-  | { type: 'tool'; toolName: string; toolInput?: Record<string, unknown>; toolCallId?: string }
-  | { type: 'tool_result'; toolName: string; toolOutput: string; toolCallId?: string }
-  | { type: 'workflow_dispatch'; workerConversationId: string; workflowName: string };
+yield { type: 'agent_message_chunk', text: 'Reading the file.' };
+yield { type: 'tool_call', toolCallId: 'call-1', name: 'Read', rawInput: { path: 'a.ts' } };
+yield { type: 'tool_call_update', toolCallId: 'call-1', status: 'completed', output: '...' };
+yield { type: 'result', sessionId: 'session-1', stopReason: 'end_turn' };
+// The turn is over and nothing more runs for it: always the last chunk.
+// The executor finishes a node on it, not on `result`.
+yield { type: 'settled' };
 ```
 
 ### Implementation Guide
@@ -385,21 +365,30 @@ export class YourAssistantProvider implements IAgentProvider {
     // Send query to AI and stream responses
     for await (const event of this.sdk.streamQuery(session, prompt)) {
       if (event.type === 'text_response') {
-        yield { type: 'assistant', content: event.text };
+        yield { type: 'agent_message_chunk', text: event.text };
       } else if (event.type === 'tool_call') {
         yield {
-          type: 'tool',
-          toolName: event.tool,
-          toolInput: event.parameters,
+          type: 'tool_call',
           toolCallId: event.id,
+          name: event.tool,
+          rawInput: event.parameters,
+        };
+      } else if (event.type === 'tool_result') {
+        yield {
+          type: 'tool_call_update',
+          toolCallId: event.id,
+          status: event.ok ? 'completed' : 'failed',
+          ...truncateToolOutput(event.output),
         };
       } else if (event.type === 'thinking') {
-        yield { type: 'thinking', content: event.reasoning };
+        yield { type: 'agent_thought_chunk', text: event.reasoning };
       }
     }
 
     // Yield session ID for persistence
     yield { type: 'result', sessionId: session.id };
+    // Nothing more runs for this turn
+    yield { type: 'settled' };
   }
 
   getType(): string {
@@ -481,28 +470,43 @@ if (trigger && shouldCreateNewSession(trigger)) {
 
 ### Streaming Event Mapping
 
-Different SDKs use different event types. Map them to MessageChunk types:
+Different SDKs use different event types. Map them to the contract's events (simplified excerpts; the providers also close interrupted tool calls, report subtasks, hooks and MCP status, and cap tool output):
 
 **Claude Code SDK** (`packages/providers/src/claude/provider.ts`):
 
 ```typescript
+let resultReported = false;
 for await (const msg of query({ prompt, options })) {
   if (msg.type === 'assistant') {
     for (const block of msg.message.content) {
       if (block.type === 'text') {
-        yield { type: 'assistant', content: block.text };
+        yield { type: 'agent_message_chunk', text: block.text };
       } else if (block.type === 'tool_use') {
         yield {
-          type: 'tool',
-          toolName: block.name,
-          toolInput: block.input,
+          type: 'tool_call',
+          toolCallId: block.id,
+          name: block.name,
+          rawInput: block.input,
         };
       }
     }
   } else if (msg.type === 'result') {
+    resultReported = true;
     yield { type: 'result', sessionId: msg.session_id };
+  } else if (msg.type === 'system' && msg.subtype === 'session_state_changed' && msg.state === 'idle') {
+    break; // turn over, background agents drained
   }
 }
+if (!resultReported) {
+  // A stream that closed without a result is a failed turn, never an empty success.
+  yield {
+    type: 'result',
+    isError: true,
+    errorSubtype: 'stream_ended_without_result',
+    failure: { class: 'unknown', evidence: 'Claude Code ended the turn without a result' },
+  };
+}
+yield { type: 'settled' };
 ```
 
 **Codex SDK** (`packages/providers/src/codex/provider.ts`):
@@ -516,16 +520,29 @@ for await (const event of result.events) {
     resolvedThreadId = event.thread_id; // resumable id; persist_session depends on it
     continue;
   }
-  if (event.type === 'item.completed') {
+  if (event.type === 'item.started' && event.item.type === 'command_execution') {
+    // The command is the title the operator reads; the kind of tool is the name.
+    yield {
+      type: 'tool_call',
+      toolCallId: event.item.id,
+      name: 'command_execution',
+      title: event.item.command,
+    };
+  } else if (event.type === 'item.completed') {
     switch (event.item.type) {
       case 'agent_message':
-        yield { type: 'assistant', content: event.item.text };
+        yield { type: 'agent_message_chunk', text: event.item.text };
         break;
       case 'command_execution':
-        yield { type: 'tool', toolName: event.item.command };
+        yield {
+          type: 'tool_call_update',
+          toolCallId: event.item.id,
+          status: event.item.exit_code === 0 ? 'completed' : 'failed',
+          ...truncateToolOutput(event.item.aggregated_output),
+        };
         break;
       case 'reasoning':
-        yield { type: 'thinking', content: event.item.text };
+        yield { type: 'agent_thought_chunk', text: event.item.text };
         break;
     }
   } else if (event.type === 'turn.completed') {
@@ -533,6 +550,7 @@ for await (const event of result.events) {
     break; // CRITICAL: Exit loop on turn completion
   }
 }
+yield { type: 'settled' };
 ```
 
 ### Error Handling

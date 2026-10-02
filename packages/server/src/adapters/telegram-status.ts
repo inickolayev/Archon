@@ -8,7 +8,7 @@
  * and the phone learned nothing.
  *
  * This wrapper implements it for Telegram — not to display the events, but to
- * read them. The RAW chunk is what arrives here (`toolName`, `toolInput`),
+ * read them. The RAW event is what arrives here (`name`, `rawInput`),
  * which matters: the formatted arm of the same stream
  * (`sendMessage(…, 'tool_call_formatted')`) has the operator's absolute paths
  * baked into its text, and re-parsing display text to get them back out again
@@ -24,7 +24,7 @@
 import { z } from 'zod';
 import { createLogger } from '@archon/paths';
 import type { IPlatformAdapter } from '@archon/core';
-import type { MessageChunk } from '@archon/providers/types';
+import type { PlatformStructuredEvent } from '@archon/workflows/deps';
 import { TurnStatus, describeTool, type StatusTransport } from '@archon/adapters';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -104,15 +104,15 @@ export function withTurnStatus<T extends IPlatformAdapter>(
   return new Proxy(primary, {
     get(target, prop, _receiver): unknown {
       if (prop === 'sendStructuredEvent') {
-        return async (conversationId: string, event: MessageChunk): Promise<void> => {
+        return async (conversationId: string, event: PlatformStructuredEvent): Promise<void> => {
           // Synchronous and self-guarding: `step` only records what to say
           // next, so nothing here can delay or fail the turn's own work.
-          if (event.type === 'tool') status.step(describeTool(event.toolName, event.toolInput));
+          if (event.type === 'tool_call') status.step(describeTool(event.name, event.rawInput));
           // Forwarded when the wrapped adapter has one of its own, so this
           // stays a decoration on the chain rather than a hole in it.
           const forward = Reflect.get(target, prop, target) as unknown;
           if (typeof forward === 'function') {
-            await (forward as (id: string, e: MessageChunk) => Promise<void>)(
+            await (forward as (id: string, e: PlatformStructuredEvent) => Promise<void>)(
               conversationId,
               event
             );

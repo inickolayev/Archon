@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
-import type { MessageChunk } from '@archon/providers/types';
+import type { PlatformStructuredEvent } from '@archon/workflows/deps';
 import { TurnStatus, type StatusTransport } from '@archon/adapters';
 import { MirrorBuffer, withOutboundMirror } from './mirror';
 import { createTurnStatus, telegramStatusConfig, withTurnStatus } from './telegram-status';
@@ -61,10 +61,11 @@ class FakeTransport implements StatusTransport {
   }
 }
 
-const toolEvent = (toolName: string, toolInput?: Record<string, unknown>): MessageChunk => ({
-  type: 'tool',
-  toolName,
-  ...(toolInput === undefined ? {} : { toolInput }),
+const toolEvent = (name: string, rawInput?: Record<string, unknown>): PlatformStructuredEvent => ({
+  type: 'tool_call',
+  toolCallId: `call-${name}`,
+  name,
+  ...(rawInput === undefined ? {} : { rawInput }),
 });
 
 describe('telegramStatusConfig', () => {
@@ -175,7 +176,7 @@ describe('withTurnStatus', () => {
 
     status.begin();
     await tick(5);
-    await adapter.sendStructuredEvent?.('4242', { type: 'system', content: 'Sync failed' });
+    await adapter.sendStructuredEvent?.('4242', { type: 'system_status', content: 'Sync failed' });
     await tick(50);
 
     expect(transport.edited).toHaveLength(0);

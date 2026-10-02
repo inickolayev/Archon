@@ -3696,6 +3696,21 @@ export interface components {
                 | 'child_failed'
                 | 'cancelled'
                 | 'config';
+              providerFailure?: {
+                /** @enum {string} */
+                class:
+                  | 'auth'
+                  | 'quota_exhausted'
+                  | 'budget_exceeded'
+                  | 'misconfigured'
+                  | 'rate_limited'
+                  | 'transient'
+                  | 'unknown';
+                retryAfterMs?: number;
+                /** Format: date-time */
+                resetAt?: string;
+                evidence: string;
+              };
             }
           | {
               /** @enum {string} */
@@ -4269,6 +4284,7 @@ export interface components {
       };
       mcp?: string;
       skills?: string[];
+      plugins?: string[];
       agents?: {
         [key: string]: {
           description: string;
@@ -4978,6 +4994,7 @@ export interface components {
       mcp: boolean;
       hooks: boolean;
       skills: boolean;
+      plugins: boolean;
       agents: boolean;
       toolRestrictions: boolean;
       knownToolNames?: string[];
