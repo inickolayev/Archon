@@ -74,6 +74,42 @@ jobs:
           fetch-depth: 0
           ref: ${{ env.ENGINE_BRANCH }}
 
+      # Both ways this job can give up end in an issue, and for three weeks both opened a NEW
+      # one every night: a week of the same conflict would have left seven identical issues,
+      # and — since the Factory's nightly script started announcing a waiting night — seven
+      # Telegram messages saying the same thing. An escalation has to be a state, not an event.
+      #
+      # Written to a file rather than kept in two steps because the checkout is the ENGINE
+      # branch, not `ops` where this workflow lives: a helper committed next to this file is
+      # not in the working tree at all.
+      - name: Prepare the escalation helper
+        if: steps.block.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/escalate.sh" << 'HELPER'
+          # escalate <title> <body file> — one open issue per situation, not per night.
+          escalate() {
+            local title="$1" body="$2" existing
+            # The title goes through the environment, not through the jq filter: a title is
+            # free text and interpolating it into a jq string is one apostrophe away from a
+            # filter that does not parse.
+            existing="$(TITLE="${title}" gh issue list -R "${GITHUB_REPOSITORY}" \
+                          --label needs-agent --state open --json number,title \
+                          --jq '[.[] | select(.title == env.TITLE)] | first | .number // empty')"
+            if [ -n "${existing}" ]; then
+              # The night is worth recording even when the problem is not new: "still stuck,
+              # four nights running" is the fact a person acts on.
+              gh issue comment -R "${GITHUB_REPOSITORY}" "${existing}" \
+                --body "Ночь $(date -u +%Y-%m-%d): та же картина, ничего не слито." >/dev/null
+              printf 'Та же задача, что и раньше: %s/%s/issues/%s\n' \
+                "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${existing}"
+              return 0
+            fi
+            gh issue create -R "${GITHUB_REPOSITORY}" --label needs-agent \
+              --title "${title}" --body-file "${body}"
+          }
+          HELPER
+
       - name: Choose the newest upstream commit whose own CI passed
         id: target
         if: steps.block.outputs.skip == 'false'
@@ -160,9 +196,10 @@ jobs:
             printf '\nNothing is blocked yet: the next nights keep trying. Add the label '
             printf '`sync-block` to stop them while this is decided.\n'
           } > /tmp/issue.md
-          gh issue create -R "${GITHUB_REPOSITORY}" --label needs-agent \
-            --title "catch-up: conflicts against upstream $(git rev-parse --short "${TARGET}")" \
-            --body-file /tmp/issue.md | tee -a "${GITHUB_STEP_SUMMARY}"
+          # shellcheck disable=SC1091
+          . "${RUNNER_TEMP}/escalate.sh"
+          escalate "catch-up: conflicts against upstream $(git rev-parse --short "${TARGET}")" \
+            /tmp/issue.md | tee -a "${GITHUB_STEP_SUMMARY}"
 
       - name: Prove it
         id: prove
@@ -240,6 +277,9 @@ jobs:
             printf 'The engine branch has not moved. The next nights keep trying; add the\n'
             printf '`sync-block` label to stop them.\n'
           } > /tmp/issue.md
-          gh issue create -R "${GITHUB_REPOSITORY}" --label needs-agent \
-            --title "catch-up: ${BRANCH} merged cleanly but is not green" \
-            --body-file /tmp/issue.md | tee -a "${GITHUB_STEP_SUMMARY}"
+          # Named after the upstream commit, not after the branch: the branch carries the
+          # date, so the old title was new every night and deduplication could never match.
+          # shellcheck disable=SC1091
+          . "${RUNNER_TEMP}/escalate.sh"
+          escalate "catch-up: upstream $(git rev-parse --short "${TARGET}") merges cleanly but is not green" \
+            /tmp/issue.md | tee -a "${GITHUB_STEP_SUMMARY}"
