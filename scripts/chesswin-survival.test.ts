@@ -132,6 +132,9 @@ const OURS_INSIDE_THEIRS: Record<string, [string, string][]> = {
     ['packages/core/src/db/workflows.ts', 'user_display_name'],
     ['packages/web/src/experiments/console/components/RecentRunRow.tsx', 'run.startedBy'],
   ],
+  // Upstream owns this file and ships `baseBranch: dev` in it, so a catch-up that takes their
+  // version silently points every run in this repository at their branch instead of ours.
+  'worktrees are cut from this fork, not from upstream': [['.archon/config.yaml', 'baseBranch: chesswin']],
 };
 
 describe('what this fork adds is still here', () => {

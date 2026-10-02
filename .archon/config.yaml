@@ -1,5 +1,10 @@
 worktree:
-  baseBranch: dev
+  # ChessWin fork: our engine branch, not upstream's `dev`. Upstream ships `dev` here and for
+  # them that is right; for us it means every run against this repository in the Factory cuts
+  # its worktree from UPSTREAM's branch instead of the engine we actually run — including the
+  # nightly catch-up's own repair, which then merges upstream into upstream and proves nothing.
+  # Found 2026-10-02, when the repair was first exercised for real.
+  baseBranch: chesswin
   # `git worktree add` carries tracked files only, so every gitignored runtime file is
   # absent from a fresh worktree. Agents work inside worktrees, so without this they
   # cannot start the server, run integration tests, or reproduce anything that reads
