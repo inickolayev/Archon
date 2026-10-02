@@ -147,6 +147,33 @@ jobs:
           echo "sha=${chosen}" >> "${GITHUB_OUTPUT}"
           echo "Target: ${chosen} ($(git log -1 --format=%s "${chosen}"))" | tee -a "${GITHUB_STEP_SUMMARY}"
 
+      # An escalation is a state: "we could not take commit X". It stops being true the moment
+      # the engine branch contains X — whoever got it there, the repair agent or a person with
+      # a merge. Closed here rather than by whoever fixed it, because only this job knows the
+      # answer for certain, and because a fix that forgets to close leaves every later night
+      # reporting that somebody is still waiting. #6 stayed open through a successful repair,
+      # which is exactly how that would have gone unnoticed.
+      - name: Close what is no longer true
+        if: steps.block.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for number in $(gh issue list -R "${GITHUB_REPOSITORY}" --label needs-agent --state open \
+                            --json number --jq '.[].number'); do
+            sha="$(gh issue view "${number}" -R "${GITHUB_REPOSITORY}" --json body --jq '.body' \
+                     | grep -oE '[0-9a-f]{40}' | head -1)"
+            [ -n "${sha}" ] || continue
+            git cat-file -e "${sha}^{commit}" 2>/dev/null || continue
+            if git merge-base --is-ancestor "${sha}" HEAD; then
+              gh issue close "${number}" -R "${GITHUB_REPOSITORY}" \
+                --comment "Ветка движка содержит $(git rev-parse --short "${sha}") — догонять больше нечего." \
+                >/dev/null
+              echo "Closed #${number}: the engine branch already contains ${sha}." \
+                | tee -a "${GITHUB_STEP_SUMMARY}"
+            fi
+          done
+
       - name: Nothing to do?
         id: need
         if: steps.block.outputs.skip == 'false' && steps.target.outputs.sha != ''
