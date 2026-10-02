@@ -4499,6 +4499,7 @@ export interface components {
           }
         | unknown;
       codebase_name: string | null;
+      user_display_name?: string | null;
       platform_type: string | null;
       worker_platform_id: string | null;
       parent_platform_id: string | null;

@@ -31,7 +31,16 @@ export interface ManageRunContext {
    * (including a friendly error for an unknown name). Omitted when the dispatch
    * context isn't available — `start` is then rejected.
    */
-  startWorkflow?: (workflowName: string, message: string) => Promise<string>;
+  startWorkflow?: (
+    workflowName: string,
+    message: string,
+    launch?: {
+      /** Values for the workflow's declared `inputs:` — validated at the dispatch gate. */
+      readonly inputs?: Readonly<Record<string, string>>;
+      /** The branch the run works on, when the caller already knows it. */
+      readonly branch?: string;
+    }
+  ) => Promise<string>;
   /**
    * Continuation seam for a gate the agent just resolved. Called with the run
    * reloaded AFTER the committed decision leaves it resumable
@@ -111,6 +120,27 @@ const INPUT_SCHEMA = defineNativeToolInputSchema({
     workflow: {
       kind: 'string',
       description: 'Workflow name to launch — required for action=start.',
+    },
+    // A workflow that declares `inputs:` cannot be launched without them, and until now the
+    // only launcher that could supply them was the CLI. That left an agent in a conversation
+    // able to start the workflows that need nothing and none of the ones that do real work.
+    //
+    // Carried as a JSON string, not an object: this schema is deliberately flat (string /
+    // enum / boolean) because every provider maps it to its own SDK's shape, and widening it
+    // would mean changing each of those converters for one argument of one tool.
+    inputs: {
+      kind: 'string',
+      description:
+        "For action=start: a JSON object of the workflow's declared inputs, e.g. " +
+        '{"target": "https://github.com/owner/repo/issues/7", "publish": "false"}. A missing ' +
+        'required input, or a name the workflow never declared, is refused before any ' +
+        'worktree, clone or AI cost is spent.',
+    },
+    branch: {
+      kind: 'string',
+      description:
+        'For action=start: the branch the run should work on. Omit to let the engine derive ' +
+        'one — supply it when the name is decided elsewhere and must match.',
     },
     decision: {
       kind: 'string',
@@ -345,8 +375,86 @@ async function handleStart(ctx: ManageRunContext, input: Record<string, unknown>
   const workflow = typeof input.workflow === 'string' ? input.workflow.trim() : '';
   if (workflow === '') return 'manage_run: action=start requires a workflow name.';
   const message = typeof input.message === 'string' ? input.message.trim() : '';
+  const branch =
+    typeof input.branch === 'string' && input.branch.trim() !== ''
+      ? input.branch.trim()
+      : undefined;
+  const inputs = parseInputs(input.inputs);
+  if (inputs === null) {
+    return 'manage_run: action=start expects `inputs` to be a JSON object of strings, e.g. {"target": "..."}.';
+  }
+  const alreadyRunning = inputs?.target === undefined ? null : await liveRunFor(ctx, inputs.target);
+  if (alreadyRunning !== null) {
+    return (
+      `manage_run: ${alreadyRunning.workflow_name} run ${alreadyRunning.id.slice(0, 8)} is already ` +
+      `working on that target (${alreadyRunning.status}). Two runs on one target push one branch ` +
+      'and open two pull requests — look at it with action=get, or stop it with action=cancel.'
+    );
+  }
   log.info({ codebaseId: ctx.codebaseId, workflow }, 'manage_run.start_requested');
-  return await ctx.startWorkflow(workflow, message);
+  return await ctx.startWorkflow(workflow, message, {
+    ...(inputs === undefined ? {} : { inputs }),
+    ...(branch === undefined ? {} : { branch }),
+  });
+}
+
+/** Statuses that mean the run is over. A run paused at a gate is very much alive. */
+const FINISHED_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+
+/**
+ * A run already working on this target, or null.
+ *
+ * Two people asking for the same thing a minute apart is an ordinary accident once a run can be
+ * started from a conversation — from a phone, by anyone who can reach the Factory — where before
+ * there was one door and a person standing at it who could see what they were starting. The
+ * result would be two runs pushing one branch and two pull requests for one piece of work.
+ *
+ * Nothing else catches it: uniqueness in the database is per RUN, not per target, and the
+ * isolation layer happily hands a second run a second worktree.
+ *
+ * Matched on the declared `target` input rather than on the branch, because the branch is
+ * usually derived from the target and the derivation can change while the target cannot.
+ */
+async function liveRunFor(
+  ctx: ManageRunContext,
+  target: string
+): Promise<{ id: string; workflow_name: string; status: string } | null> {
+  const { runs } = await listDashboardRuns({ codebaseId: ctx.codebaseId, limit: 50 });
+  for (const run of runs) {
+    if (FINISHED_STATUSES.has(run.status)) continue;
+    const inputs = (run.metadata as { inputs?: Record<string, unknown> } | undefined)?.inputs;
+    if (inputs?.target === target) return run;
+  }
+  return null;
+}
+
+/**
+ * The declared inputs parsed out of the JSON string the agent passed, `undefined` when it
+ * passed none, or `null` when what it passed is not a flat JSON object.
+ *
+ * Null rather than a throw, and never a silent coercion: an input quietly turned into
+ * "[object Object]" would reach the workflow looking like a value and fail much later, inside
+ * the run, where the agent can no longer be told what it did wrong. Numbers and booleans are
+ * accepted and stringified because an agent writing JSON will spell `false` without quotes and
+ * mean it — that is a spelling, not a type error.
+ */
+function parseInputs(raw: unknown): Readonly<Record<string, string>> | undefined | null {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value === 'string') out[key] = value;
+    else if (typeof value === 'number' || typeof value === 'boolean') out[key] = String(value);
+    else return null;
+  }
+  return out;
 }
 
 /** resume / cancel / abandon / approve / reject / respond — all by-id, project-scoped. */

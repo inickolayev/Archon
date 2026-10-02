@@ -378,7 +378,88 @@ describe('manage_run — start', () => {
     const tool = buildManageRunTool({ codebaseId: CODEBASE_ID, startWorkflow });
     const out = await tool.handler({ action: 'start', workflow: 'plan', message: 'add dark mode' });
     expect(out).toBe('dispatched');
-    expect(startWorkflow).toHaveBeenCalledWith('plan', 'add dark mode');
+    expect(startWorkflow).toHaveBeenCalledWith('plan', 'add dark mode', {});
+  });
+
+  test('start carries the declared inputs and the branch', async () => {
+    // The duplicate-target check runs first and asks for the project's live runs.
+    mockListDashboardRuns.mockImplementation(() => Promise.resolve({ runs: [] }));
+    const startWorkflow = mock(() => Promise.resolve('dispatched'));
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID, startWorkflow });
+    await tool.handler({
+      action: 'start',
+      workflow: 'ship',
+      message: 'take it',
+      inputs: '{"target": "https://github.com/o/r/issues/7", "publish": false}',
+      branch: 'feat/7-dark-mode',
+    });
+    expect(startWorkflow).toHaveBeenCalledWith('ship', 'take it', {
+      // `false` written without quotes is a spelling, not a type error.
+      inputs: { target: 'https://github.com/o/r/issues/7', publish: 'false' },
+      branch: 'feat/7-dark-mode',
+    });
+  });
+
+  test('inputs that are not a JSON object are refused, and nothing is started', async () => {
+    mockListDashboardRuns.mockImplementation(() => Promise.resolve({ runs: [] }));
+    const startWorkflow = mock(() => Promise.resolve('dispatched'));
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID, startWorkflow });
+    for (const bad of ['not json', '["a"]', '{"target": {"deep": 1}}']) {
+      expect(await tool.handler({ action: 'start', workflow: 'ship', inputs: bad })).toContain(
+        'JSON object'
+      );
+    }
+    expect(startWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('a second run on the same target is refused, not started', async () => {
+    mockListDashboardRuns.mockImplementation(() =>
+      Promise.resolve({
+        runs: [
+          {
+            id: 'aaaaaaaabbbb',
+            workflow_name: 'ship',
+            status: 'paused',
+            metadata: { inputs: { target: 'https://github.com/o/r/issues/7' } },
+          },
+        ],
+      })
+    );
+    const startWorkflow = mock(() => Promise.resolve('dispatched'));
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID, startWorkflow });
+    const out = await tool.handler({
+      action: 'start',
+      workflow: 'ship',
+      inputs: '{"target": "https://github.com/o/r/issues/7"}',
+    });
+    // Paused counts as alive — a run waiting at a gate is exactly when a second person
+    // assumes nothing is happening.
+    expect(out).toContain('aaaaaaaa');
+    expect(out).toContain('already');
+    expect(startWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('a finished run on the same target does not block a new one', async () => {
+    mockListDashboardRuns.mockImplementation(() =>
+      Promise.resolve({
+        runs: [
+          {
+            id: 'old',
+            workflow_name: 'ship',
+            status: 'completed',
+            metadata: { inputs: { target: 'https://github.com/o/r/issues/7' } },
+          },
+        ],
+      })
+    );
+    const startWorkflow = mock(() => Promise.resolve('dispatched'));
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID, startWorkflow });
+    await tool.handler({
+      action: 'start',
+      workflow: 'ship',
+      inputs: '{"target": "https://github.com/o/r/issues/7"}',
+    });
+    expect(startWorkflow).toHaveBeenCalled();
   });
 
   test('start without a dispatch context is rejected', async () => {

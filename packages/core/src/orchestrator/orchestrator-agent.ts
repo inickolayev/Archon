@@ -2661,7 +2661,7 @@ export async function handleMessage(
             gateResolution.resolved = { run, action };
             return true;
           },
-          startWorkflow: async (workflowName, msg): Promise<string> => {
+          startWorkflow: async (workflowName, msg, launch): Promise<string> => {
             let wf: ResolvedWorkflow | undefined;
             try {
               wf = resolveWorkflowName(workflowName, workflows);
@@ -2683,8 +2683,16 @@ export async function handleMessage(
                   codebaseId: scopedCodebaseId,
                   availableWorkflows: workflows,
                   userId,
+                  // Declared inputs are validated at the dispatch gate, before any worktree,
+                  // clone or AI cost — a workflow that needs a target is refused here rather
+                  // than failing deep inside the run.
+                  ...(launch?.inputs === undefined ? {} : { inputs: launch.inputs }),
                 },
-                wf
+                wf,
+                // The branch, when the caller already knows it. Ours are derived from the
+                // issue by a step that runs before the launch, and the name has to match what
+                // the rest of the task expects.
+                launch?.branch === undefined ? undefined : { branchName: launch.branch }
               );
             } catch (e: unknown) {
               const err = toError(e);

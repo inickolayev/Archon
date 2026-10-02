@@ -119,6 +119,15 @@ const OURS_INSIDE_THEIRS: Record<string, [string, string][]> = {
     // harness cannot tell a conversation from a run (chesswin-factory ADR 0011, ADR 0007).
     ['packages/workflows/src/dag-executor.ts', 'WORKFLOW_ID: workflowRunId'],
   ],
+  'a conversation can start the run that does real work': [
+    // Without these a chat can only launch workflows that declare no inputs — which is none
+    // of ours (chesswin-factory ADR 0011).
+    ['packages/core/src/orchestrator/manage-run-tool.ts', 'parseInputs'],
+    ['packages/core/src/orchestrator/orchestrator-agent.ts', 'launch?.inputs'],
+  ],
+  'two people cannot start two runs on one target': [
+    ['packages/core/src/orchestrator/manage-run-tool.ts', 'liveRunFor'],
+  ],
   'a run says who asked for it': [
     ['packages/core/src/db/workflows.ts', 'user_display_name'],
     ['packages/web/src/experiments/console/components/RecentRunRow.tsx', 'run.startedBy'],
