@@ -87,26 +87,43 @@ jobs:
         run: |
           set -euo pipefail
           cat > "${RUNNER_TEMP}/escalate.sh" << 'HELPER'
-          # escalate <title> <body file> — one open issue per situation, not per night.
+          # escalate <title> <body file> — ONE open escalation at a time.
+          #
+          # The first version of this deduplicated by the upstream commit named in the title.
+          # That was the wrong key: upstream's newest green commit is a different one every
+          # night, so the title was new every night and nothing ever matched. Three nights
+          # (2026-10-03..05) left three issues, and the roll-forward sent an agent at each —
+          # 54, 54 and 94 minutes of the most expensive model, all three reaching the same
+          # correct conclusion. The situation is "the catch-up is stuck", and which commit it
+          # stumbled on this night belongs in a comment.
           escalate() {
             local title="$1" body="$2" existing
-            # The title goes through the environment, not through the jq filter: a title is
-            # free text and interpolating it into a jq string is one apostrophe away from a
-            # filter that does not parse.
-            existing="$(TITLE="${title}" gh issue list -R "${GITHUB_REPOSITORY}" \
-                          --label needs-agent --state open --json number,title \
-                          --jq '[.[] | select(.title == env.TITLE)] | first | .number // empty')"
+            existing="$(gh issue list -R "${GITHUB_REPOSITORY}" --label needs-agent --state open \
+                          --limit 20 --json number,title \
+                          --jq '[.[] | select(.title | startswith("catch-up:"))] | first | .number // empty')"
             if [ -n "${existing}" ]; then
               # The night is worth recording even when the problem is not new: "still stuck,
               # four nights running" is the fact a person acts on.
-              gh issue comment -R "${GITHUB_REPOSITORY}" "${existing}" \
-                --body "Ночь $(date -u +%Y-%m-%d): та же картина, ничего не слито." >/dev/null
+              { printf 'Ночь %s: та же картина. %s\n\n' "$(date -u +%Y-%m-%d)" "${title}"
+                cat "${body}"; } > /tmp/again.md
+              gh issue comment -R "${GITHUB_REPOSITORY}" "${existing}" --body-file /tmp/again.md >/dev/null
               printf 'Та же задача, что и раньше: %s/%s/issues/%s\n' \
                 "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${existing}"
-              return 0
+            else
+              existing="$(gh issue create -R "${GITHUB_REPOSITORY}" --label needs-agent \
+                            --title "${title}" --body-file "${body}" | grep -oE '[0-9]+$')"
+              printf '%s/%s/issues/%s\n' "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${existing}"
             fi
-            gh issue create -R "${GITHUB_REPOSITORY}" --label needs-agent \
-              --title "${title}" --body-file "${body}"
+
+            # A wall no agent can climb gets a label that stops anyone sending one. Our token
+            # has `repo` but not `workflow`, and the Actions token cannot push workflow files
+            # either — `workflows` is not a permission a workflow may request, GitHub rejects
+            # the file outright (probed 2026-10-05).
+            if [ "${CREDENTIAL_BLOCKED:-false}" = true ] && [ -n "${existing}" ]; then
+              gh issue edit "${existing}" -R "${GITHUB_REPOSITORY}" --add-label needs-credential >/dev/null 2>&1 || true
+              echo 'Помечено needs-credential: встало на правах доступа, агент не поможет.' \
+                | tee -a "${GITHUB_STEP_SUMMARY}"
+            fi
           }
           HELPER
 
@@ -188,12 +205,38 @@ jobs:
             echo 'merge=true' >> "${GITHUB_OUTPUT}"
           fi
 
+      # Asked before anything is attempted, because the answer changes who should be called.
+      - name: Could we even push what we are about to take?
+        id: credential
+        if: steps.need.outputs.merge == 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # From the point we diverged, not from our HEAD: our own `test.yml` permanently
+          # differs from theirs (we took Windows out of the matrix), so comparing the two tips
+          # would report that file every single night and this check would always say "blocked".
+          # The question is what THEY changed in the range we are about to take.
+          base="$(git merge-base HEAD "${TARGET}")"
+          touched="$(git diff --name-only "${base}" "${TARGET}" -- .github/workflows || true)"
+          if [ -n "${touched}" ]; then
+            echo 'blocked=true' >> "${GITHUB_OUTPUT}"
+            {
+              echo 'Этот диапазон трогает файлы воркфлоу, а наш токен их менять не может'
+              echo '(есть `repo`, нет `workflow`). Отправка будет отклонена:'
+              printf '```\n%s\n```\n' "${touched}"
+            } | tee -a "${GITHUB_STEP_SUMMARY}"
+          else
+            echo 'blocked=false' >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Merge, and hand conflicts to a person
         id: merge
         if: steps.need.outputs.merge == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET: ${{ steps.target.outputs.sha }}
+          CREDENTIAL_BLOCKED: ${{ steps.credential.outputs.blocked }}
         run: |
           set -euo pipefail
           branch="sync/upstream-$(date -u +%Y-%m-%d)"
@@ -288,6 +331,7 @@ jobs:
           TARGET: ${{ steps.target.outputs.sha }}
           PROOF: ${{ steps.prove.outputs.run }}
           VERDICT: ${{ steps.prove.outputs.verdict }}
+          CREDENTIAL_BLOCKED: ${{ steps.credential.outputs.blocked }}
         run: |
           set -euo pipefail
           # A clean merge that does not build is the case worth having an agent for: it is
