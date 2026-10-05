@@ -5,6 +5,7 @@
 name: probe-workflow-scope
 on: workflow_dispatch
 permissions:
+  workflows: write
   contents: write
 jobs:
   probe:
