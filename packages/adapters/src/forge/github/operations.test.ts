@@ -1,7 +1,41 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve } from 'node:path';
+import { discoverPlugins } from '@archon/forge/discovery';
+import { dispatchForge } from '@archon/forge/dispatch';
 import type { ForgeRequest } from '@archon/forge/operations';
 import { githubPluginMetadata, handleGithubOperation } from './operations';
+
+const invalidRemotePaths = [
+  'team',
+  'team/repo/extra',
+  'team/.git',
+  'team/%2E%2E',
+  'team/../owner/repo.git',
+  'team/%2E%2E/owner/repo.git',
+  'team/..git',
+  'team/...git',
+  'team/%2E.git',
+  'team/%2E%2E.git',
+  'team\\../owner/repo.git',
+  'team/..\\owner/repo.git',
+];
+
+const normalizedRemotePaths = [
+  ...['\t', '\n', '\r'].flatMap(control => [`te${control}am/repo.git`, `team/re${control}po.git`]),
+];
+const invalidHttpRemotePaths = [
+  'team\\extra/repo.git',
+  'team/repo\\extra.git',
+  ...['%5C', '%5c'].flatMap(backslash => [
+    `team${backslash}extra/repo.git`,
+    `team/repo${backslash}extra.git`,
+  ]),
+  ...['', '/', '//'].flatMap(slashes =>
+    ['\\', '\\\\'].flatMap(backslashes =>
+      ['team/repo.git', 'team/extra/repo.git'].map(path => `${slashes}${backslashes}${path}`)
+    )
+  ),
+];
 
 const checksRequest = {
   operationId: 'operation-1',
@@ -13,6 +47,10 @@ function json(value: unknown, status = 200): Response {
   return Response.json(value, { status });
 }
 
+const failingFetch = async (): Promise<never> => {
+  throw new Error('Resolution must not fetch');
+};
+
 describe('GitHub outbound producer', () => {
   test('publishes bounded metadata without naming the child credential', () => {
     expect(githubPluginMetadata).toEqual({
@@ -23,19 +61,64 @@ describe('GitHub outbound producer', () => {
       hosts: ['github.com'],
       capabilities: [
         'resolve',
+        'resolve:subject',
         'checks.state',
+        'checks.commit',
+        'checks.logs',
         'workitem.view',
+        'workitem.comments',
+        'workitem.create',
+        'workitem.labels.set',
+        'workitem.label.add',
+        'workitem.label.remove',
+        'workitem.comment.upsert',
+        'workitem.close',
+        'workitem.edit-body',
+        'workitem.list',
+        'workitem.search',
+        'repo.labels.list',
+        'repo.label.ensure',
         'pr.view',
+        'pr.view:any-state',
         'pr.create',
         'pr.edit-body',
         'pr.ready',
+        'pr.draft',
         'comment.upsert',
+        'pr.merge',
+        'checks.rerun',
+        'pr.reviews',
+        'pr.threads',
+        'pr.merge-state',
+        'pr.files',
+        'repo.file',
+        'pr.thread.reply',
+        'pr.thread.resolve',
       ],
+      mutationConditions: { 'pr.merge': ['head'] },
       token_env: ['GH_TOKEN', 'GITHUB_TOKEN'],
     });
   });
 
   test.each([
+    [
+      'HTTP URL',
+      'http://GHES.example.test:8080/Archon/Repo.git',
+      'ghes.example.test:8080',
+      'Archon/Repo',
+    ],
+    ...[
+      ['http', '80'],
+      ['https', '443'],
+      ['http', '443'],
+      ['https', '80'],
+      ['https', '8080'],
+    ].map(([protocol, port]) => [
+      `${protocol} port ${port}`,
+      `${protocol}://GHES.example.test:${port}/Archon/Repo.git`,
+      `ghes.example.test:${port}`,
+      'Archon/Repo',
+    ]),
     ['https URL', 'https://github.com/Archon/Repo.git', 'github.com', 'Archon/Repo'],
     [
       'SSH URL',
@@ -43,11 +126,36 @@ describe('GitHub outbound producer', () => {
       'github.example.test',
       'Archon/Repo',
     ],
+    ...['http', 'https', 'ssh'].flatMap(protocol =>
+      normalizedRemotePaths.map(path => [
+        `${protocol} normalized path ${JSON.stringify(path)}`,
+        `${protocol}://ghes.example.test:8080/${path}`,
+        'ghes.example.test:8080',
+        'team/repo',
+      ])
+    ),
+    [
+      'SSH backslash owner',
+      'ssh://ghes.example.test:8080/team\\extra/repo.git',
+      'ghes.example.test:8080',
+      'team\\extra/repo',
+    ],
+    [
+      'SSH backslash repository',
+      'ssh://ghes.example.test:8080/team/repo\\extra.git',
+      'ghes.example.test:8080',
+      'team/repo\\extra',
+    ],
     ['SCP-like SSH', 'git@github.com:Archon/Repo.git', 'github.com', 'Archon/Repo'],
   ])('resolves an explicit %s remote', async (_label, remote, host, path) => {
     const response = await handleGithubOperation(
       { operationId: 'resolve-1', op: 'resolve', remote },
-      { token: undefined }
+      {
+        token: undefined,
+        fetch: async () => {
+          throw new Error('Resolution must not fetch');
+        },
+      }
     );
     expect(response).toMatchObject({
       ok: true,
@@ -55,20 +163,83 @@ describe('GitHub outbound producer', () => {
     });
   });
 
-  test('rejects credential-bearing HTTP remotes and treats unsupported remotes as none', async () => {
+  test.each([
+    ['a pull request', 'https://github.com/Archon/Repo/pull/42', { kind: 'pr', number: 42 }],
+    ['an issue', 'https://github.com/Archon/Repo/issues/7', { kind: 'issue', number: 7 }],
+    [
+      'a link to one comment',
+      'https://github.com/Archon/Repo/pull/42#issuecomment-9',
+      { kind: 'pr', number: 42 },
+    ],
+  ])('resolves the web URL of %s to its repository and number', async (_label, remote, subject) => {
+    const response = await handleGithubOperation(
+      { operationId: 'resolve-web', op: 'resolve', remote, web: true },
+      { token: undefined, fetch: failingFetch }
+    );
+    expect(response).toMatchObject({
+      ok: true,
+      result: {
+        op: 'resolve',
+        value: { kind: 'resolved', repo: { host: 'github.com', path: 'Archon/Repo' }, subject },
+      },
+    });
+  });
+
+  test.each([
+    'https://github.com/Archon/Repo',
+    'https://github.com/Archon/Repo/pull/0',
+    'https://github.com/Archon/Repo/tree/main',
+    'git@github.com:Archon/Repo.git',
+  ])('answers none for %s, which names no issue or pull request', async remote => {
+    const response = await handleGithubOperation(
+      { operationId: 'resolve-web', op: 'resolve', remote, web: true },
+      { token: undefined, fetch: failingFetch }
+    );
+    expect(response).toMatchObject({ ok: true, result: { value: { kind: 'none' } } });
+  });
+
+  test.each([
+    'https://secret@github.com/a/b.git',
+    'http://secret@ghes.example.test:8080/a/b.git',
+    'http://:secret@ghes.example.test:8080/a/b.git',
+    'http://user:secret@ghes.example.test:8080/a/b.git',
+    'http://ghes.example.test:8080/a/b.git?query=1',
+    'http://ghes.example.test:8080/a/b.git#fragment',
+    ...['http', 'https', 'ssh'].flatMap(protocol =>
+      ['?', '#'].map(marker => `${protocol}://ghes.example.test:8080/a/b.git${marker}`)
+    ),
+  ])('rejects credentials, queries and fragments: %s', async remote => {
     expect(
       await handleGithubOperation(
-        { operationId: 'resolve-1', op: 'resolve', remote: 'https://secret@github.com/a/b.git' },
+        { operationId: 'resolve-invalid', op: 'resolve', remote },
         { token: undefined }
       )
     ).toMatchObject({ ok: false, error: { kind: 'invalid_request' } });
+  });
+
+  test.each([
+    '/workspace/local-repository',
+    ...['http', 'https', 'ssh'].flatMap(protocol =>
+      invalidRemotePaths.map(path => `${protocol}://ghes.example.test:8080/${path}`)
+    ),
+    ...['http', 'https'].flatMap(protocol =>
+      invalidHttpRemotePaths.map(path => `${protocol}://ghes.example.test:8080/${path}`)
+    ),
+    ...['http', 'https'].flatMap(protocol =>
+      ['team/repo.git', 'team/extra/repo.git'].map(
+        path => `${protocol}://ghes.example.test:8080\\${path}`
+      )
+    ),
+    'git@ghes.example.test:team/..git',
+    'git@ghes.example.test:team/...git',
+  ])('treats invalid repository paths as none: %s', async remote => {
     expect(
       await handleGithubOperation(
-        { operationId: 'resolve-2', op: 'resolve', remote: '/workspace/local-repository' },
+        { operationId: 'resolve-invalid', op: 'resolve', remote },
         { token: undefined }
       )
     ).toEqual({
-      operationId: 'resolve-2',
+      operationId: 'resolve-invalid',
       ok: true,
       result: { op: 'resolve', value: { kind: 'none', forge: 'none' } },
     });
@@ -80,6 +251,7 @@ describe('GitHub outbound producer', () => {
       const url = String(input);
       urls.push(url);
       if (url.endsWith('/pulls/42')) return json({ head: { sha: 'exact-head-revision' } });
+      if (url.includes('/actions/runs')) return json({ total_count: 0, workflow_runs: [] });
       if (url.includes('/check-runs')) {
         return json({
           check_runs: [
@@ -143,6 +315,7 @@ describe('GitHub outbound producer', () => {
       const url = String(input);
       seen.push(url);
       if (url.endsWith('/pulls/7')) return json({ head: { sha: 'abc123' } });
+      if (url.includes('/actions/runs')) return json({ total_count: 0, workflow_runs: [] });
       if (url.includes('/check-runs')) return json({ check_runs: [] });
       if (url.endsWith('page=1')) return json(firstPage);
       if (url.endsWith('page=2')) return json([{ id: 101, context: 'last', state: 'success' }]);
@@ -244,6 +417,7 @@ test('passes the public read conformance kit for an external-status-only reposit
         fetch: async input => {
           const url = String(input);
           if (url.includes('/pulls/')) return json({ head: { sha: 'fixture-revision' } });
+          if (url.includes('/actions/runs')) return json({ total_count: 0, workflow_runs: [] });
           if (url.includes('/check-runs')) return json({ check_runs: [] });
           return json([{ id: 55, context: 'external/status', state: 'success' }]);
         },
@@ -261,4 +435,616 @@ test('passes the public read conformance kit for an external-status-only reposit
     ]
   );
   expect(failures).toEqual([]);
+});
+
+test.each([
+  ['action_required', 'head', true],
+  ['action_required', 'old-head', false],
+  [null, 'head', false],
+  ['success', 'head', false],
+] as const)(
+  'approval evidence uses explicit workflow conclusions at the current head: %s %s',
+  async (conclusion, head, approvalPending) => {
+    const response = await handleGithubOperation(checksRequest, {
+      token: 'token',
+      fetch: async input => {
+        const url = String(input);
+        if (url.includes('/pulls/')) return json({ head: { sha: 'head' } });
+        if (url.includes('/actions/runs'))
+          return json({
+            total_count: 1,
+            workflow_runs: [
+              {
+                id: 100,
+                head_sha: head,
+                check_suite_id: 10,
+                run_attempt: 1,
+                status: conclusion === null ? 'waiting' : 'completed',
+                conclusion,
+              },
+            ],
+          });
+        if (url.includes('/check-runs')) return json({ check_runs: [] });
+        return json([]);
+      },
+    });
+    expect(response).toMatchObject({
+      ok: true,
+      result: { value: { approvalPending, units: [], summary: { state: 'none' } } },
+    });
+  }
+);
+
+test('failed or truncated Actions enumeration cannot certify absence of approval', async () => {
+  for (const reply of [json({}, 403), json({ total_count: 1001, workflow_runs: [] })]) {
+    const response = await handleGithubOperation(checksRequest, {
+      token: 'token',
+      fetch: async input => {
+        const url = String(input);
+        if (url.includes('/pulls/')) return json({ head: { sha: 'head' } });
+        if (url.includes('/actions/runs')) return reply;
+        if (url.includes('/check-runs')) return json({ check_runs: [] });
+        return json([]);
+      },
+    });
+    expect(response.ok).toBe(false);
+  }
+});
+
+test('check suites resolve opaque rerun groups, preserving distinct same-name check units', async () => {
+  const response = await handleGithubOperation(checksRequest, {
+    token: 'token',
+    fetch: async input => {
+      const url = String(input);
+      if (url.includes('/pulls/')) return json({ head: { sha: 'head' } });
+      if (url.includes('/actions/runs'))
+        return json({
+          total_count: 1,
+          workflow_runs: [
+            {
+              id: 900,
+              head_sha: 'head',
+              check_suite_id: 10,
+              run_attempt: 3,
+              status: 'completed',
+              conclusion: 'failure',
+            },
+          ],
+        });
+      if (url.includes('/check-runs'))
+        return json({
+          check_runs: [1, 2].map(id => ({
+            id,
+            name: 'same',
+            head_sha: 'head',
+            app: { slug: 'github-actions' },
+            check_suite: { id: 10 },
+            status: 'completed',
+            conclusion: 'failure',
+          })),
+        });
+      return json([{ id: 3, context: 'external', state: 'failure' }]);
+    },
+  });
+  if (!response.ok || response.result.op !== 'checks.state') throw new Error('expected checks');
+  expect(response.result.value.units.map(unit => [unit.unit.id, unit.rerun])).toEqual([
+    ['1', { id: '900', attempt: 3 }],
+    ['2', { id: '900', attempt: 3 }],
+    ['3', null],
+  ]);
+});
+
+test('workflow-run approval enumeration includes later enterprise pages', async () => {
+  const seen: string[] = [];
+  const response = await handleGithubOperation(
+    {
+      ...checksRequest,
+      ref: { ...checksRequest.ref, repo: { host: 'ghe.example.test', path: 'owner/repo' } },
+    },
+    {
+      token: 'token',
+      fetch: async input => {
+        const url = String(input);
+        seen.push(url);
+        if (url.includes('/pulls/')) return json({ head: { sha: 'head' } });
+        if (url.includes('/check-runs')) return json({ check_runs: [] });
+        if (url.includes('/statuses')) return json([]);
+        const run = {
+          id: 100,
+          head_sha: 'head',
+          check_suite_id: 10,
+          run_attempt: 1,
+          status: 'completed',
+          conclusion: 'success',
+        };
+        return json({
+          total_count: 101,
+          workflow_runs: url.endsWith('page=1')
+            ? Array.from({ length: 100 }, (_, id) => ({ ...run, id }))
+            : [{ ...run, conclusion: 'action_required' }],
+        });
+      },
+    }
+  );
+  expect(response).toMatchObject({
+    ok: true,
+    result: { value: { approvalPending: true, summary: { state: 'none' } } },
+  });
+  expect(seen).toContain(
+    'https://ghe.example.test/api/v3/repos/owner/repo/actions/runs?head_sha=head&per_page=100&page=2'
+  );
+});
+
+test('empty-response mode is explicit and never disables existing JSON validation', async () => {
+  const { githubRequest } = await import('./api');
+  const fetch = async () => new Response(null, { status: 201 });
+  await expect(githubRequest(fetch, 'token', 'https://api.github.com/test')).rejects.toThrow(
+    'invalid JSON'
+  );
+  expect(
+    await githubRequest(fetch, 'token', 'https://api.github.com/test', {}, undefined, 'empty')
+  ).toBeUndefined();
+});
+
+describe('GitHub forge origins', () => {
+  test.each([
+    [
+      'http://GHES.example.test:8080/',
+      'ghes.example.test:8080',
+      'http://ghes.example.test:8080/api/v3',
+      'http://ghes.example.test:8080/api/graphql',
+    ],
+    [
+      'http://ghes.example.test:80',
+      'ghes.example.test:80',
+      'http://ghes.example.test/api/v3',
+      'http://ghes.example.test/api/graphql',
+    ],
+    [
+      'http://ghes.example.test:8080',
+      'ghes.example.test:08080',
+      'http://ghes.example.test:8080/api/v3',
+      'http://ghes.example.test:8080/api/graphql',
+    ],
+    [
+      'http://ghes.example.test:80',
+      'ghes.example.test',
+      'http://ghes.example.test/api/v3',
+      'http://ghes.example.test/api/graphql',
+    ],
+    [
+      'https://ghes.example.test:443',
+      'ghes.example.test:443',
+      'https://ghes.example.test/api/v3',
+      'https://ghes.example.test/api/graphql',
+    ],
+    [
+      'http://ghes.example.test:8080',
+      'GHES.EXAMPLE.TEST:8080',
+      'http://ghes.example.test:8080/api/v3',
+      'http://ghes.example.test:8080/api/graphql',
+    ],
+    [
+      'https://ghes.example.test:8443',
+      'ghes.example.test:8443',
+      'https://ghes.example.test:8443/api/v3',
+      'https://ghes.example.test:8443/api/graphql',
+    ],
+    [
+      'http://ghes.example.test:443',
+      'ghes.example.test:443',
+      'http://ghes.example.test:443/api/v3',
+      'http://ghes.example.test:443/api/graphql',
+    ],
+    [
+      'http://github.com:8080',
+      'github.com',
+      'https://api.github.com',
+      'https://api.github.com/graphql',
+    ],
+    [
+      'http://other.example.test:8080',
+      'ghes.example.test:8080',
+      'https://ghes.example.test:8080/api/v3',
+      'https://ghes.example.test:8080/api/graphql',
+    ],
+    [
+      'http://ghes.example.test:8080',
+      'ghes.example.test:8443',
+      'https://ghes.example.test:8443/api/v3',
+      'https://ghes.example.test:8443/api/graphql',
+    ],
+    [
+      '',
+      'ghes.example.test',
+      'https://ghes.example.test/api/v3',
+      'https://ghes.example.test/api/graphql',
+    ],
+    [
+      'http://ghes.example.test:8080',
+      'github.com',
+      'https://api.github.com',
+      'https://api.github.com/graphql',
+    ],
+  ])('routes REST and GraphQL with GITHUB_URL=%s for %s', async (origin, host, rest, graphql) => {
+    const previous = process.env.GITHUB_URL;
+    process.env.GITHUB_URL = origin;
+    try {
+      const repo = { host, path: 'owner/repo' };
+      const calls: { url: string; authorization: string | null }[] = [];
+      const fetch = async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          url: String(input),
+          authorization: new Headers(init?.headers).get('authorization'),
+        });
+        return Response.json(
+          init?.method === 'POST'
+            ? {
+                data: {
+                  repository: {
+                    pullRequest: {
+                      reviewThreads: {
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                        nodes: [],
+                      },
+                    },
+                  },
+                },
+              }
+            : []
+        );
+      };
+      expect(
+        await handleGithubOperation(
+          { operationId: 'labels', op: 'repo.labels.list', repo },
+          { token: 'selected-token', fetch }
+        )
+      ).toMatchObject({ ok: true });
+      expect(
+        await handleGithubOperation(
+          { operationId: 'threads', op: 'pr.threads', ref: { repo, number: 1 } },
+          { token: 'selected-token', fetch }
+        )
+      ).toMatchObject({ ok: true });
+      expect(calls).toEqual([
+        {
+          url: `${rest}/repos/owner/repo/labels?per_page=100&page=1`,
+          authorization: 'Bearer selected-token',
+        },
+        { url: graphql, authorization: 'Bearer selected-token' },
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.GITHUB_URL;
+      else process.env.GITHUB_URL = previous;
+    }
+  });
+
+  test.each(['owner/../repo', 'owner/.git', 'owner/..git', 'owner/...git'])(
+    'invalid repository path %s fails before shared and head-repository consumers fetch',
+    async path => {
+      let calls = 0;
+      const fetch = async () => {
+        calls++;
+        throw new Error('Invalid repository must not fetch');
+      };
+      const repo = { host: 'ghes.example.test:8080', path };
+      const baseRepo = { ...repo, path: 'valid/repo' };
+      const operationId = 'invalid-path';
+      const requests = [
+        { operationId, op: 'repo.labels.list', repo },
+        { operationId, op: 'pr.threads', ref: { repo, number: 1 } },
+        {
+          operationId,
+          op: 'pr.view',
+          selector: { kind: 'head', repo: baseRepo, headRepo: repo, head: 'feature' },
+        },
+        {
+          operationId,
+          op: 'pr.create',
+          repo: baseRepo,
+          headRepo: repo,
+          head: 'feature',
+          headRevision: 'a'.repeat(40),
+          base: 'dev',
+          title: 'title',
+          body: '',
+          draft: false,
+        },
+      ] satisfies ForgeRequest[];
+      for (const request of requests) {
+        const response = await handleGithubOperation(request, {
+          token: 'selected-token',
+          fetch,
+        });
+        expect(response).toMatchObject({
+          ok: false,
+          error: { kind: 'invalid_request', message: expect.stringContaining('repository path') },
+        });
+      }
+      expect(calls).toBe(0);
+    }
+  );
+});
+
+test('invalid configured GitHub origins fail before sending a credential', async () => {
+  const previous = process.env.GITHUB_URL;
+  process.env.GITHUB_URL = 'http://user:private@ghes.example.test:8080';
+  try {
+    let calls = 0;
+    const fetch = async () => {
+      calls++;
+      return Response.json({});
+    };
+    const repo = { host: 'ghes.example.test:8080', path: 'owner/repo' };
+    for (const request of [
+      { operationId: 'labels', op: 'repo.labels.list', repo },
+      { operationId: 'threads', op: 'pr.threads', ref: { repo, number: 1 } },
+      {
+        operationId: 'create',
+        op: 'repo.label.ensure',
+        repo,
+        name: 'queued',
+        color: 'abcdef',
+        description: '',
+      },
+    ] satisfies ForgeRequest[]) {
+      const response = await handleGithubOperation(request, { token: 'selected-token', fetch });
+      expect(response).toMatchObject({
+        ok: false,
+        error: { message: expect.stringContaining('GITHUB_URL') },
+      });
+      expect(JSON.stringify(response)).not.toContain('private');
+    }
+    expect(calls).toBe(0);
+  } finally {
+    if (previous === undefined) delete process.env.GITHUB_URL;
+    else process.env.GITHUB_URL = previous;
+  }
+});
+
+test('dispatch resolves HTTPS default ports through exact or bare host claims', async () => {
+  const host = 'ghes.example.test';
+  const discovery = await discoverPlugins({
+    config: {
+      plugins: [
+        {
+          plugin: 'github',
+          command: process.execPath,
+          args: [resolve(import.meta.dir, 'plugin.ts')],
+        },
+      ],
+      hosts: { [host]: 'github', [`${host}:443`]: 'github' },
+      scanPath: false,
+    },
+    env: {},
+  });
+  const plugin = discovery.plugins[0];
+  for (const byHost of [
+    new Map([[host, plugin]]),
+    new Map([[`${host}:443`, plugin]]),
+    new Map([
+      [`${host}:443`, plugin],
+      [host, { ...plugin, metadata: { ...plugin.metadata, name: 'bare', capabilities: [] } }],
+    ]),
+  ]) {
+    const result = await dispatchForge(
+      { operationId: 'default-port', op: 'resolve', remote: `https://${host}:443/team/repo.git` },
+      { discovery: { ...discovery, byHost }, env: {} }
+    );
+    expect(result.plugin).toEqual({ name: 'github', version: '1' });
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: {
+        op: 'resolve',
+        value: { kind: 'resolved', repo: { host: `${host}:443`, path: 'team/repo' } },
+      },
+    });
+    if (
+      !result.response.ok ||
+      result.response.result.op !== 'resolve' ||
+      result.response.result.value.kind !== 'resolved'
+    )
+      throw new Error('Expected resolved repository');
+    expect(result.response.result.value.repo.hostClaim).toEqual(
+      byHost.has(`${host}:443`) ? undefined : true
+    );
+    const qualified = await dispatchForge(
+      {
+        operationId: 'qualified-port',
+        op: 'repo.labels.list',
+        repo: JSON.parse(JSON.stringify(result.response.result.value.repo)),
+      },
+      { discovery: { ...discovery, byHost }, env: { GH_TOKEN: '' } }
+    );
+    expect(qualified.plugin).toEqual({ name: 'github', version: '1' });
+    expect(qualified.response).toMatchObject({ ok: false, error: { kind: 'no_credential' } });
+  }
+  for (const remote of [
+    `http://${host}:80/team/repo.git`,
+    `http://${host}:443/team/repo.git`,
+    `https://${host}:8443/team/repo.git`,
+    `ssh://git@${host}:443/team/repo.git`,
+  ]) {
+    const result = await dispatchForge(
+      { operationId: 'unclaimed-port', op: 'resolve', remote },
+      { discovery: { ...discovery, byHost: new Map([[host, plugin]]) }, env: {} }
+    );
+    expect(result.plugin).toBeNull();
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: { op: 'resolve', value: { kind: 'none', forge: 'none' } },
+    });
+  }
+  const qualified = await dispatchForge(
+    {
+      operationId: 'qualified-port',
+      op: 'repo.labels.list',
+      repo: { host: `${host}:443`, path: 'team/repo' },
+    },
+    { discovery: { ...discovery, byHost: new Map([[host, plugin]]) }, env: {} }
+  );
+  expect(qualified.plugin).toBeNull();
+  expect(qualified.response).toMatchObject({ ok: false, error: { kind: 'no_plugin_for_host' } });
+});
+
+test('dispatch resolves only claimed GitHub remotes and preserves parser validation', async () => {
+  const host = 'ghes.example.test:8080';
+  const discovery = await discoverPlugins({
+    config: {
+      plugins: [
+        {
+          plugin: 'github',
+          command: process.execPath,
+          args: [resolve(import.meta.dir, 'plugin.ts')],
+        },
+      ],
+      hosts: {
+        [host]: 'github',
+      },
+      scanPath: false,
+    },
+    env: {},
+  });
+  for (const [remote, expectedHost] of [
+    [`http://GHES.example.test:8080/team/repo.git`, host],
+    [`https://${host}/team/repo.git`, host],
+    [`ssh://git@${host}/team/repo.git`, host],
+    ['git@github.com:team/repo.git', 'github.com'],
+  ]) {
+    const result = await dispatchForge(
+      { operationId: 'resolve-dispatch', op: 'resolve', remote },
+      { discovery, env: {} }
+    );
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: {
+        op: 'resolve',
+        value: {
+          kind: 'resolved',
+          forge: 'github',
+          repo: { host: expectedHost, path: 'team/repo' },
+        },
+      },
+    });
+    expect(result.plugin).toEqual({ name: 'github', version: '1' });
+  }
+  for (const remote of [
+    'http://unclaimed.example.test:8080/team/repo.git',
+    'http://ghes.example.test:9090/team/repo.git',
+  ]) {
+    const unclaimed = await dispatchForge(
+      { operationId: 'unclaimed', op: 'resolve', remote },
+      { discovery, env: {} }
+    );
+    expect(unclaimed.plugin).toBeNull();
+    expect(unclaimed.response).toMatchObject({
+      ok: true,
+      result: { op: 'resolve', value: { kind: 'none', forge: 'none' } },
+    });
+  }
+  for (const remote of [
+    `http://user@${host}/team/repo.git`,
+    `http://${host}/team/repo.git?query=1`,
+    `http://${host}/team/repo.git#fragment`,
+  ]) {
+    const result = await dispatchForge(
+      { operationId: 'invalid', op: 'resolve', remote },
+      { discovery, env: {} }
+    );
+    expect(result.response).toMatchObject({ ok: false, error: { kind: 'invalid_request' } });
+  }
+  for (const remote of [
+    `http://${host}/team/../owner/repo.git`,
+    `http://${host}/team%5Cextra/repo.git`,
+    `http://${host}/\\team/repo.git`,
+  ]) {
+    const result = await dispatchForge(
+      { operationId: 'invalid-path', op: 'resolve', remote },
+      { discovery, env: {} }
+    );
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: { op: 'resolve', value: { kind: 'none', forge: 'none' } },
+    });
+  }
+});
+
+describe('temporary failures are told apart by status, header or error type', () => {
+  const repo = { host: 'github.com', path: 'archon/test' };
+  const view = {
+    operationId: 'view',
+    op: 'pr.view',
+    selector: { kind: 'number', ref: { repo, number: 42 } },
+  } satisfies ForgeRequest;
+  const search = {
+    operationId: 'search',
+    op: 'workitem.search',
+    repo,
+    text: 'retry backoff',
+  } satisfies ForgeRequest;
+  const answer = (status: number, headers: Record<string, string> = {}): Response =>
+    Response.json({ message: 'You have exceeded a secondary rate limit.' }, { status, headers });
+
+  test.each([
+    ['a 503', view, () => answer(503), 'unavailable'],
+    ['a 429', view, () => answer(429), 'rate_limited'],
+    [
+      'a search 403 with retry-after',
+      search,
+      () => answer(403, { 'retry-after': '60' }),
+      'rate_limited',
+    ],
+    [
+      'a search 403 with an exhausted limit',
+      search,
+      () => answer(403, { 'x-ratelimit-remaining': '0' }),
+      'rate_limited',
+    ],
+    // Without a header only the message says "rate limit", and prose is not read.
+    ['a 403 with neither header', search, () => answer(403), 'authorization'],
+    [
+      'a 403 with quota left',
+      view,
+      () => answer(403, { 'x-ratelimit-remaining': '4999' }),
+      'authorization',
+    ],
+  ] as const)('%s is %s, asked once', async (_name, request, reply, kind) => {
+    let calls = 0;
+    const response = await handleGithubOperation(request, {
+      token: 'token',
+      fetch: async () => {
+        calls++;
+        return reply();
+      },
+    });
+    expect(response).toMatchObject({ ok: false, error: { kind, status: reply().status } });
+    // The host owns the retry, so the plugin asks GitHub once per request it makes.
+    expect(calls).toBe(request.op === 'workitem.search' ? 2 : 1);
+  });
+
+  test('no answer at all is unavailable', async () => {
+    const response = await handleGithubOperation(view, {
+      token: 'token',
+      fetch: async () => {
+        throw new TypeError('connection lost');
+      },
+    });
+    expect(response).toEqual({
+      operationId: 'view',
+      ok: false,
+      error: { kind: 'unavailable', message: 'GitHub API request failed' },
+    });
+  });
+
+  test('a GraphQL RATE_LIMITED error is rate limited', async () => {
+    const response = await handleGithubOperation(
+      { operationId: 'threads', op: 'pr.threads', ref: { repo, number: 42 } },
+      {
+        token: 'token',
+        fetch: async () =>
+          Response.json({ errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded' }] }),
+      }
+    );
+    expect(response).toMatchObject({ ok: false, error: { kind: 'rate_limited' } });
+  });
 });

@@ -13,7 +13,9 @@
  * so a future SDK update that reads the filesystem at module load can't
  * break compiled-binary bootstrap.
  */
+import type { CredentialStatus } from '@archon/provider-contract';
 import { createLogger } from '@archon/paths';
+import { sessionPreview } from '@archon/provider-contract';
 import type {
   CopilotClientOptions,
   CopilotSession,
@@ -31,11 +33,11 @@ import type {
   SendQueryOptions,
 } from '../../types';
 import { loadMcpConfig } from '../../mcp/config';
-import { resolveSkillDirectories } from '../../shared/skills';
+import { resolveSkillDirectories } from '@archon/paths/skills';
 import { augmentPromptForJsonSchema } from '../../shared/structured-output';
 import { COPILOT_CAPABILITIES } from './capabilities';
 import { COPILOT_EFFORTS, parseCopilotConfig, type CopilotProviderDefaults } from './config';
-import { clampEffort } from '@archon/paths/effort';
+import { clampEffort } from '@archon/provider-contract';
 import { resolveCopilotBinaryPath } from './binary-resolver';
 import { bridgeSession } from './event-bridge';
 import { closeOpenToolCalls } from '../../shared/tool-calls';
@@ -188,11 +190,9 @@ function resolveCopilotReasoning(
 
 function resolveSystemMessage(requestOptions?: SendQueryOptions): SystemMessageConfig | undefined {
   const requestPrompt = requestOptions?.systemPrompt;
-  const nodePrompt =
-    typeof requestOptions?.nodeConfig?.systemPrompt === 'string'
-      ? requestOptions.nodeConfig.systemPrompt
-      : undefined;
-  const content = requestPrompt ?? nodePrompt;
+  const explicitPrompt = requestPrompt ?? requestOptions?.nodeConfig?.systemPrompt;
+  const prompt = explicitPrompt ?? requestOptions?.appendSystemPrompt;
+  const content = Array.isArray(prompt) ? prompt.join('\n') : prompt;
   if (typeof content === 'string' && content.length > 0) {
     return { mode: 'append', content };
   }
@@ -203,9 +203,9 @@ function resolveSystemMessage(requestOptions?: SendQueryOptions): SystemMessageC
 
 /**
  * Translate Archon's per-node `allowed_tools` / `denied_tools` to Copilot's
- * `availableTools` / `excludedTools`. Copilot's spec: `availableTools` takes
- * precedence over `excludedTools`; we pass both through when present and let
- * the SDK enforce precedence.
+ * `availableTools` / `excludedTools`. Both match every session tool, MCP tools
+ * included, and `excludedTools` wins over `availableTools`; we pass both
+ * through when present and let the SDK enforce precedence.
  */
 function applyToolRestrictions(
   sessionConfig: SessionConfig,
@@ -448,6 +448,10 @@ function buildFriendlyCopilotError(error: unknown, lastSessionError?: string): E
  * per-request env vars are honored.
  */
 export class CopilotProvider implements IAgentProvider {
+  async checkCredential(): Promise<CredentialStatus> {
+    return { state: 'not_checked', source: 'native' };
+  }
+
   getType(): string {
     return 'copilot';
   }
@@ -493,18 +497,11 @@ export class CopilotProvider implements IAgentProvider {
   ): AsyncGenerator<MessageChunk> {
     const log = getLog();
 
-    // forkSession / persistSession are boolean flags the executor may set in
-    // normal operation; log-warn rather than throw — throwing would block
-    // ordinary session reuse.
+    // The executor sets forkSession in normal operation; log rather than throw,
+    // which would block ordinary session reuse.
     if (requestOptions?.forkSession !== undefined) {
       log.debug(
         { option: 'forkSession', value: requestOptions.forkSession },
-        'copilot.option_not_supported'
-      );
-    }
-    if (requestOptions?.persistSession !== undefined) {
-      log.debug(
-        { option: 'persistSession', value: requestOptions.persistSession },
         'copilot.option_not_supported'
       );
     }
@@ -536,8 +533,8 @@ export class CopilotProvider implements IAgentProvider {
       yield { type: 'warning', ...w };
     }
 
-    // Best-effort structured output: Copilot has no native JSON-mode, so we
-    // augment the prompt with the schema. bridgeSession parses the
+    // Best-effort structured output: augment the prompt with the schema.
+    // bridgeSession parses the
     // accumulated assistant transcript and attaches `structuredOutput` to
     // the terminal result chunk.
     const outputFormat = requestOptions?.outputFormat;
@@ -560,12 +557,15 @@ export class CopilotProvider implements IAgentProvider {
     const wantsFork = requestOptions?.forkSession === true;
     try {
       if (resumeSessionId && !wantsFork) {
-        log.debug({ sessionId: resumeSessionId, cwd }, 'copilot.resume_attempt');
+        log.debug(
+          { sessionIdPreview: sessionPreview(resumeSessionId), cwd },
+          'copilot.resume_attempt'
+        );
         try {
           session = await client.resumeSession(resumeSessionId, sessionConfig);
         } catch (err) {
           log.debug(
-            { err, sessionId: resumeSessionId },
+            { err, sessionIdPreview: sessionPreview(resumeSessionId) },
             'copilot.resume_failed_falling_back_to_create'
           );
           resumeFailed = true;
@@ -574,7 +574,7 @@ export class CopilotProvider implements IAgentProvider {
       } else {
         if (resumeSessionId && wantsFork) {
           log.warn(
-            { requestedResumeSessionId: resumeSessionId },
+            { requestedResumeSessionIdPreview: sessionPreview(resumeSessionId) },
             'copilot.fork_unsupported_creating_fresh_session'
           );
           forkedToFresh = true;
@@ -610,7 +610,7 @@ export class CopilotProvider implements IAgentProvider {
 
     log.info(
       {
-        sessionId: session.sessionId,
+        sessionIdPreview: sessionPreview(session.sessionId),
         model: sessionConfig.model,
         cwd,
         reasoningEffort: sessionConfig.reasoningEffort,
@@ -634,9 +634,12 @@ export class CopilotProvider implements IAgentProvider {
         ),
         { resultEndsTurn: true }
       );
-      log.info({ sessionId: session.sessionId }, 'copilot.prompt_completed');
+      log.info({ sessionIdPreview: sessionPreview(session.sessionId) }, 'copilot.prompt_completed');
     } catch (err) {
-      log.error({ err, sessionId: session.sessionId }, 'copilot.prompt_failed');
+      log.error(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.prompt_failed'
+      );
       throw buildFriendlyCopilotError(err);
     } finally {
       // Stop the client so its CLI subprocess shuts down; bridgeSession already

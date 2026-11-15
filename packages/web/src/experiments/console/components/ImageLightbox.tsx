@@ -60,7 +60,7 @@ export function ImageLightbox({
       aria-modal="true"
       aria-label={current.name}
       onClick={onClose}
-      className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-[14px] bg-[rgba(0,0,0,0.82)] p-[24px] backdrop-blur-[2px]"
+      className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3.5 bg-[rgba(0,0,0,0.82)] p-6 backdrop-blur-[2px]"
     >
       <img
         src={current.url}
@@ -68,13 +68,13 @@ export function ImageLightbox({
         onClick={e => {
           e.stopPropagation();
         }}
-        className="max-h-[82vh] max-w-[92vw] rounded-[8px] object-contain shadow-[0_24px_80px_-20px_rgba(0,0,0,0.8)]"
+        className="max-h-[82vh] max-w-[92vw] rounded-md object-contain shadow-[0_24px_80px_-20px_rgba(0,0,0,0.8)]"
       />
       <div
         onClick={e => {
           e.stopPropagation();
         }}
-        className="flex items-center gap-[12px] font-mono text-[11.5px] text-text-secondary"
+        className="flex items-center gap-3 font-mono text-console-12 text-text-secondary"
       >
         {images.length > 1 ? (
           <button
@@ -83,7 +83,7 @@ export function ImageLightbox({
               step(-1);
             }}
             aria-label="Previous image"
-            className="rounded px-[8px] py-[3px] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+            className="rounded px-2 py-0.75 transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
           >
             ←
           </button>
@@ -100,7 +100,7 @@ export function ImageLightbox({
                 step(1);
               }}
               aria-label="Next image"
-              className="rounded px-[8px] py-[3px] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+              className="rounded px-2 py-0.75 transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
             >
               →
             </button>
@@ -110,7 +110,7 @@ export function ImageLightbox({
           type="button"
           onClick={onClose}
           aria-label="Close"
-          className="rounded border px-[8px] py-[3px] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+          className="rounded border px-2 py-0.75 transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
           style={{ borderColor: 'var(--border-bright)' }}
         >
           esc

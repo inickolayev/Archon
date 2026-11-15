@@ -35,6 +35,27 @@ export function GithubIdentityPanel(): ReactElement | null {
     };
   }, []);
 
+  const pollUntilConnected = async (
+    start: Awaited<ReturnType<typeof skill.startGithubDeviceFlow>>
+  ): Promise<boolean> => {
+    const deadline = Date.now() + start.expires_in * 1000;
+    let interval = Math.max(1, start.interval);
+    for (;;) {
+      if (cancelledRef.current) return false;
+      if (Date.now() > deadline) throw new Error('Device code expired — try again.');
+      await new Promise(r => setTimeout(r, interval * 1000));
+      if (cancelledRef.current) return false;
+      const res = await skill.pollGithubDeviceFlow(start.device_code);
+      const step = skill.interpretPollStatus(res, interval);
+      if (step.kind === 'connected') return true;
+      if (step.kind === 'retry') {
+        interval = step.nextInterval;
+        continue;
+      }
+      throw new Error(step.message); // 'failed'
+    }
+  };
+
   const connect = async (): Promise<void> => {
     setPhase('pending');
     setMessage(null);
@@ -43,29 +64,13 @@ export function GithubIdentityPanel(): ReactElement | null {
       if (cancelledRef.current) return;
       setUserCode(start.user_code);
       setVerificationUri(start.verification_uri);
-      const deadline = Date.now() + start.expires_in * 1000;
-      let interval = Math.max(1, start.interval);
-      for (;;) {
-        if (cancelledRef.current) return;
-        if (Date.now() > deadline) throw new Error('Device code expired — try again.');
-        await new Promise(r => setTimeout(r, interval * 1000));
-        if (cancelledRef.current) return;
-        const res = await skill.pollGithubDeviceFlow(start.device_code);
-        const step = skill.interpretPollStatus(res, interval);
-        if (step.kind === 'connected') {
-          // Keep `phase = 'pending'` (button stays "Connecting…") until the
-          // invalidate refetch flips `status.connected` to true — otherwise the
-          // not-connected branch flashes "Connect GitHub" for one render.
-          setUserCode(null);
-          setVerificationUri(null);
-          invalidate(K.githubConnection);
-          return;
-        }
-        if (step.kind === 'retry') {
-          interval = step.nextInterval;
-          continue;
-        }
-        throw new Error(step.message); // 'failed'
+      if (await pollUntilConnected(start)) {
+        // Keep `phase = 'pending'` (button stays "Connecting…") until the
+        // invalidate refetch flips `status.connected` to true — otherwise the
+        // not-connected branch flashes "Connect GitHub" for one render.
+        setUserCode(null);
+        setVerificationUri(null);
+        invalidate(K.githubConnection);
       }
     } catch (e: unknown) {
       if (cancelledRef.current) return;
@@ -99,21 +104,21 @@ export function GithubIdentityPanel(): ReactElement | null {
   if (error !== undefined) {
     return (
       <SettingsSection title="GitHub Identity">
-        <p className="font-mono text-[11px] text-error">{error.message}</p>
+        <p className="font-mono text-console-11 text-error">{error.message}</p>
       </SettingsSection>
     );
   }
   if (status === undefined) {
     return (
       <SettingsSection title="GitHub Identity">
-        <p className="font-mono text-[11px] text-text-tertiary">Loading…</p>
+        <p className="font-mono text-console-11 text-text-tertiary">Loading…</p>
       </SettingsSection>
     );
   }
 
   return (
     <SettingsSection title="GitHub Identity">
-      <div className="flex flex-col gap-3 text-[12px]">
+      <div className="flex flex-col gap-3 text-console-12">
         {status.connected ? (
           <div className="flex items-center justify-between gap-3">
             <span className="text-text-secondary">
@@ -124,7 +129,7 @@ export function GithubIdentityPanel(): ReactElement | null {
               type="button"
               onClick={() => void disconnect()}
               disabled={disconnecting}
-              className="shrink-0 rounded border border-border px-2.5 py-1 text-[11px] text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary disabled:opacity-40"
+              className="shrink-0 rounded border border-border px-2.5 py-1 text-console-11 text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary disabled:opacity-40"
             >
               {disconnecting ? 'Disconnecting…' : 'Disconnect'}
             </button>
@@ -138,7 +143,7 @@ export function GithubIdentityPanel(): ReactElement | null {
               type="button"
               onClick={() => void connect()}
               disabled={phase === 'pending'}
-              className="brand-bar shrink-0 rounded px-3 py-0.5 text-[11px] font-medium text-white transition-all hover:brightness-110 disabled:opacity-40"
+              className="brand-bar shrink-0 rounded px-3 py-0.5 text-console-11 font-medium text-white transition-all hover:brightness-110 disabled:opacity-40"
             >
               {phase === 'pending' ? 'Connecting…' : 'Connect GitHub'}
             </button>
@@ -167,7 +172,9 @@ export function GithubIdentityPanel(): ReactElement | null {
         {/* `message` is only ever set by a failed connect OR disconnect (both clear
             it on start), so render it whenever present — gating on `phase === 'error'`
             silently swallowed disconnect failures. */}
-        {message !== null ? <p className="font-mono text-[11px] text-error">{message}</p> : null}
+        {message !== null ? (
+          <p className="font-mono text-console-11 text-error">{message}</p>
+        ) : null}
       </div>
     </SettingsSection>
   );

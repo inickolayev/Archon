@@ -12,6 +12,7 @@ export * from './workflows';
 export * from './nodeSource';
 export * from './worktrees';
 export * from './runs';
+export * from './metrics';
 export * from './startRun';
 export * from './messages';
 export * from './conversations';

@@ -1,41 +1,5 @@
 import { describe, test, expect, afterEach } from 'bun:test';
-import {
-  buildWorkflowPath,
-  buildSavePath,
-  getWorkflowGraph,
-  listWorkflows,
-  nodeKind,
-} from './workflows';
-
-describe('buildWorkflowPath', () => {
-  test('encodes both name and cwd', () => {
-    expect(buildWorkflowPath('my-flow', 'D:/Dynamous/Archon')).toBe(
-      '/api/workflows/my-flow?cwd=D%3A%2FDynamous%2FArchon'
-    );
-  });
-
-  test('encodes special characters in the name', () => {
-    expect(buildWorkflowPath('a b', '/repo')).toBe('/api/workflows/a%20b?cwd=%2Frepo');
-  });
-
-  test('uses encodeURIComponent (not encodeURI) — a literal % is escaped', () => {
-    expect(buildWorkflowPath('50%off', '/repo')).toBe('/api/workflows/50%25off?cwd=%2Frepo');
-  });
-});
-
-describe('buildSavePath', () => {
-  test('appends &source=project to the encoded cwd query', () => {
-    expect(buildSavePath('my-flow', '/repo', 'project')).toBe(
-      '/api/workflows/my-flow?cwd=%2Frepo&source=project'
-    );
-  });
-
-  test('appends &source=global', () => {
-    expect(buildSavePath('my-flow', '/repo', 'global')).toBe(
-      '/api/workflows/my-flow?cwd=%2Frepo&source=global'
-    );
-  });
-});
+import { getWorkflowGraph, listWorkflows, loadWorkflow } from './workflows';
 
 describe('listWorkflows — declared inputs survive the wire mapping (#2554)', () => {
   const originalFetch = globalThis.fetch;
@@ -45,10 +9,6 @@ describe('listWorkflows — declared inputs survive the wire mapping (#2554)', (
   });
 
   test("carries a workflow's declared inputs through to the console primitive", async () => {
-    // The console's run form depends on this field surviving `listWorkflows`, and the
-    // wire shape here is hand-rolled — it once omitted `inputs` entirely and still
-    // compiled, because a missing optional property satisfies the parameter type. This
-    // is the regression guard the compiler cannot be.
     globalThis.fetch = ((_input: RequestInfo | URL, _init?: RequestInit) =>
       Promise.resolve(
         new Response(
@@ -75,32 +35,6 @@ describe('listWorkflows — declared inputs survive the wire mapping (#2554)', (
       { name: 'diff', required: true, default: null, description: null },
       { name: 'style', required: false, default: 'strict', description: null },
     ]);
-  });
-});
-
-describe('nodeKind — the transformed shape the endpoint actually serves', () => {
-  test('a command node is a command, not a prompt', () => {
-    expect(nodeKind({ id: 'write', kind: 'agent', source: { kind: 'command' } })).toBe('command');
-  });
-
-  test('an inline agent node is a prompt', () => {
-    expect(nodeKind({ id: 'ask', kind: 'agent', source: { kind: 'inline' } })).toBe('prompt');
-  });
-
-  test('an exec node with the shell runtime is bash; any other runtime is a script', () => {
-    expect(nodeKind({ id: 'build', kind: 'exec', runtime: 'sh' })).toBe('bash');
-    expect(nodeKind({ id: 'deliver', kind: 'exec', runtime: 'uv' })).toBe('script');
-  });
-
-  test('gate, halt and loop group read as their palette names', () => {
-    expect(nodeKind({ id: 'gate', kind: 'gate' })).toBe('approval');
-    expect(nodeKind({ id: 'stop', kind: 'halt' })).toBe('cancel');
-    expect(nodeKind({ id: 'each', kind: 'loop_group' })).toBe('loop');
-  });
-
-  test('a definition still in authoring shape keeps reading correctly', () => {
-    expect(nodeKind({ id: 'write', command: 'announce' })).toBe('command');
-    expect(nodeKind({ id: 'build', bash: 'make' })).toBe('bash');
   });
 });
 
@@ -134,5 +68,71 @@ describe('getWorkflowGraph', () => {
     await expect(getWorkflowGraph('await-checks')).resolves.toEqual([
       { id: 'checks', dependsOn: [], kind: 'wait' },
     ]);
+  });
+});
+
+describe('loadWorkflow', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function stubGet(body: unknown): void {
+    globalThis.fetch = ((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      )) as typeof fetch;
+  }
+
+  test('hands the builder the authored form, not the normalized one', async () => {
+    // The normalized `workflow` is what the engine runs; the builder imports and
+    // saves the authored shape, and the server rejects the normalized one on save.
+    const authored = {
+      name: 'assist',
+      description: 'one node',
+      nodes: [{ id: 'assist', command: 'archon-assist' }],
+    };
+    stubGet({
+      workflow: {
+        name: 'assist',
+        description: 'one node',
+        nodes: [
+          { id: 'assist', kind: 'agent', source: { kind: 'command', name: 'archon-assist' } },
+        ],
+      },
+      authored,
+      filename: 'assist.yaml',
+      source: 'bundled',
+    });
+
+    const loaded = await loadWorkflow('assist', '/repo');
+    expect(loaded).toMatchObject({ definition: authored });
+  });
+
+  test('reports an installed-pack workflow as such instead of failing on its missing authored form', async () => {
+    stubGet({
+      workflow: { name: 'acme/review:pr', description: 'pack entrypoint', nodes: [] },
+      filename: 'acme/review:pr',
+      source: 'installed',
+    });
+
+    expect(await loadWorkflow('acme/review:pr', '/repo')).toEqual({
+      installedPack: true,
+      name: 'acme/review:pr',
+    });
+  });
+
+  test('refuses a response without the authored form instead of editing the normalized one', async () => {
+    stubGet({
+      workflow: { name: 'assist', description: 'one node', nodes: [] },
+      filename: 'assist.yaml',
+      source: 'bundled',
+    });
+
+    await expect(loadWorkflow('assist', '/repo')).rejects.toThrow('authored');
   });
 });

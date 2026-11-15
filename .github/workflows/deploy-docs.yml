@@ -5,12 +5,10 @@ on:
     branches: [main]
     paths:
       - 'packages/docs-web/**'
-      # The community-provider page renders this file's contents, so changing it changes the site.
-      - 'packages/providers/src/community/_template/capabilities.ts'
+      - 'packages/plugin-manifest/**'
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
-
-env:
-  BUN_VERSION: '1.4.2'
 
 permissions:
   contents: read
@@ -22,7 +20,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Schedules run on the default branch (dev), which the github-pages
+  # environment refuses to deploy. The scheduled run only asks for a run
+  # on main; that run builds and deploys.
+  dispatch-main:
+    if: github.event_name == 'schedule'
+    permissions:
+      actions: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch the deploy on main
+        run: gh workflow run deploy-docs.yml --ref main --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   build:
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,12 +45,12 @@ jobs:
         with:
           node-version: 22
       - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Build docs
         run: bun run build:docs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

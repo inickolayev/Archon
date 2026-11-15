@@ -1,14 +1,20 @@
-import { serializeNodeStateRecord, type SerializedNodeEvent } from './node-record-serialization';
-import type { NodeExecutionMetadata, NodeExecutionRecord } from './schemas/node-execution';
-import type { CheckoutObservation } from './schemas/checkout-observation';
-import type { RunCancelReason, RunExitReason, RunStopSignal } from './schemas/run-terminal-reason';
 /**
- * IWorkflowStore - trait interface for workflow database operations.
+ * IWorkflowStore - persistence port for workflow operations.
  *
  * Mirrors the IIsolationStore pattern from @archon/isolation.
- * Implementations live in @archon/core (backed by the real DB);
+ * SQL lives in @archon/core; append-only files live in @archon/workflows.
  * the workflow engine depends only on this narrow interface.
+ *
+ * The records and rules every store shares live in `./store/` by area and are
+ * re-exported here, so this stays the one import path for the port.
  */
+import type { AttentionRead } from './schemas/attention-degraded';
+import type { IResourceStartStore } from './resource-start-store';
+import type { CheckoutObservation } from './schemas/checkout-observation';
+import type { ProviderEventQuery, ProviderEventRecord } from './schemas/provider-event';
+import type { WorkflowEventRow } from './schemas/workflow-event';
+import type { ExpectedApprovalGate } from './schemas/workflow-run';
+import type { ListDashboardRunsOptions, DashboardRunsResult } from './schemas/workflow-run-listing';
 import type {
   WorkflowRun,
   WorkflowRunOutcome,
@@ -16,67 +22,40 @@ import type {
   ApprovalContext,
   WorkflowAttentionWaitContext,
   WorkflowWaitContext,
-  WorkflowWaitResult,
-  ScheduledWorkflowResume,
   WorkflowNodeSession,
   WorkflowRunNodeSession,
 } from './schemas';
-import type { TokenUsage } from '@archon/providers/types';
-import type { FanOutInstanceSnapshot } from './fan-out-identity';
+import type { IStateDocumentStore } from './state-document-store';
+import type { AttentionAnswerWrite, AttentionLabelWrite } from './store/attention-writes';
+import type { PauseCursor, WorkflowResumeCursor } from './store/continuation-cursors';
+import type { IWorkflowEventFeed } from './store/event-feed';
+import type {
+  GatePauseEventInput,
+  GateResolutionEvent,
+  NodeStateEventInput,
+  ObservabilityEventInput,
+  WorkflowEventInput,
+  WorkflowEventType,
+} from './store/event-types';
+import type { DagResumeSnapshot } from './store/resume-snapshot';
+import type { WorkflowRunFailureOptions } from './workflow-run-failure';
+import type {
+  FanOutCancelReason,
+  SourceReleaseWrite,
+  WorkflowCancellationEventDetails,
+  WorkflowWaitCompletion,
+  WorkflowWaitPause,
+} from './store/run-writes';
 
 export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
-
-/**
- * One completed node's persisted result, as rehydrated for resume (#2637).
- * `structuredOutput` is the logical value the node's `node_completed` event carried
- * under `structured_output`; absent for text-only nodes and rows persisted before
- * the key existed — those degrade to text re-parsing, the pre-#2637 behavior.
- * `declaredFields` is the field-access contract the node completed under, from the
- * event's `declared_fields` (#2453). Only a `workflow:` node writes it, because only
- * it can hold a contract the parent's own definition does not state — every other
- * producer's projection is re-derived from the loaded `output_format` on resume.
- */
-export interface PersistedNodeOutput {
-  output: string;
-  structuredOutput?: unknown;
-  declaredFields?: readonly string[];
-  /** Present only when resume recovered a preview rather than the full text.
-   * Replay must retain this original provenance instead of certifying the preview. */
-  outputTruncation?: { originalBytes: number | null; spillPath: string | null };
-  /**
-   * The execution facts of the completion this output came from, carried across prior-
-   * success replays so a resumed consumer reads the same producer record a fresh run
-   * would (`$node.execution.checkoutStart`). Absent on rows written before those facts.
-   */
-  execution?: NodeExecutionMetadata;
-}
-
-export interface DagResumeSnapshot {
-  /** Latest unfinished invocation, keyed by canonical path and enclosing loop lineage. */
-  unfinishedInvocations?: Map<string, NodeExecutionMetadata>;
-  completedNodeOutputs: Map<string, PersistedNodeOutput>;
-  /** First durable ordered snapshot for each instance-qualified composed fan-out scope. */
-  fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
-  /** Node/instance starts with no later terminal event, in lifecycle order. */
-  unresolvedNodeStarts: Set<string>;
-  tokens?: TokenUsage;
-  /** Cumulative USD cost persisted by completed and failed node attempts across prior passes. */
-  costUsd: number;
-}
-
-/** Durable wait outcome committed atomically with consumption of its active cursor. */
-export interface WorkflowWaitCompletion {
-  execution?: NodeExecutionRecord;
-  stepName: string;
-  result: WorkflowWaitResult;
-}
-
-export type WorkflowWaitPause = { kind: 'started'; stepName: string } | { kind: 'continued' };
-
-/** Exact persisted cursor expected by an automatic continuation claim. */
-export type WorkflowResumeCursor =
-  | { kind: 'wait'; nodeId: string; resumeAt: string }
-  | { kind: 'quota'; attempt: number; resumeAt: string };
+export * from './store/attention-writes';
+export * from './store/continuation-cursors';
+export * from './store/errors';
+export * from './store/event-feed';
+export * from './store/event-types';
+export * from './store/resume-snapshot';
+export * from './store/run-writes';
+export type { WorkflowRunFailureOptions } from './workflow-run-failure';
 
 /** Composite primary key identifying a single persisted node session row. */
 export interface WorkflowNodeSessionKey {
@@ -86,176 +65,9 @@ export interface WorkflowNodeSessionKey {
   provider: string;
 }
 
-export const NODE_LIFECYCLE_EVENT_TYPES = [
-  'node_started',
-  'node_suspended',
-  'node_completed',
-  'node_failed',
-  'node_skipped',
-  'node_skipped_prior_success',
-] as const;
-
-export type NodeLifecycleEventType = (typeof NODE_LIFECYCLE_EVENT_TYPES)[number];
-
-/** Node state writes must remain durable, including resume-cache invalidations. */
-export const NODE_STATE_EVENT_TYPES = [
-  ...NODE_LIFECYCLE_EVENT_TYPES,
-  // #2402 — written when a cached prior-success node is invalidated because a
-  // dependency re-executed during the current resume (e.g. an `always_run: true`
-  // upstream, or any dep that re-ran with fresh output). `data.prior_output` is the
-  // stale cached value being thrown away; `data.invalidating_deps` lists the
-  // upstream node ids whose current output no longer matches the prior snapshot.
-  // The audit counterpart to the resume cache invalidation; absence never implies
-  // the cache was honored — a skipped node only writes `node_skipped_prior_success`.
-  'node_prior_cache_invalidated',
-  'node_always_run_reset',
-] as const;
-
-export type NodeStateEventType = (typeof NODE_STATE_EVENT_TYPES)[number];
-
-export const WORKFLOW_EVENT_TYPES = [
-  'workflow_started',
-  'workflow_completed',
-  'workflow_failed',
-  // #2348 — written by the resume CAS ONLY when it clears a non-empty
-  // `metadata.error`, carrying that error in `data.error`. It is the audit
-  // record for a legacy failure that resume would otherwise erase (older CLI
-  // SIGTERM handlers could record a failure in metadata and nowhere else), NOT
-  // a general "a resume happened" marker: its absence never means the run wasn't resumed.
-  'workflow_resumed',
-  // Between-run continuation (#2747) — written on the ADOPTING run's log when it
-  // starts with `--adopt`/`--supersedes`, so the chain renders from events alone.
-  'workflow.run_adopted',
-  ...NODE_STATE_EVENT_TYPES,
-  'loop_iteration_started',
-  'loop_iteration_completed',
-  'loop_iteration_failed',
-  'tool_called',
-  'tool_completed',
-  'ralph_story_started',
-  'ralph_story_completed',
-  'approval_requested',
-  'approval_received',
-  'wait_started',
-  'wait_signaled',
-  'wait_completed',
-  'wait_expired',
-  'quota_resume_scheduled',
-  'quota_resume_triggered',
-  'quota_resume_exhausted',
-  'quota_resume_skipped',
-  'workflow_cancelled',
-  'workflow_artifact',
-  'integration_operation',
-  'node_session_resumed',
-  // Phase 2 of #975 — subagent task lifecycle (translated from provider
-  // `subtask` and `hook` events). Stored
-  // alongside other workflow_events for the timeline view; the SSE bridge
-  // fans out task_activity / hook_activity to live Web UI subscribers.
-  'task_activity',
-  'hook_activity',
-  // Container isolation backend lifecycle (folder-project container runs).
-  // `container_created`/`container_destroyed` bracket the run; `container_stopped`/
-  // `container_resumed` bracket a suspend/resume across a pause (Phase C).
-  'container_created',
-  'container_stopped',
-  'container_resumed',
-  'container_destroyed',
-  // Container write-back gate (Phase C): the finished run's overlay diff is
-  // requested (paused for approval), then applied to / discarded from the live root.
-  'writeback_requested',
-  'writeback_applied',
-  'writeback_discarded',
-  // File-presence gate (#2230): `evidence_policy.required` was set but its
-  // conventional `$ARTIFACTS_DIR/evidence.json` marker was absent at completion.
-  // Data carries the expected path; the legacy event name is a persisted contract.
-  'evidence_validation_failed',
-  // #2213 — keys the engine dropped from this run's workflow YAML. Written by the
-  // executor at run start for EVERY run that has them, whatever surface started
-  // it, so the record does not depend on a chat/console notification being
-  // deliverable. `data.warnings` is the message list. Absence means the YAML was
-  // clean OR the run predates this event type — never that delivery failed.
-  'workflow_parse_warnings',
-  // #2781 — the run's workflow declares `deprecated:`. Written by the executor at
-  // run start for every deprecated workflow, whatever surface started it (the
-  // chat/console message is best-effort; this is the durable trace).
-  // `data.notice` is the composed message; absence means not deprecated OR the run
-  // predates this event type.
-  'workflow_deprecation_notice',
-  // #2512 — audit snapshot of a composed fan-out's ordered instance set (identity +
-  // item per ordinal), written before the first instance schedules.
-  'fan_out_instances',
-] as const;
-
-export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
-
-export function isNodeStateEventType(value: WorkflowEventType): value is NodeStateEventType {
-  return NODE_STATE_EVENT_TYPES.some(eventType => eventType === value);
-}
-
-/** The column payload shared by every workflow-event writer. */
-export interface WorkflowEventInput<EventType extends WorkflowEventType = WorkflowEventType> {
-  workflow_run_id: string;
-  event_type: EventType;
-  step_index?: number;
-  step_name?: string;
-  data?: Record<string, unknown>;
-}
-
-export type NodeStateEventInput = SerializedNodeEvent;
-export type ObservabilityEventInput = WorkflowEventInput<
-  Exclude<WorkflowEventType, NodeStateEventType>
->;
-
-/**
- * The two rows a wait's completion produces: the wait outcome for observability and
- * the node's own completed state. A wait completes on one of two paths, in the same
- * tick inside the executor or on resume inside the store's cursor-clearing
- * transaction, and both paths must write the same rows for the same result. This is
- * the only place that knows their shape.
- */
-export function waitCompletionEvents(
-  workflowRunId: string,
-  completion: WorkflowWaitCompletion
-): { outcome: ObservabilityEventInput; node: NodeStateEventInput } {
-  const { stepName, result } = completion;
-  return {
-    outcome: {
-      workflow_run_id: workflowRunId,
-      event_type: result.status === 'expired' ? 'wait_expired' : 'wait_completed',
-      step_name: stepName,
-      data: result,
-    },
-    node:
-      completion.execution !== undefined
-        ? serializeNodeStateRecord(completion.execution)
-        : {
-            workflow_run_id: workflowRunId,
-            event_type: 'node_completed',
-            step_name: stepName,
-            data: {
-              type: 'wait',
-              duration_ms: result.waited_ms,
-              node_output: JSON.stringify(result),
-              structured_output: result,
-            },
-          },
-  };
-}
-
-export const FAN_OUT_CANCEL_REASONS = [
-  'fan_out_gate',
-  'fan_out_sibling',
-  'fan_out_orphan',
-] as const;
-export type FanOutCancelReason = (typeof FAN_OUT_CANCEL_REASONS)[number];
-
-export interface WorkflowCancellationEventDetails {
-  step_name?: string;
-  reason?: string;
-  /** Categorical cause, reported to telemetry; `reason` is free text and never is. */
-  cancel_reason?: RunCancelReason;
-}
+/** Where an install persists workflow state; selected by `store:` in the global config. */
+export const WORKFLOW_STORE_KINDS = ['database', 'files'] as const;
+export type WorkflowStoreKind = (typeof WORKFLOW_STORE_KINDS)[number];
 
 /**
  * Run-tree navigation (#2121 Phase 2) — a narrow, distinct concern (walking the
@@ -279,6 +91,47 @@ export interface IRunTreeStore {
   getRunAncestry(runId: string): Promise<WorkflowRun[]>;
 }
 
+/** One attention wait as its `wait_started` row recorded it. */
+export interface AttentionWaitStart {
+  runId: string;
+  startedAt: string;
+  /** The row's raw `data`: its labels and ask record, as far as the row recorded them. */
+  data: Record<string, unknown>;
+}
+
+/** One `workflow_notice` row as recorded. */
+export interface WorkflowNoticeRow {
+  runId: string;
+  at: string;
+  /** The row's raw `data`; `listWorkflowNotices` reads it. */
+  data: Record<string, unknown>;
+}
+
+/** A `node_completed` row whose `structured_output` carries a `metrics` key. */
+export interface MetricRecordRow {
+  eventId: string;
+  runId: string;
+  workflowName: string;
+  /** The run's codebase. */
+  codebaseId: string | null;
+  /** The event's `step_name`. */
+  nodeId: string;
+  /** The event's `data.type`: the kind of node that completed, when the row records it. */
+  nodeType: string | null;
+  completedAt: string;
+  /** The raw `structured_output.metrics` value; the engine parses it. */
+  metrics: unknown;
+}
+
+/**
+ * Every metric completion on the install, in the order it was recorded, across runs. Rows
+ * are raw: which completions count, for which codebase, and what a record means, is
+ * decided once in `queryMetrics`.
+ */
+export interface IMetricRecordStore {
+  listMetricRecords(): Promise<MetricRecordRow[]>;
+}
+
 export interface IWorkflowRunNodeSessionStore {
   listWorkflowRunNodeSessions(workflowRunId: string): Promise<readonly WorkflowRunNodeSession[]>;
   upsertWorkflowRunNodeSession(params: {
@@ -289,7 +142,66 @@ export interface IWorkflowRunNodeSessionStore {
   }): Promise<void>;
 }
 
-export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionStore {
+export interface IWorkflowStore
+  extends IRunTreeStore,
+    IMetricRecordStore,
+    IWorkflowRunNodeSessionStore,
+    IResourceStartStore,
+    IStateDocumentStore,
+    IWorkflowEventFeed {
+  setToolCallAttention(
+    runId: string,
+    streamId: string,
+    calls: import('./schemas/workflow-run').ToolCallAttention[]
+  ): Promise<boolean>;
+  /** Resolve an open paused gate and commit its audit events atomically; a CAS loser writes nothing. */
+  resolveApprovalGate(
+    id: string,
+    metadata: Record<string, unknown>,
+    events: GateResolutionEvent[],
+    expectedGate?: ExpectedApprovalGate
+  ): Promise<{ resolved: boolean }>;
+  /** Resolve, cancel and commit gate plus terminal events atomically; reports telemetry after a winning commit. */
+  resolveAndCancelApprovalGate(
+    id: string,
+    events: GateResolutionEvent[],
+    cancellation: WorkflowCancellationEventDetails,
+    expectedGate?: ExpectedApprovalGate
+  ): Promise<{ resolved: boolean }>;
+  /**
+   * Atomically cancel resumable runs matching conversation_id or parent_conversation_id; return their pre-cancellation rows.
+   * Invoke assertMayCancel on the locked snapshot before any write; a thrown refusal aborts the transaction.
+   */
+  cancelResumableRunsForConversation(
+    conversationId: string,
+    assertMayCancel?: (runs: WorkflowRun[]) => void
+  ): Promise<WorkflowRun[]>;
+  deleteWorkflowNodeSessions(filter: {
+    workflow_name: string;
+    scope_key?: string;
+    node_id?: string;
+  }): Promise<{ deleted: number }>;
+  findWorkflowRunsByIdPrefix(prefix: string, codebaseId: string): Promise<WorkflowRun[]>;
+  listWorkflowRuns(options?: ListDashboardRunsOptions): Promise<DashboardRunsResult>;
+
+  findOpenWorkRuns(options?: { codebaseId?: string; limit?: number }): Promise<WorkflowRun[]>;
+  findAdoptingRuns(runId: string): Promise<WorkflowRun[]>;
+  /** Every run of one item in a project, in the order they started. */
+  listItemRuns(projectKey: string, itemKey: string): Promise<WorkflowRun[]>;
+  getItem(id: string): Promise<import('./schemas/workflow-run').WorkflowItem | null>;
+  deleteOldWorkflowRuns(olderThanDays: number): Promise<{ count: number }>;
+  /** Event reads use explicit UTC offsets; batched reads preserve durable append order. */
+  listWorkflowEvents(
+    runId: string,
+    options?: { excludeEventTypes?: readonly string[] }
+  ): Promise<WorkflowEventRow[]>;
+  /** Strict reads reject malformed event data instead of returning a partial history. */
+  listEventsForRuns(
+    runIds: readonly string[],
+    eventTypes: readonly WorkflowEventType[],
+    options?: { strict?: boolean }
+  ): Promise<Map<string, WorkflowEventRow[]>>;
+
   // Run lifecycle
   createWorkflowRun(data: {
     /**
@@ -299,14 +211,11 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
      */
     id?: string;
     workflow_name: string;
-    conversation_id: string;
+    origin?: import('./schemas/workflow-run').WorkflowRunOrigin;
     codebase_id?: string;
     user_message: string;
     metadata?: Record<string, unknown>;
     working_path?: string;
-    parent_conversation_id?: string;
-    /** Archon user UUID; populated via ExecuteWorkflowOptions.userId. */
-    user_id?: string;
     /**
      * Run-tree parent (#2121 Phase 2). Set for a `workflow:` sub-run so its row
      * links back to the spawning parent run; omitted for top-level runs.
@@ -318,9 +227,19 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
      * resume. Omitted for ordinary fresh runs.
      */
     adopted_from_run_id?: string;
+    /**
+     * The key of the item this run belongs to, in the project of `codebase_id`, which it
+     * needs. The item is created on first use. Absent: a run with `adopted_from_run_id`
+     * belongs to that run's item, and any other run has no item.
+     */
+    item_key?: string;
   }): Promise<WorkflowRun>;
-  /** Fresh execution must win this pending-to-running CAS before doing any work. */
-  claimPendingWorkflowRun(id: string): Promise<WorkflowRun | null>;
+  /**
+   * Fresh execution must win this pending-to-running CAS before doing any work.
+   * `workingPath` is the checkout the run will use; the claim stamps it on a row
+   * created without one.
+   */
+  claimPendingWorkflowRun(id: string, workingPath?: string): Promise<WorkflowRun | null>;
   /**
    * Record the run's checkout baseline (#3305). Write-once in the store: the first value
    * sticks and a later call returns it unchanged. Returns the persisted baseline.
@@ -330,14 +249,17 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     baseline: CheckoutObservation
   ): Promise<CheckoutObservation>;
   getWorkflowRun(id: string): Promise<WorkflowRun | null>;
+  /** The runs with these ids, in no particular order; an id with no run is absent. */
+  getWorkflowRunsByIds(ids: readonly string[]): Promise<WorkflowRun[]>;
   /**
    * Find the workflow run currently holding the lock on `workingPath`.
    *
    * Pass `self` from the calling dispatch so:
    *   1. Self is never returned (excluded by `id != self.id`).
    *   2. Two near-simultaneous dispatches deterministically agree on which
-   *      is "first" via the `(started_at, id)` tiebreaker — newer aborts.
+   *      is "first" via the `(effective phase time, id)` tiebreaker — newer aborts.
    *
+   * `startedAt` is the effective path priority from `workflowPathPriorityTime`.
    * `id` and `startedAt` must travel together — the tiebreaker requires
    * both. Bundling them as a single optional struct makes the
    * paired-or-nothing invariant structural rather than a doc-only contract.
@@ -356,10 +278,84 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     self?: { id: string; startedAt: Date; excludeRunIds?: string[] }
   ): Promise<WorkflowRun | null>;
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
+  /**
+   * Return at most `limit` due continuations, defaulting to 25: time waits past their
+   * deadline, signaled event waits, due quota resumes, and answered gates and attention
+   * waits (`answeredPauseContinuation`), and runs released for an unreadable source
+   * (`readSourceRelease`). Timed ones come earliest first, answered pauses after.
+   */
+  listDueWorkflowContinuations(now: Date, limit?: number): Promise<WorkflowRun[]>;
+  /** Back off only the unchanged wait, quota, answered or source occurrence; a stale cursor writes nothing. */
+  deferWorkflowContinuation(
+    id: string,
+    retryAt: string,
+    cursor: WorkflowResumeCursor
+  ): Promise<void>;
+  /**
+   * Atomically add one answer to the stored attention wait (`answeredAttentionWait`) and
+   * commit its `wait_answered` audit row (`waitAnsweredEvent`), without changing
+   * lifecycle. Writes nothing, and returns `answered: false`, when the run is no longer
+   * paused at that unanswered wait.
+   */
+  answerAttentionWait(id: string, write: AttentionAnswerWrite): Promise<{ answered: boolean }>;
+  /**
+   * Atomically apply one label write to an open attention wait (`labeledAttentionWait`)
+   * and commit its `attention_labeled` audit row (`attentionLabeledEvent`). Writes
+   * nothing, and returns `labeled: false`, when the run is no longer paused at that
+   * unanswered wait.
+   */
+  labelAttentionWait(
+    id: string,
+    write: AttentionLabelWrite
+  ): Promise<{ labeled: true; wait: WorkflowAttentionWaitContext } | { labeled: false }>;
+  /** Batch descendant read: corrupt origins become safe reports; query failures still reject. */
+  getWorkflowRunForAttention(id: string): Promise<AttentionRead<WorkflowRun> | null>;
+  /**
+   * Every row the attention queue reads (`isAttentionQueueRow`), most recently started
+   * first, with a degraded report for each unreadable row.
+   * `@archon/workflows/attention-queue` builds items from readable rows.
+   */
+  listAttentionQueueRows(): Promise<AttentionRead<WorkflowRun>[]>;
+  /**
+   * The `wait_started` row of every attention wait on the install, open or answered,
+   * oldest first, for runs that still exist. Rows are raw: `countAttentionWaitStarts`
+   * decides which count.
+   */
+  listAttentionWaitStarts(): Promise<AttentionWaitStart[]>;
+  /**
+   * Every `workflow_notice` row on the install, oldest first, for runs that still exist;
+   * a run's rows of one moment stay in the order it emitted them.
+   * Rows are raw: `listWorkflowNotices` decides which are read.
+   */
+  listWorkflowNoticeRows(): Promise<WorkflowNoticeRow[]>;
+  /** Atomically record an unexpired event signal and its audit event without changing lifecycle. */
+  signalWorkflowWait(
+    id: string,
+    wait: Extract<WorkflowWaitContext, { kind: 'event' }>,
+    payload?: unknown
+  ): Promise<{ signaled: boolean }>;
+  /**
+   * A resume of a run admitted through a resource start takes a slot or throws
+   * `WorkflowResourceBusyError` (`resourceResumeBlocker`). A paused run refused while ready
+   * to continue (answered, due or signaled, or claimed with a `cursor`) records its first
+   * refusal (`CAPACITY_WAIT_METADATA_KEY`) before the error is thrown, so it keeps its place
+   * while the host retries (`resumeRefusal`).
+   */
   resumeWorkflowRun(id: string, cursor?: WorkflowResumeCursor): Promise<WorkflowRun>;
+  /**
+   * Give back the resource slot of a run admitted through a resource start, while it is
+   * still paused at exactly `cursor`, and clear any capacity wait it carries. Called once
+   * nothing of the run executes any more. `released` is false when the run moved on, never
+   * held a slot, or already gave it back; a capacity wait then stays, keeping its place.
+   */
+  releasePausedRunSlot(id: string, cursor: PauseCursor): Promise<{ released: boolean }>;
   /** Claim an engine-cancelled fan-out child for immediate in-process recovery. */
   recoverCancelledFanOutRun(id: string): Promise<WorkflowRun>;
   /**
+   * `metadata.parent_node_id` is creation-only: all later metadata writes ignore it,
+   * preserving child provenance after parent deletion. A child created without a
+   * spawning node ID carries null under that key. Top-level creation strips it.
+   *
    * `output_root` (#2200) is write-once: the executor sets it at run start only
    * when the persisted value is null. Re-writing it on resume would re-derive
    * the path from a possibly-renamed codebase and orphan the run's artifacts,
@@ -379,6 +375,11 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
       working_path?: string;
     }
   ): Promise<void>;
+  /** Atomically merge metadata only while running; false means nothing was written. */
+  updateWorkflowRunMetadataIfRunning(
+    id: string,
+    metadata: WorkflowRun['metadata']
+  ): Promise<boolean>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
   /**
@@ -396,8 +397,12 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     metadata?: Record<string, unknown>
   ): Promise<void>;
   /**
-   * Atomically fail the run and persist its matching lifecycle event. `exitReason`
-   * is recorded on that event as the run's categorical failure cause, and — with
+   * Atomically fail a pending or running run and persist its matching lifecycle event.
+   * `failed` is false when the run was already terminal: a no-op that leaves the winning
+   * outcome in place, so the caller must not announce its own failure. Missing runs and
+   * other start states reject unless a supplied failure condition mismatches.
+   * `pendingOnly` refuses claimed, settled, or missing runs without writing.
+   * `exitReason` is recorded on that event as the run's categorical failure cause, and — with
    * `signal`, when a signal arriving at the owning process is what stopped the run —
    * on the run row as `metadata.stop_reason`, which is what the operator surfaces
    * read (#3479). Reports terminal telemetry after a won commit (see completeWorkflowRun).
@@ -405,38 +410,42 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   failWorkflowRun(
     id: string,
     error: string,
-    options?: {
-      scheduledResume?: ScheduledWorkflowResume;
-      exitReason?: RunExitReason;
-      signal?: RunStopSignal;
-    }
-  ): Promise<void>;
+    options?: WorkflowRunFailureOptions
+  ): Promise<{ failed: boolean }>;
   /**
    * Pause a running run for human review, stamping the approval context. Optional
    * `extraMetadata` is folded into the SAME atomic metadata write (e.g. the
    * container write-back gate's `pending_writeback` marker) so there is never a
-   * paused-without-marker window.
+   * paused-without-marker window. `event` is committed with the pause, so a decision
+   * cannot be followed by a stale node_suspended row and the pause reaches the event
+   * feed; every executor gate pause supplies one.
    */
   pauseWorkflowRun(
     id: string,
     approvalContext: ApprovalContext,
-    extraMetadata?: Record<string, unknown>
+    extraMetadata?: Record<string, unknown>,
+    event?: GatePauseEventInput
   ): Promise<void>;
-  /** Pause a running run and record its engine-owned wait start atomically. */
+  /**
+   * Claim-checked release from running to paused for unreadable source; status/claim losers write nothing.
+   * Atomically writes source_release (store-minted releaseId/releasedAt), continuation_retry_at, and source_released.
+   * beforePublish runs under exclusion against resume; rejection aborts the transition.
+   * It must be repeatable (SQL may retry), without store I/O or event publication.
+   */
+  releaseRunForUnreadableSource(
+    id: string,
+    release: SourceReleaseWrite,
+    beforePublish?: () => Promise<void>
+  ): Promise<{ released: boolean }>;
+  /**
+   * Pause a running run on a wait, committing `wait_started` for a new wait or
+   * `wait_continued` (`waitContinuedEvent`) for one a resume reached again.
+   */
   pauseWorkflowRunForWait(
     id: string,
     waitContext: WorkflowWaitContext,
     pause: WorkflowWaitPause
   ): Promise<void>;
-  /**
-   * Fail the exact paused action-required cursor after its required notification is lost.
-   * Reports terminal telemetry after a won commit (see completeWorkflowRun).
-   */
-  failPausedAttentionWait(
-    id: string,
-    waitContext: WorkflowAttentionWaitContext,
-    error: string
-  ): Promise<{ failed: boolean }>;
   /**
    * Consume the exact wait cursor and persist its completion snapshot atomically. Both
    * rows come from `waitCompletionEvents`, and the node's `node_completed` row is
@@ -448,30 +457,13 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     waitContext: WorkflowWaitContext,
     completion: WorkflowWaitCompletion
   ): Promise<{ cleared: false } | { cleared: true; nodeEvent: NodeStateEventInput }>;
-  /**
-   * Rewrite the approval context of an ALREADY-paused, still-open gate — unlike
-   * `pauseWorkflowRun`, which requires the run to currently be `'running'` and so
-   * cannot be used once a pause has already landed. CAS-guarded on the gate still
-   * being unresolved: a human who resolves the gate first wins the race, and this
-   * returns `resolved: false` instead of clobbering their resolution.
-   *
-   * Built for #2707 step 3's pause escalation: a `loop_group` body gate pauses
-   * generically (via `pauseWorkflowRun`, `nodeId` = the gate's own bare id), and
-   * this then rewrites `nodeId` to the enclosing loop_group's id (so the
-   * top-level DAG's resume walk finds it) and adds `bodyGateId` (the gate's
-   * original id, otherwise lost). Pass the COMPLETE rewritten `ApprovalContext`,
-   * not a partial one — the write merges into stored metadata, and an omitted
-   * field can survive from the prior context on one dialect and not the other.
-   */
-  rewriteApprovalContext(
-    id: string,
-    approvalContext: ApprovalContext
-  ): Promise<{ resolved: boolean }>;
 
   /**
    * Atomically CLAIM the container write-back apply before the live root is mutated
    * (retry-safe apply). Sets `metadata.writeback_apply_claimed` only while unset;
-   * returns whether THIS caller won. Apply the overlay only when `claimed`.
+   * returns whether THIS caller won. Apply the overlay only when `claimed`. A held
+   * claim with no recorded `writeback_resolved` means the apply outcome is unknown;
+   * the gate fails the run for operator reconciliation instead of resolving it.
    */
   claimWriteback(id: string): Promise<{ claimed: boolean }>;
 
@@ -526,6 +518,15 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    */
   getDagResumeSnapshot(workflowRunId: string): Promise<DagResumeSnapshot>;
 
+  /**
+   * A run's provider events, one node's or all of them, as served. Records come grouped
+   * by node, and within a node in emission order (attempts in the order they started,
+   * each by `seq`). With `after`, only the node's records after that cursor.
+   * Rows written before `provider_event` existed come back translated, with a null
+   * `attemptId`. Throws on storage error.
+   */
+  listProviderEvents(runId: string, query?: ProviderEventQuery): Promise<ProviderEventRecord[]>;
+
   // Per-codebase env vars for workflow node injection
   getCodebaseEnvVars(codebaseId: string): Promise<Record<string, string>>;
 
@@ -541,24 +542,16 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
 
   // Per-node provider sessions persisted across workflow re-runs (opt-in via
   // `persist_session: true` on a node, or `persist_sessions: true` at workflow root).
-  // Distinct from `AgentRequestOptions.persistSession` (Claude SDK on-disk transcript).
-  getWorkflowNodeSession(key: WorkflowNodeSessionKey): Promise<WorkflowNodeSession | null>;
+  // The executor lists a scope's rows once at run start, so a run continues the sessions
+  // that existed when it started, never one a concurrent run wrote afterwards (#2667).
+  listWorkflowNodeSessions(scope: {
+    workflow_name: string;
+    scope_key: string;
+  }): Promise<readonly WorkflowNodeSession[]>;
   upsertWorkflowNodeSession(
     params: WorkflowNodeSessionKey & {
       provider_session_id: string;
       last_run_id: string | null;
     }
   ): Promise<void>;
-  deleteWorkflowNodeSessions(filter: {
-    workflow_name: string;
-    scope_key?: string;
-    node_id?: string;
-    /**
-     * Optional provider filter. The executor's stale-row cleanup (run finished with
-     * no sessionId) sets this so switching providers between runs doesn't clobber
-     * the prior provider's saved row. Reset surfaces (CLI/chat/REST) leave it
-     * undefined so a reset wipes every provider for the given scope.
-     */
-    provider?: string;
-  }): Promise<{ deleted: number }>;
 }

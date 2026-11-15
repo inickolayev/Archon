@@ -1,4 +1,4 @@
-import { settlingProvider } from './test-settling-provider';
+// @archon-test-isolated
 /**
  * Tests for US-005: dependency installation (deps field) in script nodes.
  *
@@ -6,8 +6,10 @@ import { settlingProvider } from './test-settling-provider';
  * without actually running uv/bun, and are isolated from dag-executor.test.ts
  * to avoid mock.module() pollution.
  */
+import { providerRegistry } from '@archon/providers';
+import { settlingProvider } from './test-settling-provider';
 import type { CheckoutObservation } from './schemas/checkout-observation';
-import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, mock, spyOn, beforeEach, afterEach } from 'bun:test';
 import { mkdir, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -45,8 +47,7 @@ mock.module('@archon/paths', () => ({
     return paths;
   },
   // This fixture has project scripts and no installed bundled source tree.
-  getDefaultCommandsPath: () => join(testDir, 'absent-bundle', 'commands', 'defaults'),
-  getDefaultWorkflowsPath: () => join(testDir, 'absent-bundle', 'workflows', 'defaults'),
+  getBundledWorkflowsPath: () => join(testDir, 'absent-bundle', 'workflows'),
 }));
 
 // --- Imports (after all mock.module calls) ---
@@ -55,13 +56,158 @@ import { resolveWorkflow } from './graph-plan';
 import type { ExecNode, WorkflowDefinition, WorkflowRun } from './schemas';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
+import * as subprocess from './subprocess';
 
 // --- Helpers ---
 
 function createMockStore(): IWorkflowStore {
   return {
+    getWorkflowEventHead: mock<IWorkflowStore['getWorkflowEventHead']>(() => {
+      throw new Error('Unexpected event feed read');
+    }),
+    readWorkflowEventsAfter: mock<IWorkflowStore['readWorkflowEventsAfter']>(() => {
+      throw new Error('Unexpected event feed read');
+    }),
+    getStateDocument: mock<IWorkflowStore['getStateDocument']>(() => {
+      throw new Error('Unexpected getStateDocument');
+    }),
+    putStateDocument: mock<IWorkflowStore['putStateDocument']>(() => {
+      throw new Error('Unexpected putStateDocument');
+    }),
+    patchStateDocument: mock<IWorkflowStore['patchStateDocument']>(() => {
+      throw new Error('Unexpected patchStateDocument');
+    }),
+    deleteStateDocument: mock<IWorkflowStore['deleteStateDocument']>(() => {
+      throw new Error('Unexpected deleteStateDocument');
+    }),
+    claimStateDocument: mock<IWorkflowStore['claimStateDocument']>(() => {
+      throw new Error('Unexpected claimStateDocument');
+    }),
+    listStateRevisions: mock<IWorkflowStore['listStateRevisions']>(() => {
+      throw new Error('Unexpected listStateRevisions');
+    }),
+    listStateDocuments: mock<IWorkflowStore['listStateDocuments']>(() => {
+      throw new Error('Unexpected listStateDocuments');
+    }),
+    getStateDocuments: mock<IWorkflowStore['getStateDocuments']>(() => {
+      throw new Error('Unexpected getStateDocuments');
+    }),
+    pruneStateRevisions: mock<IWorkflowStore['pruneStateRevisions']>(() => {
+      throw new Error('Unexpected pruneStateRevisions');
+    }),
+    admitResourceStart: mock<IWorkflowStore['admitResourceStart']>(() => {
+      throw new Error('Unexpected admitResourceStart');
+    }),
+    admitPendingRun: mock<IWorkflowStore['admitPendingRun']>(() => {
+      throw new Error('Unexpected admitPendingRun');
+    }),
+    drainResourceStarts: mock<IWorkflowStore['drainResourceStarts']>(() => {
+      throw new Error('Unexpected drainResourceStarts');
+    }),
+    hasStartReceiptForDelivery: mock<IWorkflowStore['hasStartReceiptForDelivery']>(() => {
+      throw new Error('Unexpected hasStartReceiptForDelivery');
+    }),
+    acceptStartReceipt: mock<IWorkflowStore['acceptStartReceipt']>(() => {
+      throw new Error('Unexpected acceptStartReceipt');
+    }),
+    getStartReceipt: mock<IWorkflowStore['getStartReceipt']>(() => {
+      throw new Error('Unexpected getStartReceipt');
+    }),
+    listStartReceipts: mock<IWorkflowStore['listStartReceipts']>(() => {
+      throw new Error('Unexpected listStartReceipts');
+    }),
+    listPendingStartBindings: mock<IWorkflowStore['listPendingStartBindings']>(() => {
+      throw new Error('Unexpected listPendingStartBindings');
+    }),
+    getResourceStartRequest: mock<IWorkflowStore['getResourceStartRequest']>(() => {
+      throw new Error('Unexpected getResourceStartRequest');
+    }),
+    listQueuedResourceStartsForHost: mock<IWorkflowStore['listQueuedResourceStartsForHost']>(() => {
+      throw new Error('Unexpected listQueuedResourceStartsForHost');
+    }),
+    withdrawQueuedResourceStart: mock<IWorkflowStore['withdrawQueuedResourceStart']>(() => {
+      throw new Error('Unexpected withdrawQueuedResourceStart');
+    }),
+    claimStartBindingPreparation: mock<IWorkflowStore['claimStartBindingPreparation']>(() => {
+      throw new Error('Unexpected claimStartBindingPreparation');
+    }),
+    completeStartBindingPreparation: mock<IWorkflowStore['completeStartBindingPreparation']>(() => {
+      throw new Error('Unexpected completeStartBindingPreparation');
+    }),
+    failStartBindingPreparation: mock<IWorkflowStore['failStartBindingPreparation']>(() => {
+      throw new Error('Unexpected failStartBindingPreparation');
+    }),
+    resetStartBindingPreparation: mock<IWorkflowStore['resetStartBindingPreparation']>(() => {
+      throw new Error('Unexpected resetStartBindingPreparation');
+    }),
+    listDueWorkflowContinuations: mock<IWorkflowStore['listDueWorkflowContinuations']>(() => {
+      throw new Error('Unexpected listDueWorkflowContinuations');
+    }),
+    deferWorkflowContinuation: mock<IWorkflowStore['deferWorkflowContinuation']>(() => {
+      throw new Error('Unexpected deferWorkflowContinuation');
+    }),
+    releaseRunForUnreadableSource: mock<IWorkflowStore['releaseRunForUnreadableSource']>(() => {
+      throw new Error('Unexpected releaseRunForUnreadableSource');
+    }),
+    releasePausedRunSlot: mock<IWorkflowStore['releasePausedRunSlot']>(() =>
+      Promise.resolve({ released: false })
+    ),
+    answerAttentionWait: mock<IWorkflowStore['answerAttentionWait']>(() => {
+      throw new Error('Unexpected answerAttentionWait');
+    }),
+    labelAttentionWait: mock<IWorkflowStore['labelAttentionWait']>(() => {
+      throw new Error('Unexpected labelAttentionWait');
+    }),
+    getWorkflowRunForAttention: mock<IWorkflowStore['getWorkflowRunForAttention']>(() => {
+      throw new Error('Unexpected getWorkflowRunForAttention');
+    }),
+    listAttentionQueueRows: mock<IWorkflowStore['listAttentionQueueRows']>(() => {
+      throw new Error('Unexpected listAttentionQueueRows');
+    }),
+    signalWorkflowWait: mock<IWorkflowStore['signalWorkflowWait']>(() => {
+      throw new Error('Unexpected signalWorkflowWait');
+    }),
+    resolveApprovalGate: mock<IWorkflowStore['resolveApprovalGate']>(() => {
+      throw new Error('Unexpected resolveApprovalGate');
+    }),
+    resolveAndCancelApprovalGate: mock<IWorkflowStore['resolveAndCancelApprovalGate']>(() => {
+      throw new Error('Unexpected resolveAndCancelApprovalGate');
+    }),
+    cancelResumableRunsForConversation: mock<IWorkflowStore['cancelResumableRunsForConversation']>(
+      () => {
+        throw new Error('Unexpected cancelResumableRunsForConversation');
+      }
+    ),
+    deleteWorkflowNodeSessions: mock<IWorkflowStore['deleteWorkflowNodeSessions']>(() => {
+      throw new Error('Unexpected deleteWorkflowNodeSessions');
+    }),
+    listItemRuns: mock<IWorkflowStore['listItemRuns']>(async () => []),
+    getItem: mock<IWorkflowStore['getItem']>(async () => null),
+    findOpenWorkRuns: mock<IWorkflowStore['findOpenWorkRuns']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    findAdoptingRuns: mock<IWorkflowStore['findAdoptingRuns']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    deleteOldWorkflowRuns: mock<IWorkflowStore['deleteOldWorkflowRuns']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    listWorkflowEvents: mock<IWorkflowStore['listWorkflowEvents']>(async () => {
+      throw new Error('Not used by this test');
+    }),
+    listEventsForRuns: mock<IWorkflowStore['listEventsForRuns']>(
+      async runIds => new Map(runIds.map(runId => [runId, []]))
+    ),
+    listMetricRecords: mock<IWorkflowStore['listMetricRecords']>(async () => []),
+    listAttentionWaitStarts: mock<IWorkflowStore['listAttentionWaitStarts']>(async () => []),
+    listWorkflowNoticeRows: mock<IWorkflowStore['listWorkflowNoticeRows']>(async () => []),
+    findWorkflowRunsByIdPrefix: mock<IWorkflowStore['findWorkflowRunsByIdPrefix']>(async () => []),
+    listWorkflowRuns: mock<IWorkflowStore['listWorkflowRuns']>(() => {
+      throw new Error('Unexpected listWorkflowRuns');
+    }),
     createWorkflowRun: mock(() =>
       Promise.resolve({
+        origin: { conversationId: 'conv-mock' },
         id: 'mock-run-id',
         workflow_name: 'mock',
         conversation_id: 'conv-mock',
@@ -71,6 +217,7 @@ function createMockStore(): IWorkflowStore {
         outcome: null,
         user_message: 'mock message',
         metadata: {},
+        active_phase_started_at: null,
         started_at: new Date(),
         completed_at: null,
         last_activity_at: null,
@@ -79,6 +226,7 @@ function createMockStore(): IWorkflowStore {
         parent_run_id: null,
         output_root: null,
         checkout_baseline: null,
+        item_id: null,
         adopted_from_run_id: null,
       })
     ),
@@ -87,12 +235,14 @@ function createMockStore(): IWorkflowStore {
       async (_id: string, baseline: CheckoutObservation) => baseline
     ),
     getWorkflowRun: mock(() => Promise.resolve(null)),
+    getWorkflowRunsByIds: mock(() => Promise.resolve([])),
     findChildRuns: mock(() => Promise.resolve([])),
     getRunAncestry: mock(() => Promise.resolve([])),
     getActiveWorkflowRunByPath: mock(() => Promise.resolve(null)),
     findResumableRun: mock(() => Promise.resolve(null)),
     resumeWorkflowRun: mock(() =>
       Promise.resolve({
+        origin: { conversationId: 'conv-mock' },
         id: 'mock-run-id',
         workflow_name: 'mock',
         conversation_id: 'conv-mock',
@@ -102,6 +252,7 @@ function createMockStore(): IWorkflowStore {
         outcome: null,
         user_message: 'mock message',
         metadata: {},
+        active_phase_started_at: null,
         started_at: new Date(),
         completed_at: null,
         last_activity_at: null,
@@ -110,18 +261,21 @@ function createMockStore(): IWorkflowStore {
         parent_run_id: null,
         output_root: null,
         checkout_baseline: null,
+        item_id: null,
         adopted_from_run_id: null,
       })
     ),
     recoverCancelledFanOutRun: mock(() => Promise.reject(new Error('unused in this test'))),
+    updateWorkflowRunMetadataIfRunning: mock<IWorkflowStore['updateWorkflowRunMetadataIfRunning']>(
+      async () => true
+    ),
     updateWorkflowRun: mock(() => Promise.resolve()),
     updateWorkflowActivity: mock(() => Promise.resolve()),
     getWorkflowRunStatus: mock(() => Promise.resolve('running' as const)),
     completeWorkflowRun: mock(() => Promise.resolve()),
-    failWorkflowRun: mock(() => Promise.resolve()),
+    failWorkflowRun: mock(() => Promise.resolve({ failed: true })),
     pauseWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRunForWait: mock(() => Promise.resolve()),
-    failPausedAttentionWait: mock(() => Promise.resolve({ failed: true })),
     clearWorkflowWaitContext: mock((id: string, _wait: unknown, completion: { stepName: string }) =>
       Promise.resolve({
         cleared: true as const,
@@ -133,30 +287,32 @@ function createMockStore(): IWorkflowStore {
         },
       })
     ),
-    rewriteApprovalContext: mock(() => Promise.resolve({ resolved: true })),
     claimWriteback: mock(() => Promise.resolve({ claimed: true })),
     releaseWritebackClaim: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve({ cancelled: false })),
     cancelFanOutRun: mock(() => Promise.resolve({ cancelled: false })),
+    setToolCallAttention: mock<IWorkflowStore['setToolCallAttention']>(async () => true),
     createWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEventIfRunning: mock(() => Promise.resolve({ persisted: true })),
+    listProviderEvents: mock(() => Promise.resolve([])),
     getDagResumeSnapshot: mock(() =>
       Promise.resolve({
         completedNodeOutputs: new Map<string, { output: string }>(),
         fanOutSnapshots: new Map(),
+        failedNodes: new Map(),
         unresolvedNodeStarts: new Set<string>(),
+        budget: { workUnits: 0, spendUsd: 0 },
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })
     ),
     getCodebase: mock(() => Promise.resolve(null)),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
-    getWorkflowNodeSession: mock(() => Promise.resolve(null)),
+    listWorkflowNodeSessions: mock(() => Promise.resolve([])),
     listWorkflowRunNodeSessions: mock(() => Promise.resolve([])),
     upsertWorkflowRunNodeSession: mock(() => Promise.resolve()),
     upsertWorkflowNodeSession: mock(() => Promise.resolve()),
-    deleteWorkflowNodeSessions: mock(() => Promise.resolve({ deleted: 0 })),
   };
 }
 
@@ -169,8 +325,10 @@ const mockSendQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQue
 
 const mockGetAgentProvider = mock<WorkflowDeps['getAgentProvider']>(_provider => ({
   sendQuery: mockSendQuery,
+  checkCredential: async () => ({ state: 'not_checked' as const, source: 'native' as const }),
   getType: () => 'claude',
   getCapabilities: () => ({
+    backgroundWork: 'unobserved' as const,
     sessionResume: true,
     mcp: true,
     hooks: true,
@@ -194,6 +352,7 @@ const mockGetAgentProvider = mock<WorkflowDeps['getAgentProvider']>(_provider =>
 
 function createMockDeps(): WorkflowDeps {
   return {
+    providers: providerRegistry,
     store: createMockStore(),
     getAgentProvider: provider => settlingProvider(mockGetAgentProvider(provider)),
     loadConfig: mock(() =>
@@ -218,6 +377,7 @@ function createMockPlatform(): IWorkflowPlatform {
 
 function makeWorkflowRun(id: string): WorkflowRun {
   return {
+    origin: { conversationId: 'conv-deps' },
     id,
     workflow_name: 'deps-test',
     conversation_id: 'conv-deps',
@@ -227,6 +387,7 @@ function makeWorkflowRun(id: string): WorkflowRun {
     outcome: null,
     user_message: 'test',
     metadata: {},
+    active_phase_started_at: null,
     started_at: new Date(),
     completed_at: null,
     last_activity_at: null,
@@ -235,6 +396,7 @@ function makeWorkflowRun(id: string): WorkflowRun {
     parent_run_id: null,
     output_root: null,
     checkout_baseline: null,
+    item_id: null,
     adopted_from_run_id: null,
   };
 }
@@ -288,6 +450,8 @@ function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
 }
 
 describe('script node deps field — command construction', () => {
+  let ownedGroupSpy: { mockRestore(): void } | undefined;
+
   beforeEach(async () => {
     testDir = join(
       tmpdir(),
@@ -297,9 +461,17 @@ describe('script node deps field — command construction', () => {
     mockExecFileAsync.mockClear();
     mockSendQuery.mockClear();
     mockGetAgentProvider.mockClear();
+    // On Windows a script node runs through the owned process group so its deadline can end
+    // the whole tree; route that path into the same mock.
+    if (process.platform === 'win32')
+      ownedGroupSpy = spyOn(subprocess, 'execOwnedProcessGroup').mockImplementation(
+        (cmd, args, options) => mockExecFileAsync(cmd, args, options)
+      );
   });
 
   afterEach(async () => {
+    ownedGroupSpy?.mockRestore();
+    ownedGroupSpy = undefined;
     try {
       await rm(testDir, { recursive: true, force: true });
     } catch {
@@ -392,7 +564,7 @@ describe('script node deps field — command construction', () => {
     expect(args).toEqual(['run', 'python', '-c', 'print("no deps")']);
   });
 
-  it('bun inline with deps uses bun --no-env-file -e (no extra dep flags — bun auto-installs)', async () => {
+  it('bun inline with deps uses bun --no-env-file stdin (no extra dep flags — bun auto-installs)', async () => {
     const node: ExecNode = {
       id: 'bun-with-deps',
       kind: 'exec',
@@ -413,15 +585,16 @@ describe('script node deps field — command construction', () => {
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'bun');
     expect(scriptCall).toBeDefined();
-    const [cmd, args] = scriptCall as [string, string[]];
+    const [cmd, args, options] = scriptCall as [string, string[], { input?: string }];
     expect(cmd).toBe('bun');
     // --no-env-file prevents repo .env auto-load; no dep flags — bun auto-installs
-    expect(args).toEqual(['--no-env-file', '-e', node.script]);
+    expect(args).toEqual(['--no-env-file', expect.stringMatching(/^--preload=.*script-api/), '-']);
+    expect(options.input).toBe(node.script);
     expect(args).not.toContain('--packages');
     expect(args).not.toContain('--with');
   });
 
-  it('bun inline without deps uses bun --no-env-file -e', async () => {
+  it('bun inline without deps uses bun --no-env-file stdin', async () => {
     const node: ExecNode = {
       id: 'bun-no-deps',
       kind: 'exec',
@@ -441,9 +614,10 @@ describe('script node deps field — command construction', () => {
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'bun');
     expect(scriptCall).toBeDefined();
-    const [cmd, args] = scriptCall as [string, string[]];
+    const [cmd, args, options] = scriptCall as [string, string[], { input?: string }];
     expect(cmd).toBe('bun');
-    expect(args).toEqual(['--no-env-file', '-e', 'console.log("hello")']);
+    expect(args).toEqual(['--no-env-file', expect.stringMatching(/^--preload=.*script-api/), '-']);
+    expect(options.input).toBe('console.log("hello")');
   });
 
   it('uv named script with deps uses uv run --with flags', async () => {

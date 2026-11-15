@@ -1,10 +1,15 @@
 import { z } from 'zod';
 
 /**
- * Provider capability flags. The dag-executor uses these for capability warnings
- * when a node specifies features the target provider doesn't support.
+ * Provider capability flags. The dag-executor warns when a node specifies a feature
+ * the target provider doesn't support, and fails the run before any spend when a
+ * node names MCP servers, skills or plugins the provider cannot load.
  */
 export const providerCapabilitiesSchema = z.object({
+  /** reported: runtime reports live work and its ends; none: verified absent;
+   * unobserved: background work may exist but the provider cannot observe it.
+   */
+  backgroundWork: z.enum(['reported', 'none', 'unobserved']),
   sessionResume: z.boolean(),
   /**
    * Given a session ID, create a new session containing the source history
@@ -99,8 +104,8 @@ export const providerCapabilitiesSchema = z.object({
   /**
    * Whether the provider honors the per-node `settingSources` override (which
    * filesystem setting sources the agent loads: CLAUDE.md, skills, commands,
-   * agents). `true` for Claude only — the Claude Agent SDK's `settingSources`
-   * option; other providers have no equivalent knob.
+   * agents). Its install-level default is `assistants.<id>.settingSources`, and
+   * the `project` and `user` sources gate the provider's declared skill roots.
    */
   settingSources: z.boolean(),
   /** Whether the provider can register in-process `NativeTool`s for a turn. */

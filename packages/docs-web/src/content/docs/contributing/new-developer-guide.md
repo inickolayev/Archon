@@ -87,15 +87,16 @@ Run workflows directly from your terminal without needing the server:
 │ $ bun run cli workflow list                                     │
 │                                                                 │
 │ Available workflows in .archon/workflows/:                     │
-│   - archon-assist                General help and questions     │
-│   - archon-fix-github-issue      Investigate and fix issues     │
-│   - archon-comprehensive-pr-review  Full PR review with agents  │
+│   - archon-ship                  Issue to reviewed PR           │
+│   - archon-investigate           Prove a root cause             │
+│   - archon-review                Parallel PR review             │
 │                                                                 │
-│ $ bun run cli workflow run archon-assist "What does the         │
+│ $ bun run cli workflow run archon-investigate "What does the    │
 │   orchestrator do?"                                             │
 │                                                                 │
 │ 🔧 READ                                                         │
-│ Reading: packages/core/src/orchestrator/orchestrator.ts                │
+│ Reading:                                                        │
+│ packages/core/src/orchestrator/orchestrator-agent.ts            │
 │                                                                 │
 │ The orchestrator is the main entry point that routes incoming  │
 │ messages. It checks if it's a slash command, loads conversation│
@@ -118,7 +119,8 @@ Just talk to the AI like you would in Claude Code terminal:
 │                                                                 │
 │ You: What does the handleMessage function do?                   │
 │                                                                 │
-│ Archon: Looking at packages/core/src/orchestrator/orchestrator.ts...          │
+│ Archon: Looking at                                              │
+│ packages/core/src/orchestrator/orchestrator-agent.ts            │
 │                                                                 │
 │         The handleMessage function is the main entry point      │
 │         that routes incoming messages. It:                      │
@@ -127,7 +129,8 @@ Just talk to the AI like you would in Claude Code terminal:
 │         3. Routes to AI client for processing                   │
 │         4. Streams responses back to platform                   │
 │                                                                 │
-│         See: packages/core/src/orchestrator/orchestrator.ts            │
+│         See:                                                    │
+│ packages/core/src/orchestrator/orchestrator-agent.ts            │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -246,10 +249,9 @@ When you send a message, an AI "router" decides what to do:
 │                                                                         │
 │   USER MESSAGE                           ROUTER DECISION                │
 │                                                                         │
-│   "fix this issue"          ───────▶     archon-fix-github-issue       │
-│   "review this PR"          ───────▶     archon-comprehensive-pr-review│
-│   "what does X do?"         ───────▶     archon-assist (catch-all)     │
-│   "resolve the conflicts"   ───────▶     archon-resolve-conflicts      │
+│   "fix this issue"          ───────▶     archon-ship                   │
+│   "review this PR"          ───────▶     archon-review                 │
+│   "what does X do?"         ───────▶     answered directly, no workflow│
 │                                                                         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
@@ -262,7 +264,7 @@ When you send a message, an AI "router" decides what to do:
 │                                       │                                 │
 │                                       ▼                                 │
 │                    ┌─────────────────────────────────────┐             │
-│                    │ /invoke-workflow fix-github-issue   │             │
+│                    │ invoke_workflow: archon-ship        │             │
 │                    └─────────────────────────────────────┘             │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -272,7 +274,7 @@ When you send a message, an AI "router" decides what to do:
 
 ## Available Workflows
 
-The table below lists the key bundled workflows. All bundled workflows are prefixed with `archon-`. Run `bun run cli workflow list` to see the full current list.
+The table below lists the key workflows in the bundled `sdlc` pack. All bundled workflows are prefixed with `archon-`. Run `bun run cli workflow list` to see the full current list.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -280,30 +282,18 @@ The table below lists the key bundled workflows. All bundled workflows are prefi
 │   WORKFLOW                              TRIGGER PHRASES    WHAT IT DOES │
 │                                                                         │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ archon-fix-github-issue    "fix this issue"        Investigate   │  │
-│   │                            "implement #42"         + Fix + PR    │  │
+│   │ archon-ship               "fix this issue"        Triage +       │  │
+│   │                           "implement #42"         deliver a PR   │  │
 │   └─────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ archon-comprehensive-     "review this PR"        5 parallel     │  │
-│   │   pr-review               "code review"           review agents  │  │
-│   │                                                   + auto-fix     │  │
+│   │ archon-review             "review this PR"        Parallel       │  │
+│   │                           "is this ready"         review lenses  │  │
 │   └─────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ archon-resolve-conflicts  "resolve conflicts"     Auto-resolve   │  │
-│   │                           "fix merge conflicts"   git conflicts  │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ archon-ralph-dag          "run ralph"             PRD loop       │  │
-│   │                           "ralph dag"             (autonomous)   │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ archon-assist             (anything else)         General help    │  │
-│   │                           "what does X do?"       questions,     │  │
-│   │                           "help me debug"         debugging      │  │
+│   │ archon-deliver            "deliver this plan"     Implement +    │  │
+│   │                           "take this to a PR"     PR + review    │  │
 │   └─────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -313,7 +303,7 @@ The table below lists the key bundled workflows. All bundled workflows are prefi
 
 ## Parallel Agents: The PR Review Example
 
-The `archon-comprehensive-pr-review` workflow runs 5 AI agents simultaneously:
+A quick route agent picks which specialist lenses the change earns, and `archon-review` runs them in fresh sessions as shown below. The code lens uses the configured `large` model tier.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -321,104 +311,44 @@ The `archon-comprehensive-pr-review` workflow runs 5 AI agents simultaneously:
 │   USER: "review this PR"                                               │
 │                                                                         │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Step 1: pr-review-scope        Determine what changed           │  │
+│   │ Step 1: scope + route          Resolve the PR, its diff, the    │  │
+│   │                                contract, and which lenses run   │  │
 │   └─────────────────────────────────────────────────────────────────┘  │
 │                              │                                          │
 │                              ▼                                          │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Step 2: sync-pr-with-main      Rebase onto latest main          │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                              │                                          │
-│                              ▼                                          │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Step 3: PARALLEL BLOCK (5 agents running at once)               │  │
+│   │ Step 2: PARALLEL LENSES (each in a fresh session)               │  │
 │   │                                                                 │  │
 │   │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │  │
-│   │   │ code-review  │  │ error-       │  │ test-        │         │  │
-│   │   │ agent        │  │ handling     │  │ coverage     │         │  │
-│   │   │              │  │ agent        │  │ agent        │         │  │
-│   │   │ Style,       │  │ Catch blocks │  │ Missing      │         │  │
-│   │   │ patterns,    │  │ Silent fails │  │ tests?       │         │  │
-│   │   │ bugs         │  │ Logging      │  │ Edge cases   │         │  │
+│   │   │ code         │  │ seams        │  │ ux           │         │  │
+│   │   │              │  │              │  │ (when a UI   │         │  │
+│   │   │ Bugs,        │  │ Contracts    │  │  changes)    │         │  │
+│   │   │ correctness  │  │ that drift   │  │ Clear, honest│         │  │
 │   │   └──────────────┘  └──────────────┘  └──────────────┘         │  │
 │   │                                                                 │  │
-│   │   ┌──────────────┐  ┌──────────────┐                           │  │
-│   │   │ comment-     │  │ docs-        │                           │  │
-│   │   │ quality      │  │ impact       │                           │  │
-│   │   │ agent        │  │ agent        │                           │  │
-│   │   │              │  │              │                           │  │
-│   │   │ Outdated?    │  │ README?      │                           │  │
-│   │   │ Accurate?    │  │ CLAUDE.md?   │                           │  │
-│   │   └──────────────┘  └──────────────┘                           │  │
+│   │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │  │
+│   │   │ tests        │  │ errors       │  │ docs         │         │  │
+│   │   │              │  │              │  │ (when docs   │         │  │
+│   │   │ Missing      │  │ Visibility & │  │  change)     │         │  │
+│   │   │ coverage     │  │ containment  │  │ Stale docs   │         │  │
+│   │   └──────────────┘  └──────────────┘  └──────────────┘         │  │
 │   │                                                                 │  │
 │   └─────────────────────────────────────────────────────────────────┘  │
 │                              │                                          │
 │                              ▼                                          │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Step 4: synthesize-review      Combine all findings             │  │
+│   │ Step 3: synthesize             Combine findings into one verdict│  │
 │   └─────────────────────────────────────────────────────────────────┘  │
 │                              │                                          │
 │                              ▼                                          │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Step 5: implement-review-fixes  Auto-fix CRITICAL/HIGH issues   │  │
+│   │ Step 4: publish                Post one review comment on the PR│  │
 │   └─────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## The Ralph Loop: Autonomous PRD Implementation
-
-For larger features, Ralph executes user stories one-by-one until complete. The workflow is `archon-ralph-dag`:
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                         │
-│   PRD FILE: .archon/ralph/my-feature/prd.json                          │
-│                                                                         │
-│   {                                                                     │
-│     "stories": [                                                        │
-│       { "id": "S1", "title": "Add button", "passes": true },           │
-│       { "id": "S2", "title": "Add handler", "passes": true },          │
-│       { "id": "S3", "title": "Add tests", "passes": false }, ◀─ NEXT  │
-│       { "id": "S4", "title": "Add docs", "passes": false }             │
-│     ]                                                                   │
-│   }                                                                     │
-│                                                                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   RALPH LOOP EXECUTION:                                                 │
-│                                                                         │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Iteration 1                                                     │  │
-│   │ ─────────────────────────────────────────────────────────────── │  │
-│   │ 1. Read prd.json → Find S3 (first with passes: false)          │  │
-│   │ 2. Implement S3: "Add tests"                                    │  │
-│   │ 3. Run: bun run type-check && bun test                         │  │
-│   │ 4. Commit: "feat: S3 - Add tests"                              │  │
-│   │ 5. Update prd.json: S3.passes = true                           │  │
-│   │ 6. More stories remain → Continue                              │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                              │                                          │
-│                              ▼                                          │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Iteration 2                                                     │  │
-│   │ ─────────────────────────────────────────────────────────────── │  │
-│   │ 1. Read prd.json → Find S4 (next with passes: false)           │  │
-│   │ 2. Implement S4: "Add docs"                                     │  │
-│   │ 3. Run validation                                               │  │
-│   │ 4. Commit                                                       │  │
-│   │ 5. Update prd.json: S4.passes = true                           │  │
-│   │ 6. ALL stories pass → Create PR                                │  │
-│   │ 7. Output: <promise>COMPLETE</promise>                          │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                              │                                          │
-│                              ▼                                          │
-│                        LOOP STOPS                                       │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Review never edits code. Fixing findings belongs to `archon-implement`, or to `archon-deliver`, which runs review and corrections in a loop.
 
 ---
 
@@ -474,7 +404,7 @@ For larger features, Ralph executes user stories one-by-one until complete. The 
 │   ─────────────────────────────────────────────────────────────────    │
 │   ┌──────────────────┐              - Webhook on issues/PRs            │
 │   │  Issue #42       │              - @archon in comments              │
-│   │                  │              - Batch mode (single comment)      │
+│   │                  │              - Batch mode (assembled reply)     │
 │   │  @archon fix     │              - Auto-creates PRs                 │
 │   │  this issue      │              - Good for automation              │
 │   └──────────────────┘                                                  │
@@ -483,6 +413,8 @@ For larger features, Ralph executes user stories one-by-one until complete. The 
 ```
 
 ---
+
+Batch mode assembles the reply before delivery. Adapters may split long replies into multiple messages or comments.
 
 ## Isolation: Git Worktrees
 
@@ -652,7 +584,7 @@ Each conversation gets its own isolated copy of the repo:
 
 ## Next Steps
 
-1. **Read**: [Getting Started](/getting-started/overview/) - Set up your first instance
+1. **Read**: [Quickstart](/getting-started/quick-start/) - Set up your first instance
 2. **Explore**: `.archon/workflows/` - See example workflows
 3. **Customize**: `.archon/commands/` - Create your own prompts
 4. **Configure**: `.archon/config.yaml` - Tweak settings

@@ -3,6 +3,10 @@ import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
 import { MirrorBuffer, withOutboundMirror } from './mirror';
 
 class FakeAdapter implements IPlatformAdapter {
+  readonly capabilities = {
+    messagePersistence: 'core',
+    defaultWorkflowDispatch: 'foreground',
+  } as const;
   readonly sent: { conversationId: string; message: string; metadata?: MessageMetadata }[] = [];
   #secret = 'private field — a proxy must not break access to it';
 

@@ -12,6 +12,8 @@ export interface NativeScheduleConfig {
   programArguments: readonly [string, ...string[]];
   workingDirectory: string;
   archonHome: string;
+  /** The installing shell's PATH; launchd's default PATH lacks bun, gh, and provider CLIs. */
+  path: string;
   schedule: {
     intervalSeconds: number;
     runAtLoad: boolean;
@@ -64,6 +66,9 @@ export function renderMacosLaunchAgent(config: NativeScheduleConfig): RenderedMa
   assertAbsolute('Native schedule working directory', config.workingDirectory);
   assertAbsolute('Native schedule ARCHON_HOME', config.archonHome);
 
+  if (config.path.length === 0) {
+    throw new Error('Native schedule PATH must not be empty');
+  }
   if (config.programArguments.some(argument => argument.length === 0)) {
     throw new Error('Native schedule program arguments must not be empty');
   }
@@ -99,6 +104,8 @@ ${programArguments}
     <dict>
       <key>ARCHON_HOME</key>
       <string>${escapeXml(config.archonHome)}</string>
+      <key>PATH</key>
+      <string>${escapeXml(config.path)}</string>
     </dict>
     <key>StartInterval</key>
     <integer>${String(config.schedule.intervalSeconds)}</integer>
@@ -117,7 +124,7 @@ function resolveRuntime(options: NativeScheduleOptions): {
 } {
   if ((options.platform ?? process.platform) !== 'darwin') {
     throw new Error(
-      'Native schedule installation is supported only on macOS. Use the documented systemd, cron, or Task Scheduler command recipe on this host.'
+      'Native schedule installation is supported only on macOS. Use the documented long-lived systemd or Task Scheduler host recipe on this host.'
     );
   }
 
@@ -137,13 +144,21 @@ function resolveRuntime(options: NativeScheduleOptions): {
   };
 }
 
+/** The installed job differs from the one rendered now, often because PATH changed. */
+function differentConfiguration(path: string): Error {
+  return new Error(
+    `Refusing to replace an existing native schedule with different configuration: ${path}. ` +
+      "The job records the installing shell's PATH, so a different PATH or an upgrade changes it. " +
+      'Remove it (`archon trigger schedule remove`, or `archon workflow wake schedule remove` for the wake schedule), ' +
+      'then install it again from the shell whose PATH the job should use.'
+  );
+}
+
 async function writeOwnedConfiguration(path: string, contents: string): Promise<boolean> {
   try {
     const existing = await readFile(path, 'utf8');
     if (existing !== contents) {
-      throw new Error(
-        `Refusing to replace an existing native schedule with different configuration: ${path}`
-      );
+      throw differentConfiguration(path);
     }
     return false;
   } catch (error) {
@@ -158,9 +173,7 @@ async function writeOwnedConfiguration(path: string, contents: string): Promise<
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     const existing = await readFile(path, 'utf8');
     if (existing !== contents) {
-      throw new Error(
-        `Refusing to replace an existing native schedule with different configuration: ${path}`
-      );
+      throw differentConfiguration(path);
     }
     return false;
   } finally {
@@ -178,7 +191,10 @@ export async function installMacosNativeSchedule(
   await mkdir(runtime.directory, { recursive: true, mode: 0o700 });
   const path = join(runtime.directory, `${rendered.label}.plist`);
   const created = await writeOwnedConfiguration(path, rendered.plist);
-  if (!created) return path;
+  if (!created) {
+    await runtime.runCommand('/bin/launchctl', ['print', `${runtime.domain}/${rendered.label}`]);
+    return path;
+  }
 
   try {
     await runtime.runCommand('/bin/launchctl', ['bootstrap', runtime.domain, path]);

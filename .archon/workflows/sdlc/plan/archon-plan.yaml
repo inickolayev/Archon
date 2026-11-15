@@ -10,7 +10,7 @@ description: |
   feature", "turn this investigation into a plan", "how should we build this".
   NOT for: root-causing a bug (investigate), or building the plan (implement).
 
-model: large
+model: ['@planner', large]
 
 inputs:
   work:
@@ -23,6 +23,12 @@ inputs:
     description: >-
       Optional path to a prior investigation report to build on — its claims are
       verified, not trusted. Empty means no prior report.
+  related:
+    default: "[]"
+    description: >-
+      Related work triage found, as a JSON list of { url, relation }: overlapping
+      open issues, closed earlier attempts, recent merged changes on the same
+      surface. Defaults to an empty list.
 
 # ready:false is a valid completion (see the plan node): the run succeeds with
 # an authored outcome of false — lifecycle status and work outcome are separate facts.
@@ -30,10 +36,12 @@ returns: plan
 outcome_field: ready
 
 nodes:
-
-  # Blocked is a valid outcome, not a failure: ready:false naming exactly what
-  # is missing beats a plan built on guesses. Consumers gate on
-  # $plan.output.ready before building.
+  # Open questions are a valid outcome, not a failure: the calls only a person can
+  # make, named, beat a plan built on guesses. Whether the plan is ready is the
+  # planner's judgment; consumers gate on $plan.output.ready and relay
+  # $plan.output.open_questions either way. A schema cannot tie the two without a
+  # root union, which the providers' structured output rejects, so the prompt
+  # holds the rule: not ready always names at least one question.
   - id: plan
     command: plan
     # Advisory on both counts, and the engine holds both: it fails this node with
@@ -46,6 +54,9 @@ nodes:
       properties:
         ready:
           type: boolean
+        open_questions:
+          type: array
+          items: { type: string, pattern: '\S' }
         summary:
           type: string
         report:
@@ -59,4 +70,4 @@ nodes:
             run_id: { type: string }
             path: { type: string, enum: [plan.md] }
           required: [type, run_id, path]
-      required: [ready, summary, report]
+      required: [ready, open_questions, summary, report]

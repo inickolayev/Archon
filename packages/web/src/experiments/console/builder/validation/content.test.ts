@@ -186,7 +186,7 @@ describe('validateContent', () => {
   });
 
   test('a cancel body is scanned — the engine rejects a dangling ref there', () => {
-    // `loader.ts` pushes `{ field: 'cancel', text: node.cancel }` into its ref scan, and
+    // `loader/dag-references.ts` scans the `cancel.reason` template slot for refs, and
     // the executor substitutes it, so a dangling ref fails the workflow at load. The
     // builder used to stay silent about it, which is the gap this closes.
     const issues = validateContent(
@@ -385,4 +385,18 @@ describe('validateContent — base-field AI text is scanned too (#1764/#2476)', 
     );
     expect(issues.filter(i => i.rule === 'content.var.unknown')).toEqual([]);
   });
+});
+
+test('reports a malformed LOOP_PREV condition as a parse error', () => {
+  const issues = validateContent(
+    wf([
+      {
+        id: 'use',
+        variant: 'bash',
+        base: { when: "$LOOP_PREV.output == 'x'" },
+        data: { bash: 'echo ok' },
+      },
+    ])
+  );
+  expect(issues.map(issue => issue.rule)).toEqual(['content.when.parse']);
 });

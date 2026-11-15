@@ -45,24 +45,23 @@ export async function generateAndSetTitle(
   try {
     getLog().debug({ conversationDbId, assistantType }, 'title.generate_started');
 
-    // TITLE_GENERATION_MODEL is an emergency literal override for operators.
-    // Normal title generation should be resolved by the caller to the `small` tier.
-    const titleModel = process.env.TITLE_GENERATION_MODEL || undefined;
+    // Credential-aware callers resolve the literal override before authorizing the model.
+    const titleModel = requestOptions?.model ?? (process.env.TITLE_GENERATION_MODEL || undefined);
 
     // Build the title generation prompt
     const titlePrompt = buildTitlePrompt(userMessage, workflowName);
 
-    // Use the configured AI client with no tools (pure text generation)
     const client = getAgentProvider(assistantType);
     let generatedTitle = '';
 
     const options: SendQueryOptions = {
       ...(requestOptions ?? {}),
+      purpose: 'title-generation',
       ...(titleModel ? { model: titleModel } : {}),
       assistantConfig: requestOptions?.assistantConfig ?? assistantConfig,
       nodeConfig: {
         ...(requestOptions?.nodeConfig ?? {}),
-        allowed_tools: [], // No tool access — pure text generation
+        allowed_tools: [],
       },
     };
 
@@ -79,23 +78,23 @@ export async function generateAndSetTitle(
     const title = cleanTitle(generatedTitle);
 
     if (!title) {
-      getLog().warn({ conversationDbId, raw: generatedTitle }, 'title.generate_empty');
+      getLog().warn({ conversationDbId }, 'title.generate_empty');
       const fallback = truncateMessage(userMessage);
       await conversationDb.updateConversationTitle(conversationDbId, fallback);
       return;
     }
 
     await conversationDb.updateConversationTitle(conversationDbId, title);
-    getLog().info({ conversationDbId, title }, 'title.generate_completed');
-  } catch (error) {
-    const err = error as Error;
-    getLog().warn({ err, conversationDbId }, 'title.generate_failed');
+    getLog().info({ conversationDbId }, 'title.generate_completed');
+  } catch {
+    // Provider and database errors can echo the prompt or title.
+    getLog().warn({ conversationDbId }, 'title.generate_failed');
     // Fire-and-forget — do NOT re-throw.
     // Fallback: try to set a truncated message title
     try {
       const fallback = truncateMessage(userMessage);
       await conversationDb.updateConversationTitle(conversationDbId, fallback);
-      getLog().info({ conversationDbId, title: fallback }, 'title.fallback_set');
+      getLog().info({ conversationDbId }, 'title.fallback_set');
     } catch (_fallbackErr: unknown) {
       // Double failure — just log and move on
       getLog().warn({ conversationDbId }, 'title.fallback_also_failed');

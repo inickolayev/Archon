@@ -1,3 +1,4 @@
+// @archon-test-isolated
 /**
  * Tests for between-run continuation adoption resolution (#2747).
  *
@@ -11,6 +12,7 @@ import type { IsolationEnvironmentRow } from '@archon/isolation';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { toBranchName } from '@archon/git';
 import {
+  resolveRegisteredWorktree,
   resolveWorkflowAdoption,
   WorkflowAdoptionError,
   type ResolveWorkflowAdoptionArgs,
@@ -18,6 +20,7 @@ import {
 
 function runRow(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   return {
+    origin: { conversationId: 'conv-1' },
     id: 'run-1',
     workflow_name: 'implement',
     conversation_id: 'conv-1',
@@ -27,6 +30,7 @@ function runRow(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     outcome: 'failed',
     user_message: '',
     metadata: {},
+    active_phase_started_at: null,
     started_at: new Date(),
     completed_at: new Date(),
     last_activity_at: new Date(),
@@ -36,6 +40,7 @@ function runRow(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     adopted_from_run_id: null,
     output_root: '/root/artifacts',
     checkout_baseline: null,
+    item_id: null,
     ...overrides,
   };
 }
@@ -152,8 +157,10 @@ describe('resolveWorkflowAdoption', () => {
     ).lane;
     expect(lane).toEqual({
       kind: 'reuse-worktree',
-      workingPath: '/ws/repo/.worktrees/run-1',
-      envId: 'env-1',
+      environment: expect.objectContaining({
+        id: 'env-1',
+        working_path: '/ws/repo/.worktrees/run-1',
+      }),
     });
   });
 
@@ -252,6 +259,7 @@ describe('resolveWorkflowAdoption', () => {
           ...makeDeps({
             run: runRow({
               working_path: '/ws/repo/.worktrees/vanished',
+              active_phase_started_at: null,
               started_at: startedAt,
               completed_at: completedAt,
             }),
@@ -293,6 +301,7 @@ describe('resolveWorkflowAdoption', () => {
           ...makeDeps({
             run: runRow({
               working_path: '/ws/repo/.worktrees/vanished',
+              active_phase_started_at: null,
               started_at: startedAt,
               completed_at: null,
             }),
@@ -353,3 +362,36 @@ describe('resolveWorkflowAdoption', () => {
     expect(lane).toEqual({ kind: 'in-place' });
   });
 });
+
+test.each(['token', 'legacy', 'destroyed'] as const)(
+  'reuse lane refuses a same-path %s registration replaced after selection',
+  async kind => {
+    const selected = envRow({
+      metadata: kind === 'token' ? { worktree_registration_id: 'selected' } : {},
+    });
+    const { lane } = await resolveWorkflowAdoption({
+      ...baseArgs,
+      adoptedRunId: 'run-1',
+      deps: makeDeps({ run: runRow(), environment: selected }),
+    });
+    if (lane.kind !== 'reuse-worktree') throw new Error('Expected reuse');
+    await expect(
+      resolveRegisteredWorktree(
+        {
+          getById: async () => ({
+            ...selected,
+            ...(kind === 'destroyed'
+              ? { status: 'destroyed' as const }
+              : {
+                  metadata:
+                    kind === 'token'
+                      ? { worktree_registration_id: 'replacement' }
+                      : { legacy: true },
+                }),
+          }),
+        },
+        lane
+      )
+    ).rejects.toThrow('changed during adoption');
+  }
+);

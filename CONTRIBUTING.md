@@ -7,62 +7,201 @@ Thank you for your interest in contributing to Archon!
 1. Fork the repository
 2. Clone your fork
 3. Install dependencies: `bun install`
-4. Copy `.env.example` to `.env` and configure
+4. Copy `.env.example` to `.env` in the Archon checkout and configure it for the source server. This file loads after CWD env stripping, without overriding remaining process values, and before `~/.archon/.env` and `<cwd>/.archon/.env`. See [environment file locations](packages/docs-web/src/content/docs/reference/configuration.md#env-file-locations) for precedence and the distinction from a target repository's `.env`.
 5. Start development: `bun run dev`
 
 ## Development Workflow
 
 ### Code Quality
 
-`bun run validate` is the gate. Run it before opening a pull request: it runs every
-check that gates a pull request except the five listed below. A green run means CI's `test`
-and `workflow-fixtures` jobs will pass on your OS. CI runs the `static` job on Linux only; a
-green run on another OS predicts it because type-check, lint and format do not depend on the
-OS, and the generated-file checks run on both Linux and Windows. It needs no network and no
-services, takes a couple of minutes, and prints what each check cost so you can see
-where the time goes.
+Packages using the shared test runner without legacy `testGroups` discover tests
+under `src` automatically (`*.test.ts`, `*.spec.ts`, and their `.tsx` equivalents).
+Core uses this default. A test that uses `mock.module()`, directly
+or through a helper, must start with the exact line `// @archon-test-isolated`;
+discovery fails on a direct call without it.
+Use the same directive for any other test requiring a fresh process. Unmarked tests
+share one process. Run package test scripts to preserve isolation; requested selectors
+retain Bun's substring-filter meaning and run only matching files, preserving the same
+isolation groups. Every requested group runs, and any failed group makes the command
+fail. Discovery errors, including selected files outside explicit `testGroups`, stop
+the request before any group starts. Test flags apply to each selected group; JUnit output
+is combined across groups and, from the repository root, across every started owner.
+Name filters (`-t` or `--test-name-pattern`) are supported only when the request selects
+one isolation group, preserving Bun's native exit result. Requests selecting multiple
+groups with a name filter fail before tests load, with a diagnostic naming the groups.
+Sharding (`--shard`) also requires one isolation group; splitting the shard across
+groups could omit selected files. Root requests with name filters or `--shard` must
+also select one test owner; multi-owner requests fail before any tests start and name
+the owners. Select files from one group or run each group separately. Load and hook
+failures remain failures. An unreadable or invalid private report fails its group and
+contributes a runner error; later requested groups still run. Bun can omit JUnit output on successful
+zero-file runs. An absent report after exit 0 emits a diagnostic and contributes no
+results, preserving Bun's exit code; absence after a nonzero exit remains a runner error.
+The wrapper cannot distinguish successful zero-file execution from report loss after exit 0.
+
+CI is the full validation gate. While working, choose checks for the files and packages
+you changed: package `type-check` and `test` scripts, `bun run lint`,
+or `bun run test <path>` for root scripts. Keep package tests isolated through their runners.
+The isolation PR lookup conformance test requires `jq` on PATH to execute the production `gh --jq` projection.
+
+Optional `bun run validate` runs `cli-import-boundary`, `package-edges`,
+`generated-files`, `type-check`, `lint`, `ratchet`,
+`format`, `installer` (POSIX only), `package-tests`, `cli-tests`, `core-tests`, and
+`script-tests`.
+The generated group checks the Pi vendor map, the capability matrix,
+provider and chat contract schemas, API types, and the SDLC pack's generated
+workflow output types. Tests default to 20 seconds on every
+platform. Lint runs Biome (`biome.jsonc`) after TypeScript-API checks for test-cleanup
+drift, incomplete `mock.module()` factories (see "`mock.module()` merges over the real module"
+in the DX quirks guide), pack portability, the workflow persistence boundary, and SDK type
+restatements. Install the Biome
+extension for in-editor lint and formatting; disable Prettier for this repository.
+Formatting uses two spaces, single quotes, semicolons, a 100-column width, and LF line
+endings on every OS. On Windows, `bun run format` converts CRLF working files to LF;
+Git still normalizes text through the existing `.gitattributes`. `.archon/**` remains
+excluded from formatting while its TypeScript scripts remain linted. Markdown and HTML
+are hand-formatted. After resolving conflicts in an in-flight PR, run `bun run format`.
+
+The ratchet (`bun run check:ratchet`) lets code grow up to a ceiling and holds what is above
+it, compared with the merge base with `origin/dev` (fetch it locally). A touched function is
+refused when it ends above cognitive complexity 15 and scores higher than at the merge base. A
+touched source file is refused when it ends above 800 lines and has more lines than at the
+merge base. Test files have no line ceiling. It scores the TS/JS files
+Biome lints. To land an increase above a ceiling on purpose, add a trailer to one of the
+change's commits:
+`Ratchet-Allow: <path>` for a file's length, `Ratchet-Allow: <path>:<function>` for a function,
+using the names the failure prints.
+
+The SDK check reads exported types from installed provider SDK declarations and scans
+tracked and untracked TypeScript sources outside `packages/providers/`. Import SDK
+types instead of declaring copies. Independent same-name types and necessary SDK-free
+boundary copies belong in `scripts/sdk-type-exceptions.ts`, one named type per entry
+with a reason. Boundary entries identify the SDK module and the required relationship:
+matching declared fields, an SDK subset, or a local subset. Their conformance test is
+`scripts/sdk-type-conformance.test.ts`, which generates TypeScript assertions importing
+the exact named local declaration and SDK export from each entry. Comparisons compile
+as implementation source; arbitrary proof files and keyed placeholder assertions are
+not accepted. Removed collisions must lose their ledger entries; stale entries fail lint. The generated Codex protocol
+is excluded with the provider package; `generate:codex-protocol` owns it.
 
 ```bash
-bun run validate                            # the whole gate
-bun run validate --only workflow-fixtures   # one check, while iterating
+bun run validate                            # optional local checks
+bun run validate --only generated-files     # generated artifacts
+bun run validate --only format              # formatting, also run by the staged-file hook
+bun run validate --only workflow-fixtures   # when changing a workflow or its fixtures
+bun run test --plan pack                    # when changing .archon/workflows or .archon/scripts
 ```
 
-`scripts/validate.ts` owns the list of checks, and the CI jobs call that script instead
-of restating its commands, so the two cannot describe different work.
+`scripts/validate.ts` owns the check commands and CI selects them by ID.
 
-While you work, run the narrow check instead — `bun run type-check`, `bun run lint`,
-`bun run test <path>`, `bun run check:bundled` — and keep the full gate for the end.
+A ready pull request runs the Linux jobs its change can affect: `static` (type-check, lint,
+format, generated files, the ratchet), the Linux test jobs (`test`, `test-scripts`,
+`test-pack`), `schema-upgrade` and `postgres-parity`. A push to `dev` or `main` runs every
+job on every platform, and that run is the complete verification of a merge. These jobs wait
+for the push:
+
+| Job | Also runs on a pull request that changes |
+| --- | --- |
+| `test-windows`, `test-scripts-windows`, `test-pack-windows`, `file-store-primitives-macos` | nothing narrower than the list below |
+| `docker-build` | `Dockerfile`, `.dockerignore`, `docker-entrypoint.sh`, or a script the image build or its upgrade test runs |
+| `serve-binary` | `scripts/build-binaries.sh` or a smoke test the job runs |
+
+A pull request runs every job, as a push does, when it changes `.github/workflows/`, the root
+`package.json`, `bun.lock`, `bunfig.toml`, `scripts/validate.ts`, `scripts/repo-tests.ts` or a
+script they import, or the two scripts that decide and judge the run.
+`EVERY_JOB_INPUTS` and `PUSH_ONLY_MODES` in `scripts/should-run-test-suite.ts` are the
+authoritative lists.
+
+To run every job on a branch before it merges, for example when a change touches path
+handling, process spawning or anything else that differs on Windows or macOS, dispatch the
+workflow on the branch: `gh workflow run test.yml --ref <branch>`. The results appear in the
+pull request's checks. Dispatching needs write access, and the branch must be in this
+repository, so on a pull request from a fork a maintainer decides whether to push the branch
+here and dispatch it. A break that only another platform shows otherwise appears in the push
+run on `dev`.
+
+A change touching only prose or files no check reads skips the test, service and binary jobs.
+`scripts/should-run-test-suite.ts` decides which files those are: Markdown and the docs site
+count as prose unless `BUILD_INPUTS` or `isPackPrompt` names them (pack `commands/` and
+`.shared/` documents). `BUILD_INPUTS` is the authoritative list of other exceptions, including
+Markdown read by tests, bundled skills, generated docs, and the docs manifest. A conformance test
+requires every tracked Markdown path with a directory named in a test file to run the suite,
+even when the mention is only in a comment. Bare filenames such as `README.md` are excluded.
+`INERT_PATHS`
+lists the non-prose files no check reads. On a pull request, `workspaceTestInputs` in the same
+file decides whether the `cli` and `packages` legs of the `test` job run: a change limited to
+root `scripts/` files that no package test or CI entry point reads skips them, the
+`test-scripts` job still runs, and the `test-suite` check accepts the skip because the gate
+said so. A push to `dev` or `main` skips its jobs only when
+a pull request run already passed every job on the same tree, the ones that wait for the push
+included, and otherwise runs them, so a prose change's test-visible effects are checked on `dev`.
+
+The tests under `.archon/scripts/` (the SDLC pack's script tests) and the workflow fixtures
+run in the `test-pack` job (and `test-pack-windows` when it runs) when a pull request or an unproven push changes the pack or a
+contract it is written against: `PACK_INPUTS` in `scripts/should-run-test-suite.ts` lists
+those paths. Run them locally with `bun run test --plan pack` and
+`bun run validate --only workflow-fixtures`; a single test file runs with
+`bun run test .archon/scripts/__tests__/<file>.test.ts`. To run them in CI on a branch
+without a pull request, dispatch the Test Suite workflow with `pack-tests` or
+`pack-fixtures` set:
+`gh workflow run test.yml --ref <branch> -f pack-tests=true -f pack-fixtures=true`.
+
+Local validation has no fixed duration: tests and typed analysis dominate, and machine
+load matters. The audit for [#3985](https://github.com/coleam00/Archon/issues/3985)
+estimated the previous total at about 25 minutes under load, including fixtures and
+formatting. Workflow fixtures require explicit selection; formatting runs by default.
+Each validate run prints its actual elapsed time per check. A local success does not predict service, build,
+or other-platform CI results.
 
 **Important:** Use `bun run test` (not `bun test` from the repo root) to avoid mock pollution across packages.
 
+**macOS:** tests that compile a fresh binary with `bun build --compile` skip on macOS and print a line saying so. Running them locally has preceded a stuck `syspolicyd` that stalls every new process on the machine until a reboot. CI runs them on Linux and Windows. Do not compile binaries locally on macOS. A new test that compiles a binary gates itself on `skipCompiledBinaryTests()` from `@archon/paths/test-utils`. One exception: the file-store lock tests compile their probe only under GitHub Actions, on every OS, and skip it everywhere else whatever `ARCHON_TEST_COMPILED_BINARIES` says. The `file-store-primitives-macos` job runs POSIX plugin cleanup, provider and chat inspection diagnostics, process-provider and Codex cleanup, the file-store group, and database-free CLI lifecycle on a disposable Mac so these behaviors and the compiled probe are also proved on macOS.
+
 #### What `bun run validate` deliberately leaves out
 
-These PR-gating jobs need something a contributor may not have, so they stay in CI only.
-If you touched what they cover, run them yourself.
+These additional CI jobs need services or build environments a contributor may
+not have. Run applicable service checks only against scratch databases you create and
+drop; never run destructive verification against a configured live database.
 
 | CI job | Needs | Run it yourself |
 | --- | --- | --- |
 | `schema-upgrade` | a live PostgreSQL; the SQLite half also reads every release tag | `bun run check:schema-upgrades` (`PGHOST`/`PGUSER`/… or `DATABASE_URL`) and `bun run check:sqlite-vintages` |
-| `postgres-parity` | a live PostgreSQL | `ARCHON_TEST_PG_URL=postgres://… bun test packages/core/src/db/isolation-environments.live-run.postgres.integration.test.ts`, then the same for `packages/core/src/db/resource-slots.postgres.integration.test.ts`, `packages/core/src/db/provider-attempts.postgres.integration.test.ts`, and `packages/core/src/db/workflows.metadata-merge.postgres.integration.test.ts` |
+| `postgres-parity` | a PostgreSQL service; conformance creates and drops scratch databases and requires `CREATE DATABASE` permission | `ARCHON_TEST_PG_URL=postgres://… bun test packages/core/src/db/isolation-environments.live-run.postgres.integration.test.ts`, then the same for `packages/core/src/db/resource-slots.postgres.integration.test.ts`, `packages/core/src/db/provider-attempts.postgres.integration.test.ts`, `packages/core/src/db/workflows.postgres.integration.test.ts`, `packages/core/src/db/workflow-events.provider-events.postgres.integration.test.ts`, `packages/core/src/db/workflow-store.conformance.postgres.integration.test.ts`, `packages/core/src/db/state-documents.postgres.integration.test.ts`, `packages/core/src/db/codebase-rename.postgres.integration.test.ts`, and `packages/core/src/db/schema-convergence.postgres.integration.test.ts`; then `ARCHON_TEST_PG_URL=postgres://… bun run --cwd packages/core test src/db/users.postgres.integration.test.ts`, `ARCHON_TEST_PG_URL=postgres://… bun run --cwd packages/core test src/db/codebase-delete.postgres.integration.test.ts`, and `ARCHON_TEST_PG_URL=postgres://… bun run --cwd packages/core test src/db/user-provider-key-store.postgres.integration.test.ts` |
 | `docker-build` | a Docker daemon, and ~14GB of free disk for the image | `docker build .` |
+| Linux `test` Slack conformance and smoke | compiled Slack plugin with a stubbed client for conformance, and the unmodified release binary for initialization and missing-token smoke | CI only; source conformance runs in `cd packages/chat-slack && bun run test` |
+| `serve-binary` | compiled CLI and server artifacts; CI runs the build and smoke on Linux and Windows | CI only; no local compilation on macOS |
 | `docs-build` | Node (Astro's CLI does not run under Bun); path-filtered to `packages/docs-web/` | `bun run build:docs` — run it when you change the docs site |
-| `marketplace-lint` | 9 unauthenticated github.com API calls against a 60/hour per-IP quota, which seven `validate` runs an hour would exhaust | `bun packages/docs-web/scripts/lint-marketplace.ts` — run it when you change `packages/docs-web/src/data/marketplace.ts` |
+| `file-store-primitives-macos` | GitHub Actions for the compiled probe, and a macOS runner for process-group and filesystem behavior; ordinary tests also run under `validate` | On macOS, run the test commands from this job in [`.github/workflows/test.yml`](.github/workflows/test.yml); the compiled probe skips locally |
+
+The `serve-binary` CI job builds matching CLI and server executables on Linux and
+Windows, then checks `archon serve` against `/api/health` and the console. The
+release workflow runs the same smoke with its release artifacts. These compiled
+checks, and the server-free bundle assertion (including a restored-import
+negative proof), run in CI. Local `check:cli-import-boundary` still checks startup
+and policy import boundaries. Do not compile these binaries locally on macOS.
 
 **Schema changes**: run `bun run check:schema-upgrades` and `bun run check:sqlite-vintages`
 yourself if you touched `migrations/000_combined.sql`. A statement that applies cleanly to a fresh install can
 abort the whole apply on an upgrade, and nothing before that job catches it.
 
-`scripts/validate-ci-parity.test.ts` holds the same exclusions as a machine-checked list,
-so another PR-gating command cannot appear without a deliberate decision to leave it out.
+**SDLC workflows**: We do not accept pull requests from outside contributors
+that change `.archon/workflows/sdlc/`. Open an issue instead and describe the
+problem or change you want the maintainers to consider. Maintainers change the
+pack through pull requests that deliver an accepted issue.
 
-**SDLC workflows**: We do not accept pull requests that change
-`.archon/workflows/sdlc/`. Open an issue instead and describe the problem or
-change you want the maintainers to consider.
+### Publishing the container image
+
+The `Publish` workflow checks provenance and SBOM attestations on the pushed image
+digest. Keep `provenance: mode=max` and `sbom: true` enabled.
+Build arguments are published in the attestation; secrets must use `secrets:`, whose values are excluded.
+See [Verify image attestations](packages/docs-web/src/content/docs/deployment/docker.md#verify-image-attestations)
+for the consumer inspection commands.
 
 ### Commit messages
 
-Follow the repository's Conventional Commit style. Write a concise,
-human-readable subject that explains the meaningful outcome. Commit subjects
+Write a concise, human-readable subject that explains the meaningful outcome:
+a sentence about what is now true. A Conventional Commit prefix
+(`fix(cli):`, `docs:`) is optional. Commit subjects
 may become changelog entries or pull request titles, so they must make sense
 without the diff.
 
@@ -73,9 +212,9 @@ evidence of valid structure, not as the writing-quality standard.
 Never add AI attribution, generated-by text, robot emoji, or
 `Co-Authored-By: $Agent`.
 
-**Bad:** `refactor(prp-pr): update skill instructions`
+**Bad:** `refactor(cli): update trigger handling`
 
-**Good:** `refactor(prp-pr): PR creation now uses one focused workflow`
+**Good:** `A refused run start gets the same answer from the Web UI as from the CLI`
 
 ### Pull requests
 
@@ -93,8 +232,10 @@ Never add AI attribution, generated-by text, robot emoji, or
    Bot-authored dependency pull requests (`renovate[bot]`) are exempt because
    Renovate generates the body.
 5. Link the issue the pull request addresses with `Closes #<number>`,
-   `Fixes #<number>`, or `Resolves #<number>` in the description. Pull requests
-   without a linked issue will be closed.
+   `Fixes #<number>`, or `Resolves #<number>` in the description. When the
+   issue's dated "Current scope" ruling keeps it open after this pull request,
+   link it with `Refs #<number>` instead. Pull requests without a linked issue
+   will be closed.
 
 Treat repository rules as syntax constraints, not as the writing-quality
 standard. Write in plain, natural language. Use the repository's exact terms
@@ -104,12 +245,12 @@ formulaic transitions, and vague claims.
 #### Title
 
 Write a concise, human-readable title that describes the meaningful outcome.
-Follow the repository's Conventional Commit style, but do not copy vague or
-implementation-focused titles from its history.
+A Conventional Commit prefix is optional. Do not copy vague or
+implementation-focused titles from the history.
 
 **Bad:** `feat(core): add child run traversal and parent event aggregation`
 
-**Good:** `feat(core): workflows can now include a child workflow in the parent run`
+**Good:** `Workflows can now include a child workflow in the parent run`
 
 #### Description
 
@@ -117,12 +258,18 @@ Preserve the pull request template's structure and fill every applicable section
 with concrete information from the issue, diff, commits, and validation
 evidence. Lead with the problem and outcome, not an implementation inventory.
 
+### Changelog entries
+
+Writing a hand-written entry under `[Unreleased]` in `CHANGELOG.md` is optional.
+At release time, the release skill keeps their substance, drafts entries
+for merged PRs they do not cover, and removes duplicates.
+
 ## Code style
 
 - Follow [`AGENTS.md`](./AGENTS.md) and
   [`.archon/engineering.md`](./.archon/engineering.md).
 - TypeScript strict mode is enforced.
-- All functions require explicit return types.
+- Use inferred types where they are clear; annotate boundaries when needed to express a meaningful contract.
 - Do not use `any` without justification.
 - Follow existing patterns in the codebase.
 
@@ -132,70 +279,12 @@ with the documented product direction will be closed.
 
 ## Architecture
 
-See [AGENTS.md](./AGENTS.md) for detailed architecture documentation.
+See [`.archon/architecture.md`](./.archon/architecture.md) for the package map, main flows, extension points and enforced boundaries.
 
-## Contributing Workflows to the Marketplace
+## Sharing workflows
 
-Share your Archon workflows with the community by adding an entry to the marketplace registry at [`packages/docs-web/src/data/marketplace.ts`](packages/docs-web/src/data/marketplace.ts).
+Publish a workflow pack from your own GitHub repository: add an `archon-plugin.json` with `"kind": "workflow-pack"` and users install it with `archon plugin add owner/repo[/path][@tag]`. The layout and manifest are described in the [installed workflow packs guide](https://archon.diy/guides/global-workflows/#installed-workflow-packs).
 
-### How to Submit
-
-1. Keep your workflow in a **public GitHub repository** — either as a single YAML file or a directory
-2. Pin it to a specific commit SHA (ensures immutability after merge)
-3. Fork Archon and add an entry to `packages/docs-web/src/data/marketplace.ts`
-4. Open a PR — automated lint validates your entry before review
-
-### Submission Formats
-
-**Single-file workflow** — a standalone `.yaml` file:
-
-```
-sourceUrl: "https://github.com/you/repo/blob/main/my-workflow.yaml"
-```
-
-**Directory workflow** — a folder containing the workflow YAML plus supporting commands, scripts, or skills:
-
-```
-sourceUrl: "https://github.com/you/repo/tree/main/my-workflow/"
-```
-
-Directory structure convention:
-
-```
-my-workflow/
-├── README.md          # Describe what the workflow does and any prereqs a user needs to run it
-├── my-workflow.yaml   # Main workflow (must match slug or be the only .yaml)
-├── commands/          # → installed to .archon/commands/
-│   └── helper.md
-├── scripts/           # → installed to .archon/scripts/
-│   └── analyze.ts
-└── skills/            # → installed to .archon/skills/
-    └── my-skill/
-```
-
-Use a directory when your workflow references custom commands, scripts, or other resources that users need locally.
-
-### Entry Requirements
-
-| Field | Requirement |
-|-------|-------------|
-| `slug` | Lowercase, hyphens only (e.g. `my-review-workflow`) — must be unique |
-| `name` | Human-readable display name |
-| `author` | Your GitHub username |
-| `description` | 1–3 sentences: what it does and when to use it |
-| `sourceUrl` | GitHub blob URL (single file) or tree URL (directory) |
-| `sha` | Full 40-character commit SHA pinning the exact version |
-| `tags` | At least one from: `development`, `review`, `automation`, `planning` |
-| `archonVersionCompat` | Semver range (e.g. `>=0.3.0`) |
-
-### Self-Attestation
-
-By submitting, you attest that:
-
-- [ ] The workflow does not exfiltrate data, credentials, or secrets
-- [ ] The workflow does not execute destructive operations without user confirmation
-- [ ] You have the right to share this workflow publicly
-- [ ] The pinned SHA points to a reviewed, stable version of your workflow
 
 ## Questions?
 

@@ -25,7 +25,7 @@ import type {
   ToolExecutionCompleteData,
 } from '@github/copilot-sdk';
 
-import { truncateToolOutput } from '@archon/provider-contract';
+import { sessionPreview, truncateToolOutput } from '@archon/provider-contract';
 
 import type { MessageChunk, TokenUsage } from '../../types';
 import { tryParseStructuredOutput } from '../../shared/structured-output';
@@ -153,6 +153,36 @@ export interface EventMapperContext {
   markErrored: (errorMsg: string) => void;
 }
 
+type CopilotMcpStatus = Extract<
+  SessionEvent,
+  { type: 'session.mcp_server_status_changed' }
+>['data']['status'];
+type McpServerStatusChunk = Extract<MessageChunk, { type: 'mcp_server_status' }>;
+
+const MCP_STATUS = {
+  connected: 'connected',
+  failed: 'failed',
+  'needs-auth': 'needs_auth',
+  pending: 'pending',
+  disabled: 'disabled',
+  stopped: 'disabled',
+  // A server the session did not configure is unavailable to it.
+  not_configured: 'failed',
+} as const satisfies Record<CopilotMcpStatus, McpServerStatusChunk['status']>;
+
+function mcpServerStatusOf(
+  server: string,
+  status: CopilotMcpStatus,
+  error: string | undefined
+): McpServerStatusChunk {
+  return {
+    type: 'mcp_server_status',
+    server,
+    status: MCP_STATUS[status],
+    ...(error !== undefined ? { error } : {}),
+  };
+}
+
 /**
  * Translate one Copilot SDK `SessionEvent` into zero or more Archon
  * `MessageChunk`s, mutating the supplied context (captured usage, terminal
@@ -187,7 +217,7 @@ export function mapCopilotEvent(event: SessionEvent, ctx: EventMapperContext): M
     case 'tool.execution_start': {
       const { toolCallId, toolName, arguments: args } = event.data;
       const call: MessageChunk = { type: 'tool_call', toolCallId, name: toolName };
-      if (args) call.rawInput = args;
+      if (args !== undefined) call.rawInput = args;
       return [call];
     }
     case 'tool.execution_complete': {
@@ -214,6 +244,14 @@ export function mapCopilotEvent(event: SessionEvent, ctx: EventMapperContext): M
       ctx.markErrored(msg);
       return [];
     }
+    case 'session.mcp_server_status_changed': {
+      const { serverName, status, error } = event.data;
+      return [mcpServerStatusOf(serverName, status, error)];
+    }
+    case 'session.mcp_servers_loaded':
+      return event.data.servers.map(server =>
+        mcpServerStatusOf(server.name, server.status, server.error)
+      );
     case 'session.compaction_start':
       return [{ type: 'compaction', phase: 'started' }];
     case 'session.compaction_complete': {
@@ -317,7 +355,10 @@ export async function* bridgeSession(
 
   const onAbort = (): void => {
     void session.abort().catch(err => {
-      log.debug({ err, sessionId: session.sessionId }, 'copilot.abort_failed');
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.abort_failed'
+      );
     });
   };
   // `addEventListener('abort', ...)` is a no-op on an already-aborted signal,
@@ -336,7 +377,10 @@ export async function* bridgeSession(
     try {
       await session.disconnect();
     } catch (err) {
-      log.debug({ err, sessionId: session.sessionId }, 'copilot.disconnect_failed');
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.disconnect_failed'
+      );
     }
     throw new DOMException('Copilot sendQuery aborted before start', 'AbortError');
   }
@@ -402,7 +446,10 @@ export async function* bridgeSession(
         result.structuredOutput = parsed;
       } else {
         log.warn(
-          { bufferLength: assistantBuffer.length, sessionId: session.sessionId },
+          {
+            bufferLength: assistantBuffer.length,
+            sessionIdPreview: sessionPreview(session.sessionId),
+          },
           'copilot.structured_output_parse_failed'
         );
       }
@@ -426,12 +473,18 @@ export async function* bridgeSession(
     try {
       await session.abort();
     } catch (err) {
-      log.debug({ err, sessionId: session.sessionId }, 'copilot.abort_cleanup_failed');
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.abort_cleanup_failed'
+      );
     }
     try {
       await session.disconnect();
     } catch (err) {
-      log.debug({ err, sessionId: session.sessionId }, 'copilot.disconnect_failed');
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.disconnect_failed'
+      );
     }
     // Let the SDK's sendPromise settle so we don't leave a dangling promise.
     // Any error was already pushed to the queue.

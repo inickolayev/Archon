@@ -7,9 +7,10 @@
  */
 import { memo, type CSSProperties, type ReactElement, type ReactNode } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
-import { VARIANT_REGISTRY } from '../variants';
-import type { BuilderNode } from '../types';
+import { nodeCapabilities } from '../variants';
+import type { BuilderNode, WireDagNode } from '../types';
 import type { BuilderFlowNode } from '../flow/types';
+import { modelRefLabel } from './inspector/fields';
 
 /** First line of the node's main content, for the in-node preview. */
 export function contentPreview(node: BuilderNode): string {
@@ -36,12 +37,26 @@ export function contentPreview(node: BuilderNode): string {
       );
     case 'cancel':
       return node.data.reason.split('\n')[0] ?? '';
+    case 'opaque':
+      return opaquePreview(node.data.fields);
   }
+}
+
+/** Preview line for a read-only node: the sub-workflow / include target, or the group size. */
+function opaquePreview(fields: Partial<WireDagNode>): string {
+  if (fields.workflow !== undefined) {
+    return fields.fan_out !== undefined
+      ? `${fields.workflow} × ${fields.fan_out.items}`
+      : fields.workflow;
+  }
+  if (fields.include !== undefined) return fields.include;
+  const inner = fields.loop_group?.nodes.length ?? 0;
+  return `${String(inner)} nodes, ≤${String(fields.loop_group?.max_iterations ?? 0)} rounds`;
 }
 
 function BuilderNodeRender({ data, selected }: NodeProps<BuilderFlowNode>): ReactElement {
   const node = data.node;
-  const capabilities = VARIANT_REGISTRY[node.variant].capabilities;
+  const capabilities = nodeCapabilities(node);
   const preview = contentPreview(node);
   const stripeStyle: CSSProperties = { background: `var(--node-${node.variant})` };
   const badgeStyle: CSSProperties = {
@@ -52,18 +67,18 @@ function BuilderNodeRender({ data, selected }: NodeProps<BuilderFlowNode>): Reac
 
   return (
     <div
-      className={`flex w-[180px] cursor-pointer overflow-hidden rounded-lg border bg-surface transition-all ${
+      className={`flex w-45 cursor-pointer overflow-hidden rounded-lg border bg-surface transition-all ${
         selected ? 'border-accent-bright ring-1 ring-accent-bright' : 'border-border'
       }`}
     >
       <Handle type="target" position={Position.Top} className="!h-2 !w-2 !bg-accent" />
 
-      <div aria-hidden className="w-[3px] shrink-0" style={stripeStyle} />
+      <div aria-hidden className="w-0.75 shrink-0" style={stripeStyle} />
 
       <div className="min-w-0 flex-1 px-2.5 py-2">
         <div className="mb-1 flex items-center gap-1.5">
           <span
-            className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase"
+            className="shrink-0 rounded px-1.5 py-0.5 text-console-9 font-semibold uppercase"
             style={badgeStyle}
           >
             {data.label}
@@ -74,16 +89,18 @@ function BuilderNodeRender({ data, selected }: NodeProps<BuilderFlowNode>): Reac
         </div>
 
         {preview.length > 0 ? (
-          <div className="mb-1 truncate font-mono text-[10px] text-text-tertiary">{preview}</div>
+          <div className="mb-1 truncate font-mono text-console-10 text-text-tertiary">
+            {preview}
+          </div>
         ) : null}
 
         <div className="flex flex-wrap gap-1">
-          {node.base.model !== undefined ? <Pill>{node.base.model}</Pill> : null}
+          {node.base.model !== undefined ? <Pill>{modelRefLabel(node.base.model)}</Pill> : null}
           {hasWhen ? <Pill>when</Pill> : null}
           {node.base.trigger_rule !== undefined && node.base.trigger_rule !== 'all_success' ? (
             <Pill>{node.base.trigger_rule}</Pill>
           ) : null}
-          {capabilities.requiresInteractive === true ? <Pill>interactive</Pill> : null}
+          {capabilities.pausesRun === true ? <Pill>pauses</Pill> : null}
           {node.base.output_format !== undefined ? <Pill>{'{}'} JSON</Pill> : null}
         </div>
       </div>
@@ -95,7 +112,7 @@ function BuilderNodeRender({ data, selected }: NodeProps<BuilderFlowNode>): Reac
 
 function Pill({ children }: { children: ReactNode }): ReactElement {
   return (
-    <span className="inline-flex items-center rounded bg-surface-inset px-1.5 py-0.5 text-[9px] font-medium text-text-secondary">
+    <span className="inline-flex items-center rounded bg-surface-inset px-1.5 py-0.5 text-console-9 font-medium text-text-secondary">
       {children}
     </span>
   );

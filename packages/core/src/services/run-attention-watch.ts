@@ -6,21 +6,33 @@
  * This service never mutates run lifecycle state.
  */
 import { createLogger } from '@archon/paths';
-import { runAttention } from '@archon/workflows/schemas/workflow-run';
-import type {
-  RunAttention,
-  WorkflowRun,
-  WorkflowRunStatus,
-} from '@archon/workflows/schemas/workflow-run';
-import { WORKFLOW_EVENT_NOTIFY_CHANNEL } from '../db/adapters/types';
-import { getDbNotificationListener } from '../db/connection';
-import * as workflowDb from '../db/workflows';
 import {
-  RUN_LIVE_OWNER_CONTROL_HANDOFF_GRACE_MS,
+  TOOL_CALL_ATTENTION_METADATA_KEY,
+  type ExecutionOwnerRecord,
+  type RunAttention,
+  type WorkflowRun,
+  type WorkflowRunStatus,
+} from '@archon/workflows/schemas/workflow-run';
+import {
+  isOwnerEndpointLocal,
+  resolveRunAttention,
+  type RunAttentionReadStore,
+  type RunResolution,
+} from '@archon/workflows/run-attention-resolution';
+import { executionClaim } from '@archon/workflows/store';
+import type { RunOwnerLossWatch } from '@archon/workflows/attention-watch';
+
+import {
   watchRunLiveOwner,
   type RunLiveOwnerWatch,
   type RunLiveOwnerWatchEvent,
+  type RunLiveOwnerWatchResult,
 } from './run-live-owner';
+import { DETACHED_RUN_STOP_HANDOFF_GRACE_MS } from './run-stop-bounds';
+import type { RunOwnerObservation } from '../schemas/workflow-run';
+
+export type { RunAttentionReadStore };
+export type RunDoorbell = (runId: string, onDoorbell: () => void) => Promise<(() => void) | null>;
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -29,8 +41,6 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 export const DEFAULT_ATTENTION_POLL_INTERVAL_MS = 1000;
-// Persisted child and parent links are not trusted to be acyclic.
-const MAX_CHAIN_RUNS = 500;
 
 export type NonTerminalWorkflowRunStatus = Exclude<
   WorkflowRunStatus,
@@ -47,18 +57,27 @@ export type RunWaitResult =
 export interface RunAttentionWaitOptions {
   /** Stop waiting when this aborts. The run row is left untouched. */
   signal?: AbortSignal;
+  doorbell?: RunDoorbell;
   /** Give up after this long. Omitted means wait until the run says something. */
   deadlineMs?: number;
   /** Backstop re-read cadence. Defaults to `DEFAULT_ATTENTION_POLL_INTERVAL_MS`. */
   pollIntervalMs?: number;
-  /** Called once after the required durable and live watches are attached. */
-  onAttached?: (observedStatus: WorkflowRunStatus) => void | Promise<void>;
+  /**
+   * Called once after the required durable and live watches are attached. `ownerLiveness`
+   * is set when the run needs an owner whose endpoint this host and user cannot reach, so
+   * the wait watches only the durable row.
+   */
+  onAttached?: (
+    observedStatus: WorkflowRunStatus,
+    ownerLiveness?: UnknownOwnerLiveness
+  ) => void | Promise<void>;
 }
 
-type RunResolution =
-  | { kind: 'attention'; attention: RunAttention }
-  | { kind: 'owner_required'; activeRun: WorkflowRun; executionChainIds: readonly string[] }
-  | { kind: 'ownerless' };
+export interface UnknownOwnerLiveness {
+  kind: 'unknown';
+  /** The run's `execution_owner` record; undefined on runs that predate it. */
+  recordedOwner: ExecutionOwnerRecord | undefined;
+}
 
 type WakeSource =
   | 'immediate'
@@ -69,140 +88,122 @@ type WakeSource =
   | 'owner_disconnect'
   | 'owner_handoff';
 
-function unreadable(
-  runId: string,
-  reason: 'child_run_missing' | 'child_chain_too_deep',
-  detail: string
-): RunAttention {
-  return { kind: 'unreadable', runId, reason, detail };
+type OwnerRequired = Extract<RunResolution, { kind: 'owner_required' }>;
+
+type RunOwnerAttachment =
+  | { kind: 'attached'; runId: string; handle: RunLiveOwnerWatch }
+  | { kind: 'unreachable' | 'unproven' | 'unknown' };
+
+/**
+ * Attach to the first owner candidate that answers. No answer from any candidate is
+ * `unreachable` only when the recorded owner's endpoint lives on this host and user;
+ * otherwise this process cannot observe it and the result is `unknown`.
+ */
+async function attachRunOwner(
+  resolution: OwnerRequired,
+  onEvent: (event: RunLiveOwnerWatchEvent) => void
+): Promise<RunOwnerAttachment> {
+  let attachment: 'unreachable' | 'unproven' = 'unreachable';
+  for (const candidate of resolution.ownerCandidateIds) {
+    const result = await watchRunLiveOwner(candidate, onEvent);
+    if (result.kind === 'attached')
+      return { kind: 'attached', runId: candidate, handle: result.handle };
+    if (result.kind === 'unproven') attachment = 'unproven';
+  }
+  return {
+    kind:
+      attachment === 'unreachable' && !isOwnerEndpointLocal(resolution.recordedOwner)
+        ? 'unknown'
+        : attachment,
+  };
 }
 
 function isNonTerminalStatus(status: WorkflowRunStatus): status is NonTerminalWorkflowRunStatus {
   return status !== 'completed' && status !== 'failed' && status !== 'cancelled';
 }
 
-/** Resolve the child chain while retaining whether its current state needs a live process. */
-async function resolveRun(run: WorkflowRun): Promise<RunResolution> {
-  const executionChain = [run];
-  let current = run;
-  let attention = runAttention(current);
-  let steps = 0;
+type OwnerAttachmentKind = RunLiveOwnerWatchResult['kind'] | 'unknown';
 
-  while (attention?.kind === 'blocked_on_child') {
-    steps += 1;
-    if (steps > MAX_CHAIN_RUNS) {
-      return {
-        kind: 'attention',
-        attention: unreadable(
-          attention.runId,
-          'child_chain_too_deep',
-          `sub-run chain is deeper than ${String(MAX_CHAIN_RUNS)} runs`
-        ),
-      };
-    }
-    const child = await workflowDb.getWorkflowRun(attention.childRunId);
-    if (!child) {
-      return {
-        kind: 'attention',
-        attention: unreadable(
-          attention.runId,
-          'child_run_missing',
-          `blocked on sub-run ${attention.childRunId}, which has no row`
-        ),
-      };
-    }
-    executionChain.push(child);
-    current = child;
-    const childAttention = runAttention(child);
-    if (childAttention?.kind === 'terminal') {
-      return {
-        kind: 'owner_required',
-        activeRun: child,
-        executionChainIds: executionChain.map(candidate => candidate.id).reverse(),
-      };
-    }
-    attention = childAttention;
-  }
+/** What one read of the row settled: an end of the wait, or the status to keep waiting on. */
+type Settled = RunWaitResult | { kind: 'waiting'; observedStatus: WorkflowRunStatus };
 
-  if (attention) return { kind: 'attention', attention };
-  if (current.status === 'running' || (current !== run && current.status === 'pending')) {
-    return {
-      kind: 'owner_required',
-      activeRun: current,
-      executionChainIds: executionChain.map(candidate => candidate.id).reverse(),
+/** The owner check after a failed attach: an end of the wait, or the re-read row's state. */
+type OwnerRecheck =
+  | RunWaitResult
+  | {
+      kind: 'rechecked';
+      observedStatus: WorkflowRunStatus;
+      resolution: RunResolution;
+      ownerAttachment: OwnerAttachmentKind;
     };
-  }
-  return { kind: 'ownerless' };
-}
-
-/** Prefer the active child, then walk toward the process-entry ancestor. */
-async function ownerCandidates(
-  resolution: Extract<RunResolution, { kind: 'owner_required' }>
-): Promise<string[]> {
-  const candidates = [...resolution.executionChainIds];
-  const seen = new Set(candidates);
-  let current = resolution.activeRun;
-  let steps = 0;
-  while (current.parent_run_id) {
-    steps += 1;
-    if (steps > MAX_CHAIN_RUNS) break;
-    const parentId = current.parent_run_id;
-    if (!seen.has(parentId)) {
-      seen.add(parentId);
-      candidates.push(parentId);
-    }
-    const parent = await workflowDb.getWorkflowRun(parentId);
-    if (!parent) break;
-    current = parent;
-  }
-  return candidates;
-}
-
-async function subscribeToRunDoorbell(
-  runId: string,
-  onDoorbell: () => void
-): Promise<(() => void) | null> {
-  const listener = getDbNotificationListener();
-  if (!listener) return null;
-  try {
-    return await listener.listen(
-      WORKFLOW_EVENT_NOTIFY_CHANNEL,
-      payload => {
-        if (payload === runId) onDoorbell();
-      },
-      err => {
-        getLog().debug({ err, runId }, 'run_attention.doorbell_dropped');
-      }
-    );
-  } catch (err) {
-    getLog().debug({ err, runId }, 'run_attention.doorbell_unavailable');
-    return null;
-  }
-}
 
 /** Block until durable attention, owner loss, deadline, or caller abort. */
 export async function waitForRunAttention(
+  store: RunAttentionReadStore,
   runId: string,
   opts: RunAttentionWaitOptions = {}
 ): Promise<RunWaitResult> {
-  const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_ATTENTION_POLL_INTERVAL_MS;
   const deadlineAt = opts.deadlineMs === undefined ? undefined : Date.now() + opts.deadlineMs;
-  const signal = opts.signal;
-  if (signal?.aborted) return { kind: 'aborted', runId };
+  if (opts.signal?.aborted) return { kind: 'aborted', runId };
+  const wait = openAttentionWait(store, runId, opts, deadlineAt);
+  await wait.subscribe();
+  try {
+    let wakeSource: WakeSource = 'immediate';
+    for (;;) {
+      const settled = await wait.settle(wakeSource);
+      if (settled.kind !== 'waiting') return settled;
+      if (opts.signal?.aborted) return { kind: 'aborted', runId };
+      if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+        return { kind: 'deadline', runId, observedStatus: settled.observedStatus };
+      }
+      wakeSource = await wait.nextWake();
+    }
+  } finally {
+    wait.close();
+  }
+}
 
+/**
+ * One wait's state and its phases: subscribe to the doorbell, settle what the row says
+ * (delivering `onAttached` once the required watches hold), wait for the next wake, and
+ * close every watch it opened.
+ */
+function openAttentionWait(
+  store: RunAttentionReadStore,
+  runId: string,
+  opts: RunAttentionWaitOptions,
+  deadlineAt: number | undefined
+): {
+  subscribe: () => Promise<void>;
+  settle: (wakeSource: WakeSource) => Promise<Settled>;
+  nextWake: () => Promise<WakeSource>;
+  close: () => void;
+} {
+  const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_ATTENTION_POLL_INTERVAL_MS;
+  const signal = opts.signal;
   let pendingWake: WakeSource | undefined;
   let wake: ((source: WakeSource) => void) | null = null;
   let ownerWatch: { runId: string; handle: RunLiveOwnerWatch } | undefined;
   let ownerWatchEnded = false;
   let controlHandoffUntil: number | undefined;
+  let attached = false;
+  let unsubscribeDoorbell: (() => void) | null | undefined;
 
   const queueWake = (source: WakeSource): void => {
     if (wake) wake(source);
     else pendingWake = source;
   };
-  const unsubscribeDoorbell = await subscribeToRunDoorbell(runId, () => {
-    queueWake('notify');
-  });
+
+  const subscribe = async (): Promise<void> => {
+    try {
+      unsubscribeDoorbell = await opts.doorbell?.(runId, () => {
+        queueWake('notify');
+      });
+    } catch (err) {
+      // Notifications only reduce latency; durable polling must survive subscription failure.
+      getLog().debug({ err, runId }, 'run_attention.doorbell_unavailable');
+    }
+  };
 
   const nextWake = (): Promise<WakeSource> => {
     if (pendingWake) {
@@ -244,7 +245,7 @@ export async function waitForRunAttention(
 
   const onOwnerEvent = (event: RunLiveOwnerWatchEvent): void => {
     if (event === 'control_handoff') {
-      controlHandoffUntil = Date.now() + RUN_LIVE_OWNER_CONTROL_HANDOFF_GRACE_MS;
+      controlHandoffUntil = Date.now() + DETACHED_RUN_STOP_HANDOFF_GRACE_MS;
       queueWake('owner_handoff');
       return;
     }
@@ -258,101 +259,189 @@ export async function waitForRunAttention(
     ownerWatchEnded = false;
   };
 
-  const attachOwner = async (
-    resolution: Extract<RunResolution, { kind: 'owner_required' }>
-  ): Promise<boolean> => {
-    const candidates = await ownerCandidates(resolution);
-    if (ownerWatch && !ownerWatchEnded && candidates.includes(ownerWatch.runId)) return true;
+  const attachOwner = async (resolution: OwnerRequired): Promise<OwnerAttachmentKind> => {
+    if (ownerWatch && !ownerWatchEnded && resolution.ownerCandidateIds.includes(ownerWatch.runId))
+      return 'attached';
     discardOwnerWatch();
-    for (const candidate of candidates) {
-      ownerWatchEnded = false;
-      const handle = await watchRunLiveOwner(candidate, onOwnerEvent);
-      if (handle) {
-        ownerWatch = { runId: candidate, handle };
-        return !ownerWatchEnded;
-      }
-    }
-    return false;
+    const attachment = await attachRunOwner(resolution, onOwnerEvent);
+    if (attachment.kind !== 'attached') return attachment.kind;
+    ownerWatch = { runId: attachment.runId, handle: attachment.handle };
+    return ownerWatchEnded ? 'unproven' : 'attached';
   };
 
-  try {
-    let wakeSource: WakeSource = 'immediate';
-    let attached = false;
-    for (;;) {
-      if (ownerWatchEnded) discardOwnerWatch();
+  /** `onAttached` fires once, after the first read whose required watches all hold. */
+  const deliverAttached = async (
+    observedStatus: WorkflowRunStatus,
+    ownerLiveness?: UnknownOwnerLiveness
+  ): Promise<void> => {
+    if (attached) return;
+    attached = true;
+    if (ownerLiveness) await opts.onAttached?.(observedStatus, ownerLiveness);
+    else await opts.onAttached?.(observedStatus);
+  };
 
-      const run = await workflowDb.getWorkflowRun(runId);
-      if (!run) return { kind: 'not_found', runId };
-      let observedStatus = run.status;
-      let resolution = await resolveRun(run);
-      if (resolution.kind === 'attention') {
-        getLog().debug(
-          { runId, wakeSource, attention: resolution.attention.kind },
-          'run_attention.resolved'
-        );
-        return { kind: 'attention', attention: resolution.attention };
-      }
-
-      if (resolution.kind === 'owner_required') {
-        let liveOwnerAttached = await attachOwner(resolution);
-        if (!liveOwnerAttached) {
-          const latestRun = await workflowDb.getWorkflowRun(runId);
-          if (!latestRun) return { kind: 'not_found', runId };
-          observedStatus = latestRun.status;
-          resolution = await resolveRun(latestRun);
-          if (resolution.kind === 'attention') {
-            return { kind: 'attention', attention: resolution.attention };
-          }
-          if (resolution.kind === 'owner_required') {
-            liveOwnerAttached = await attachOwner(resolution);
-            if (!liveOwnerAttached) {
-              if (controlHandoffUntil !== undefined && Date.now() < controlHandoffUntil) {
-                pendingWake = undefined;
-              } else if (isNonTerminalStatus(latestRun.status)) {
-                controlHandoffUntil = undefined;
-                return {
-                  kind: 'owner_lost',
-                  runId,
-                  observedStatus: latestRun.status,
-                };
-              }
-            }
-          } else {
-            discardOwnerWatch();
-          }
-        }
-        if (liveOwnerAttached && !attached) {
-          const verifiedRun = await workflowDb.getWorkflowRun(runId);
-          if (!verifiedRun) return { kind: 'not_found', runId };
-          observedStatus = verifiedRun.status;
-          const verified = await resolveRun(verifiedRun);
-          if (verified.kind === 'attention') {
-            return { kind: 'attention', attention: verified.attention };
-          }
-          if (verified.kind !== 'owner_required') {
-            discardOwnerWatch();
-          } else if ((await attachOwner(verified)) && !ownerWatchEnded) {
-            attached = true;
-            await opts.onAttached?.(verifiedRun.status);
-          }
-        }
-      } else {
-        controlHandoffUntil = undefined;
-        discardOwnerWatch();
-        if (!attached) {
-          attached = true;
-          await opts.onAttached?.(run.status);
-        }
-      }
-
-      if (signal?.aborted) return { kind: 'aborted', runId };
-      if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
-        return { kind: 'deadline', runId, observedStatus };
-      }
-      wakeSource = await nextWake();
+  /** No owner answered: a control handoff holds the wait open, a local unreachable owner ends it. */
+  const ownerLoss = (
+    ownerAttachment: OwnerAttachmentKind,
+    status: WorkflowRunStatus
+  ): RunWaitResult | undefined => {
+    if (controlHandoffUntil !== undefined && Date.now() < controlHandoffUntil) {
+      pendingWake = undefined;
+      return undefined;
     }
-  } finally {
+    if (ownerAttachment !== 'unreachable' || !isNonTerminalStatus(status)) return undefined;
+    controlHandoffUntil = undefined;
+    return { kind: 'owner_lost', runId, observedStatus: status };
+  };
+
+  /** Re-read the row before trusting a failed attach: the owner may have just written it. */
+  const recheckOwner = async (ownerAttachment: OwnerAttachmentKind): Promise<OwnerRecheck> => {
+    const latestRun = await store.getWorkflowRun(runId);
+    if (!latestRun) return { kind: 'not_found', runId };
+    const resolution = await resolveRunAttention(store, latestRun);
+    if (resolution.kind === 'attention') {
+      return { kind: 'attention', attention: resolution.attention };
+    }
+    const observedStatus = latestRun.status;
+    if (resolution.kind !== 'owner_required') {
+      discardOwnerWatch();
+      await deliverAttached(observedStatus);
+      return { kind: 'rechecked', observedStatus, resolution, ownerAttachment };
+    }
+    const reattached = await attachOwner(resolution);
+    const lost = reattached === 'attached' ? undefined : ownerLoss(reattached, observedStatus);
+    return lost ?? { kind: 'rechecked', observedStatus, resolution, ownerAttachment: reattached };
+  };
+
+  /** The first attach is trusted only after a re-read still asks for that owner. */
+  const verifyAttached = async (): Promise<Settled> => {
+    const verifiedRun = await store.getWorkflowRun(runId);
+    if (!verifiedRun) return { kind: 'not_found', runId };
+    const verified = await resolveRunAttention(store, verifiedRun);
+    if (verified.kind === 'attention') {
+      return { kind: 'attention', attention: verified.attention };
+    }
+    if (verified.kind !== 'owner_required') {
+      discardOwnerWatch();
+      await deliverAttached(verifiedRun.status);
+    } else if ((await attachOwner(verified)) === 'attached' && !ownerWatchEnded) {
+      await deliverAttached(verifiedRun.status);
+    }
+    return { kind: 'waiting', observedStatus: verifiedRun.status };
+  };
+
+  const settleOwnerRequired = async (
+    required: OwnerRequired,
+    status: WorkflowRunStatus
+  ): Promise<Settled> => {
+    let check: OwnerRecheck = {
+      kind: 'rechecked',
+      observedStatus: status,
+      resolution: required,
+      ownerAttachment: await attachOwner(required),
+    };
+    if (check.ownerAttachment !== 'attached') check = await recheckOwner(check.ownerAttachment);
+    if (check.kind !== 'rechecked') return check;
+    const { observedStatus, resolution, ownerAttachment } = check;
+    if (ownerAttachment === 'unknown' && resolution.kind === 'owner_required') {
+      await deliverAttached(observedStatus, {
+        kind: 'unknown',
+        recordedOwner: resolution.recordedOwner,
+      });
+    }
+    if (ownerAttachment === 'attached' && !attached) return verifyAttached();
+    return { kind: 'waiting', observedStatus };
+  };
+
+  const settle = async (wakeSource: WakeSource): Promise<Settled> => {
+    if (ownerWatchEnded) discardOwnerWatch();
+    const run = await store.getWorkflowRun(runId);
+    if (!run) return { kind: 'not_found', runId };
+    const resolution = await resolveRunAttention(store, run);
+    if (resolution.kind === 'attention') {
+      getLog().debug(
+        { runId, wakeSource, attention: resolution.attention.kind },
+        'run_attention.resolved'
+      );
+      return { kind: 'attention', attention: resolution.attention };
+    }
+    if (resolution.kind === 'owner_required') return settleOwnerRequired(resolution, run.status);
+    controlHandoffUntil = undefined;
+    discardOwnerWatch();
+    await deliverAttached(run.status);
+    return { kind: 'waiting', observedStatus: run.status };
+  };
+
+  const close = (): void => {
     discardOwnerWatch();
     unsubscribeDoorbell?.();
+  };
+
+  return { subscribe, settle, nextWake, close };
+}
+
+/**
+ * The attention watch's owner liveness, by the rule `workflow wait` uses: `owner_lost`
+ * reports the observed status, and any other end of the wait means the run no longer
+ * needs watching. A running row's tool-call attention is not an end of the wait: a process
+ * that died mid-call leaves exactly that row, so the watch reads running rows without it
+ * and keeps asking for their owner. Polls only; one notification
+ * listener per running run would hold one database connection each.
+ */
+export function runOwnerLossWatch(store: RunAttentionReadStore): RunOwnerLossWatch {
+  return async (runId, signal, claim) => {
+    const ownerStore: RunAttentionReadStore = {
+      getWorkflowRun: async id => {
+        const run = await store.getWorkflowRun(id);
+        // This wait owns only the armed execution. The feed arms any successor;
+        // presenting it here would attribute its loss to the prior claim.
+        if (id === runId && run && executionClaim(run.metadata) !== claim) return null;
+        return withoutRunningAttention(run);
+      },
+    };
+    const result = await waitForRunAttention(ownerStore, runId, { signal });
+    return result.kind === 'owner_lost' ? { observedStatus: result.observedStatus } : null;
+  };
+}
+
+/**
+ * What this process observes about a running row's owner, by the rule `workflow wait`
+ * uses for `owner_lost`. Null when the row is not running, so it makes no ownership claim.
+ * Reads only the owner endpoints and the stored row: how long the run has been quiet is
+ * not an input, and the run is never mutated.
+ */
+export async function observeRunOwner(
+  store: RunAttentionReadStore,
+  run: WorkflowRun
+): Promise<RunOwnerObservation | null> {
+  // A process that died mid-call leaves tool-call attention on a running row, as in
+  // `runOwnerLossWatch`, so the observation asks for the owner instead.
+  const ownerStore: RunAttentionReadStore = {
+    getWorkflowRun: async id => withoutRunningAttention(await store.getWorkflowRun(id)),
+  };
+  let current: WorkflowRun | null = run;
+  for (let read = 1; ; read++) {
+    if (current?.status !== 'running') return null;
+    const resolution = await resolveRunAttention(ownerStore, withoutRunningAttention(current));
+    if (resolution.kind !== 'owner_required') return null;
+    const attachment = await attachRunOwner(resolution, () => undefined);
+    if (attachment.kind === 'attached') {
+      attachment.handle.unsubscribe();
+      return 'reachable';
+    }
+    if (attachment.kind !== 'unreachable') return 'unknown';
+    // An owner closes its endpoint only after its terminal write, so a second read tells a
+    // run that just finished from one whose owner is gone.
+    if (read === 2) return 'unreachable';
+    current = await store.getWorkflowRun(run.id);
   }
+}
+
+function withoutRunningAttention(run: WorkflowRun): WorkflowRun;
+function withoutRunningAttention(run: WorkflowRun | null): WorkflowRun | null;
+function withoutRunningAttention(run: WorkflowRun | null): WorkflowRun | null {
+  if (run?.status !== 'running' || !Object.hasOwn(run.metadata, TOOL_CALL_ATTENTION_METADATA_KEY))
+    return run;
+  const { [TOOL_CALL_ATTENTION_METADATA_KEY]: _attention, ...metadata } = run.metadata;
+  return { ...run, metadata };
 }

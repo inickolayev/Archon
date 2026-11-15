@@ -9,8 +9,10 @@ import { z } from 'zod';
  *  - `budget_exceeded`  the run's spend limit stopped the turn. Never retried.
  *  - `misconfigured`    the operator's setup must change first: a bad proxy, a missing or too-old
  *                       CLI, an unknown model, an unreadable config file. Never retried.
- *  - `rate_limited`     the vendor is shedding load. Retried with the patient rate-limit budget.
- *  - `transient`        network, overload or process failure that a new attempt may clear.
+ *  - `rate_limited`     the vendor is limiting requests. Retried with the patient rate-limit budget;
+ *                       one that outlasts it pauses the run until `resetAt`, or a computed backoff.
+ *  - `overloaded`       provider capacity exhausted. Retried with capped exponential backoff.
+ *  - `transient`        network or process failure that a new attempt may clear.
  *  - `unknown`          the provider knows the turn failed but not why. Retried only on `on_error: all`.
  */
 export const providerFailureClassSchema = z.enum([
@@ -19,6 +21,7 @@ export const providerFailureClassSchema = z.enum([
   'budget_exceeded',
   'misconfigured',
   'rate_limited',
+  'overloaded',
   'transient',
   'unknown',
 ]);
@@ -28,7 +31,7 @@ export const providerFailureSchema = z.object({
   class: providerFailureClassSchema,
   /** Vendor-advised wait before the next attempt, in milliseconds. */
   retryAfterMs: z.number().int().nonnegative().optional(),
-  /** When an exhausted quota window reopens. */
+  /** When an exhausted quota window reopens, or when a rate limit clears. */
   resetAt: z.iso.datetime({ offset: true }).optional(),
   /**
    * The vendor's own words or code, kept for the operator and the logs. Diagnostic only:

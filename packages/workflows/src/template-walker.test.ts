@@ -1,5 +1,6 @@
+// @archon-test-isolated
 import { expect, test } from 'bun:test';
-import { z } from '@hono/zod-openapi';
+import { z } from 'zod';
 import type { DagNode } from './schemas';
 import {
   bindingDirectiveSchema,
@@ -35,6 +36,10 @@ const STRING_FIELD_CLASSIFICATIONS = {
   when: { kind: 'template', slots: ['when'] },
   trigger_rule: { kind: 'literal', reason: 'Trigger rule is a scheduling policy enum' },
   model: { kind: 'literal', reason: 'Model is a provider model identifier' },
+  'model.*': {
+    kind: 'literal',
+    reason: 'Model preference entries are aliases, tiers or model identifiers',
+  },
   provider: { kind: 'literal', reason: 'Provider is an integration identifier' },
   context: { kind: 'literal', reason: 'Context string selects a session policy' },
   'context.resume': { kind: 'literal', reason: 'Resume target is a node identifier' },
@@ -47,6 +52,7 @@ const STRING_FIELD_CLASSIFICATIONS = {
   'retry.on_error': { kind: 'literal', reason: 'Retry error class is an engine policy enum' },
   ...HOOK_FIELD_CLASSIFICATIONS,
   mcp: { kind: 'literal', reason: 'MCP value is a configuration path' },
+  'mcp.path': { kind: 'literal', reason: 'MCP value is a configuration path' },
   'skills.*': { kind: 'literal', reason: 'Skill entries are capability identifiers' },
   'plugins.*': { kind: 'literal', reason: 'Plugin entries are capability identifiers' },
   'agents.*.description': { kind: 'template', slots: ['agents.*.description'] },
@@ -123,6 +129,14 @@ const STRING_FIELD_CLASSIFICATIONS = {
     kind: 'literal',
     reason: 'Loop completion field names an output-schema property',
   },
+  'loop.on_exhausted': {
+    kind: 'literal',
+    reason: 'Loop exhaustion policy is an enum the executor reads',
+  },
+  'loop_group.on_exhausted': {
+    kind: 'literal',
+    reason: 'Loop-group exhaustion policy is an enum the executor reads',
+  },
   'loop_group.until': {
     kind: 'literal',
     reason: 'Loop-group completion signal is matched verbatim',
@@ -145,6 +159,35 @@ const STRING_FIELD_CLASSIFICATIONS = {
   'wait.until': { kind: 'template', slots: ['wait.until'] },
   'wait.event': { kind: 'template', slots: ['wait.event'] },
   'wait.attention': { kind: 'template', slots: ['wait.attention'] },
+  'wait.form': { kind: 'literal', reason: 'Attention form fixes the output contract' },
+  'wait.options': { kind: 'template', slots: ['wait.options'] },
+  'wait.options.*.id': { kind: 'literal', reason: 'Attention option id is an answer wire value' },
+  'wait.options.*.label': {
+    kind: 'literal',
+    reason: 'Display text is not an execution template',
+  },
+  'wait.options.*.does': {
+    kind: 'literal',
+    reason: 'Display text is not an execution template',
+  },
+  'wait.options.*.value': {
+    kind: 'literal',
+    reason: 'Option value is opaque and returned unchanged with the answer',
+  },
+  'wait.recommendation': { kind: 'template', slots: ['wait.recommendation'] },
+  'wait.recommendation.option': {
+    kind: 'literal',
+    reason: 'Recommended option id is an answer wire value',
+  },
+  'wait.recommendation.why': {
+    kind: 'literal',
+    reason: 'Display text is not an execution template',
+  },
+  'wait.recommendation.confidence': {
+    kind: 'literal',
+    reason: 'Recommendation confidence is a display enum',
+  },
+  'wait.labels.*': { kind: 'template', slots: ['wait.labels.*'] },
   cancel: { kind: 'template', slots: ['cancel.reason'] },
   include: { kind: 'literal', reason: 'Include target is a workflow resource identifier' },
   workflow: { kind: 'literal', reason: 'Child target is a workflow resource identifier' },
@@ -155,6 +198,10 @@ const STRING_FIELD_CLASSIFICATIONS = {
     slots: ['workflow.fan_out.items', 'compose_fan_out.fan_out.items'],
   },
   'fan_out.as': { kind: 'literal', reason: 'Fan-out alias is an input identifier' },
+  'fan_out.max_parallel': {
+    kind: 'literal',
+    reason: 'Fan-out concurrency is a numeric bound or the literal all policy',
+  },
   'fan_out.join': { kind: 'literal', reason: 'Fan-out join is an execution policy enum' },
   'with.*': {
     kind: 'template',
@@ -236,46 +283,24 @@ function collectStringFields(
     stringFields.add(options.opaqueRecordPaths?.has(path) === true ? `${path}.*` : path);
   };
 
-  const walk = (value: unknown, path: string, activeReferences: ReadonlySet<string>): void => {
-    if (value === true) {
-      addOpaquePosition(path);
-      return;
-    }
-    if (!isRecord(value)) return;
-
-    const reference = value.$ref;
-    if (reference !== undefined) {
-      if (typeof reference !== 'string')
-        throw new Error(`Invalid JSON Schema reference at ${path}`);
-      followedReferences.add(path);
-      if (activeReferences.has(reference)) return;
-      const nextReferences = new Set(activeReferences);
-      nextReferences.add(reference);
-      walk(
-        resolveLocalReference(root, reference),
-        reference === '#' ? rootPath : path,
-        nextReferences
-      );
-      return;
-    }
-
-    if (Object.keys(value).length === 0) {
-      addOpaquePosition(path);
-      return;
-    }
-
-    const type = value.type;
-    if (type === 'string' || (Array.isArray(type) && type.includes('string'))) {
-      if (path !== '') stringFields.add(path);
-    }
-
+  function walkVariants(
+    value: Record<string, unknown>,
+    path: string,
+    activeReferences: ReadonlySet<string>
+  ): void {
     for (const keyword of ['anyOf', 'oneOf', 'allOf'] as const) {
       const variants = value[keyword];
       if (variants === undefined) continue;
       if (!Array.isArray(variants)) throw new Error(`Invalid JSON Schema ${keyword} at ${path}`);
       for (const variant of variants) walk(variant, path, activeReferences);
     }
+  }
 
+  function walkProperties(
+    value: Record<string, unknown>,
+    path: string,
+    activeReferences: ReadonlySet<string>
+  ): void {
     const properties = value.properties;
     if (properties !== undefined) {
       if (!isRecord(properties)) throw new Error(`Invalid JSON Schema properties at ${path}`);
@@ -283,7 +308,13 @@ function collectStringFields(
         walk(property, childPath(path, name), activeReferences);
       }
     }
+  }
 
+  function walkItems(
+    value: Record<string, unknown>,
+    path: string,
+    activeReferences: ReadonlySet<string>
+  ): void {
     const items = value.items;
     if (Array.isArray(items)) {
       for (const item of items) walk(item, childPath(path, '*'), activeReferences);
@@ -297,6 +328,51 @@ function collectStringFields(
         throw new Error(`Invalid JSON Schema prefixItems at ${path}`);
       for (const item of prefixItems) walk(item, childPath(path, '*'), activeReferences);
     }
+  }
+
+  function followReference(
+    reference: unknown,
+    path: string,
+    activeReferences: ReadonlySet<string>
+  ): void {
+    if (typeof reference !== 'string') throw new Error(`Invalid JSON Schema reference at ${path}`);
+    followedReferences.add(path);
+    if (activeReferences.has(reference)) return;
+    const nextReferences = new Set(activeReferences);
+    nextReferences.add(reference);
+    walk(
+      resolveLocalReference(root, reference),
+      reference === '#' ? rootPath : path,
+      nextReferences
+    );
+  }
+
+  const walk = (value: unknown, path: string, activeReferences: ReadonlySet<string>): void => {
+    if (value === true) {
+      addOpaquePosition(path);
+      return;
+    }
+    if (!isRecord(value)) return;
+
+    const reference = value.$ref;
+    if (reference !== undefined) {
+      followReference(reference, path, activeReferences);
+      return;
+    }
+
+    if (Object.keys(value).length === 0) {
+      addOpaquePosition(path);
+      return;
+    }
+
+    const type = value.type;
+    if (type === 'string' || (Array.isArray(type) && type.includes('string'))) {
+      if (path !== '') stringFields.add(path);
+    }
+
+    walkVariants(value, path, activeReferences);
+    walkProperties(value, path, activeReferences);
+    walkItems(value, path, activeReferences);
 
     const additionalProperties = value.additionalProperties;
     if (additionalProperties !== undefined && additionalProperties !== false) {
@@ -486,6 +562,9 @@ test('the slot catalogue rejects omitted fixed fields', () => {
     'wait.until': { surface: 'value' },
     'wait.event': { surface: 'value' },
     'wait.attention': { surface: 'prompt' },
+    'wait.options': { surface: 'value' },
+    'wait.recommendation': { surface: 'value' },
+    'wait.labels.*': { surface: 'value' },
     'workflow.input': { surface: 'value' },
     'workflow.with.*': { surface: 'value' },
     'workflow.fan_out.items': { surface: 'value' },

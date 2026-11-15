@@ -2,14 +2,17 @@
  * `buildNodeSummaries` projects a run's event log into the per-node view that
  * `archon workflow get/status --verbose` renders, and the `nodes` array their
  * `--json` form emits.
- *
- * `.spec.ts` rather than `.test.ts`: `packages/cli/tsconfig.json` excludes
- * `**\/*.test.ts` and the root ESLint config ignores it, so a `.test.ts` here
- * would be neither type-checked nor linted.
  */
-import { describe, expect, it } from 'bun:test';
-import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
-import { buildNodeSummaries } from './workflow';
+import { describe, expect, it, spyOn } from 'bun:test';
+import type { WorkflowEventRow } from '@archon/workflows/schemas/workflow-event';
+import { WORKFLOW_EVENT_TYPES } from '@archon/workflows/store';
+import {
+  formatSkipCause,
+  NODE_SUMMARY_EVENT_TYPES,
+  buildNodeSummaries,
+  buildRunNodes,
+  printVerboseNodes,
+} from './workflow-node-summaries';
 
 function event(
   id: string,
@@ -30,6 +33,69 @@ function event(
 }
 
 describe('buildNodeSummaries', () => {
+  it('renders include provenance while retaining legacy cause wording', () => {
+    const boundary = { includeId: 'cycle.review%5Fqa', workflow: 'review-block' };
+    const causes = [
+      { kind: 'condition', expr: "$gate.output == 'go'" },
+      { kind: 'condition_parse_error', expr: '$INPUTS.missing' },
+      { kind: 'upstream_failed', origin: 'original-failure' },
+      { kind: 'upstream_skipped', origin: 'original-skip' },
+      { kind: 'timeout' },
+    ] as const;
+    const expected = [
+      "condition: $gate.output == 'go'",
+      'condition parse error: $INPUTS.missing',
+      'upstream failed: original-failure',
+      'upstream skipped: original-skip',
+      'timeout',
+    ];
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      for (const [index, cause] of causes.entries()) {
+        expect(formatSkipCause(cause)).toBe(expected[index]!);
+        const detail =
+          cause.kind === 'condition_parse_error'
+            ? 'condition evaluation error: $INPUTS.missing'
+            : expected[index];
+        const rendered = `${detail} [include 'cycle.["review_qa"]', workflow 'review-block']`;
+        expect(formatSkipCause({ ...cause, boundary })).toBe(rendered);
+        printVerboseNodes([
+          event(`skip-${index}`, 'node_skipped', 'review__node', '2026-11-12T10:00:00Z', {
+            cause: { ...cause, boundary },
+          }),
+        ]);
+        expect(log).toHaveBeenCalledWith(`    - review__node (${rendered})`);
+      }
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('distinguishes empty from absent output', () => {
+    const summaries = buildNodeSummaries([
+      event('empty', 'node_completed', 'empty', '2026-11-10T10:00:00.000Z', { node_output: '' }),
+      event('absent', 'node_completed', 'absent', '2026-11-10T10:00:00.000Z'),
+    ]);
+    expect(summaries[0]).toMatchObject({ output: '', outputTruncated: false, outputPreview: '' });
+    expect(summaries[1]).not.toHaveProperty('output');
+    expect(summaries[1]).not.toHaveProperty('outputTruncated');
+  });
+
+  it('keeps human output limited to the preview', () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      printVerboseNodes([
+        event('output', 'node_completed', 'work', '2026-11-10T10:00:00.000Z', {
+          node_output: `${'x'.repeat(200)}hidden suffix`,
+        }),
+      ]);
+      expect(log).toHaveBeenCalledWith(`        Output: ${'x'.repeat(200)}...`);
+      expect(log.mock.calls.flat().join(' ')).not.toContain('hidden suffix');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('resets a retried node to its current running attempt', () => {
     const summaries = buildNodeSummaries([
       {
@@ -111,6 +177,8 @@ describe('buildNodeSummaries', () => {
         startedAt: '2026-08-29T14:27:29.000Z',
         durationMs: 107_000,
         outputPreview: 'https://github.com/coleam00/Archon/pull/2971',
+        output: 'https://github.com/coleam00/Archon/pull/2971',
+        outputTruncated: false,
       },
     ]);
   });
@@ -174,23 +242,21 @@ describe('buildNodeSummaries', () => {
     ]);
 
     expect(summaries).toEqual([
-      { nodeId: 'triage__triage', state: 'completed', outputPreview: 'bug' },
+      {
+        nodeId: 'triage__triage',
+        state: 'completed',
+        outputPreview: 'bug',
+        output: 'bug',
+        outputTruncated: false,
+      },
     ]);
   });
 });
 
-// #3271: SQLite writes `created_at` as `datetime('now')` — UTC, "YYYY-MM-DD HH:MM:SS",
-// no zone marker — and `new Date()` reads a marker-less string as LOCAL time. A
-// constant UTC offset cancels out of `end - start`, so the defect only shows when
-// the offset changes between the two events: across a DST transition the local
-// reading skips or repeats an hour and the duration is off by that hour.
 describe('buildNodeSummaries durations', () => {
-  // 01:30 → 03:30 UTC on 2026-03-08 is two hours. Read as America/New_York local
-  // time, the 02:00 → 03:00 hour does not exist that morning, so the naive parse
-  // yields one hour. UTC and Asia/Kolkata (no DST) are the controls.
-  const SQLITE_DST_INTERVAL = [
-    event('dst-start', 'node_started', 'build', '2026-03-08 01:30:00'),
-    event('dst-end', 'node_completed', 'build', '2026-03-08 03:30:00'),
+  const HYDRATED_DST_INTERVAL = [
+    event('dst-start', 'node_started', 'build', '2026-03-08T01:30:00.000Z'),
+    event('dst-end', 'node_completed', 'build', '2026-03-08T03:30:00.000Z'),
   ];
 
   function withTimezone<T>(tz: string, fn: () => T): T {
@@ -205,9 +271,9 @@ describe('buildNodeSummaries durations', () => {
   }
 
   it.each(['America/New_York', 'UTC', 'Asia/Kolkata'])(
-    'measures a SQLite interval across a DST boundary as two hours under %s',
+    'measures a hydrated interval across a DST boundary as two hours under %s',
     tz => {
-      const [summary] = withTimezone(tz, () => buildNodeSummaries(SQLITE_DST_INTERVAL));
+      const [summary] = withTimezone(tz, () => buildNodeSummaries(HYDRATED_DST_INTERVAL));
       expect(summary?.durationMs).toBe(7_200_000);
     }
   );
@@ -215,8 +281,8 @@ describe('buildNodeSummaries durations', () => {
   it('measures a failed node the same way as a completed one', () => {
     const [summary] = withTimezone('America/New_York', () =>
       buildNodeSummaries([
-        event('fail-start', 'node_started', 'build', '2026-03-08 01:30:00'),
-        event('fail-end', 'node_failed', 'build', '2026-03-08 03:30:00', { error: 'boom' }),
+        event('fail-start', 'node_started', 'build', '2026-03-08T01:30:00.000Z'),
+        event('fail-end', 'node_failed', 'build', '2026-03-08T03:30:00.000Z', { error: 'boom' }),
       ])
     );
     expect(summary?.durationMs).toBe(7_200_000);
@@ -251,5 +317,236 @@ describe('buildNodeSummaries durations', () => {
       ])
     );
     expect(summary?.durationMs).toBe(7_200_000);
+  });
+});
+
+// A resume writes the reset before the node's new node_started; a process that dies
+// between the two leaves the reset as the node's last word.
+describe('buildNodeSummaries resume resets', () => {
+  for (const reset of ['node_always_run_reset', 'node_prior_cache_invalidated'] as const) {
+    describe(`after ${reset}`, () => {
+      const completedThenReset = [
+        event('1', 'node_started', 'prepare', '2026-10-03T10:00:00.000Z'),
+        event('2', 'node_completed', 'prepare', '2026-10-03T10:00:01.000Z', {
+          node_output: 'prepared',
+        }),
+        event('3', reset, 'prepare', '2026-10-03T10:05:00.000Z', { prior_output: 'prepared' }),
+      ];
+
+      it('reports the node pending, without the prior attempt’s details', () => {
+        expect(buildNodeSummaries(completedThenReset)).toEqual([
+          { nodeId: 'prepare', state: 'pending' },
+        ]);
+      });
+
+      it('follows the re-run to running and completed', () => {
+        const started = [
+          ...completedThenReset,
+          event('4', 'node_started', 'prepare', '2026-10-03T10:05:01.000Z'),
+        ];
+        expect(buildNodeSummaries(started)).toEqual([
+          { nodeId: 'prepare', state: 'running', startedAt: '2026-10-03T10:05:01.000Z' },
+        ]);
+        expect(
+          buildNodeSummaries([
+            ...started,
+            event('5', 'node_completed', 'prepare', '2026-10-03T10:05:03.000Z', {
+              node_output: 'prepared again',
+            }),
+          ])
+        ).toEqual([
+          {
+            nodeId: 'prepare',
+            state: 'completed',
+            startedAt: '2026-10-03T10:05:01.000Z',
+            durationMs: 2_000,
+            outputPreview: 'prepared again',
+            output: 'prepared again',
+            outputTruncated: false,
+          },
+        ]);
+      });
+
+      it('reports a later prior-success replay as completed', () => {
+        expect(
+          buildNodeSummaries([
+            ...completedThenReset,
+            event('4', 'node_skipped_prior_success', 'prepare', '2026-10-03T10:05:01.000Z', {
+              reason: 'prior_success',
+              node_output: 'prepared',
+            }),
+          ])
+        ).toEqual([
+          {
+            nodeId: 'prepare',
+            state: 'completed',
+            outputPreview: 'prepared',
+            output: 'prepared',
+            outputTruncated: false,
+          },
+        ]);
+      });
+    });
+  }
+});
+
+describe('buildRunNodes', () => {
+  const graph = { terminal_graph: { node_ids: ['plan', 'implement', 'review'] } };
+
+  it('lists every declared node in declared order, pending until an event reaches it', () => {
+    const nodes = buildRunNodes({ metadata: graph }, [
+      event('implement-started', 'node_started', 'implement', '2026-09-27T10:00:05.000Z'),
+      event('plan-started', 'node_started', 'plan', '2026-09-27T10:00:00.000Z'),
+      event('plan-completed', 'node_completed', 'plan', '2026-09-27T10:00:04.000Z'),
+    ]);
+
+    expect(nodes.map(node => [node.nodeId, node.state])).toEqual([
+      ['plan', 'completed'],
+      ['implement', 'running'],
+      ['review', 'pending'],
+    ]);
+    expect(nodes[2]).toEqual({ nodeId: 'review', state: 'pending' });
+  });
+
+  it('appends a node that ran without being declared after the declared ones', () => {
+    const nodes = buildRunNodes({ metadata: graph }, [
+      event('loop-body', 'node_started', 'plan.step', '2026-09-27T10:00:00.000Z'),
+      event('plan-started', 'node_started', 'plan', '2026-09-27T10:00:01.000Z'),
+    ]);
+
+    expect(nodes.map(node => [node.nodeId, node.state])).toEqual([
+      ['plan', 'running'],
+      ['implement', 'pending'],
+      ['review', 'pending'],
+      ['plan.step', 'running'],
+    ]);
+  });
+
+  it('reports only the folded nodes when the run recorded no graph', () => {
+    const nodes = buildRunNodes({ metadata: {} }, [
+      event('plan-started', 'node_started', 'plan', '2026-09-27T10:00:00.000Z'),
+    ]);
+
+    expect(nodes).toEqual([
+      { nodeId: 'plan', state: 'running', startedAt: '2026-09-27T10:00:00.000Z' },
+    ]);
+  });
+});
+
+describe('buildNodeSummaries session ids', () => {
+  const at = (second: number): string => `2026-10-03T10:00:${String(second).padStart(2, '0')}.000Z`;
+
+  it('lists every attempt’s session in order, surviving the retry’s reset', () => {
+    const [summary] = buildNodeSummaries([
+      event('1', 'node_started', 'plan', at(0)),
+      event('2', 'node_failed', 'plan', at(1), { error: 'overloaded', session_id: 'attempt-1' }),
+      event('3', 'node_started', 'plan', at(2)),
+      event('4', 'node_completed', 'plan', at(3), { session_id: 'attempt-2' }),
+    ]);
+    expect(summary).toMatchObject({ state: 'completed', sessionIds: ['attempt-1', 'attempt-2'] });
+  });
+
+  it('lists a fresh-context loop’s iterations once each', () => {
+    // The loop's node_completed repeats its last iteration's session.
+    const [summary] = buildNodeSummaries([
+      event('1', 'node_started', 'work', at(0)),
+      event('2', 'loop_iteration_completed', 'work', at(1), { iteration: 1, session_id: 'it-1' }),
+      event('3', 'loop_iteration_completed', 'work', at(2), { iteration: 2, session_id: 'it-2' }),
+      event('4', 'node_completed', 'work', at(3), { session_id: 'it-2' }),
+    ]);
+    expect(summary?.sessionIds).toEqual(['it-1', 'it-2']);
+  });
+
+  it('lists a loop that continues one session once', () => {
+    const [summary] = buildNodeSummaries([
+      event('1', 'node_started', 'work', at(0)),
+      event('2', 'loop_iteration_completed', 'work', at(1), { iteration: 1, session_id: 'same' }),
+      event('3', 'loop_iteration_completed', 'work', at(2), { iteration: 2, session_id: 'same' }),
+      event('4', 'node_completed', 'work', at(3), { session_id: 'same' }),
+    ]);
+    expect(summary?.sessionIds).toEqual(['same']);
+  });
+
+  it('adds nothing for a run recorded before session ids were stored', () => {
+    const [summary] = buildNodeSummaries([
+      event('1', 'node_started', 'plan', at(0)),
+      event('2', 'node_completed', 'plan', at(1), { node_output: 'done' }),
+    ]);
+    expect(summary).not.toHaveProperty('sessionIds');
+  });
+});
+
+describe('buildNodeSummaries - failed bash/script node structured fields', () => {
+  function failedNode(data: Record<string, unknown>) {
+    return buildNodeSummaries([
+      event('f-start', 'node_started', 'check', '2026-11-12T10:00:00.000Z'),
+      event('f-failed', 'node_failed', 'check', '2026-11-12T10:00:01.000Z', {
+        type: 'bash',
+        error: "Bash node 'check' failed",
+        ...data,
+      }),
+    ])[0];
+  }
+
+  it('exposes exitCode on a failed node when exit_code is recorded', () => {
+    expect(failedNode({ exit_code: 1 })).toMatchObject({ state: 'failed', exitCode: 1 });
+  });
+
+  it('omits exitCode when exit_code is absent (spawn failure, timeout, cancel)', () => {
+    expect(failedNode({})).not.toHaveProperty('exitCode');
+  });
+
+  it('exposes captured stdout on a failed node when node_output is recorded', () => {
+    expect(failedNode({ exit_code: 1, node_output: 'line1' })).toMatchObject({
+      state: 'failed',
+      exitCode: 1,
+      output: 'line1',
+      outputPreview: 'line1',
+      outputTruncated: false,
+    });
+  });
+
+  it('reports a truncated stdout tail as truncated', () => {
+    expect(
+      failedNode({ exit_code: 1, node_output: 'tail', node_output_truncated: true })
+    ).toMatchObject({ output: 'tail', outputTruncated: true });
+  });
+
+  it('omits output fields when no stdout was captured', () => {
+    // `''` is what config failures and older binaries persist for "no stdout".
+    for (const node of [
+      failedNode({ exit_code: 1 }),
+      failedNode({ exit_code: 1, node_output: '' }),
+    ]) {
+      expect(node).not.toHaveProperty('output');
+      expect(node).not.toHaveProperty('outputPreview');
+      expect(node).not.toHaveProperty('outputTruncated');
+    }
+  });
+
+  it('leaves non-exec failures unchanged, even when they kept partial output', () => {
+    const summary = failedNode({ type: 'agent', node_output: 'partial agent text' });
+    expect(summary).toMatchObject({ state: 'failed' });
+    expect(summary).not.toHaveProperty('output');
+    expect(summary).not.toHaveProperty('exitCode');
+  });
+});
+
+describe('NODE_SUMMARY_EVENT_TYPES', () => {
+  it('names every event type the fold reads: fetching only those changes nothing', () => {
+    // One row of every event type, each carrying fields the fold would pick up.
+    const log = WORKFLOW_EVENT_TYPES.map((type, i) =>
+      event(String(i), type, 'work', `2026-10-03T10:00:${String(i).padStart(2, '0')}.000Z`, {
+        session_id: `session-${type}`,
+        iteration: 1,
+        node_output: 'out',
+        error: 'boom',
+      })
+    );
+    const read = new Set<string>(NODE_SUMMARY_EVENT_TYPES);
+
+    expect(buildNodeSummaries(log.filter(row => read.has(row.event_type)))).toEqual(
+      buildNodeSummaries(log)
+    );
   });
 });

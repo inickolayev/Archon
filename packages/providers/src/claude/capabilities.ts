@@ -1,13 +1,14 @@
+import type { BUILTIN_TOOL_NAMES } from '@anthropic-ai/claude-agent-sdk';
+import type { SkillDiscovery } from '@archon/provider-contract';
 import type { ProviderCapabilities } from '../types';
 
 /**
- * Built-in Claude Code tool names. The SDK exposes tool restrictions as plain
- * `string[]` options and exports no tool-name constant or literal union, so this
- * list is maintained by hand. `capabilities.test.ts` fails when the installed
- * SDK's `sdk-tools.d.ts` declares a tool missing here. Used for advisory
- * (warning-level) validation only, so a missing name can never break a workflow.
+ * The SDK's `BUILTIN_TOOL_NAMES`, spelled out because the descriptor is read by
+ * hosts that never load the SDK runtime. The type annotation makes type-check
+ * fail when the SDK's list changes. Used for advisory (warning-level)
+ * validation only, so a missing name can never break a workflow.
  */
-const CLAUDE_KNOWN_TOOL_NAMES = [
+const CLAUDE_KNOWN_TOOL_NAMES: typeof BUILTIN_TOOL_NAMES = [
   'Agent',
   'Artifact',
   'AskUserQuestion',
@@ -17,56 +18,72 @@ const CLAUDE_KNOWN_TOOL_NAMES = [
   'CronDelete',
   'CronList',
   'Edit',
+  'EndConversation',
   'EnterPlanMode',
   'EnterWorktree',
   'ExitPlanMode',
   'ExitWorktree',
   'Glob',
   'Grep',
+  'ListAgents',
   'ListMcpResourcesTool',
+  'LSP',
   'Monitor',
   'NotebookEdit',
+  'OfferChromeSetup',
   'PowerShell',
   'Projects',
+  'propose_skills',
   'ProposeGoal',
-  'ProposeSkills',
   'PushNotification',
   'Read',
   'ReadMcpResourceDirTool',
   'ReadMcpResourceTool',
   'ReadNotifications',
-  'RefreshMcpTools',
   'RemoteTrigger',
   'ReportFindings',
   'ScheduleWakeup',
   'SendFeedback',
+  'SendMessage',
+  'SendUserFile',
+  'SendUserMessage',
+  'ShareOnboardingGuide',
   'ShowOnboardingRolePicker',
   'Skill',
-  'SlashCommand',
+  'SubagentHandback',
   'TaskCreate',
   'TaskGet',
   'TaskList',
   'TaskStop',
   'TaskUpdate',
   'TodoWrite',
+  'ToolSearch',
+  'WaitForMcpServers',
   'WebFetch',
   'WebSearch',
   'Workflow',
   'Write',
-] as const;
+];
 
 /**
- * Tools the SDK renamed — a stale old name in allowed_tools/denied_tools is a
- * silent no-op at runtime (the trigger for #2084: `denied_tools: [Task]`
- * denied nothing after the 0.3.193 Task → Agent rename).
+ * The SDK's `LEGACY_TOOL_NAME_ALIASES` (old name → current name), spelled out
+ * for the same reason; `capabilities.test.ts` fails when they differ. A stale
+ * old name in allowed_tools/denied_tools is a silent no-op at runtime (#2084:
+ * `denied_tools: [Task]` denied nothing after the Task → Agent rename).
  */
-const CLAUDE_RENAMED_TOOLS = {
+const CLAUDE_RENAMED_TOOLS: Readonly<Record<string, string>> = {
   Task: 'Agent',
   KillShell: 'TaskStop',
-  MultiEdit: 'Edit',
-} as const;
+  KillBash: 'TaskStop',
+  ListPeers: 'ListAgents',
+  Brief: 'SendUserMessage',
+  ListMcpResources: 'ListMcpResourcesTool',
+  ReadMcpResource: 'ReadMcpResourceTool',
+  ReadMcpResourceDir: 'ReadMcpResourceDirTool',
+};
 
 export const CLAUDE_CAPABILITIES: ProviderCapabilities = {
+  backgroundWork: 'reported',
   sessionResume: true,
   sessionFork: true,
   mcp: true,
@@ -93,3 +110,10 @@ export const CLAUDE_CAPABILITIES: ProviderCapabilities = {
   nativeTools: true,
   containerExec: true, // spawns the CLI in-container via spawnClaudeCodeProcess
 };
+
+/** Claude Code's native skill roots: it never discovers `.agents/skills`. */
+export const CLAUDE_SKILL_DISCOVERY = {
+  project: ['.claude/skills'],
+  user: ['skills'],
+  userDirectory: { env: 'CLAUDE_CONFIG_DIR', home: '.claude' },
+} satisfies SkillDiscovery;

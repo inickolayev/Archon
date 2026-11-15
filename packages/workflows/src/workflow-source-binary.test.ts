@@ -1,3 +1,4 @@
+// @archon-test-isolated
 /**
  * A compiled binary's capture has to stand on its own.
  *
@@ -20,18 +21,40 @@ import { cp, mkdtemp, mkdir, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { removeTempTree } from '@archon/paths/test-utils';
+import { writeFakeBundle } from './test-fake-bundle';
 
+// The embedded records come from a fake pack, never the shipped one.
+const bundleRoot = await mkdtemp(join(tmpdir(), 'archon-binary-bundle-'));
+const records = await writeFakeBundle(
+  bundleRoot,
+  {
+    'fake/flow/fake-flow.yaml':
+      'name: fake-flow\ndescription: Flow fixture.\nnodes:\n  - id: work\n    command: work\n',
+    'fake/flow/commands/work.md': 'Do the work the flow describes.\n',
+    'fake/flow/scripts/helper.ts': "console.log('helper');\n",
+  },
+  ['fake']
+);
 const actual = await import('./defaults/bundled-defaults');
-mock.module('./defaults/bundled-defaults', () => ({ ...actual, isBinaryBuild: () => true }));
+mock.module('./defaults/bundled-defaults', () => ({
+  ...actual,
+  ...records,
+  isBinaryBuild: () => true,
+}));
 
-const { captureWorkflowSource, capturedSourceRoots, loadWorkflowSource } =
-  await import('./workflow-source');
-const { loadCommandPrompt } = await import('./executor-shared');
+const { captureWorkflowSource, capturedSourceRoots, loadWorkflowSource } = await import(
+  './workflow-source'
+);
+const { loadCommandPrompt } = await import('./load-command-prompt');
 const { discoverScriptsForCwd } = await import('./script-discovery');
 
 let root: string;
 let target: string;
 let capture: Awaited<ReturnType<typeof captureWorkflowSource>>;
+
+// A bundled pack command, and where the capture writes it.
+const COMMAND = '__archon_pack__bundled:fake:flow::work';
+const COMMAND_PATH = ['bundled', 'workflows', 'fake', 'flow', 'commands', 'work.md'];
 
 const deps = {
   loadConfig: () => Promise.resolve({} as unknown as Awaited<ReturnType<() => Promise<never>>>),
@@ -43,7 +66,7 @@ beforeAll(async () => {
   target = join(root, 'target');
   await mkdir(join(source, '.archon', 'workflows'), { recursive: true });
   await mkdir(target, { recursive: true });
-  // The readers share one immutable real bundle; the tamper case copies it below.
+  // The readers share one immutable capture; the tamper case copies it below.
   capture = await captureWorkflowSource({
     sourceRoot: source,
     captureRoot: join(root, 'capture'),
@@ -52,6 +75,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await removeTempTree(root);
+  await removeTempTree(bundleRoot);
 });
 
 describe('a binary freezes its embedded bundled source', () => {
@@ -62,18 +86,15 @@ describe('a binary freezes its embedded bundled source', () => {
   });
 
   test('a bundled command exists as a file and resolves from the capture', async () => {
-    const onDisk = await readFile(
-      join(capture.anchor.root, 'bundled', 'commands', 'defaults', 'archon-assist.md'),
-      'utf-8'
-    );
-    expect(onDisk.length).toBeGreaterThan(0);
+    const onDisk = await readFile(join(capture.anchor.root, ...COMMAND_PATH), 'utf-8');
+    expect(onDisk).toBe('Do the work the flow describes.\n');
 
     // Resolved against the TARGET's cwd: the only way this succeeds is by reading the
     // capture, because the target has no `.archon` of its own.
     const result = await loadCommandPrompt(
       deps as never,
       target,
-      'archon-assist',
+      COMMAND,
       undefined,
       capturedSourceRoots(capture.anchor)
     );
@@ -83,17 +104,18 @@ describe('a binary freezes its embedded bundled source', () => {
   test('bundled workflows are written where discovery expects them', async () => {
     const roots = capturedSourceRoots(capture.anchor);
     const yaml = await readFile(
-      join(roots.bundledWorkflows, 'defaults', 'archon-assist.yaml'),
+      join(roots.bundledWorkflows, 'fake', 'flow', 'fake-flow.yaml'),
       'utf-8'
     );
-    expect(yaml).toContain('name: archon-assist');
+    expect(yaml).toContain('name: fake-flow');
   });
 
   test('script discovery reads the capture rather than re-materializing constants', async () => {
     // A captured run must read scripts from its frozen roots.
     const roots = capturedSourceRoots(capture.anchor);
     expect(roots.kind).toBe('captured');
-    await expect(discoverScriptsForCwd(target, roots)).resolves.toBeInstanceOf(Map);
+    const scripts = await discoverScriptsForCwd(target, roots);
+    expect(scripts.has('__archon_pack__bundled:fake:flow::helper')).toBe(true);
   });
 
   test('the digest covers the bundled bytes, so an upgrade cannot change them unnoticed', async () => {
@@ -105,10 +127,7 @@ describe('a binary freezes its embedded bundled source', () => {
     const tamperedRoot = join(root, 'tampered-capture');
     await cp(capture.anchor.root, tamperedRoot, { recursive: true });
     const { writeFile } = await import('fs/promises');
-    await writeFile(
-      join(tamperedRoot, 'bundled', 'commands', 'defaults', 'archon-assist.md'),
-      'swapped by a different Archon build'
-    );
+    await writeFile(join(tamperedRoot, ...COMMAND_PATH), 'swapped by a different Archon build');
     await expect(loadWorkflowSource(tamperedRoot, capture.manifest.digest)).rejects.toThrow();
   });
 });

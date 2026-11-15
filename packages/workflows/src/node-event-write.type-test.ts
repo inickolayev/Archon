@@ -1,18 +1,29 @@
 import type { NodeStateRecord } from './schemas/node-execution';
 import type { persistNodeEvent, recordNodeState } from './node-event-write';
-import type { IWorkflowStore, NodeStateEventType } from './store';
+import type { SerializedNodeEvent } from './node-record-serialization';
+import type { IWorkflowStore, DurableWorkflowEventType, NodeStateEventType } from './store';
 
 type AssertNever<Value extends never> = Value;
 type AssertTrue<Value extends true> = Value;
 
-export type NodeStateCannotBeBestEffort = AssertNever<
-  Extract<NodeStateEventType, Parameters<IWorkflowStore['createWorkflowEvent']>[0]['event_type']>
+export type SerializedNodeEventsCoverReaderAdmission = AssertNever<
+  Exclude<NodeStateEventType, SerializedNodeEvent['event_type']>
+>;
+export type ReaderAdmitsEverySerializedNodeEvent = AssertNever<
+  Exclude<SerializedNodeEvent['event_type'], NodeStateEventType>
+>;
+
+export type DurableNodeEventsCannotBeBestEffort = AssertNever<
+  Extract<
+    DurableWorkflowEventType,
+    Parameters<IWorkflowStore['createWorkflowEvent']>[0]['event_type']
+  >
 >;
 export type NodeWriterAcceptsEveryState = AssertNever<
   Exclude<NodeStateEventType, Parameters<typeof persistNodeEvent>[1]['event_type']>
 >;
 export type NodeWriterRejectsOtherEvents = AssertNever<
-  Exclude<Parameters<typeof persistNodeEvent>[1]['event_type'], NodeStateEventType>
+  Exclude<Parameters<typeof persistNodeEvent>[1]['event_type'], DurableWorkflowEventType>
 >;
 export type CanonicalWriterAcceptsRecord = AssertTrue<
   Parameters<typeof recordNodeState>[1] extends NodeStateRecord ? true : false

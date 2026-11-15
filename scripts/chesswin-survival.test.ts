@@ -117,19 +117,29 @@ const OURS_INSIDE_THEIRS: Record<string, [string, string][]> = {
   'the engine tells an agent which run it is in': [
     // Without this an agent inherits the server's environment, where no run exists, and the
     // harness cannot tell a conversation from a run (chesswin-factory ADR 0011, ADR 0007).
-    ['packages/workflows/src/dag-executor.ts', 'WORKFLOW_ID: workflowRunId'],
+    // Upstream shipped the same guarantee independently (#4059: `buildAiNodeEnvironment`,
+    // spread after project env in agent and loop nodes), superseding our line in
+    // `dag-executor.ts`; the fragment now follows their implementation.
+    ['packages/workflows/src/exec-environment.ts', 'WORKFLOW_ID: execution.runId'],
   ],
   'a conversation can start the run that does real work': [
     // Without these a chat can only launch workflows that declare no inputs — which is none
-    // of ours (chesswin-factory ADR 0011).
-    ['packages/core/src/orchestrator/manage-run-tool.ts', 'parseInputs'],
-    ['packages/core/src/orchestrator/orchestrator-agent.ts', 'launch?.inputs'],
+    // of ours (chesswin-factory ADR 0011). Upstream now carries this itself: chat launches
+    // moved from manage_run's `start` (which we had taught to take inputs) to the typed
+    // `invoke_workflow` tool, whose inputs ride the launch to the dispatch gate. The
+    // fragments are theirs; what is ours is the need for them to stay.
+    ['packages/core/src/orchestrator/chat-tools.ts', 'resolveLaunchInputs'],
+    ['packages/core/src/orchestrator/orchestrator-agent.ts', '{ inputs }'],
   ],
   'two people cannot start two runs on one target': [
-    ['packages/core/src/orchestrator/manage-run-tool.ts', 'liveRunFor'],
+    // Ported from manage_run's `start` to `invoke_workflow` when upstream moved launches.
+    ['packages/core/src/orchestrator/chat-tools.ts', 'liveRunFor'],
   ],
   'a run says who asked for it': [
-    ['packages/core/src/db/workflows.ts', 'user_display_name'],
+    // Upstream split `db/workflows.ts` into `workflow-run-*` modules (#4509); the dashboard
+    // query, and our join on it, now live in `workflow-run-lists.ts`.
+    ['packages/core/src/db/workflow-run-lists.ts', 'user_display_name'],
+    ['packages/workflows/src/schemas/workflow-run-listing.ts', 'user_display_name'],
     ['packages/web/src/experiments/console/components/RecentRunRow.tsx', 'run.startedBy'],
   ],
   // Upstream owns this file and ships `baseBranch: dev` in it, so a catch-up that takes their

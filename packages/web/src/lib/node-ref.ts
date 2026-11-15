@@ -3,8 +3,8 @@
  * built from it — for the whole web package.
  *
  * The engine is the authority: `OUTPUT_REF_SOURCE` in
- * `packages/workflows/src/loader.ts`, whose own docblock warns that a second
- * hand-written copy is exactly the drift it is trying to prevent. The web app
+ * `packages/workflows/src/output-ref.ts`, which exists so the engine's scanners share
+ * one grammar instead of hand-written copies that drift. The web app
  * cannot import it — `@archon/web` must never depend on `@archon/workflows`
  * (a server package), and `api.generated.d.ts` is type-only so it cannot carry
  * a runtime value. AGENTS.md records the same exception for `TRIGGER_RULES`.
@@ -14,6 +14,8 @@
  * `scripts/node-ref-parity.test.ts` compares it against the engine's literal so
  * a divergence fails the repository's test run rather than shipping.
  */
+
+import { INPUTS_SCOPE } from './input-ref';
 
 /**
  * A node id: letters, digits, underscore and hyphen, no leading digit.
@@ -47,7 +49,7 @@ export function findOutputRefs(text: string): Set<string> {
     const id = match[1];
     // `$INPUTS.output` names the workflow input `output`, not a node. The engine
     // gives that reserved scope precedence after the same lexical match.
-    if (id !== undefined && id !== 'INPUTS') refs.add(id);
+    if (id !== undefined && id !== INPUTS_SCOPE) refs.add(id);
   }
   return refs;
 }

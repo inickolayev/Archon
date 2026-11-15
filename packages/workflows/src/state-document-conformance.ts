@@ -1,0 +1,701 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  StateRevisionConflictError,
+  StateDocumentTooLargeError,
+  StateLeaseHeldError,
+  StateLeaseNotHeldError,
+  StatePatchError,
+  claimFirstStateDocument,
+  StateDocumentMissingError,
+  stateValueSchema,
+  statePutSchema,
+  stateWriterSchema,
+  stateScopeSchema,
+  stateDocumentSummarySchema,
+  type IStateDocumentStore,
+  type StateScope,
+  type StateWriter,
+} from './state-document-store';
+import type { WorkflowRunStatus } from './schemas/run-status';
+
+const writer: StateWriter = { kind: 'surface', via: 'cli' };
+const p = (name: string): StateScope => ({ kind: 'project', key: `conformance/${name}` });
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  throw new Error('Expected the state write to reject');
+}
+export async function assertStatePutRace(
+  store: Pick<IStateDocumentStore, 'putStateDocument' | 'listStateRevisions'>
+): Promise<void> {
+  const results = await Promise.allSettled(
+    Array.from({ length: 8 }, (_, value) =>
+      store.putStateDocument({ scope: p('race'), name: 'put', value, ifRevision: 0, writer })
+    )
+  );
+  expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+  for (const result of results)
+    if (result.status === 'rejected')
+      expect(result.reason).toBeInstanceOf(StateRevisionConflictError);
+  expect(await store.listStateRevisions(p('race'), 'put')).toHaveLength(1);
+}
+export async function assertStatePatchRace(
+  store: Pick<IStateDocumentStore, 'patchStateDocument' | 'listStateRevisions'>
+): Promise<void> {
+  await Promise.all(
+    Array.from({ length: 8 }, (_, value) =>
+      store.patchStateDocument({
+        scope: p('race'),
+        name: 'patch',
+        ops: [{ op: 'append', path: '/seen', value }],
+        writer,
+      })
+    )
+  );
+  const revisions = await store.listStateRevisions(p('race'), 'patch');
+  expect(revisions.map(row => row.revision)).toEqual([8, 7, 6, 5, 4, 3, 2, 1]);
+  expect(revisions[0]?.value).toEqual({ seen: expect.arrayContaining([0, 1, 2, 3, 4, 5, 6, 7]) });
+  const value = revisions[0]?.value;
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('Missing ledger');
+  expect(value.seen).toHaveLength(8);
+}
+/** Runs a store's leases can name, moved through statuses in the order a real run can. */
+export interface StateLeaseRuns {
+  /** A new `pending` run's id. */
+  create(): Promise<string>;
+  setStatus(id: string, status: WorkflowRunStatus): Promise<void>;
+  /** Delete a finished run. */
+  remove(id: string): Promise<void>;
+}
+export interface StateDocumentHarness {
+  store: IStateDocumentStore;
+  runs: StateLeaseRuns;
+  backdate(scope: StateScope, name: string): Promise<void>;
+  close(): Promise<void>;
+}
+const leaseWriter = (runId: string): StateWriter => ({ kind: 'run', runId, nodePath: 'claim' });
+export function describeStateDocumentConformance(
+  label: string,
+  makeHarness: () => Promise<StateDocumentHarness>
+): void {
+  const check = (name: string, run: (harness: StateDocumentHarness) => Promise<void>): void => {
+    test(name, async () => {
+      const harness = await makeHarness();
+      try {
+        await run(harness);
+      } finally {
+        await harness.close();
+      }
+    });
+  };
+  describe(`state documents: ${label}`, () => {
+    check(
+      'eight appenders preserve every value and contiguous immutable revisions',
+      async ({ store }) => {
+        await assertStatePatchRace(store);
+        const before = await store.listStateRevisions(p('race'), 'patch');
+        await store.patchStateDocument({
+          scope: p('race'),
+          name: 'patch',
+          ops: [{ op: 'append', path: '/seen', value: 9 }],
+          writer,
+        });
+        expect((await store.listStateRevisions(p('race'), 'patch')).slice(1)).toEqual(before);
+      }
+    );
+    check('put has exactly one winner', async ({ store }) => assertStatePutRace(store));
+    check('a patch that names a stale revision conflicts and writes nothing', async ({ store }) => {
+      const input = { scope: p('cas'), name: 'patch', writer };
+      await store.putStateDocument({ ...input, value: { owner: 'a' }, ifRevision: 0 });
+      await store.patchStateDocument({
+        ...input,
+        ops: [{ op: 'set', path: '/owner', value: 'b' }],
+      });
+      expect(
+        await rejection(
+          store.patchStateDocument({
+            ...input,
+            ifRevision: 1,
+            ops: [{ op: 'set', path: '/owner', value: 'c' }],
+          })
+        )
+      ).toBeInstanceOf(StateRevisionConflictError);
+      expect((await store.getStateDocument(p('cas'), 'patch'))?.value).toEqual({ owner: 'b' });
+      expect(await store.listStateRevisions(p('cas'), 'patch')).toHaveLength(2);
+    });
+    check('a patch records the revision it named, and only then', async ({ store }) => {
+      const input = { scope: p('cas'), name: 'basis', writer };
+      const ops = [{ op: 'set' as const, path: '/v', value: 1 }];
+      await store.patchStateDocument({ ...input, ifRevision: 0, ops });
+      await store.patchStateDocument({ ...input, ops });
+      expect((await store.listStateRevisions(p('cas'), 'basis')).map(row => row.operation)).toEqual(
+        [
+          { op: 'patch', ops },
+          { op: 'patch', ops, ifRevision: 0 },
+        ]
+      );
+    });
+    check('install scope and each project hold separate documents', async ({ store }) => {
+      const install: StateScope = { kind: 'install' };
+      const input = { name: 'shared', writer, ifRevision: 0 };
+      await store.putStateDocument({ ...input, scope: install, value: 'install' });
+      await store.putStateDocument({ ...input, scope: p('one'), value: 'project' });
+      expect((await store.getStateDocument(install, 'shared'))?.value).toBe('install');
+      expect((await store.getStateDocument(p('one'), 'shared'))?.value).toBe('project');
+      expect(await store.listStateRevisions(install, 'shared')).toHaveLength(1);
+      expect(stateScopeSchema.safeParse({ kind: 'project', key: '_install' }).success).toBe(false);
+    });
+    check('listing returns names and latest revisions, never values', async ({ store }) => {
+      const scope = p('list');
+      for (const name of ['b_x/1', 'a/2', 'b_x/3', 'bax/4'])
+        await store.putStateDocument({
+          scope,
+          name,
+          value: { secret: name },
+          ifRevision: 0,
+          writer,
+        });
+      await store.patchStateDocument({
+        scope,
+        name: 'a/2',
+        ops: [{ op: 'set', path: '/v', value: 1 }],
+        writer,
+      });
+      await store.deleteStateDocument({ scope, name: 'bax/4', writer });
+      const all = await store.listStateDocuments(scope);
+      expect(all.map(row => [row.name, row.revision, row.deleted])).toEqual([
+        ['a/2', 2, false],
+        ['b_x/1', 1, false],
+        ['b_x/3', 1, false],
+        ['bax/4', 2, true],
+      ]);
+      for (const row of all) {
+        expect(stateDocumentSummarySchema.strict().parse(row)).toEqual(row);
+        expect(row.writer).toEqual(writer);
+      }
+      // `_` is a literal prefix character, not a wildcard.
+      expect(
+        (await store.listStateDocuments(scope, { prefix: 'b_' })).map(row => row.name)
+      ).toEqual(['b_x/1', 'b_x/3']);
+      expect(await store.listStateDocuments(p('empty'))).toEqual([]);
+    });
+    check('a bulk read returns each live document with its value', async ({ store }) => {
+      const scope = p('bulk');
+      for (const name of ['b_x/1', 'a/2', 'bax/3', 'c/4'])
+        await store.putStateDocument({ scope, name, value: { v: name }, ifRevision: 0, writer });
+      await store.patchStateDocument({
+        scope,
+        name: 'a/2',
+        ops: [{ op: 'set', path: '/v', value: 'patched' }],
+        writer,
+      });
+      await store.deleteStateDocument({ scope, name: 'c/4', writer });
+      await store.putStateDocument({
+        scope: p('other'),
+        name: 'a/9',
+        value: 1,
+        ifRevision: 0,
+        writer,
+      });
+      const all = await store.getStateDocuments(scope);
+      expect(all.map(row => [row.name, row.revision, row.value])).toEqual([
+        ['a/2', 2, { v: 'patched' }],
+        ['b_x/1', 1, { v: 'b_x/1' }],
+        ['bax/3', 1, { v: 'bax/3' }],
+      ]);
+      for (const row of all) expect(await store.getStateDocument(scope, row.name)).toEqual(row);
+      // `_` is a literal prefix character, not a wildcard.
+      expect((await store.getStateDocuments(scope, { prefix: 'b_' })).map(row => row.name)).toEqual(
+        ['b_x/1']
+      );
+      expect(await store.getStateDocuments(p('empty'))).toEqual([]);
+    });
+    check('writers, project isolation, tombstones and recreation', async ({ store }) => {
+      const input = { scope: p('one'), name: 'ledger', value: { seen: [] }, ifRevision: 0, writer };
+      const first = await store.putStateDocument(input);
+      expect(first.writer).toEqual(writer);
+      expect(first.operation).toEqual({ op: 'put' });
+      expect(await rejection(store.putStateDocument(input))).toBeInstanceOf(
+        StateRevisionConflictError
+      );
+      await store.putStateDocument({ ...input, scope: p('two'), value: 123 });
+      const runWriter: StateWriter = { kind: 'run', runId: 'run', nodePath: 'loop/commit' };
+      const deleted = await store.deleteStateDocument({
+        ...input,
+        ifRevision: 1,
+        writer: runWriter,
+      });
+      expect(deleted.revision).toBe(2);
+      expect(await store.getStateDocument(p('one'), 'ledger')).toBeNull();
+      expect((await store.listStateRevisions(p('one'), 'ledger'))[0]).toMatchObject({
+        value: null,
+        operation: { op: 'delete' },
+        writer: runWriter,
+      });
+      expect((await store.getStateDocument(p('two'), 'ledger'))?.value).toBe(123);
+      await store.putStateDocument({ ...input, ifRevision: 2 });
+      expect((await store.getStateDocument(p('one'), 'ledger'))?.revision).toBe(3);
+      expect(await store.listStateRevisions(p('one'), 'ledger', { limit: 1 })).toHaveLength(1);
+    });
+    check('every schema-defined writer field round-trips', async ({ store }) => {
+      for (const variant of stateWriterSchema.options) {
+        const supplied = Object.fromEntries(
+          Object.keys(variant.shape).map(field => [
+            field,
+            field === 'kind' ? variant.shape.kind.value : `writer-${field}`,
+          ])
+        );
+        const writer = stateWriterSchema.parse(supplied);
+        const input = { scope: p('writers'), name: writer.kind, writer };
+        await store.putStateDocument({ ...input, value: {}, ifRevision: 0 });
+        expect((await store.getStateDocument(input.scope, input.name))?.writer).toEqual(writer);
+        expect((await store.listStateRevisions(input.scope, input.name))[0]?.writer).toEqual(
+          writer
+        );
+      }
+    });
+    check(
+      'JSON members survive reads, patch values and subsequent unrelated patches',
+      async ({ store }) => {
+        const supplied: unknown = JSON.parse(
+          '{"__proto__":{"own":true},"nested":{"__proto__":null},"array":[{"__proto__":[1]}]}'
+        );
+        const value = stateValueSchema.parse(supplied);
+        expect(supplied).toEqual(value);
+        if (value === null || typeof value !== 'object' || Array.isArray(value))
+          throw new Error('Expected JSON object');
+        const input = { scope: p('json'), name: 'members', writer };
+        await store.putStateDocument({ ...input, value, ifRevision: 0 });
+        expect((await store.getStateDocument(input.scope, input.name))?.value).toEqual(value);
+        const ops = [{ op: 'set' as const, path: '/added', value }];
+        await store.patchStateDocument({ ...input, ops });
+        const expected = { ...value, added: value };
+        expect((await store.getStateDocument(input.scope, input.name))?.value).toEqual(expected);
+        const history = await store.listStateRevisions(input.scope, input.name);
+        expect(history[0]?.operation).toEqual({ op: 'patch', ops });
+        expect(history[1]?.value).toEqual(value);
+        await store.patchStateDocument({
+          ...input,
+          ops: [{ op: 'set', path: '/other', value: true }],
+        });
+        expect((await store.getStateDocument(input.scope, input.name))?.value).toEqual({
+          ...expected,
+          other: true,
+        });
+      }
+    );
+    check('audit history is complete unless the caller requests a limit', async ({ store }) => {
+      for (let revision = 0; revision < 101; revision++) {
+        await store.putStateDocument({
+          scope: p('audit'),
+          name: 'ledger',
+          value: revision,
+          ifRevision: revision,
+          writer,
+        });
+      }
+      expect(await store.listStateRevisions(p('audit'), 'ledger')).toHaveLength(101);
+      expect(
+        (await store.listStateRevisions(p('audit'), 'ledger', { limit: 1 }))[0]?.revision
+      ).toBe(101);
+    });
+    check('cleanup never reuses a revision that a stale writer can still hold', async harness => {
+      const { store } = harness;
+      const input = { scope: p('aba'), name: 'ledger', writer };
+      await store.putStateDocument({ ...input, value: 'old', ifRevision: 0 });
+      await store.deleteStateDocument(input);
+      await harness.backdate(input.scope, input.name);
+      await store.pruneStateRevisions(30);
+      const head = (await store.listStateRevisions(input.scope, input.name))[0];
+      const recreated = await store.putStateDocument({
+        ...input,
+        value: 'new',
+        ifRevision: head?.revision ?? 0,
+      });
+      expect(
+        await rejection(store.putStateDocument({ ...input, value: 'stale', ifRevision: 1 }))
+      ).toBeInstanceOf(StateRevisionConflictError);
+      expect(recreated.revision).toBe(3);
+      expect((await store.getStateDocument(input.scope, input.name))?.value).toBe('new');
+    });
+    check('over-cap values and invalid patches write nothing', async ({ store }) => {
+      const input = { scope: p('one'), name: 'limit', writer };
+      expect(
+        await rejection(
+          store.putStateDocument({ ...input, value: 'é'.repeat(32768), ifRevision: 0 })
+        )
+      ).toBeInstanceOf(StateDocumentTooLargeError);
+      expect(
+        await rejection(
+          store.patchStateDocument({
+            ...input,
+            ops: [{ op: 'set', path: '/large', value: 'x'.repeat(65536) }],
+          })
+        )
+      ).toBeInstanceOf(StateDocumentTooLargeError);
+      expect(
+        await rejection(
+          store.patchStateDocument({ ...input, ops: [{ op: 'set', path: 'invalid', value: 1 }] })
+        )
+      ).toBeInstanceOf(StatePatchError);
+      const oversized = statePutSchema.shape.value.parse(
+        JSON.parse(`{"__proto__":"${'x'.repeat(65536)}"}`) as unknown
+      );
+      expect(
+        await rejection(store.putStateDocument({ ...input, value: oversized, ifRevision: 0 }))
+      ).toBeInstanceOf(StateDocumentTooLargeError);
+      expect(
+        await rejection(
+          store.patchStateDocument({
+            ...input,
+            ops: [{ op: 'append', path: '/values', value: oversized }],
+          })
+        )
+      ).toBeInstanceOf(StateDocumentTooLargeError);
+      expect(await store.listStateRevisions(p('one'), 'limit')).toEqual([]);
+      await store.putStateDocument({ ...input, value: { target: 2 }, ifRevision: 0 });
+      expect(
+        await rejection(
+          store.patchStateDocument({
+            ...input,
+            ops: [
+              { op: 'set', path: '/extra', value: true },
+              { op: 'append', path: '/target', value: 3 },
+            ],
+          })
+        )
+      ).toMatchObject({ opIndex: 1 });
+      expect(
+        await rejection(
+          store.patchStateDocument({ ...input, ops: [{ op: 'append', path: '/target', value: 3 }] })
+        )
+      ).toBeInstanceOf(StatePatchError);
+      expect((await store.getStateDocument(p('one'), 'limit'))?.value).toEqual({ target: 2 });
+      expect(await store.listStateRevisions(p('one'), 'limit')).toHaveLength(1);
+    });
+    check('retention preserves every latest revision, including tombstones', async harness => {
+      const { store } = harness;
+      for (const name of ['live', 'deleted']) {
+        await store.putStateDocument({ scope: p('one'), name, value: {}, ifRevision: 0, writer });
+        await store.patchStateDocument({
+          scope: p('one'),
+          name,
+          ops: [{ op: 'set', path: '/v', value: 1 }],
+          writer,
+        });
+      }
+      await store.deleteStateDocument({ scope: p('one'), name: 'deleted', writer });
+      await harness.backdate(p('one'), 'live');
+      await harness.backdate(p('one'), 'deleted');
+      expect(await store.pruneStateRevisions(30)).toEqual({ count: 3 });
+      expect((await store.getStateDocument(p('one'), 'live'))?.revision).toBe(2);
+      expect(await store.listStateRevisions(p('one'), 'live')).toHaveLength(1);
+      expect(await store.listStateRevisions(p('one'), 'deleted')).toMatchObject([
+        { revision: 3, value: null },
+      ]);
+      expect(await store.getStateDocument(p('one'), 'deleted')).toBeNull();
+    });
+    check('a lease survives pause and failure and a resumed run still holds it', async harness => {
+      const { store, runs } = harness;
+      const holder = await runs.create();
+      const scope = p('lease');
+      const taken = await store.putStateDocument({
+        scope,
+        name: 'item',
+        value: { stage: 'next' },
+        ifRevision: 0,
+        writer: leaseWriter(holder),
+        lease: 'take',
+      });
+      expect(taken.lease).toMatchObject({ runId: holder, nodePath: 'claim', live: true });
+      for (const status of ['running', 'paused', 'running', 'failed', 'running'] as const) {
+        await runs.setStatus(holder, status);
+        expect((await store.getStateDocument(scope, 'item'))?.lease?.live).toBe(true);
+      }
+      const other = await runs.create();
+      expect(
+        await rejection(
+          store.patchStateDocument({
+            scope,
+            name: 'item',
+            ops: [{ op: 'set', path: '/stage', value: 'stolen' }],
+            writer: leaseWriter(other),
+            lease: 'take',
+          })
+        )
+      ).toBeInstanceOf(StateLeaseHeldError);
+      // The resumed holder writes its outcome under the lease it took before failing.
+      const outcome = await store.patchStateDocument({
+        scope,
+        name: 'item',
+        ops: [{ op: 'set', path: '/stage', value: 'done' }],
+        writer: leaseWriter(holder),
+        lease: 'take',
+        ifRevision: 1,
+      });
+      expect(outcome.lease).toEqual(taken.lease);
+      expect(await store.listStateRevisions(scope, 'item')).toHaveLength(2);
+    });
+    const leaseEndings: [string, (runs: StateLeaseRuns, id: string) => Promise<void>][] = [
+      ['completes', (runs, id) => runs.setStatus(id, 'completed')],
+      ['is cancelled', (runs, id) => runs.setStatus(id, 'cancelled')],
+      [
+        'is deleted',
+        async (runs, id) => {
+          await runs.setStatus(id, 'failed');
+          await runs.remove(id);
+        },
+      ],
+    ];
+    for (const [ending, end] of leaseEndings)
+      check(
+        `a lease ends when its holder ${ending}, and another run takes it over`,
+        async harness => {
+          const { store, runs } = harness;
+          const scope = p('lease-end');
+          const holder = await runs.create();
+          await runs.setStatus(holder, 'running');
+          await store.putStateDocument({
+            scope,
+            name: 'item',
+            value: {},
+            ifRevision: 0,
+            writer: leaseWriter(holder),
+            lease: 'take',
+          });
+          await end(runs, holder);
+          const ended = await store.getStateDocument(scope, 'item');
+          expect(ended?.lease).toMatchObject({ runId: holder, live: false });
+          expect((await store.listStateDocuments(scope))[0]?.lease).toEqual(ended?.lease ?? null);
+          expect((await store.getStateDocuments(scope))[0]?.lease).toEqual(ended?.lease ?? null);
+          // Taking over an ended lease is an ordinary conditional write.
+          const next = await runs.create();
+          const takeover = await store.putStateDocument({
+            scope,
+            name: 'item',
+            value: { taken: true },
+            ifRevision: 1,
+            writer: leaseWriter(next),
+            lease: 'take',
+          });
+          expect(takeover.lease).toMatchObject({ runId: next, live: true });
+        }
+      );
+    check(
+      'writes that name no lease change keep the lease; release and delete end it',
+      async harness => {
+        const { store, runs } = harness;
+        const holder = await runs.create();
+        const scope = p('lease-keep');
+        const input = { scope, name: 'item', writer: leaseWriter(holder) };
+        const taken = await store.putStateDocument({
+          ...input,
+          value: { seen: [] },
+          ifRevision: 0,
+          lease: 'take',
+        });
+        const appended = await store.patchStateDocument({
+          scope,
+          name: 'item',
+          ops: [{ op: 'append', path: '/seen', value: 1 }],
+          writer,
+        });
+        expect(appended.lease).toEqual(taken.lease);
+        expect(
+          await rejection(
+            store.patchStateDocument({
+              scope,
+              name: 'item',
+              ops: [{ op: 'append', path: '/seen', value: 2 }],
+              writer,
+              lease: 'take',
+            })
+          )
+        ).toMatchObject({ message: 'Only a run can take or release a state lease' });
+        const released = await store.putStateDocument({
+          ...input,
+          value: { seen: [1] },
+          ifRevision: 2,
+          lease: 'release',
+        });
+        expect(released.lease).toBeNull();
+        await store.putStateDocument({
+          ...input,
+          value: { seen: [1] },
+          ifRevision: 3,
+          lease: 'take',
+        });
+        const deleted = await store.deleteStateDocument({ ...input, ifRevision: 4 });
+        expect(deleted.lease).toBeNull();
+        expect(
+          (await store.listStateRevisions(scope, 'item')).map(row => row.lease?.live ?? null)
+        ).toEqual([null, true, null, true, true]);
+      }
+    );
+    check('a held write is refused unless its run holds the live lease', async harness => {
+      const { store, runs } = harness;
+      const scope = p('lease-held');
+      const holder = await runs.create();
+      const other = await runs.create();
+      const input = { scope, name: 'item', held: true as const };
+      const ops = [{ op: 'set' as const, path: '/stage', value: 'stolen' }];
+      await store.putStateDocument({ scope, name: 'item', value: {}, ifRevision: 0, writer });
+      // No lease yet: nobody holds it.
+      expect(
+        await rejection(store.patchStateDocument({ ...input, ops, writer: leaseWriter(holder) }))
+      ).toMatchObject({ holder: null });
+      const taken = await store.patchStateDocument({
+        scope,
+        name: 'item',
+        ops: [{ op: 'set', path: '/stage', value: 'building' }],
+        writer: leaseWriter(holder),
+        lease: 'take',
+      });
+      for (const refused of [
+        () => store.patchStateDocument({ ...input, ops, writer: leaseWriter(other) }),
+        () =>
+          store.putStateDocument({
+            ...input,
+            value: {},
+            ifRevision: 2,
+            writer: leaseWriter(other),
+          }),
+        () => store.deleteStateDocument({ ...input, writer: leaseWriter(other) }),
+        () => store.patchStateDocument({ ...input, ops, writer }),
+      ]) {
+        const error = await rejection(refused());
+        expect(error).toBeInstanceOf(StateLeaseNotHeldError);
+        expect(error).toMatchObject({ holder: { runId: holder } });
+      }
+      expect(await store.getStateDocument(scope, 'item')).toEqual(taken);
+      const written = await store.patchStateDocument({
+        ...input,
+        ops: [{ op: 'set', path: '/stage', value: 'done' }],
+        writer: leaseWriter(holder),
+      });
+      expect(written).toMatchObject({ revision: 3, value: { stage: 'done' }, lease: taken.lease });
+      // An ended lease is held by nobody, its former holder included.
+      await runs.setStatus(holder, 'running');
+      await runs.setStatus(holder, 'completed');
+      expect(
+        await rejection(store.deleteStateDocument({ ...input, writer: leaseWriter(holder) }))
+      ).toBeInstanceOf(StateLeaseNotHeldError);
+      expect(await store.listStateRevisions(scope, 'item')).toHaveLength(3);
+    });
+    check('a claim takes the first candidate that is still claimable', async harness => {
+      const { store, runs } = harness;
+      const scope = p('claim');
+      const holder = await runs.create();
+      const ended = await runs.create();
+      const claimer = await runs.create();
+      const put = (name: string, runId?: string): Promise<unknown> =>
+        store.putStateDocument({
+          scope,
+          name,
+          value: { name },
+          ifRevision: 0,
+          writer: runId ? leaseWriter(runId) : writer,
+          ...(runId ? { lease: 'take' as const } : {}),
+        });
+      await put('leased', holder);
+      await put('moved');
+      await store.patchStateDocument({
+        scope,
+        name: 'moved',
+        ops: [{ op: 'set', path: '/v', value: 2 }],
+        writer,
+      });
+      await put('dead', ended);
+      await runs.setStatus(ended, 'running');
+      await runs.setStatus(ended, 'cancelled');
+      await put('free');
+      await put('gone');
+      const tombstone = await store.deleteStateDocument({ scope, name: 'gone', writer });
+      const candidates = [
+        // Named at the revision of its delete, so only the missing value can refuse it.
+        { name: 'gone', ifRevision: tombstone.revision },
+        ...['absent', 'leased', 'moved', 'dead', 'free'].map(name => ({ name, ifRevision: 1 })),
+      ];
+      const input = { scope, writer: { kind: 'run' as const, runId: claimer, nodePath: 'claim' } };
+      expect(
+        await rejection(store.claimStateDocument({ ...input, ...candidates[0] }))
+      ).toBeInstanceOf(StateDocumentMissingError);
+      // A candidate deleted between the claim's read and its write is passed over too.
+      const deletedMeanwhile: typeof store = Object.create(store);
+      deletedMeanwhile.getStateDocument = async (target, name) => {
+        const read = await store.getStateDocument(target, name);
+        if (name === 'vanishing') await store.deleteStateDocument({ scope, name, writer });
+        return read;
+      };
+      await put('vanishing');
+      expect(
+        await claimFirstStateDocument(deletedMeanwhile, {
+          ...input,
+          candidates: [{ name: 'vanishing', ifRevision: 2 }],
+        })
+      ).toEqual({ claimed: null, skipped: [{ name: 'vanishing', reason: 'missing' }] });
+      const result = await claimFirstStateDocument(store, { ...input, candidates });
+      expect(result.skipped).toEqual([
+        { name: 'gone', reason: 'missing' },
+        { name: 'absent', reason: 'missing' },
+        {
+          name: 'leased',
+          reason: 'lease_held',
+          holder: { runId: holder, nodePath: 'claim', takenAt: expect.any(String) },
+        },
+        { name: 'moved', reason: 'revision_moved', revision: 2 },
+      ]);
+      // The dead lease is taken over; the value is unchanged and `free` is never tried.
+      expect(result.claimed).toMatchObject({
+        name: 'dead',
+        revision: 2,
+        value: { name: 'dead' },
+        lease: { runId: claimer, live: true },
+      });
+      expect(await store.getStateDocument(scope, 'dead')).toEqual(result.claimed);
+      // The log tells a claim from a write.
+      expect((await store.listStateRevisions(scope, 'dead')).map(row => row.operation)).toEqual([
+        { op: 'claim' },
+        { op: 'put' },
+      ]);
+      expect((await store.getStateDocument(scope, 'free'))?.revision).toBe(1);
+      const none = await claimFirstStateDocument(store, {
+        ...input,
+        candidates: candidates.slice(0, 4),
+      });
+      expect(none.claimed).toBeNull();
+      expect(none.skipped).toEqual(result.skipped);
+      expect((await store.getStateDocument(scope, 'leased'))?.revision).toBe(1);
+    });
+    check('runs racing to take one lease: exactly one wins', async harness => {
+      const { store, runs } = harness;
+      const scope = p('lease-race');
+      await store.putStateDocument({ scope, name: 'item', value: {}, ifRevision: 0, writer });
+      const contenders = await Promise.all(Array.from({ length: 8 }, () => runs.create()));
+      const results = await Promise.allSettled(
+        contenders.map(runId =>
+          store.patchStateDocument({
+            scope,
+            name: 'item',
+            ops: [{ op: 'set', path: '/owner', value: runId }],
+            writer: leaseWriter(runId),
+            lease: 'take',
+          })
+        )
+      );
+      const won = results.flatMap(result => (result.status === 'fulfilled' ? [result.value] : []));
+      expect(won).toHaveLength(1);
+      for (const result of results)
+        if (result.status === 'rejected') expect(result.reason).toBeInstanceOf(StateLeaseHeldError);
+      const winner = won[0]?.lease?.runId ?? null;
+      const current = await store.getStateDocument(scope, 'item');
+      expect(winner).not.toBeNull();
+      expect(current?.lease?.runId ?? null).toBe(winner);
+      expect(JSON.stringify(current?.value)).toBe(JSON.stringify({ owner: winner }));
+    });
+  });
+}

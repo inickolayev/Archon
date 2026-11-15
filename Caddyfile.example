@@ -8,6 +8,10 @@
 #   None (default) — no authentication required
 
 {$DOMAIN} {
+	handle /internal/* {
+		respond "Not Found" 404
+	}
+
 	# ── Public paths — always bypass auth ─────────────────────────────────────
 	handle /webhooks/* {
 		reverse_proxy app:{$PORT:3000}
@@ -19,7 +23,7 @@
 	# ── Option A: Form-based auth (HTML login page) ────────────────────────────
 	# Requires: docker compose --profile cloud --profile auth up -d
 	# Setup:    Set AUTH_USERNAME, AUTH_PASSWORD_HASH, COOKIE_SECRET in .env
-	#           See docs/docker.md for hash generation instructions.
+	#           See https://archon.diy/deployment/docker/#form-login-sidecar
 	# To enable: uncomment this block AND comment out the "No auth" handle block below.
 	#
 	# handle /login {
@@ -41,9 +45,13 @@
 	# }
 
 	# ── Option B: Basic auth (browser popup, no extra container) ─────────────
-	# Generate hash: docker run caddy caddy hash-password --plaintext 'YOUR_PASSWORD'
-	# Then set in .env: CADDY_BASIC_AUTH=basicauth @protected { admin $$2a$$14$$<hash> }
-	@protected not path /webhooks/* /api/health
+	# In the Compose .env, use a single-quoted multiline value (do not source it).
+	# Uncomment the whole assignment, replace admin, and paste the complete hash unchanged.
+	# Generate hash: docker run --rm caddy caddy hash-password --plaintext 'YOUR_PASSWORD'
+	# CADDY_BASIC_AUTH='basic_auth @protected {
+	#   admin REPLACE_WITH_COMPLETE_HASH_OUTPUT
+	# }'
+	@protected not path /internal/* /webhooks/* /api/health
 	{$CADDY_BASIC_AUTH:}
 
 	# ── No auth (default) ─────────────────────────────────────────────────────

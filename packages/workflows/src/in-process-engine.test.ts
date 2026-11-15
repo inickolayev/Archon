@@ -1,15 +1,24 @@
+// @archon-test-isolated
+import { WorkflowExecutionHandoffError } from './engine-port';
 /**
  * Wires the shared `IWorkflowEngine` contract-test suite
  * (`engine-contract-tests.ts`) against `InProcessWorkflowEngine`
  * (issue #3334).
  *
- * Mock setup mirrors `executor.test.ts`'s "Mock ... / Import after mocks"
- * convention — `InProcessWorkflowEngine` delegates straight through to the
+ * Mock setup mirrors `executor/test-utils.ts`, the scaffolding of the
+ * `executor.*.test.ts` files — `InProcessWorkflowEngine` delegates straight through to the
  * real `executeWorkflow`/`hydrateResumableRun`, so the same fs/git/dag-executor
  * seams need stubbing here too. This file deliberately does NOT mock
  * `./executor` or `@archon/workflows/executor` itself.
  */
-import { mock } from 'bun:test';
+import { providerRegistry } from '@archon/providers';
+import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { trackTempRoots } from '@archon/paths/test-utils';
+import { getRunArtifactsDirForRoot, getRunScratchDir } from '@archon/paths/archon-paths';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -63,24 +72,23 @@ mock.module('@archon/paths', () => ({
 
 mock.module('@archon/git', () => ({
   getDefaultBranch: mock(async () => 'main'),
+  getDefaultRemote: mock(async () => 'origin'),
   toRepoPath: mock((p: string) => p),
 }));
 
 // --- Mock dag-executor: the DAG loop itself is out of scope for this suite
-// (dag-executor.test.ts / subrun.test.ts own that); this suite only proves
+// (dag-executor.test.ts / child-runs.*.test.ts own that); this suite only proves
 // the InProcessWorkflowEngine -> executeWorkflow/hydrateResumableRun wiring. ---
 type ExecuteDagWorkflow = typeof import('./dag-executor').executeDagWorkflow;
 let executedWorkflow: Parameters<ExecuteDagWorkflow>[0]['workflow'] | undefined;
+/** Stands in for the DAG body in the subscription cases, which need it to write rows. */
+let dagBody: ExecuteDagWorkflow | undefined;
 const mockExecuteDagWorkflow = mock<ExecuteDagWorkflow>(async input => {
   executedWorkflow = input.workflow;
-  return undefined;
+  return dagBody?.(input);
 });
 mock.module('./dag-executor', () => ({
   executeDagWorkflow: mockExecuteDagWorkflow,
-  childOutcomeFromRun: mock((run: { id: string; status: string }) => ({
-    childRunId: run.id,
-    status: run.status,
-  })),
 }));
 
 mock.module('./logger', () => ({
@@ -98,12 +106,9 @@ mock.module('./event-emitter', () => ({
   getWorkflowEventEmitter: mock(() => mockEmitter),
 }));
 
-// --- Bootstrap provider registry (after path mocks), same as executor.test.ts ---
-import {
-  registerBuiltinProviders,
-  registerCommunityProviders,
-  clearRegistry,
-} from '@archon/providers';
+// --- Bootstrap provider registry (after path mocks), same as executor/test-utils.ts ---
+import { clearRegistry } from '@archon/providers';
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers/in-process';
 clearRegistry();
 registerBuiltinProviders();
 registerCommunityProviders();
@@ -111,7 +116,830 @@ registerCommunityProviders();
 // --- Import after mocks ---
 import { InProcessWorkflowEngine } from './in-process-engine';
 import { runWorkflowEngineContractTests } from './engine-contract-tests';
+import { executeWorkflow } from './executor';
+import { createFileWorkflowStore } from './file-store';
+import { resolveWorkflow } from './graph-plan';
+import type { IWorkflowPlatform, WorkflowDeps } from './deps';
+import type { WorkflowRunDelivery } from './engine-port';
+import { executionClaim, type IWorkflowStore } from './store';
+import type { WorkflowRun } from './schemas/workflow-run';
 
-runWorkflowEngineContractTests(deps => new InProcessWorkflowEngine(deps), {
+runWorkflowEngineContractTests(providerRegistry, deps => new InProcessWorkflowEngine(deps), {
   executedWorkflow: () => executedWorkflow,
+});
+
+describe('InProcessWorkflowEngine', () => {
+  const roots = trackTempRoots();
+  const originalArchonHome = process.env.ARCHON_HOME;
+  afterEach(() => {
+    dagBody = undefined;
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  const platform = {
+    sendMessage: async (): Promise<void> => undefined,
+    getPlatformType: () => 'test' as const,
+  } as unknown as IWorkflowPlatform;
+  const parent = resolveWorkflow({
+    name: 'parent',
+    description: 'Parent',
+    nodes: [
+      { id: 'first', kind: 'agent', source: { kind: 'inline', prompt: 'One' } },
+      { id: 'child', kind: 'workflow', workflow: 'child', depends_on: ['first'] },
+    ],
+  });
+  const child = resolveWorkflow({
+    name: 'child',
+    description: 'Child',
+    nodes: [{ id: 'inner', kind: 'agent', source: { kind: 'inline', prompt: 'Two' } }],
+  });
+
+  async function makeEngine(): Promise<{
+    engine: InProcessWorkflowEngine;
+    store: IWorkflowStore;
+    deps: WorkflowDeps;
+  }> {
+    const store = await createFileWorkflowStore({
+      root: roots(await mkdtemp(join(tmpdir(), 'archon-engine-subscribe-'))),
+    });
+    const deps = {
+      providers: providerRegistry,
+      store,
+      loadConfig: async () => ({
+        assistant: 'claude',
+        assistants: { claude: {}, codex: {} },
+        baseBranch: '',
+        commands: { folder: '' },
+      }),
+      getAgentProvider: () => ({
+        checkCredential: async () => ({ state: 'not_checked', source: 'native' }),
+        run: async (): Promise<void> => undefined,
+      }),
+    } as unknown as WorkflowDeps;
+    return { engine: new InProcessWorkflowEngine(deps), store, deps };
+  }
+
+  describe.each(['pending', 'claimed'] as const)('%s continuation submission', state => {
+    it.each([
+      [
+        'mode',
+        { mode: 'supersede' },
+        'ancestor',
+        'ancestor',
+        'adopt',
+        'conflicts with recorded continuation mode',
+      ],
+      [
+        'ancestor',
+        { mode: 'adopt' },
+        'ancestor',
+        'other',
+        'adopt',
+        'conflicts with recorded continuation ancestor',
+      ],
+      [
+        'malformed stamp',
+        { mode: 'unsupported' },
+        'ancestor',
+        'ancestor',
+        'adopt',
+        'Invalid recorded continuation metadata.',
+      ],
+      [
+        'legacy mode',
+        undefined,
+        'ancestor',
+        'ancestor',
+        'supersede',
+        'conflicts with recorded continuation mode',
+      ],
+      [
+        'absent ancestor',
+        undefined,
+        undefined,
+        'ancestor',
+        'adopt',
+        'conflicts with recorded continuation ancestor',
+      ],
+    ] as const)(
+      'submit refuses a pending row with conflicting %s before inheritance',
+      async (_label, stamp, recordedId, callerId, callerMode, message) => {
+        const { engine, store } = await makeEngine();
+        const pending = await store.createWorkflowRun({
+          workflow_name: parent.name,
+          user_message: '',
+          adopted_from_run_id: recordedId,
+          metadata: stamp ? { continuation: stamp } : {},
+        });
+        if (state === 'claimed') await store.claimPendingWorkflowRun(pending.id, '/other-worker');
+        const before = await store.getWorkflowRun(pending.id);
+        const read = spyOn(store, 'getWorkflowRun');
+        let executed = false;
+        dagBody = async () => {
+          executed = true;
+          return undefined;
+        };
+        await expect(
+          engine.submit({
+            platform,
+            conversationId: 'conv-1',
+            cwd: '/tmp/ops',
+            workflow: parent,
+            userMessage: '',
+            options: {
+              preCreatedRun: pending,
+              adoptedFromRunId: callerId,
+              continuationMode: callerMode,
+            },
+          })
+        ).rejects.toThrow(message);
+        expect(read).not.toHaveBeenCalledWith(callerId);
+        expect(executed).toBe(false);
+        read.mockRestore();
+        expect(await store.getWorkflowRun(pending.id)).toEqual(before);
+      }
+    );
+  });
+
+  it.each(['pending', 'claimed'] as const)(
+    'configuration refusal preserves an unowned %s row',
+    async state => {
+      const { engine, store } = await makeEngine();
+      const pending = await store.createWorkflowRun({
+        workflow_name: parent.name,
+        user_message: '',
+        metadata: { ai_configuration: { version: 2 } },
+      });
+      if (state === 'claimed') await store.claimPendingWorkflowRun(pending.id, '/other-worker');
+      const before = await store.getWorkflowRun(pending.id);
+      const execute = spyOn(store, 'claimPendingWorkflowRun');
+      await expect(
+        engine.submit({
+          platform,
+          conversationId: 'conv-1',
+          cwd: '/tmp/ops',
+          workflow: parent,
+          userMessage: '',
+          options: { preCreatedRun: pending },
+        })
+      ).rejects.toThrow('Invalid recorded run AI configuration');
+      expect(execute).not.toHaveBeenCalled();
+      execute.mockRestore();
+      expect(await store.getWorkflowRun(pending.id)).toEqual(before);
+    }
+  );
+
+  it.each(['initial', 'resumed', 'replaced'] as const)(
+    'configuration failure only terminalizes the owned resume claim (%s)',
+    async claim => {
+      const { store, deps } = await makeEngine();
+      const run = await store.createWorkflowRun({
+        workflow_name: parent.name,
+        user_message: '',
+        metadata: { ai_configuration: { version: 2 } },
+      });
+      let owned = await store.claimPendingWorkflowRun(run.id);
+      if (!owned) throw new Error('expected initial claim');
+      if (claim !== 'initial') {
+        await store.failWorkflowRun(run.id, 'interrupted');
+        owned = await store.resumeWorkflowRun(run.id);
+      }
+      if (claim === 'replaced') {
+        await store.failWorkflowRun(run.id, 'interrupted');
+        await store.resumeWorkflowRun(run.id);
+      }
+      const before = await store.getWorkflowRun(run.id);
+      await expect(
+        executeWorkflow(deps, platform, 'conv-1', '/tmp/ops', parent, '', undefined, {
+          preCreatedRun: owned,
+          priorCompletedNodes: new Map(),
+        })
+      ).rejects.toThrow('Invalid recorded run AI configuration');
+      const after = await store.getWorkflowRun(run.id);
+      if (claim === 'replaced') expect(after).toEqual(before);
+      else expect(after?.status).toBe('failed');
+    }
+  );
+
+  const completeNode = (store: IWorkflowStore, runId: string, step: string): Promise<void> =>
+    store.persistWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'node_completed',
+      step_name: step,
+      data: { node_output: step },
+    });
+
+  it('preserves a configuration load failure with exactly one terminal write on resume', async () => {
+    const { engine, store, deps } = await makeEngine();
+    const run = await store.createWorkflowRun({ workflow_name: parent.name, user_message: '' });
+    await completeNode(store, run.id, 'first');
+    await store.failWorkflowRun(run.id, 'interrupted');
+    const failed = await store.getWorkflowRun(run.id);
+    if (!failed) throw new Error('expected failed run');
+    const cause = new Error('config read unavailable');
+    const loadConfig = spyOn(deps, 'loadConfig').mockRejectedValue(cause);
+    const fail = store.failWorkflowRun.bind(store);
+    const failRun = spyOn(store, 'failWorkflowRun')
+      .mockRejectedValue(new Error('second failure write refused'))
+      .mockImplementationOnce(fail);
+    try {
+      const admission = await engine.resume({
+        platform,
+        conversationId: 'conv-1',
+        cwd: '/tmp/ops',
+        userMessage: '',
+        run: failed,
+        legacyWorkflow: parent,
+      });
+      if (!admission.accepted) throw new Error('expected resume');
+      await expect(admission.settled).rejects.toBe(cause);
+      expect(failRun).toHaveBeenCalledTimes(1);
+      expect(await store.getWorkflowRun(run.id)).toMatchObject({
+        status: 'failed',
+        metadata: { error: cause.message },
+      });
+    } finally {
+      loadConfig.mockRestore();
+      failRun.mockRestore();
+    }
+  });
+
+  it.each(['preparation', 'configuration', 'stamp'] as const)(
+    'public resume failure preserves a replaced claim during %s',
+    async phase => {
+      const { engine, store } = await makeEngine();
+      const run = await store.createWorkflowRun({
+        workflow_name: parent.name,
+        user_message: '',
+        metadata:
+          phase === 'configuration'
+            ? { ai_configuration: { version: 2 } }
+            : phase === 'stamp'
+              ? { continuation: { mode: 'unsupported' } }
+              : {},
+      });
+      await completeNode(store, run.id, 'first');
+      await store.failWorkflowRun(run.id, 'interrupted');
+      const failed = await store.getWorkflowRun(run.id);
+      if (!failed) throw new Error('expected failed run');
+      let replacement: WorkflowRun | undefined;
+      const admission = engine.resume({
+        platform,
+        conversationId: 'conv-1',
+        cwd: '/tmp/ops',
+        userMessage: '',
+        run: failed,
+        legacyWorkflow: parent,
+        prepareExecution: async () => {
+          await store.failWorkflowRun(run.id, 'replaced');
+          replacement = await store.resumeWorkflowRun(run.id);
+          if (phase === 'preparation') throw new Error('preparation refused');
+          return { cwd: '/tmp/ops' };
+        },
+      });
+      if (phase === 'preparation') await expect(admission).rejects.toThrow('preparation refused');
+      else {
+        const accepted = await admission;
+        if (!accepted.accepted) throw new Error('expected resume');
+        await expect(accepted.settled).rejects.toThrow(
+          phase === 'configuration'
+            ? 'Invalid recorded run AI configuration'
+            : 'Invalid recorded continuation metadata'
+        );
+      }
+      if (!replacement) throw new Error('expected replacement claim');
+      expect(await store.getWorkflowRun(run.id)).toEqual(replacement);
+    }
+  );
+
+  it.each(['preparation', 'stamp'] as const)(
+    'public resume records an owned %s failure',
+    async phase => {
+      const { engine, store } = await makeEngine();
+      const run = await store.createWorkflowRun({
+        workflow_name: parent.name,
+        user_message: '',
+        metadata: phase === 'stamp' ? { continuation: { mode: 'unsupported' } } : {},
+      });
+      await completeNode(store, run.id, 'first');
+      await store.failWorkflowRun(run.id, 'interrupted');
+      const failed = await store.getWorkflowRun(run.id);
+      if (!failed) throw new Error('expected failed run');
+      const cause = new Error('preparation refused');
+      const admission = engine.resume({
+        platform,
+        conversationId: 'conv-1',
+        cwd: '/tmp/ops',
+        userMessage: '',
+        run: failed,
+        legacyWorkflow: parent,
+        prepareExecution: async () => {
+          if (phase === 'preparation') throw cause;
+          return { cwd: '/tmp/ops' };
+        },
+      });
+      if (phase === 'preparation') await expect(admission).rejects.toBe(cause);
+      else {
+        const accepted = await admission;
+        if (!accepted.accepted) throw new Error('expected resume');
+        await expect(accepted.settled).rejects.toThrow('Invalid recorded continuation metadata');
+      }
+      expect(await store.getWorkflowRun(run.id)).toMatchObject({
+        status: 'failed',
+        metadata: {
+          error:
+            phase === 'preparation' ? cause.message : 'Invalid recorded continuation metadata.',
+        },
+      });
+    }
+  );
+
+  describe.each(['stamp', 'workflow'] as const)('%s resume refusal', phase => {
+    it.each(['owned', 'settled', 'replaced'] as const)(
+      'preserves the refusal without a status read for a %s claim',
+      async claim => {
+        const { engine, store } = await makeEngine();
+        const run = await store.createWorkflowRun({
+          workflow_name: parent.name,
+          user_message: '',
+          metadata: phase === 'stamp' ? { continuation: { mode: 'unsupported' } } : {},
+        });
+        await completeNode(store, run.id, 'first');
+        await store.failWorkflowRun(run.id, 'interrupted');
+        const failed = await store.getWorkflowRun(run.id);
+        if (!failed) throw new Error('expected failed run');
+        const statusRead = spyOn(store, 'getWorkflowRunStatus').mockRejectedValue(
+          new Error('status read unavailable')
+        );
+        let before: WorkflowRun | null = null;
+        try {
+          const admission = await engine.resume({
+            platform,
+            conversationId: 'conv-1',
+            cwd: '/tmp/ops',
+            userMessage: '',
+            run: failed,
+            legacyWorkflow:
+              phase === 'stamp'
+                ? parent
+                : resolveWorkflow({
+                    name: parent.name,
+                    description: 'Budgeted parent',
+                    budget: { max_work_units: 5 },
+                    nodes: [{ id: 'child', kind: 'workflow', workflow: 'child' }],
+                  }),
+            prepareExecution: async () => {
+              if (claim === 'settled') await store.cancelWorkflowRun(run.id);
+              if (claim === 'replaced') {
+                await store.failWorkflowRun(run.id, 'replaced');
+                await store.resumeWorkflowRun(run.id);
+              }
+              before = await store.getWorkflowRun(run.id);
+              return { cwd: '/tmp/ops' };
+            },
+          });
+          if (!admission.accepted) throw new Error('expected resume');
+          const refusal =
+            phase === 'stamp' ? 'Invalid recorded continuation metadata' : "node 'child'";
+          await expect(admission.settled).rejects.toThrow(refusal);
+          expect(statusRead).not.toHaveBeenCalled();
+          const after = await store.getWorkflowRun(run.id);
+          if (claim === 'owned') {
+            expect(after).toMatchObject({
+              status: 'failed',
+              metadata: { error: expect.stringContaining(refusal) },
+            });
+          } else {
+            expect(before).toMatchObject({
+              status: claim === 'settled' ? 'cancelled' : 'running',
+            });
+            expect(after).toEqual(before);
+          }
+        } finally {
+          statusRead.mockRestore();
+        }
+      }
+    );
+  });
+
+  it.each(['owned', 'replaced'] as const)(
+    'container refusal settles only the owned resume claim (%s)',
+    async claim => {
+      const { engine, store } = await makeEngine();
+      const run = await store.createWorkflowRun({
+        workflow_name: parent.name,
+        user_message: '',
+        metadata: { isolation: 'container', isolation_env_id: 'env-x' },
+      });
+      await completeNode(store, run.id, 'first');
+      await store.failWorkflowRun(run.id, 'interrupted');
+      const failed = await store.getWorkflowRun(run.id);
+      if (!failed) throw new Error('expected failed run');
+      let replacement: WorkflowRun | undefined;
+      const accepted = await engine.resume({
+        platform: {
+          ...platform,
+          sendMessage: async () => {
+            if (claim === 'replaced') {
+              await store.failWorkflowRun(run.id, 'replaced');
+              replacement = await store.resumeWorkflowRun(run.id);
+            }
+          },
+        },
+        conversationId: 'conv-1',
+        cwd: '/tmp/ops',
+        userMessage: '',
+        run: failed,
+        legacyWorkflow: parent,
+      });
+      if (!accepted.accepted) throw new Error('expected resume');
+      const result = await accepted.settled;
+      expect(result).toMatchObject({ success: false, error: expect.stringContaining('CLI') });
+      if (claim === 'replaced') {
+        if (!replacement) throw new Error('expected replacement claim');
+        expect(await store.getWorkflowRun(run.id)).toEqual(replacement);
+      } else {
+        if (result.success) throw new Error('expected refusal');
+        expect(await store.getWorkflowRun(run.id)).toMatchObject({
+          status: 'failed',
+          metadata: { error: result.error },
+        });
+        expect((await store.resumeWorkflowRun(run.id)).status).toBe('running');
+      }
+    }
+  );
+
+  it.each(['failed', 'cancelled'] as const)(
+    'returns the original %s resume result without another terminal write or required status read',
+    async status => {
+      const { engine, store } = await makeEngine();
+      const run = await store.createWorkflowRun({ workflow_name: parent.name, user_message: '' });
+      await completeNode(store, run.id, 'first');
+      await store.failWorkflowRun(run.id, 'interrupted');
+      const failed = await store.getWorkflowRun(run.id);
+      if (!failed) throw new Error('expected failed run');
+      const cause = new Error('DAG failed');
+      const readStatus = store.getWorkflowRunStatus.bind(store);
+      let statusRead: ReturnType<typeof spyOn> | undefined;
+      dagBody = async () => {
+        statusRead = spyOn(store, 'getWorkflowRunStatus')
+          .mockRejectedValue(new Error('post-settlement status read refused'))
+          .mockImplementationOnce(readStatus);
+        if (status === 'cancelled') {
+          await store.cancelWorkflowRun(run.id);
+          return undefined;
+        }
+        throw cause;
+      };
+      const fail = store.failWorkflowRun.bind(store);
+      const failRun = spyOn(store, 'failWorkflowRun')
+        .mockRejectedValue(new Error('second failure write refused'))
+        .mockImplementationOnce(fail);
+      try {
+        const admission = await engine.resume({
+          platform,
+          conversationId: 'conv-1',
+          cwd: '/tmp/ops',
+          userMessage: '',
+          run: failed,
+          legacyWorkflow: parent,
+        });
+        if (!admission.accepted) throw new Error('expected resume');
+        expect(await admission.settled).toEqual({
+          success: false,
+          workflowRunId: run.id,
+          error: status === 'failed' ? cause.message : 'Workflow did not complete successfully',
+        });
+        expect(failRun).toHaveBeenCalledTimes(status === 'failed' ? 1 : 0);
+        expect(statusRead).toHaveBeenCalledTimes(1);
+        expect(await readStatus(run.id)).toBe(status);
+        if (status === 'failed')
+          expect(await store.getWorkflowRun(run.id)).toMatchObject({
+            metadata: { error: cause.message },
+          });
+      } finally {
+        statusRead?.mockRestore();
+        failRun.mockRestore();
+      }
+    }
+  );
+
+  it('rejects an owned container refusal when its failure write rejects', async () => {
+    const { engine, store } = await makeEngine();
+    const run = await store.createWorkflowRun({
+      workflow_name: parent.name,
+      user_message: '',
+      metadata: { isolation: 'container', isolation_env_id: 'env-x' },
+    });
+    await completeNode(store, run.id, 'first');
+    await store.failWorkflowRun(run.id, 'interrupted');
+    const failed = await store.getWorkflowRun(run.id);
+    if (!failed) throw new Error('expected failed run');
+    const persistError = new Error('failure write refused');
+    const failRun = spyOn(store, 'failWorkflowRun').mockRejectedValue(persistError);
+    try {
+      const admission = await engine.resume({
+        platform,
+        conversationId: 'conv-1',
+        cwd: '/tmp/ops',
+        userMessage: '',
+        run: failed,
+        legacyWorkflow: parent,
+      });
+      if (!admission.accepted) throw new Error('expected resume');
+      await expect(admission.settled).rejects.toMatchObject({
+        name: 'TerminalStatusWriteError',
+        cause: persistError,
+        failure: expect.stringContaining('CLI'),
+      });
+      expect(failRun).toHaveBeenCalledTimes(1);
+      expect(await store.getWorkflowRunStatus(run.id)).toBe('running');
+    } finally {
+      failRun.mockRestore();
+    }
+  });
+
+  it('stale container submit preserves another worker claim', async () => {
+    const { engine, store } = await makeEngine();
+    const pending = await store.createWorkflowRun({
+      workflow_name: parent.name,
+      user_message: '',
+      metadata: { isolation: 'container', isolation_env_id: 'env-x' },
+    });
+    await store.claimPendingWorkflowRun(pending.id, '/other-worker');
+    const before = await store.getWorkflowRun(pending.id);
+    const result = await engine.submit({
+      platform,
+      conversationId: 'conv-1',
+      cwd: '/tmp/ops',
+      workflow: parent,
+      userMessage: '',
+      options: { preCreatedRun: pending },
+    });
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining('CLI') });
+    expect(await store.getWorkflowRun(pending.id)).toEqual(before);
+  });
+
+  const lifecycle = (deliveries: WorkflowRunDelivery[]): string[] =>
+    deliveries
+      .filter(({ event }) => event.event_type.startsWith('workflow_') || event.step_name)
+      .map(({ event }) => `${event.workflow_run_id}:${event.event_type}:${event.step_name ?? ''}`);
+
+  it.each(['read', 'post-publication', 'pre-publication'] as const)(
+    'preserves ownership across a %s rejection on resume',
+    async kind => {
+      const { engine, store } = await makeEngine();
+      const run = await store.createWorkflowRun({ workflow_name: parent.name, user_message: '' });
+      await completeNode(store, run.id, 'first');
+      await store.failWorkflowRun(run.id, 'interrupted');
+      const failed = await store.getWorkflowRun(run.id);
+      if (failed?.status !== 'failed') throw new Error('expected failed run');
+      const cause = new Error('required operation failed');
+      let read: ReturnType<typeof spyOn> | undefined;
+      dagBody = async ({ workflowRun }) => {
+        if (kind === 'pre-publication') throw cause;
+        const context = {
+          type: 'approval' as const,
+          nodeId: 'review',
+          message: '',
+          pauseId: 'published',
+        };
+        await store.pauseWorkflowRun(workflowRun.id, context);
+        await store.resumeWorkflowRun(workflowRun.id);
+        if (kind === 'read') {
+          const get = store.getWorkflowRun.bind(store);
+          read = spyOn(store, 'getWorkflowRun')
+            .mockImplementation(get)
+            .mockImplementationOnce(async () => {
+              throw cause;
+            });
+        }
+        if (kind === 'post-publication')
+          throw new WorkflowExecutionHandoffError(workflowRun.id, cause);
+        return {
+          kind: 'container_pause',
+          pause: { kind: 'gate', context },
+        };
+      };
+      try {
+        const admission = await engine.resume({
+          platform,
+          conversationId: 'conv-1',
+          cwd: '/tmp/ops',
+          userMessage: '',
+          run: failed,
+          legacyWorkflow: parent,
+        });
+        if (!admission.accepted) throw new Error('expected resume');
+        if (kind === 'pre-publication') {
+          expect(await admission.settled).toMatchObject({ success: false, error: cause.message });
+        } else {
+          await expect(admission.settled).rejects.toMatchObject({
+            name: 'WorkflowExecutionHandoffError',
+            workflowRunId: run.id,
+            cause,
+          });
+        }
+        expect(await store.getWorkflowRunStatus(run.id)).toBe(
+          kind === 'pre-publication' ? 'failed' : 'running'
+        );
+      } finally {
+        read?.mockRestore();
+      }
+    }
+  );
+
+  it('keeps the execution error when resume cannot mark the run failed', async () => {
+    const { engine, store } = await makeEngine();
+    const run = await store.createWorkflowRun({ workflow_name: parent.name, user_message: '' });
+    await completeNode(store, run.id, 'first');
+    await store.failWorkflowRun(run.id, 'interrupted');
+    const failed = await store.getWorkflowRun(run.id);
+    if (failed?.status !== 'failed') throw new Error('expected failed run');
+    const persistError = new Error('SQLITE_BUSY');
+    const failRun = spyOn(store, 'failWorkflowRun').mockRejectedValue(persistError);
+    try {
+      const admission = await engine.resume({
+        platform,
+        conversationId: 'conv-1',
+        cwd: '/tmp/ops',
+        userMessage: '',
+        run: failed,
+        // The executor refuses a run budget over a `workflow:` node before its own
+        // terminal-write boundary, so only the engine's catch can record the failure.
+        legacyWorkflow: resolveWorkflow({
+          name: parent.name,
+          description: 'Budgeted parent',
+          budget: { max_work_units: 5 },
+          nodes: [{ id: 'child', kind: 'workflow', workflow: 'child' }],
+        }),
+      });
+      if (!admission.accepted) throw new Error('expected resume');
+      await expect(admission.settled).rejects.toMatchObject({
+        name: 'TerminalStatusWriteError',
+        cause: persistError,
+        failure: expect.objectContaining({ message: expect.stringContaining("node 'child'") }),
+      });
+      expect(await store.getWorkflowRunStatus(run.id)).toBe('running');
+    } finally {
+      failRun.mockRestore();
+    }
+  });
+
+  it('resume settles before the host drains scratch cleanup', async () => {
+    const { engine, store } = await makeEngine();
+    const home = roots(await mkdtemp(join(tmpdir(), 'archon-engine-resume-scratch-')));
+    process.env.ARCHON_HOME = home;
+    const root = join(home, 'project');
+    const run = await store.createWorkflowRun({
+      workflow_name: parent.name,
+      user_message: '',
+    });
+    await store.updateWorkflowRun(run.id, { output_root: root });
+    await completeNode(store, run.id, 'first');
+    await store.failWorkflowRun(run.id, 'interrupted');
+    const failed = await store.getWorkflowRun(run.id);
+    if (failed?.status !== 'failed') throw new Error('expected a failed run');
+    const scratch = getRunScratchDir(getRunArtifactsDirForRoot(root, run.id));
+    await mkdir(scratch, { recursive: true });
+    dagBody = async ({ deps, workflowRun }) => {
+      await completeNode(deps.store, workflowRun.id, 'child');
+      await deps.store.completeWorkflowRun(workflowRun.id, { duration_ms: 1 });
+      return undefined;
+    };
+    const cleanups: (() => Promise<void>)[] = [];
+
+    const admission = await engine.resume({
+      platform,
+      conversationId: 'conv-1',
+      cwd: root,
+      userMessage: '',
+      run: failed,
+      legacyWorkflow: parent,
+      options: { deferScratchCleanup: cleanup => cleanups.push(cleanup) },
+    });
+    if (!admission.accepted) throw new Error('expected resume');
+    const result = await admission.settled;
+
+    expect(result).toMatchObject({ success: true, workflowRunId: run.id });
+    expect(await store.getWorkflowRunStatus(run.id)).toBe('completed');
+    expect(cleanups).toHaveLength(1);
+    expect(existsSync(scratch)).toBe(true);
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    expect(existsSync(scratch)).toBe(false);
+  });
+
+  it('delivers the run and its workflow child in commit order', async () => {
+    const { engine, store } = await makeEngine();
+    let childRunId = '';
+    dagBody = async ({ deps, workflow, workflowRun }) => {
+      if (workflow.name === 'parent') {
+        await completeNode(deps.store, workflowRun.id, 'first');
+        const childRun = await deps.store.createWorkflowRun({
+          workflow_name: 'child',
+          user_message: '',
+          parent_run_id: workflowRun.id,
+        });
+        childRunId = childRun.id;
+        await executeWorkflow(deps, platform, 'conv-1', '/tmp/ops', child, '', undefined, {
+          preCreatedRun: childRun,
+        });
+        await completeNode(deps.store, workflowRun.id, 'child');
+      } else {
+        await completeNode(deps.store, workflowRun.id, 'inner');
+      }
+      await deps.store.completeWorkflowRun(workflowRun.id, { duration_ms: 1 });
+      return undefined;
+    };
+    const unrelated = await store.createWorkflowRun({ workflow_name: 'other', user_message: '' });
+    const runId = '00000000-0000-4000-8000-000000000001';
+    const pending = await store.createWorkflowRun({
+      id: runId,
+      workflow_name: 'parent',
+      user_message: '',
+    });
+    const deliveries: WorkflowRunDelivery[] = [];
+    const subscription = await engine.subscribe(runId, delivery => deliveries.push(delivery));
+
+    const result = await engine.submit({
+      platform,
+      conversationId: 'conv-1',
+      cwd: '/tmp/ops',
+      workflow: parent,
+      userMessage: '',
+      options: { preCreatedRun: pending },
+    });
+    await store.persistWorkflowEvent({
+      workflow_run_id: unrelated.id,
+      event_type: 'workflow_started',
+    });
+    await subscription.close();
+
+    expect(result).toMatchObject({ success: true, workflowRunId: runId });
+    expect(lifecycle(deliveries)).toEqual([
+      `${runId}:workflow_started:`,
+      `${runId}:node_completed:first`,
+      `${childRunId}:workflow_started:`,
+      `${childRunId}:node_completed:inner`,
+      `${childRunId}:workflow_completed:`,
+      `${runId}:node_completed:child`,
+      `${runId}:workflow_completed:`,
+    ]);
+    expect(deliveries.some(({ event }) => event.workflow_run_id === unrelated.id)).toBe(false);
+  });
+
+  it('a subscription opened before resume sees only the new segment', async () => {
+    const { engine, store } = await makeEngine();
+    const claims: (string | null)[] = [];
+    const onExecutionClaimed = (claim: string | null): void => {
+      claims.push(claim);
+    };
+    dagBody = async ({ deps, workflowRun, priorCompletedNodes }) => {
+      expect(claims).toHaveLength(priorCompletedNodes?.has('first') ? 2 : 1);
+      expect(claims.at(-1)).toBe(executionClaim(workflowRun.metadata));
+      if (priorCompletedNodes?.has('first')) {
+        await completeNode(deps.store, workflowRun.id, 'child');
+        await deps.store.completeWorkflowRun(workflowRun.id, { duration_ms: 1 });
+      } else {
+        await completeNode(deps.store, workflowRun.id, 'first');
+        await deps.store.failWorkflowRun(workflowRun.id, 'interrupted');
+      }
+      return undefined;
+    };
+    const first = await engine.submit({
+      platform,
+      conversationId: 'conv-1',
+      cwd: '/tmp/ops',
+      workflow: parent,
+      userMessage: '',
+      options: { onExecutionClaimed },
+    });
+    const failed = await store.getWorkflowRun(first.workflowRunId ?? '');
+    if (failed?.status !== 'failed') throw new Error('expected a failed first segment');
+    const deliveries: WorkflowRunDelivery[] = [];
+    const subscription = await engine.subscribe(failed.id, delivery => deliveries.push(delivery));
+
+    const admission = await engine.resume({
+      platform,
+      conversationId: 'conv-1',
+      cwd: '/tmp/ops',
+      userMessage: '',
+      run: failed,
+      legacyWorkflow: parent,
+      options: { onExecutionClaimed },
+    });
+    if (!admission.accepted) throw new Error('expected resume');
+    await admission.settled;
+    expect(claims[0]).toBeNull();
+    expect(typeof claims[1]).toBe('string');
+    await subscription.close();
+
+    expect(lifecycle(deliveries)).toEqual([
+      `${failed.id}:workflow_resumed:`,
+      `${failed.id}:workflow_started:`,
+      `${failed.id}:node_completed:child`,
+      `${failed.id}:workflow_completed:`,
+    ]);
+  });
 });

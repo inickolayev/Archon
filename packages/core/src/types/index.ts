@@ -8,7 +8,7 @@ import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-confi
 
 // TokenUsage is used by IPlatformAdapter below.
 import type { TokenUsage } from '@archon/providers/types';
-import type { PlatformStructuredEvent } from '@archon/workflows/deps';
+import type { PlatformStructuredEvent, WorkflowMessageMetadata } from '@archon/workflows/deps';
 
 // Re-export schema-derived types so existing imports from '@archon/core/types' keep working.
 export type {
@@ -34,6 +34,9 @@ export class ConversationNotFoundError extends Error {
   }
 }
 
+import type { RunActor } from '../operations/run-authorization';
+export type { RunActor } from '../operations/run-authorization';
+
 import type { IsolationHints } from '@archon/isolation';
 
 export interface AttachedFile {
@@ -50,13 +53,13 @@ export interface HandleMessageContext {
   readonly parentConversationId?: string;
   readonly isolationHints?: IsolationHints;
   readonly attachedFiles?: AttachedFile[];
+  readonly actor: RunActor;
   /**
-   * Archon user UUID resolved from the inbound platform user identifier.
-   * Chat/forge adapters resolve this via findOrCreateUserByPlatformIdentity
-   * before calling handleMessage. Undefined for web/CLI surfaces until their
-   * own auth flows are wired.
+   * Set ONLY by the `POST /api/workflows/:name/run` route: start this workflow with the
+   * message, byte for byte, as its `$ARGUMENTS`. The message is never parsed as a command,
+   * so no word in it can change the run (#4159).
    */
-  readonly userId?: string;
+  readonly workflowName?: string;
   /**
    * True when the surface that received this message already wrote its `user`
    * row — at ingest, before the conversation lock, and stamped with the time
@@ -69,9 +72,8 @@ export interface HandleMessageContext {
    *
    * Set ONLY by the `POST /api/workflows/:name/run` route, whose body carries an
    * `inputs` map. It rides the context rather than the message text so a supplied value
-   * is never confused with `$ARGUMENTS`, and so chat platforms — which have no channel
-   * for it and never populate this field — keep their existing behaviour unchanged
-   * (#2555 tracks giving them one).
+   * is never confused with `$ARGUMENTS`. Chat launches never populate this field; they
+   * carry inputs on the `invoke_workflow` launch instead.
    */
   readonly workflowInputs?: Readonly<Record<string, string>>;
   /** Sparse tier/@alias rebindings supplied by the workflow run route (#2481). */
@@ -108,29 +110,31 @@ export interface CommandResult {
 }
 
 /**
- * Generic platform adapter interface
- * Allows supporting multiple platforms (Telegram, Slack, GitHub, etc.)
+ * What a core platform adapter accepts with a message: everything the workflow
+ * engine can send, plus buttons. Telegram turns `keyboard` into inline/reply
+ * keyboards; adapters without buttons ignore it. The workflow engine never sends
+ * buttons, so the field stays out of its contract.
  */
-export interface MessageMetadata {
-  /**
-   * Buttons the platform may render with this message. Telegram turns them
-   * into inline/reply keyboards; adapters without buttons ignore the field.
-   */
+export type MessageMetadata = WorkflowMessageMetadata & {
   keyboard?: import('../conversations/telegram-menu').MenuKeyboard;
-  category?:
-    | 'tool_call_formatted'
-    | 'workflow_status'
-    | 'workflow_dispatch_status'
-    | 'isolation_context'
-    | 'workflow_result';
-  segment?: 'new' | 'auto';
-  workflowDispatch?: { workerConversationId: string; workflowName: string };
-  workflowResult?: { workflowName: string; runId: string };
-}
+};
 
 export { toPersistedMessageMetadata } from './message-metadata';
 
 export interface IPlatformAdapter {
+  readonly capabilities: {
+    readonly messagePersistence: 'core' | 'adapter';
+    readonly canDetachProject?: true;
+    readonly defaultWorkflowDispatch: 'foreground' | 'background';
+  };
+
+  /** The returned finalizer is awaited when dispatch setup or worker execution ends. */
+  prepareBackgroundConversation?(context: {
+    workerConversationId: string;
+    parentConversationId: string;
+    conversationDbId: string;
+  }): Promise<() => Promise<void>>;
+
   /**
    * Send a message to the platform
    */
@@ -194,27 +198,6 @@ export interface IPlatformAdapter {
     conversationId: string,
     info: { cost?: number; tokens?: TokenUsage; stopReason?: string }
   ): Promise<void>;
-}
-
-/**
- * Extended platform adapter for the Web UI.
- * Adds methods for SSE event bridging, message persistence, and lock events
- * that are only meaningful in the web context.
- */
-export interface IWebPlatformAdapter extends IPlatformAdapter {
-  sendStructuredEvent(conversationId: string, event: PlatformStructuredEvent): Promise<void>;
-  setConversationDbId(platformConversationId: string, dbId: string): void;
-  setupEventBridge(workerConversationId: string, parentConversationId: string): () => void;
-  emitLockEvent(conversationId: string, locked: boolean, queuePosition?: number): Promise<void>;
-  registerOutputCallback(conversationId: string, callback: (text: string) => void): void;
-  removeOutputCallback(conversationId: string): void;
-}
-
-/**
- * Type guard for web platform adapter.
- */
-export function isWebAdapter(adapter: IPlatformAdapter): adapter is IWebPlatformAdapter {
-  return adapter.getPlatformType() === 'web';
 }
 
 // Re-export workflow schema types for config-types.ts compatibility

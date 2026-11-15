@@ -5,9 +5,7 @@ import type { components } from '@/lib/api.generated';
 export type ProviderInfo = components['schemas']['ProviderInfo'];
 
 export function listProviders(): Promise<ProviderInfo[]> {
-  return requestJson<components['schemas']['ProviderListResponse']>('/api/providers').then(
-    r => r.providers
-  );
+  return requestJson('/api/providers', 'get').then(r => r.providers);
 }
 
 /** One model an agent's runtime reports as selectable right now. */
@@ -19,48 +17,19 @@ export type ProviderModel = components['schemas']['ProviderModel'];
  * page load. Throws HttpError 503 with the runtime's reason when it can't answer.
  */
 export function listProviderModels(providerId: string): Promise<ProviderModel[]> {
-  return requestJson<components['schemas']['ProviderModelListResponse']>(
-    `/api/providers/${encodeURIComponent(providerId)}/supported-models`
-  ).then(r => r.models);
+  return requestJson('/api/providers/{id}/supported-models', 'get', {
+    params: { id: providerId },
+  }).then(r => r.models);
 }
 
-/**
- * One Pi catalog model — drives the cost/reasoning hint next to Pi tier
- * models. Inline-typed until a regen lands PiModelInfo in api.generated
- * (same convention as the tiers block in skills/settings.ts).
- */
-export interface PiModelInfo {
-  /** Full model ref as used in `model:` fields: '<pi-provider>/<model-id>' */
-  ref: string;
-  provider: string;
-  id: string;
-  name: string;
-  reasoning: boolean;
-  /** USD per million tokens. */
-  cost: { input: number; output: number };
-  contextWindow: number;
-}
+export type PiModelInfo = components['schemas']['PiModelInfo'];
 
 /** Best-effort: the server returns `{ models: [] }` when the catalog can't load. */
 export function listPiModels(): Promise<PiModelInfo[]> {
-  return requestJson<{ models: PiModelInfo[] }>('/api/providers/pi/models').then(r => r.models);
+  return requestJson('/api/providers/pi/models', 'get').then(r => r.models);
 }
 
-/**
- * One OpenCode backend provider, introspected from the embedded runtime.
- * Inline-typed (mirrors `opencodeCredentialProviderSchema` in
- * `server/.../provider.schemas.ts`) until a regen lands it in api.generated.
- */
-export interface OpencodeCredentialProvider {
-  id: string;
-  name: string;
-  /** Env var names OpenCode reads for this backend. */
-  env: string[];
-  /** Install-wide: OpenCode's auth store is server-global, not per-user. */
-  connected: boolean;
-  modelCount: number;
-  authMethods: { type: 'oauth' | 'api'; label: string }[];
-}
+export type OpencodeCredentialProvider = components['schemas']['OpencodeCredentialProvider'];
 
 /**
  * GET /api/providers/opencode/credentials — HEAVYWEIGHT: starts the embedded
@@ -69,9 +38,7 @@ export interface OpencodeCredentialProvider {
  * Throws HttpError 503 when the runtime is unavailable.
  */
 export function listOpencodeCredentials(): Promise<OpencodeCredentialProvider[]> {
-  return requestJson<{ providers: OpencodeCredentialProvider[] }>(
-    '/api/providers/opencode/credentials'
-  ).then(r => r.providers);
+  return requestJson('/api/providers/opencode/credentials', 'get').then(r => r.providers);
 }
 
 /**

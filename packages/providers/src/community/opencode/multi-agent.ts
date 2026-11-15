@@ -1,4 +1,5 @@
 import { createLogger } from '@archon/paths';
+import { sessionPreview } from '@archon/provider-contract';
 
 import { mergeTokenUsage } from '../../types';
 import type { MessageChunk, SendQueryOptions, TokenUsage } from '../../types';
@@ -13,7 +14,7 @@ import {
   TextPartBlocks,
   toolPartEvents,
 } from './session';
-import { normalizeTokens } from './tokens';
+import { sumAssistantUsage } from './tokens';
 
 interface ProviderModel {
   providerID: string;
@@ -26,7 +27,8 @@ interface AgentRunState {
   sessionId: string;
   chunks: MessageChunk[];
   textBlocks: TextPartBlocks;
-  latestAssistantInfo?: Record<string, unknown>;
+  /** Latest update of each assistant message, keyed by message id. */
+  assistantInfos: Map<string, Record<string, unknown>>;
   lastAssistantMessageId?: string;
   done: boolean;
 }
@@ -59,7 +61,10 @@ async function readStructuredOutput(
       return info.structured_output;
     }
   } catch (error) {
-    getLog().warn({ err: error, sessionId, messageId }, 'opencode.structured_output_lookup_failed');
+    getLog().warn(
+      { err: error, sessionIdPreview: sessionPreview(sessionId), messageId },
+      'opencode.structured_output_lookup_failed'
+    );
   }
   return undefined;
 }
@@ -132,7 +137,9 @@ export async function* streamMultiAgentOpencodeSession(
 
   getLog().info({ nodeId, agentCount: agents.length, cwd }, 'opencode.multi_agent_starting');
 
+  requestOptions?.abortSignal?.throwIfAborted();
   const events = await client.event.subscribe({ query: { directory: cwd } });
+  requestOptions?.abortSignal?.throwIfAborted();
   getLog().info({ nodeId }, 'opencode.multi_agent_events_subscribed');
   const streamController = new AbortController();
   const sessionToAgent = new Map<string, AgentRunState>();
@@ -145,7 +152,11 @@ export async function* streamMultiAgentOpencodeSession(
           .abort({ path: { id: state.sessionId }, query: { directory: state.cwd } })
           .catch(error => {
             getLog().debug(
-              { err: error, sessionId: state.sessionId, agent: state.agent.key },
+              {
+                err: error,
+                sessionIdPreview: sessionPreview(state.sessionId),
+                agent: state.agent.key,
+              },
               'opencode.multi_agent_abort_failed'
             );
           })
@@ -168,13 +179,17 @@ export async function* streamMultiAgentOpencodeSession(
     const states = await Promise.all(
       agents.map(async agent => {
         const { sessionId } = await resolveSessionId(client, cwd, undefined);
-        getLog().info({ agent: agent.key, sessionId, cwd }, 'opencode.multi_agent_session_created');
+        getLog().info(
+          { agent: agent.key, sessionIdPreview: sessionPreview(sessionId), cwd },
+          'opencode.multi_agent_session_created'
+        );
         const state: AgentRunState = {
           agent,
           cwd,
           sessionId,
           chunks: [],
           textBlocks: new TextPartBlocks(),
+          assistantInfos: new Map(),
           done: false,
         };
         sessionToAgent.set(sessionId, state);
@@ -182,19 +197,22 @@ export async function* streamMultiAgentOpencodeSession(
       })
     );
 
+    requestOptions?.abortSignal?.throwIfAborted();
+
     // Phase 2: Fire all prompts in parallel
     getLog().info({ nodeId, sessionCount: states.length }, 'opencode.multi_agent_prompting');
     await Promise.all(
       states.map(async state => {
+        requestOptions?.abortSignal?.throwIfAborted();
         const agentRequestOptions = withAgentNodeConfig(requestOptions, state.agent);
         const promptBody = createSessionPromptBody(prompt, model, agentRequestOptions, state.agent);
         getLog().info(
-          { agent: state.agent.key, sessionId: state.sessionId },
+          { agent: state.agent.key, sessionIdPreview: sessionPreview(state.sessionId) },
           'opencode.multi_agent_prompt_sending'
         );
         await promptSession(client, cwd, state.sessionId, promptBody);
         getLog().info(
-          { agent: state.agent.key, sessionId: state.sessionId },
+          { agent: state.agent.key, sessionIdPreview: sessionPreview(state.sessionId) },
           'opencode.multi_agent_prompt_sent'
         );
       })
@@ -226,9 +244,9 @@ export async function* streamMultiAgentOpencodeSession(
         const sessionId = typeof info?.sessionID === 'string' ? info.sessionID : undefined;
         const state = sessionId ? sessionToAgent.get(sessionId) : undefined;
         if (!state || info?.role !== 'assistant') continue;
-        state.latestAssistantInfo = info;
         if (typeof info.id === 'string') {
           state.lastAssistantMessageId = info.id;
+          state.assistantInfos.set(info.id, info);
         }
         continue;
       }
@@ -304,7 +322,7 @@ export async function* streamMultiAgentOpencodeSession(
           {
             nodeId,
             agent: state.agent.key,
-            sessionId,
+            sessionIdPreview: sessionPreview(state.sessionId),
             doneCount: states.filter(s => s.done).length,
             totalCount: states.length,
           },
@@ -329,13 +347,17 @@ export async function* streamMultiAgentOpencodeSession(
           // rule (#2662): one sub-agent without cache telemetry narrows the total and
           // flags it, instead of erasing cache the others did report. A total is only
           // available when every sub-agent reported every component needed to compute it.
-          const perAgentUsage = states
-            .map(candidate => normalizeTokens(candidate.latestAssistantInfo))
+          const assistantUsages = states.map(candidate =>
+            sumAssistantUsage([...candidate.assistantInfos.values()])
+          );
+          const perAgentUsage = assistantUsages
+            .map(usage => usage.tokens)
             .filter((usage): usage is TokenUsage => usage !== undefined);
           const mergedUsage = mergeTokenUsage(perAgentUsage);
-          const cost = perAgentUsage.some(usage => usage.cost !== undefined)
-            ? perAgentUsage.reduce((sum, usage) => sum + (usage.cost ?? 0), 0)
-            : undefined;
+          const costs = assistantUsages.flatMap(usage =>
+            usage.cost !== undefined ? [usage.cost] : []
+          );
+          const cost = costs.length > 0 ? costs.reduce((sum, value) => sum + value, 0) : undefined;
           const totals = perAgentUsage
             .map(usage => usage.total)
             .filter((total): total is number => total !== undefined);

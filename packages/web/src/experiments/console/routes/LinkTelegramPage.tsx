@@ -68,19 +68,19 @@ export function LinkTelegramPage(): ReactElement {
   return (
     <section className="flex h-full items-center justify-center p-6">
       <div
-        className="w-full max-w-[460px] rounded-lg border bg-surface-inset p-5"
+        className="w-full max-w-115 rounded-lg border bg-surface-inset p-5"
         style={{ borderColor: 'var(--border)' }}
       >
-        <h1 className="text-[15px] font-semibold text-text-primary">Link Telegram</h1>
+        <h1 className="text-console-15 font-semibold text-text-primary">Link Telegram</h1>
 
         {state === 'loading' ? (
-          <p className="mt-3 text-[12px] text-text-tertiary">Checking the link…</p>
+          <p className="mt-3 text-console-12 text-text-tertiary">Checking the link…</p>
         ) : null}
 
         {error !== null ? (
           <>
-            <p className="mt-3 text-[12px] text-error">{error}</p>
-            <p className="mt-2 text-[11px] text-text-tertiary">
+            <p className="mt-3 text-console-12 text-error">{error}</p>
+            <p className="mt-2 text-console-11 text-text-tertiary">
               Links work once and expire after a few minutes. Ask the bot for a new one: ☰ Menu →
               “Link this chat to my account”.
             </p>
@@ -89,19 +89,19 @@ export function LinkTelegramPage(): ReactElement {
 
         {state === 'done' && result !== null ? (
           <>
-            <p className="mt-3 text-[12px] text-text-primary">
+            <p className="mt-3 text-console-12 text-text-primary">
               Linked{result.email !== null ? ` to ${result.email}` : ''}. Telegram messages now
               belong to this account.
             </p>
             {result.movedRows > 0 ? (
-              <p className="mt-2 text-[11px] text-text-tertiary">
+              <p className="mt-2 text-console-11 text-text-tertiary">
                 {result.movedRows} existing rows moved across, so nothing was left behind.
               </p>
             ) : null}
             <div className="mt-4 flex gap-2">
               <Link
                 to="/console/profile"
-                className="rounded-md border px-3 py-1.5 text-[11px] text-text-secondary transition-colors hover:text-text-primary"
+                className="rounded-md border px-3 py-1.5 text-console-11 text-text-secondary transition-colors hover:text-text-primary"
                 style={{ borderColor: 'var(--border-bright)' }}
               >
                 Open Profile
@@ -111,7 +111,7 @@ export function LinkTelegramPage(): ReactElement {
                 onClick={() => {
                   navigate('/console');
                 }}
-                className="rounded-md border px-3 py-1.5 text-[11px] text-text-secondary transition-colors hover:text-text-primary"
+                className="rounded-md border px-3 py-1.5 text-console-11 text-text-secondary transition-colors hover:text-text-primary"
                 style={{ borderColor: 'var(--border-bright)' }}
               >
                 Back to the console
@@ -122,7 +122,7 @@ export function LinkTelegramPage(): ReactElement {
 
         {preview !== null && state !== 'done' && error === null ? (
           <>
-            <dl className="mt-4 flex flex-col gap-2 text-[12px]">
+            <dl className="mt-4 flex flex-col gap-2 text-console-12">
               <div className="flex justify-between gap-3">
                 <dt className="text-text-tertiary">Telegram</dt>
                 <dd className="truncate text-text-primary">
@@ -138,11 +138,11 @@ export function LinkTelegramPage(): ReactElement {
             </dl>
 
             {preview.alreadyLinkedToThisAccount ? (
-              <p className="mt-3 text-[11px] text-text-tertiary">
+              <p className="mt-3 text-console-11 text-text-tertiary">
                 These are already linked — confirming changes nothing.
               </p>
             ) : (
-              <p className="mt-3 text-[11px] text-text-tertiary">
+              <p className="mt-3 text-console-11 text-text-tertiary">
                 Confirming moves that Telegram account&apos;s chats and messages to this account.
                 Nothing is deleted.
               </p>
@@ -155,7 +155,7 @@ export function LinkTelegramPage(): ReactElement {
                   void confirm();
                 }}
                 disabled={state === 'linking'}
-                className="brand-bar rounded-md px-3 py-1.5 text-[11px] font-bold text-white disabled:opacity-50"
+                className="brand-bar rounded-md px-3 py-1.5 text-console-11 font-bold text-white disabled:opacity-50"
               >
                 {state === 'linking' ? 'Linking…' : 'Link this account'}
               </button>
@@ -164,7 +164,7 @@ export function LinkTelegramPage(): ReactElement {
                 onClick={() => {
                   navigate('/console');
                 }}
-                className="rounded-md border px-3 py-1.5 text-[11px] text-text-secondary transition-colors hover:text-text-primary"
+                className="rounded-md border px-3 py-1.5 text-console-11 text-text-secondary transition-colors hover:text-text-primary"
                 style={{ borderColor: 'var(--border-bright)' }}
               >
                 Cancel

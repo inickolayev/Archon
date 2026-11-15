@@ -1,11 +1,12 @@
 /**
- * Run event stream primitives. Six variants of events that render in the Run
- * detail page: text, tool_call, artifact, node_transition, approval, error.
+ * Run event stream primitives rendered in the run detail page.
  *
  * These are the client-side model — normalized from server workflow_events
  * rows AND from SSE events. The shape is deliberately flatter than the raw
- * event schema so EventStream rendering can switch on `kind` only.
+ * event schema so RunStream rendering can switch on `kind` only.
  */
+
+import type { components } from '../../../lib/api.generated';
 
 export type RunEventKind =
   | 'text'
@@ -55,16 +56,38 @@ export interface NodeTransitionEvent extends RunEventBase {
   /** Only populated for `skipped` — the evaluated expression that gated it. */
   skipExpr: string | null;
   /**
-   * `node_completed` enrichment, read straight from the persisted event payload.
-   * Populated only on the `completed` transition; null on every other transition
-   * (and when a provider doesn't report a given field). Not consumed by any current
-   * renderer — carried so the eventual per-node detail view needn't re-touch this.
+   * Completion enrichment from the persisted row. `foldNodeRuns` copies it from the
+   * latest `completed` transition only when the engine's node state is `completed`.
    */
-  outputPreview: string | null;
   costUsd: number | null;
+  costPartial: boolean;
+  /** The server's scope for `costUsd`; null when the row carries no cost. */
+  costScope: CostScope | null;
   stopReason: string | null;
   numTurns: number | null;
+  tokens: TokenUsage | null;
+  /**
+   * A `bash:` or `script:` node's stdout, from its `completed` row. Null for every other
+   * node kind: an AI node's output is already in the stream as the agent's messages.
+   */
+  output: NodeOutput | null;
+  /** Only populated for `failed`: the engine's error for the node. */
+  error: string | null;
 }
+
+/** A node's recorded stdout; `truncated` when the engine stored only the head of it. */
+export interface NodeOutput {
+  text: string;
+  truncated: boolean;
+}
+
+/**
+ * What a node row's `cost_usd` measures. `own` is the node's own spend; `total` is a
+ * restatement of spend other rows of the same run already carry (a `loop_group` roll-up,
+ * a composed fan-out wrapper or instance terminal, a retry amendment). Summing only `own`
+ * costs lands on the run total. The server decides it by the engine's rule.
+ */
+export type CostScope = NonNullable<RawWorkflowEvent['cost_scope']>;
 
 export interface ApprovalEvent extends RunEventBase {
   kind: 'approval';
@@ -102,15 +125,23 @@ export type RunEvent =
   | ErrorEvent
   | SystemEvent;
 
-// Server row shape (workflow_events table).
-interface RawWorkflowEvent {
-  id: string;
-  workflow_run_id: string;
-  event_type: string;
-  step_index: number | null;
-  step_name: string | null;
-  data: Record<string, unknown>;
-  created_at: string;
+type RawWorkflowEvent = components['schemas']['WorkflowEvent'];
+
+type Execution = NonNullable<components['schemas']['DagNodeSseEvent']['execution']>;
+type TokenUsage = Pick<
+  Extract<Execution['spend']['tokens'], { source: 'provider' }>['value'],
+  'input' | 'output'
+>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function readTokens(value: unknown): TokenUsage | null {
+  if (!isRecord(value)) return null;
+  const input = readNumberOrNull(value, 'input');
+  const output = readNumberOrNull(value, 'output');
+  return input === null || output === null ? null : { input, output };
 }
 
 function readString(obj: Record<string, unknown>, key: string): string {
@@ -134,300 +165,380 @@ function readNumberOrNull(obj: Record<string, unknown>, key: string): number | n
  * resume for already-completed nodes — doesn't fit that shape, and both skip
  * variants collapse to `skipped`.
  */
-const NODE_TRANSITION_BY_EVENT: Record<string, NodeTransitionEvent['transition']> = {
-  node_started: 'started',
-  node_completed: 'completed',
-  node_failed: 'failed',
-  node_skipped: 'skipped',
-  node_skipped_prior_success: 'skipped',
-};
+const NODE_TRANSITION_BY_EVENT = new Map<string, NodeTransitionEvent['transition']>([
+  ['node_started', 'started'],
+  ['node_completed', 'completed'],
+  ['node_failed', 'failed'],
+  ['node_skipped', 'skipped'],
+  ['node_skipped_prior_success', 'skipped'],
+]);
 
-/**
- * Best-effort normalizer from a raw workflow_events row to a typed RunEvent.
- * Unknown event types fall through as text events with the raw payload —
- * the spike surfaces them rather than silently dropping.
- */
-export function toRunEvent(raw: RawWorkflowEvent): RunEvent {
-  const base = {
-    id: raw.id,
-    runId: raw.workflow_run_id,
-    timestamp: raw.created_at,
-    nodeId: raw.step_name,
-  };
+type EventBase = Pick<RunEventBase, 'id' | 'runId' | 'timestamp' | 'nodeId'>;
+type EventData = RawWorkflowEvent['data'];
+type EventMapper = (raw: RawWorkflowEvent, base: EventBase) => RunEvent;
+
+function systemEvent(base: EventBase, label: string, detail: string): SystemEvent {
+  return { ...base, kind: 'system', label, detail };
+}
+
+function textEvent(base: EventBase, content: string): TextEvent {
+  return { ...base, kind: 'text', content };
+}
+
+function toNodeTransition(
+  raw: RawWorkflowEvent,
+  base: EventBase,
+  transition: NodeTransitionEvent['transition']
+): NodeTransitionEvent {
   const data = raw.data;
-  const et = raw.event_type;
+  return {
+    ...base,
+    kind: 'node_transition',
+    nodeName: readString(data, 'name') || (raw.step_name ?? ''),
+    transition,
+    // Server persists `duration_ms` (NOT `duration`); reading the wrong key here
+    // left every node duration null in the UI.
+    durationMs: readNumberOrNull(data, 'duration_ms'),
+    skipReason: transition === 'skipped' ? readStringOrNull(data, 'reason') : null,
+    skipExpr: transition === 'skipped' ? readStringOrNull(data, 'expr') : null,
+    costUsd: readNumberOrNull(data, 'cost_usd'),
+    costPartial:
+      data.cost_partial === true ||
+      (isRecord(data.spend) && isRecord(data.spend.costUsd) && data.spend.costUsd.partial === true),
+    costScope: raw.cost_scope ?? null,
+    stopReason: readStringOrNull(data, 'stop_reason'),
+    numTurns: readNumberOrNull(data, 'num_turns'),
+    tokens: readTokens(data.tokens),
+    output: transition === 'completed' ? readExecOutput(data) : null,
+    error: transition === 'failed' ? readStringOrNull(data, 'error') : null,
+  };
+}
 
-  if (
-    et === 'node_started' ||
-    et === 'node_completed' ||
-    et === 'node_failed' ||
-    et === 'node_skipped' ||
-    et === 'node_skipped_prior_success'
-  ) {
-    // Guard above restricts `et` to the map's keys; `?? 'skipped'` is only a
-    // defensive default if a new node_* type is added to the guard but not the map.
-    const transition = NODE_TRANSITION_BY_EVENT[et] ?? 'skipped';
-    const output = readStringOrNull(data, 'node_output');
-    return {
-      ...base,
-      kind: 'node_transition',
-      nodeName: readString(data, 'name') || (raw.step_name ?? ''),
-      transition,
-      // Server persists `duration_ms` (NOT `duration`); reading the wrong key here
-      // left every node duration null in the UI.
-      durationMs: readNumberOrNull(data, 'duration_ms'),
-      skipReason: transition === 'skipped' ? readStringOrNull(data, 'reason') : null,
-      skipExpr: transition === 'skipped' ? readStringOrNull(data, 'expr') : null,
-      outputPreview: output === null ? null : output.slice(0, 300),
-      costUsd: readNumberOrNull(data, 'cost_usd'),
-      stopReason: readStringOrNull(data, 'stop_reason'),
-      numTurns: readNumberOrNull(data, 'num_turns'),
-    };
+const EXEC_NODE_TYPES = new Set(['bash', 'script']);
+
+function readExecOutput(data: EventData): NodeOutput | null {
+  if (!EXEC_NODE_TYPES.has(readString(data, 'type'))) return null;
+  const text = readString(data, 'node_output');
+  return text === '' ? null : { text, truncated: data.node_output_truncated === true };
+}
+
+function integrationErrorMessage(result: unknown): string {
+  const error = isRecord(result) && 'error' in result ? result.error : null;
+  return isRecord(error) && typeof error.message === 'string'
+    ? error.message
+    : 'Integration operation failed';
+}
+
+function toIntegrationToolCall(raw: RawWorkflowEvent, base: EventBase): ToolCallEvent {
+  const data = raw.data;
+  const result = data.result;
+  const ok = isRecord(result) && result.ok === true;
+  return {
+    ...base,
+    kind: 'tool_call',
+    tool: `${readString(data, 'integration')}.${readString(data, 'operation')}`,
+    argsSummary: JSON.stringify(data.target ?? null),
+    args: { operationId: data.operationId, target: data.target, plugin: data.plugin, result },
+    result: ok
+      ? { ok: true, durationMs: readNumberOrNull(data, 'durationMs') ?? 0 }
+      : { ok: false, message: integrationErrorMessage(result) },
+  };
+}
+
+function toArtifact(raw: RawWorkflowEvent, base: EventBase): ArtifactEvent {
+  const data = raw.data;
+  return {
+    ...base,
+    kind: 'artifact',
+    artifactType: readString(data, 'artifactType'),
+    label: readString(data, 'label'),
+    url: readStringOrNull(data, 'url'),
+    path: readStringOrNull(data, 'path'),
+  };
+}
+
+// The server writes two rows around a human gate: `approval_requested` (carries
+// the prompt in `message`) and `approval_received` (carries the outcome in
+// `decision` + `comment`/`reason`). The prompt does NOT ride the received row;
+// these two are emitted as separate events and a future renderer would pair them
+// by nodeId. (Today nothing renders `approval` events in the run stream — paused
+// gates are driven from `run.approval` metadata — so this is correctness of
+// classification, not display.) The old code checked `approval_pending`/
+// `approval_resolved` and read a `resolution` key, none of which the server ever
+// writes, so approvals fell through to the raw-JSON fallback.
+function toApprovalRequest(raw: RawWorkflowEvent, base: EventBase): ApprovalEvent {
+  return { ...base, kind: 'approval', prompt: readString(raw.data, 'message'), resolution: null };
+}
+
+function approvalResolution(raw: RawWorkflowEvent): ApprovalEvent['resolution'] {
+  const data = raw.data;
+  // Match the decision explicitly. An unknown/missing value must NOT default to
+  // "approved" (that would silently render a rejected gate as approved — the exact
+  // silent-mismatch class this normalizer exists to prevent); leave it unresolved.
+  switch (readString(data, 'decision')) {
+    case 'approved':
+      return { kind: 'approved', at: raw.created_at, comment: readStringOrNull(data, 'comment') };
+    case 'rejected':
+      return { kind: 'rejected', at: raw.created_at, reason: readString(data, 'reason') };
+    default:
+      return null;
   }
+}
 
-  if (et === 'tool_called' || et === 'tool_completed') {
-    // Server writes snake_case fields (tool_name, tool_input, duration_ms);
-    // the start event carries the input, the completed event carries only
-    // the duration. RunStream pairs them by step + order to fill durationMs.
-    const toolName = readString(data, 'tool_name');
-    const toolInput = data.tool_input;
-    const argsSummary = readString(data, 'argsSummary');
-    return {
-      ...base,
-      kind: 'tool_call',
-      tool: toolName,
-      argsSummary,
-      args: toolInput,
-      result:
-        et === 'tool_called'
-          ? null
-          : { ok: true, durationMs: readNumberOrNull(data, 'duration_ms') ?? 0 },
-    };
-  }
+function toApprovalReceived(raw: RawWorkflowEvent, base: EventBase): ApprovalEvent {
+  return { ...base, kind: 'approval', prompt: '', resolution: approvalResolution(raw) };
+}
 
-  if (et === 'integration_operation') {
-    const result = data.result;
-    const ok =
-      typeof result === 'object' && result !== null && 'ok' in result && result.ok === true;
-    const error =
-      typeof result === 'object' && result !== null && 'error' in result ? result.error : null;
-    const message =
-      typeof error === 'object' &&
-      error !== null &&
-      'message' in error &&
-      typeof error.message === 'string'
-        ? error.message
-        : 'Integration operation failed';
-    return {
-      ...base,
-      kind: 'tool_call',
-      tool: `${readString(data, 'integration')}.${readString(data, 'operation')}`,
-      argsSummary: JSON.stringify(data.target ?? null),
-      args: { operationId: data.operationId, target: data.target, plugin: data.plugin, result },
-      result: ok
-        ? { ok: true, durationMs: readNumberOrNull(data, 'durationMs') ?? 0 }
-        : { ok: false, message },
-    };
-  }
+function toError(raw: RawWorkflowEvent, base: EventBase): ErrorEvent {
+  const data = raw.data;
+  return {
+    ...base,
+    kind: 'error',
+    message: readString(data, 'error') || readString(data, 'message'),
+    recoverable: Boolean(data.recoverable),
+  };
+}
 
-  if (et === 'workflow_artifact') {
-    return {
-      ...base,
-      kind: 'artifact',
-      artifactType: readString(data, 'artifactType'),
-      label: readString(data, 'label'),
-      url: readStringOrNull(data, 'url'),
-      path: readStringOrNull(data, 'path'),
-    };
-  }
-
-  // The server writes two rows around a human gate: `approval_requested` (carries
-  // the prompt in `message`) and `approval_received` (carries the outcome in
-  // `decision` + `comment`/`reason`). The prompt does NOT ride the received row;
-  // these two are emitted as separate events and a future renderer would pair them
-  // by nodeId. (Today nothing renders `approval` events in the run stream — paused
-  // gates are driven from `run.approval` metadata — so this is correctness of
-  // classification, not display.) The old code checked `approval_pending`/
-  // `approval_resolved` and read a `resolution` key, none of which the server ever
-  // writes, so approvals fell through to the raw-JSON fallback below.
-  if (et === 'approval_requested') {
-    return {
-      ...base,
-      kind: 'approval',
-      prompt: readString(data, 'message'),
-      resolution: null,
-    };
-  }
-
-  if (et === 'approval_received') {
-    const decision = readString(data, 'decision');
-    // Match the decision explicitly. An unknown/missing value must NOT default to
-    // "approved" (that would silently render a rejected gate as approved — the exact
-    // silent-mismatch class this normalizer exists to prevent); leave it unresolved.
-    const resolution: ApprovalEvent['resolution'] =
-      decision === 'approved'
-        ? { kind: 'approved', at: raw.created_at, comment: readStringOrNull(data, 'comment') }
-        : decision === 'rejected'
-          ? { kind: 'rejected', at: raw.created_at, reason: readString(data, 'reason') }
-          : null;
-    return {
-      ...base,
-      kind: 'approval',
-      prompt: '',
-      resolution,
-    };
-  }
-
-  if (et === 'error') {
-    return {
-      ...base,
-      kind: 'error',
-      message: readString(data, 'error') || readString(data, 'message'),
-      recoverable: Boolean(data.recoverable),
-    };
-  }
-
-  if (
-    et === 'workflow_started' ||
-    et === 'workflow_completed' ||
-    et === 'workflow_failed' ||
-    et === 'workflow_resumed'
-  ) {
-    // `workflow_resumed` is written only when a resume CLEARED a prior error
-    // (#2348), and carries that error in `data.error` — the same key
-    // `workflow_failed` uses, so the shared `detail` fallback below surfaces it.
-    const label =
-      et === 'workflow_started'
-        ? 'Workflow started'
-        : et === 'workflow_completed'
-          ? 'Workflow completed'
-          : et === 'workflow_resumed'
-            ? 'Workflow resumed (prior error cleared)'
-            : 'Workflow failed';
+function workflowLifecycle(label: (data: EventData) => string): EventMapper {
+  return (raw, base) => {
+    const data = raw.data;
     const detail =
       readString(data, 'name') ||
       readString(data, 'workflow') ||
       readString(data, 'message') ||
       readString(data, 'error');
-    return {
-      ...base,
-      kind: 'system',
-      label,
-      detail,
-    };
-  }
-
-  // Container isolation lifecycle (folder-project container runs). Persisted with
-  // DB-side names, NOT the emitter's `container_lifecycle` type — this normalizer
-  // reads DB rows. Surfaced behind the System toggle. created/destroyed bracket the
-  // run; stopped/resumed bracket a suspend across a pause; writeback_* track the
-  // write-back gate (Phase C).
-  const CONTAINER_EVENT_LABELS: Record<string, string> = {
-    container_created: 'Container created',
-    container_stopped: 'Container stopped (paused)',
-    container_resumed: 'Container resumed',
-    container_destroyed: 'Container removed',
-    writeback_requested: 'Write-back requested',
-    writeback_applied: 'Changes applied to live folder',
-    writeback_discarded: 'Changes discarded',
+    return systemEvent(base, label(data), detail);
   };
-  if (et in CONTAINER_EVENT_LABELS) {
-    const containerId = readString(data, 'containerId');
-    let detail = containerId ? containerId.slice(0, 12) : '';
-    if (et === 'writeback_applied') {
-      const filesApplied = readNumberOrNull(data, 'files_applied') ?? 0;
-      const filesDeleted = readNumberOrNull(data, 'files_deleted') ?? 0;
-      detail = `${filesApplied} written, ${filesDeleted} deleted`;
-    } else if (et === 'writeback_requested') {
-      const totalCount = readNumberOrNull(data, 'total_count');
-      detail = totalCount !== null ? `${totalCount} file(s) changed` : '';
-    }
-    return {
-      ...base,
-      kind: 'system',
-      label: CONTAINER_EVENT_LABELS[et] ?? et,
-      detail,
-    };
-  }
+}
 
+function containerIdDetail(data: EventData): string {
+  return readString(data, 'containerId').slice(0, 12);
+}
+
+// Container isolation lifecycle (folder-project container runs). Persisted with
+// DB-side names, NOT the emitter's `container_lifecycle` type — this normalizer
+// reads DB rows. Surfaced behind the System toggle. created/destroyed bracket the
+// run; stopped/resumed bracket a suspend across a pause; writeback_* track the
+// write-back gate (Phase C).
+function containerEvent(label: string, detail = containerIdDetail): EventMapper {
+  return (raw, base) => systemEvent(base, label, detail(raw.data));
+}
+
+function writebackAppliedDetail(data: EventData): string {
+  const filesApplied = readNumberOrNull(data, 'files_applied') ?? 0;
+  const filesDeleted = readNumberOrNull(data, 'files_deleted') ?? 0;
+  return `${filesApplied} written, ${filesDeleted} deleted`;
+}
+
+function writebackRequestedDetail(data: EventData): string {
+  const totalCount = readNumberOrNull(data, 'total_count');
+  return totalCount !== null ? `${totalCount} file(s) changed` : '';
+}
+
+function toCleanupWarning(raw: RawWorkflowEvent, base: EventBase): TextEvent {
+  const warnings = raw.data.warnings;
+  if (
+    !Array.isArray(warnings) ||
+    warnings.length === 0 ||
+    !warnings.every(warning => typeof warning === 'string')
+  ) {
+    return textEvent(
+      base,
+      `Invalid ${raw.event_type} payload: expected a nonempty string array in warnings. Inspect the stored run event before removing its checkout.`
+    );
+  }
+  return textEvent(base, warningText(warnings, '⚠️ Workflow cleanup warnings'));
+}
+
+/** Unmapped events: their text when they carry one, otherwise the raw payload behind the System toggle. */
+function toFallback(raw: RawWorkflowEvent, base: EventBase): RunEvent {
+  const data = raw.data;
+  const content = readString(data, 'text') || readString(data, 'message');
+  if (content) return textEvent(base, content);
+  return systemEvent(base, raw.event_type, JSON.stringify(data).slice(0, 200));
+}
+
+const EVENT_MAPPERS = new Map<string, EventMapper>([
+  ...[...NODE_TRANSITION_BY_EVENT].map(([eventType, transition]): [string, EventMapper] => [
+    eventType,
+    (raw, base): RunEvent => toNodeTransition(raw, base, transition),
+  ]),
+  ['integration_operation', toIntegrationToolCall],
+  ['workflow_artifact', toArtifact],
+  ['approval_requested', toApprovalRequest],
+  ['approval_received', toApprovalReceived],
+  [
+    'attention_notice_sent',
+    (raw, base): RunEvent =>
+      systemEvent(
+        base,
+        raw.data.baseline === true ? 'Attention baseline recorded' : 'Attention notice sent',
+        readString(raw.data, 'destination')
+      ),
+  ],
+  [
+    'pause_notice_undelivered',
+    (raw, base): RunEvent =>
+      systemEvent(
+        base,
+        'Pause notice not delivered; the run is still waiting',
+        readString(raw.data, 'platform')
+      ),
+  ],
+  // The answer a person or agent gave to an attention wait. Rendered as `text`, NOT
+  // `system`: it is what the run continued on, and the fallback shows it as raw JSON.
+  ['wait_answered', toWaitAnswer],
+  ['error', toError],
+  ['workflow_started', workflowLifecycle(() => 'Workflow started')],
+  ['workflow_completed', workflowLifecycle(() => 'Workflow completed')],
+  ['workflow_failed', workflowLifecycle(() => 'Workflow failed')],
+  [
+    'workflow_resumed',
+    workflowLifecycle(data =>
+      readString(data, 'error') ? 'Workflow resumed (prior error cleared)' : 'Workflow resumed'
+    ),
+  ],
+  ['container_created', containerEvent('Container created')],
+  ['container_stopped', containerEvent('Container stopped (paused)')],
+  ['container_resumed', containerEvent('Container resumed')],
+  ['container_destroyed', containerEvent('Container removed')],
+  ['writeback_requested', containerEvent('Write-back requested', writebackRequestedDetail)],
+  ['writeback_applied', containerEvent('Changes applied to live folder', writebackAppliedDetail)],
+  ['writeback_discarded', containerEvent('Changes discarded')],
+  ['workflow_cleanup_warning', toCleanupWarning],
+  [
+    'workflow_cancelled',
+    (raw, base): RunEvent =>
+      raw.data.warnings !== undefined ? toCleanupWarning(raw, base) : toFallback(raw, base),
+  ],
   // Keys the engine dropped from this run's YAML (#2213). Mapped explicitly —
-  // the fallback below would render the raw `{"warnings":[…]}` payload. Rendered
-  // as `text`, NOT `system`: system rows sit behind the System toggle (off by
+  // the fallback would render the raw `{"warnings":[…]}` payload. Rendered as
+  // `text`, NOT `system`: system rows sit behind the System toggle (off by
   // default), and a silently dropped `interactive:` gate is exactly what the
   // author needs to see without opting in.
-  if (et === 'workflow_parse_warnings') {
-    const warnings = Array.isArray(data.warnings)
-      ? data.warnings.filter((w): w is string => typeof w === 'string')
-      : [];
-    return {
-      ...base,
-      kind: 'text',
-      content:
-        warnings.length > 0
-          ? `⚠️ This workflow declares keys the engine ignores:\n${warnings.map(w => `- ${w}`).join('\n')}`
-          : '⚠️ This workflow declares keys the engine ignores.',
-    };
-  }
-
+  [
+    'workflow_parse_warnings',
+    (raw, base): RunEvent =>
+      textEvent(
+        base,
+        warningText(raw.data.warnings, '⚠️ This workflow declares keys the engine ignores')
+      ),
+  ],
   // Deprecated bundled default (#2781). Mapped explicitly — the fallback would
   // render the raw `{"workflowName":…,"notice":…}` payload, truncating away the
   // escape-hatch sentence. Rendered as `text`, NOT `system`: the notice tells the
   // user what to do (copy the workflow file out of the pack) and must be visible
   // without opting into the System toggle.
-  if (et === 'workflow_deprecation_notice') {
-    const notice = readString(data, 'notice');
-    return {
-      ...base,
-      kind: 'text',
-      content: notice || '⚠️ This workflow is deprecated.',
-    };
-  }
+  [
+    'workflow_deprecation_notice',
+    (raw, base): RunEvent =>
+      textEvent(base, readString(raw.data, 'notice') || '⚠️ This workflow is deprecated.'),
+  ],
+  // A credential check at run start could not decide and the run started anyway (#5185).
+  // Rendered as `text`, NOT `system`: it explains a first-node `auth` failure.
+  ['credential_check_inconclusive', toCredentialWarning],
+]);
 
-  // Fallback: render anything else as a text event with the payload summary.
-  return {
-    ...base,
-    kind: 'text',
-    content:
-      readString(data, 'text') ||
-      readString(data, 'message') ||
-      `${et} — ${JSON.stringify(data).slice(0, 200)}`,
-  };
+function toWaitAnswer(raw: RawWorkflowEvent, base: EventBase): RunEvent {
+  const answer = isRecord(raw.data.answer) ? raw.data.answer : {};
+  const decisions = Array.isArray(answer.decisions)
+    ? answer.decisions.filter((id): id is string => typeof id === 'string')
+    : [];
+  const chosen = [readString(answer, 'decision'), ...decisions].filter(id => id !== '');
+  const text = readString(answer, 'text');
+  const via = readString(raw.data, 'via');
+  return textEvent(
+    base,
+    `Answered${via ? ` via ${via}` : ''}${chosen.length > 0 ? `: ${chosen.join(', ')}` : ''}${text ? `\n${text}` : ''}`
+  );
 }
 
+function toCredentialWarning(raw: RawWorkflowEvent, base: EventBase): RunEvent {
+  const vendor = readString(raw.data, 'vendor');
+  const evidence = readString(raw.data, 'evidence');
+  return textEvent(
+    base,
+    `⚠️ Could not verify the credential for provider '${readString(raw.data, 'provider')}'${vendor ? ` (vendor '${vendor}')` : ''}${evidence ? `: ${evidence}` : ''}. The run started; a bad credential fails its first AI node.`
+  );
+}
+
+/** Normalize stored events; unknown payloads remain available behind the System toggle. */
+export function toRunEvent(raw: RawWorkflowEvent): RunEvent {
+  const base: EventBase = {
+    id: raw.id,
+    runId: raw.workflow_run_id,
+    timestamp: raw.created_at,
+    nodeId: raw.step_name,
+  };
+  const mapper = EVENT_MAPPERS.get(raw.event_type) ?? toFallback;
+  return mapper(raw, base);
+}
+
+/** The engine's state for one node, served as `run.nodes` on the run-detail response. */
+export type RunNodeState = components['schemas']['WorkflowRunDetail']['run']['nodes'][number];
+
 /**
- * One node's whole lifecycle, folded from its 2–3 `node_transition` events into a
- * single record. A node emits `node_started` + a terminal (`node_completed` /
- * `node_failed` / `node_skipped`), and a resumed run reuses one run id so the same
- * node can ALSO carry a later `node_skipped_prior_success`. The run stream renders
- * one `NodeRun` per node instead of one divider per raw transition.
+ * One node's display record: its `node_transition` events grouped under the
+ * engine's state for it, so the run stream renders one divider per node
+ * instead of one per raw transition.
  */
 export interface NodeRun {
-  /** `step_name`. Null-id transitions can't be keyed and are excluded from the fold. */
+  /** `step_name`, the engine's `node_id`. */
   nodeId: string;
   nodeName: string;
-  /** `running` = only a `started` transition seen so far (in-flight). */
-  status: 'running' | 'completed' | 'failed' | 'skipped';
+  status: RunNodeState['state'];
   /** Earliest transition timestamp — positions the single divider in the stream. */
   startedAt: string;
-  /** Terminal transition timestamp; null while still running. */
+  /**
+   * Timestamp of the transition that produced `status`; null while running or pending.
+   * A replayed `completed` node ends at its completion, or at the replay when none is in view.
+   */
   endedAt: string | null;
   durationMs: number | null;
-  /** Written by the engine only on `node_completed`; null for non-AI nodes and any non-completed terminal. */
+  /** From the `node_completed` behind a `completed` state; null for non-AI nodes and every other state. */
   costUsd: number | null;
+  costPartial: boolean;
+  costScope: CostScope | null;
   numTurns: number | null;
+  tokens: TokenUsage | null;
   stopReason: string | null;
   skipReason: string | null;
   skipExpr: string | null;
+  /** From the `node_completed` behind a `completed` state of a `bash:` or `script:` node. */
+  output: NodeOutput | null;
+  /** From the `node_failed` behind a `failed` state. */
+  error: string | null;
+  /** A `workflow:` fan-out node's per-slot record, from the engine's node state. */
+  fanOutOutcome: RunNodeState['fan_out_outcome'];
 }
 
+const TRANSITION_FOR_STATE: Partial<
+  Record<RunNodeState['state'], NodeTransitionEvent['transition']>
+> = {
+  completed: 'completed',
+  failed: 'failed',
+  skipped: 'skipped',
+};
+
 /**
- * Folds a run's `node_transition` events into one `NodeRun` per node, keyed by
- * `nodeId`. Status precedence is `completed > failed > skipped > running` —
- * "ever completed wins" (a completed-then-resume-skipped node stays `completed`),
- * matching the dedup `countTerminalNodes` relies on. Null-`nodeId` transitions are
- * skipped (can't be keyed). Returned sorted by `startedAt`.
+ * Groups a run's `node_transition` events under the engine's node states. The
+ * state is the engine's, copied verbatim; the console keeps no fold of its own,
+ * because a client fold drifts from the engine whenever a node event (a resume
+ * reset, a suspension) is taught to one and not the other. A served node with no
+ * transitions yet has no stream position and is not returned. Sorted by
+ * `startedAt`.
  */
-export function foldNodeRuns(events: RunEvent[]): NodeRun[] {
+export function foldNodeRuns(events: RunEvent[], nodes: readonly RunNodeState[]): NodeRun[] {
+  const byNode = groupTransitionsByNode(events);
+  const runs: NodeRun[] = [];
+  for (const node of nodes) {
+    const transitions = byNode.get(node.node_id);
+    if (transitions !== undefined) runs.push(toNodeRun(node, transitions));
+  }
+  return runs.sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
+}
+
+function groupTransitionsByNode(events: RunEvent[]): Map<string, NodeTransitionEvent[]> {
   const byNode = new Map<string, NodeTransitionEvent[]>();
   for (const e of events) {
     if (e.kind !== 'node_transition' || e.nodeId === null) continue;
@@ -435,64 +546,110 @@ export function foldNodeRuns(events: RunEvent[]): NodeRun[] {
     list.push(e);
     byNode.set(e.nodeId, list);
   }
+  return byNode;
+}
 
-  const runs: NodeRun[] = [];
-  for (const [nodeId, transitions] of byNode) {
-    // Last-of-each-kind wins; precedence is applied below, not by event order.
-    let completed: NodeTransitionEvent | null = null;
-    let failed: NodeTransitionEvent | null = null;
-    let skipped: NodeTransitionEvent | null = null;
-    let nodeName = '';
-    let startedAt = transitions[0]?.timestamp ?? '';
-    for (const t of transitions) {
-      if (new Date(t.timestamp).getTime() < new Date(startedAt).getTime()) startedAt = t.timestamp;
-      if (nodeName === '' && t.nodeName !== '') nodeName = t.nodeName;
-      if (t.transition === 'completed') completed = t;
-      else if (t.transition === 'failed') failed = t;
-      else if (t.transition === 'skipped') skipped = t;
+/** What one node's transitions say, read in stream order. */
+interface TransitionScan {
+  startedAt: string;
+  nodeName: string;
+  lastCompleted: NodeTransitionEvent | null;
+  lastSkipped: NodeTransitionEvent | null;
+  /** The latest transition matching the node's state; null for a non-terminal state. */
+  ended: NodeTransitionEvent | null;
+}
+
+function scanTransitions(
+  transitions: NodeTransitionEvent[],
+  endingTransition: NodeTransitionEvent['transition'] | undefined
+): TransitionScan {
+  const scan: TransitionScan = {
+    startedAt: transitions[0]?.timestamp ?? '',
+    nodeName: '',
+    lastCompleted: null,
+    lastSkipped: null,
+    ended: null,
+  };
+  for (const t of transitions) {
+    if (new Date(t.timestamp).getTime() < new Date(scan.startedAt).getTime()) {
+      scan.startedAt = t.timestamp;
     }
-    const terminal = completed ?? failed ?? skipped;
-    // Precedence in documented order: ever-completed wins, then failed, then
-    // skipped, else still running.
-    let status: NodeRun['status'];
-    if (completed !== null) status = 'completed';
-    else if (failed !== null) status = 'failed';
-    else if (skipped !== null) status = 'skipped';
-    else status = 'running';
-    runs.push({
-      nodeId,
-      nodeName: nodeName !== '' ? nodeName : nodeId,
-      status,
-      startedAt,
-      // Position/duration come from whichever terminal transition exists...
-      endedAt: terminal?.timestamp ?? null,
-      durationMs: terminal?.durationMs ?? null,
-      // ...but cost/turns/stop are only ever written on `node_completed`, so read
-      // them from that transition (a failed/skipped terminal carries none).
-      costUsd: completed?.costUsd ?? null,
-      numTurns: completed?.numTurns ?? null,
-      stopReason: completed?.stopReason ?? null,
-      skipReason: skipped?.skipReason ?? null,
-      skipExpr: skipped?.skipExpr ?? null,
-    });
+    if (scan.nodeName === '' && t.nodeName !== '') scan.nodeName = t.nodeName;
+    if (t.transition === 'completed') scan.lastCompleted = t;
+    else if (t.transition === 'skipped') scan.lastSkipped = t;
+    if (t.transition === endingTransition) scan.ended = t;
   }
-  return runs.sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
+  return scan;
 }
 
 /**
- * Per-node terminal tally for a run's node-count readout (e.g. `7/8 nodes`).
- * Derived from {@link foldNodeRuns} so the dedup is single-sourced: `total` =
- * distinct nodes that reached a terminal (non-`running`) state; `completed` =
- * distinct nodes that ever completed (a completed-then-resume-skipped node stays
- * counted). Nodes with a null `nodeId` are excluded by the fold.
+ * What the node left behind. Only a `failed` transition carries an error, and `ended`
+ * is that transition only for a failed node.
  */
-export function countTerminalNodes(events: RunEvent[]): { completed: number; total: number } {
+function nodeResult(
+  completed: NodeTransitionEvent | null,
+  ended: NodeTransitionEvent | null
+): Pick<NodeRun, 'output' | 'error'> {
+  return { output: completed?.output ?? null, error: ended?.error ?? null };
+}
+
+function toNodeRun(node: RunNodeState, transitions: NodeTransitionEvent[]): NodeRun {
+  const { startedAt, nodeName, lastCompleted, lastSkipped, ended } = scanTransitions(
+    transitions,
+    TRANSITION_FOR_STATE[node.state]
+  );
+  // The attempt behind a `completed` state. A prior-success replay (a `skipped`
+  // transition) restates the latest completion rather than producing one, so that
+  // completion still owns the cost and end. Any other state shows no cost: a node
+  // reset to pending or re-run to failure must not carry an earlier attempt's spend.
+  const completed = node.state === 'completed' ? lastCompleted : null;
+  // A replayed node whose completion is not in view ends at the replay.
+  const end = ended ?? (node.state === 'completed' ? lastSkipped : null);
+  return {
+    nodeId: node.node_id,
+    nodeName: nodeName !== '' ? nodeName : node.node_id,
+    status: node.state,
+    startedAt,
+    endedAt: end?.timestamp ?? null,
+    durationMs: end?.durationMs ?? null,
+    costUsd: completed?.costUsd ?? null,
+    costPartial: completed?.costPartial ?? false,
+    costScope: completed?.costScope ?? null,
+    numTurns: completed?.numTurns ?? null,
+    tokens: completed?.tokens ?? null,
+    stopReason: completed?.stopReason ?? null,
+    // Only a `skipped` state's own transition carries these; a replay's are not shown.
+    skipReason: ended?.skipReason ?? null,
+    skipExpr: ended?.skipExpr ?? null,
+    ...nodeResult(completed, ended),
+    fanOutOutcome: node.fan_out_outcome,
+  };
+}
+
+/**
+ * Per-node terminal tally for a run's node-count readout (e.g. `7/8 nodes`), from
+ * the engine's node states: `total` = nodes in a terminal state, `completed` =
+ * nodes the engine reports completed.
+ */
+export function countTerminalNodes(nodes: readonly RunNodeState[]): {
+  completed: number;
+  total: number;
+} {
   let completed = 0;
   let total = 0;
-  for (const r of foldNodeRuns(events)) {
-    if (r.status === 'running') continue;
+  for (const node of nodes) {
+    if (node.state === 'running' || node.state === 'pending') continue;
     total += 1;
-    if (r.status === 'completed') completed += 1;
+    if (node.state === 'completed') completed += 1;
   }
   return { completed, total };
+}
+
+function warningText(value: unknown, heading: string): string {
+  const warnings = Array.isArray(value)
+    ? value.filter((warning): warning is string => typeof warning === 'string')
+    : [];
+  return warnings.length > 0
+    ? `${heading}:\n${warnings.map(warning => `- ${warning}`).join('\n')}`
+    : `${heading}.`;
 }

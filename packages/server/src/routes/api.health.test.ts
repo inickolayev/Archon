@@ -2,6 +2,7 @@ import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
+import { makeIdleLockStats } from '../test/conversation-lock-fixtures';
 import {
   makeDiscoverWorkflowsMock,
   makeLoaderMock,
@@ -16,6 +17,7 @@ import {
 type TestConfig = {
   assistants?: { claude: { model: string } };
   worktree?: { baseBranch: string };
+  concurrency?: { maxConversations: number };
 };
 
 const mockLoadConfig = mock<(_repoPath?: string) => Promise<TestConfig>>(async () => ({
@@ -32,19 +34,19 @@ const mockGetSchemaVersion = mock(async () => ({
 const mockIsDocker = mock(() => false);
 const mockIsWSL = mock(() => false);
 const mockGetWSLDistroName = mock((): string | undefined => undefined);
-const mockGetStats = mock(() => ({
-  active: 1,
-  queuedTotal: 2,
-  queuedByConversation: [] as { conversationId: string; queuedMessages: number }[],
-  maxConcurrent: 10,
-  activeConversationIds: [] as string[],
-}));
+const mockGetStats = mock(() => ({ ...makeIdleLockStats(), active: 1, queuedTotal: 2 }));
 
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
   getDatabaseType: mockGetDatabaseType,
   getSchemaVersion: mockGetSchemaVersion,
   loadConfig: mockLoadConfig,
+  ProjectRegistrationError: class ProjectRegistrationError extends Error {},
+  inspectProjectBaseBranch: mock(async () => ({
+    kind: 'repo',
+    defaultBranch: 'dev',
+    reason: null,
+  })),
   cloneRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   registerRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),
   ConversationNotFoundError: class ConversationNotFoundError extends Error {
@@ -55,7 +57,7 @@ mock.module('@archon/core', () => ({
   },
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   toSafeConfig: (config: unknown) => config,
-  generateAndSetTitle: mock(async () => {}),
+  generateTitleForUser: mock(async () => {}),
   resolveTitleRequest: mock(async () => ({ provider: 'claude', options: {} })),
   createLogger: () => ({
     fatal: mock(() => undefined),
@@ -74,6 +76,7 @@ mock.module('@archon/core', () => ({
 }));
 
 mock.module('@archon/paths', () => ({
+  canonicalizeProjectPath: async (path: string) => path,
   createLogger: () => ({
     fatal: mock(() => undefined),
     error: mock(() => undefined),
@@ -90,12 +93,19 @@ mock.module('@archon/paths', () => ({
   }),
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
-  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
-  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
+  getBundledWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows'),
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   isDocker: mockIsDocker,
   isWSL: mockIsWSL,
   getWSLDistroName: mockGetWSLDistroName,
+}));
+
+const STORE_ID = '6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7';
+const mockReadStoreId = mock((): string | null => STORE_ID);
+const realServerDiscovery = { ...(await import('@archon/paths/server-discovery')) };
+mock.module('@archon/paths/server-discovery', () => ({
+  ...realServerDiscovery,
+  readStoreId: mockReadStoreId,
 }));
 
 mock.module('@archon/workflows/workflow-discovery', makeDiscoverWorkflowsMock);
@@ -103,11 +113,7 @@ mock.module('@archon/workflows/loader', makeLoaderMock);
 mock.module('@archon/workflows/command-validation', makeCommandValidationMock);
 mock.module('@archon/workflows/defaults', () => ({
   BUNDLED_WORKFLOWS: {},
-  BUNDLED_COMMANDS: {
-    'archon-assist': '# archon-assist command',
-    plan: '# plan command',
-    implement: '# implement command',
-  },
+  BUNDLED_COMMANDS: {},
   isBinaryBuild: mock(() => false),
 }));
 
@@ -147,12 +153,14 @@ mock.module('@archon/core/db/isolation-environments', () => ({
   updateStatus: mock(async () => {}),
 }));
 
-const mockGetRunningWorkflows = mock(
-  async () =>
-    [] as { id: string; conversation_id: string; workflow_name: string; started_at: string }[]
-);
+const mockGetRunningWorkflows = mock<
+  typeof import('@archon/core/db/workflows')['getRunningWorkflows']
+>(async () => []);
 
 mock.module('@archon/core/db/workflows', () => ({
+  getRunIdsByIsolationEnvId: mock(async (): Promise<string[]> => []),
+  getWorkflowRunsByIds: mock(async () => []),
+  getWorkflowRunForAttention: mock(async () => null),
   listWorkflowRuns: mock(async () => []),
   listDashboardRuns: makeListDashboardRunsMock(),
   getWorkflowRun: mock(async () => null),
@@ -177,17 +185,16 @@ mock.module('@archon/core/db/messages', () => ({
   listMessages: mock(async () => []),
 }));
 
-mock.module('@archon/core/utils/commands', () => ({
-  findCommandFiles: mock(async () => []),
-}));
-
 import { registerApiRoutes } from './api';
+import type { AppCommit } from './schemas/system.schemas';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeApp(): OpenAPIHono {
+const T0 = '2026-01-01T00:00:00.000Z';
+
+function makeApp(commit?: AppCommit): OpenAPIHono {
   const app = new OpenAPIHono();
   const mockWebAdapter = {
     setConversationDbId: mock((_platformId: string, _dbId: string) => {}),
@@ -201,7 +208,7 @@ function makeApp(): OpenAPIHono {
     }),
     getStats: mockGetStats,
   } as unknown as ConversationLockManager;
-  registerApiRoutes(app, mockWebAdapter, mockLockManager);
+  registerApiRoutes(app, mockWebAdapter, mockLockManager, undefined, undefined, {}, commit);
   return app;
 }
 
@@ -221,11 +228,8 @@ describe('GET /api/health', () => {
 
   test('returns status ok with adapter and concurrency info', async () => {
     mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
+      ...makeIdleLockStats(),
       queuedTotal: 2,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
     }));
     mockGetRunningWorkflows.mockImplementationOnce(async () => [
       { id: 'run-1', conversation_id: 'conv-1', workflow_name: 'assist', started_at: '2026-01-01' },
@@ -235,18 +239,25 @@ describe('GET /api/health', () => {
     const response = await app.request('/api/health');
     expect(response.status).toBe(200);
 
-    const body = (await response.json()) as {
+    const text = await response.text();
+    const body = JSON.parse(text) as {
       status: string;
       adapter: string;
-      concurrency: { active: number; activeConversationIds: string[] };
+      concurrency: Record<string, unknown>;
       runningWorkflows: number;
       version: string;
     };
     expect(body.status).toBe('ok');
     expect(body.adapter).toBe('web');
-    expect(body.concurrency).toBeDefined();
-    expect(body.concurrency.active).toBe(1);
-    expect(body.concurrency.activeConversationIds).toEqual(['conv-1']);
+    expect(body.concurrency).toEqual({
+      active: 1,
+      queuedTotal: 2,
+      maxConcurrent: 10,
+      oldestActiveAgeMs: null,
+      oldestQueuedAgeMs: null,
+    });
+    // Health is public: conversation ids stay behind /api/dashboard/conversations.
+    expect(text).not.toContain('conv-1');
     expect(body.runningWorkflows).toBe(1);
     expect(typeof body.version).toBe('string');
     expect(body.version.length).toBeGreaterThan(0);
@@ -255,13 +266,7 @@ describe('GET /api/health', () => {
   // Schema vintage (#2316): a bug report needs to be able to state which build
   // created this database and which last applied schema to it.
   test('reports the schema vintage', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
 
     const app = makeApp();
@@ -279,13 +284,7 @@ describe('GET /api/health', () => {
   });
 
   test('reports a null creation vintage rather than omitting it', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
 
     mockGetSchemaVersion.mockImplementationOnce(async () => ({
@@ -303,14 +302,42 @@ describe('GET /api/health', () => {
     expect(body.schema?.createdAppVersion).toBeNull();
   });
 
+  test('reports the commit it was started with, and omits it when there is none', async () => {
+    mockGetStats.mockImplementation(makeIdleLockStats);
+    mockGetRunningWorkflows.mockImplementation(async () => []);
+    const commit = { sha: '3ca084a83', committedAt: '2026-11-12T14:03:21+01:00' };
+
+    const withCommit = await makeApp(commit).request('/api/health');
+    expect(((await withCommit.json()) as { commit?: AppCommit }).commit).toEqual(commit);
+
+    const without = await makeApp().request('/api/health');
+    expect(without.status).toBe(200);
+    expect(((await without.json()) as { commit?: AppCommit }).commit).toBeUndefined();
+  });
+
+  test("reports its home's store id, and omits it when the home has none", async () => {
+    mockGetStats.mockImplementation(makeIdleLockStats);
+    mockGetRunningWorkflows.mockImplementation(async () => []);
+    const app = makeApp();
+
+    const withId = (await (await app.request('/api/health')).json()) as { storeId?: string };
+    expect(withId.storeId).toBe(STORE_ID);
+
+    mockReadStoreId.mockImplementationOnce(() => null);
+    const missing = await app.request('/api/health');
+    expect(missing.status).toBe(200);
+    expect(((await missing.json()) as { storeId?: string }).storeId).toBeUndefined();
+
+    mockReadStoreId.mockImplementationOnce(() => {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    });
+    const unreadable = await app.request('/api/health');
+    expect(unreadable.status).toBe(200);
+    expect(((await unreadable.json()) as { storeId?: string }).storeId).toBeUndefined();
+  });
+
   test('omits schema and still answers 200 when the vintage read fails', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
 
     mockGetSchemaVersion.mockImplementationOnce(async () => {
@@ -328,16 +355,11 @@ describe('GET /api/health', () => {
   });
 
   test('includes running background workflows in concurrency.active count', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => [
       { id: 'run-1', conversation_id: 'conv-1', workflow_name: 'assist', started_at: '2026-01-01' },
       { id: 'run-2', conversation_id: 'conv-2', workflow_name: 'plan', started_at: '2026-01-01' },
+      { id: 'run-local', conversation_id: null, workflow_name: 'local', started_at: '2026-01-01' },
     ]);
 
     const app = makeApp();
@@ -345,21 +367,18 @@ describe('GET /api/health', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
-      concurrency: { active: number; activeConversationIds: string[] };
+      concurrency: { active: number };
       runningWorkflows: number;
     };
     expect(body.concurrency.active).toBe(2);
-    expect(body.concurrency.activeConversationIds).toEqual(['conv-1', 'conv-2']);
-    expect(body.runningWorkflows).toBe(2);
+    expect(body.runningWorkflows).toBe(3);
   });
 
   test('deduplicates conversation IDs tracked by both lock manager and DB', async () => {
     mockGetStats.mockImplementationOnce(() => ({
+      ...makeIdleLockStats(),
       active: 1,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: ['conv-1'],
+      activeConversations: [{ conversationId: 'conv-1', acquiredAt: T0, ageMs: 1_000 }],
     }));
     mockGetRunningWorkflows.mockImplementationOnce(async () => [
       { id: 'run-1', conversation_id: 'conv-1', workflow_name: 'assist', started_at: '2026-01-01' },
@@ -369,21 +388,21 @@ describe('GET /api/health', () => {
     const response = await app.request('/api/health');
     expect(response.status).toBe(200);
 
-    const body = (await response.json()) as {
-      concurrency: { active: number; activeConversationIds: string[] };
-    };
+    const body = (await response.json()) as { concurrency: { active: number } };
     // Should NOT double-count conv-1
     expect(body.concurrency.active).toBe(1);
-    expect(body.concurrency.activeConversationIds).toEqual(['conv-1']);
   });
 
   test('combines lock manager and background workflow counts', async () => {
     mockGetStats.mockImplementationOnce(() => ({
+      ...makeIdleLockStats(),
       active: 1,
       queuedTotal: 3,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: ['conv-1'],
+      activeConversations: [{ conversationId: 'conv-1', acquiredAt: T0, ageMs: 2_220_000 }],
+      queuedConversations: [
+        { conversationId: 'conv-3', queuedMessages: 2, oldestEnqueuedAt: T0, oldestAgeMs: 60_000 },
+        { conversationId: 'conv-4', queuedMessages: 1, oldestEnqueuedAt: T0, oldestAgeMs: 5_000 },
+      ],
     }));
     mockGetRunningWorkflows.mockImplementationOnce(async () => [
       { id: 'run-2', conversation_id: 'conv-2', workflow_name: 'plan', started_at: '2026-01-01' },
@@ -393,24 +412,44 @@ describe('GET /api/health', () => {
     const response = await app.request('/api/health');
     expect(response.status).toBe(200);
 
-    const body = (await response.json()) as {
-      concurrency: { active: number; queuedTotal: number; activeConversationIds: string[] };
+    const text = await response.text();
+    const body = JSON.parse(text) as {
+      status: string;
+      concurrency: Record<string, unknown>;
       runningWorkflows: number;
     };
-    expect(body.concurrency.active).toBe(2);
-    expect(body.concurrency.queuedTotal).toBe(3);
-    expect(body.concurrency.activeConversationIds).toEqual(['conv-1', 'conv-2']);
+    // A 37-minute-old slot is reported as an age; it does not change status.
+    expect(body.status).toBe('ok');
+    expect(body.concurrency).toEqual({
+      active: 2,
+      queuedTotal: 3,
+      maxConcurrent: 10,
+      oldestActiveAgeMs: 2_220_000,
+      oldestQueuedAgeMs: 60_000,
+    });
     expect(body.runningWorkflows).toBe(1);
+    expect(text).not.toMatch(/conv-\d/);
+  });
+
+  test('GET /api/dashboard/conversations returns the per-conversation snapshot', async () => {
+    const snapshot = {
+      ...makeIdleLockStats(),
+      active: 1,
+      queuedTotal: 1,
+      activeConversations: [{ conversationId: 'conv-1', acquiredAt: T0, ageMs: 2_220_000 }],
+      queuedConversations: [
+        { conversationId: 'conv-2', queuedMessages: 1, oldestEnqueuedAt: T0, oldestAgeMs: 60_000 },
+      ],
+    };
+    mockGetStats.mockImplementationOnce(() => snapshot);
+
+    const response = await makeApp().request('/api/dashboard/conversations');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(snapshot);
   });
 
   test('returns 200 without any auth requirements', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
 
     const app = makeApp();
@@ -419,13 +458,7 @@ describe('GET /api/health', () => {
   });
 
   test('includes is_docker: false in non-Docker environment', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
     mockIsDocker.mockReturnValueOnce(false);
 
@@ -438,13 +471,7 @@ describe('GET /api/health', () => {
   });
 
   test('includes is_docker: true in Docker environment', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
     mockIsDocker.mockReturnValueOnce(true);
 
@@ -457,13 +484,7 @@ describe('GET /api/health', () => {
   });
 
   test('includes is_wsl: false and omits wsl_distro in non-WSL environment', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
     mockIsWSL.mockReturnValueOnce(false);
     mockGetWSLDistroName.mockReturnValueOnce(undefined);
@@ -478,13 +499,7 @@ describe('GET /api/health', () => {
   });
 
   test('includes is_wsl: true and wsl_distro in WSL environment', async () => {
-    mockGetStats.mockImplementationOnce(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    }));
+    mockGetStats.mockImplementationOnce(makeIdleLockStats);
     mockGetRunningWorkflows.mockImplementationOnce(async () => []);
     mockIsWSL.mockReturnValueOnce(true);
     mockGetWSLDistroName.mockReturnValueOnce('Ubuntu');
@@ -509,9 +524,10 @@ describe('GET /api/config', () => {
     mockGetDatabaseType.mockReset();
   });
 
-  test('returns config and database type', async () => {
+  test('returns the loaded conversation limit and database type', async () => {
     mockLoadConfig.mockImplementationOnce(async () => ({
       assistants: { claude: { model: 'sonnet' } },
+      concurrency: { maxConversations: 3 },
     }));
     mockGetDatabaseType.mockImplementationOnce(() => 'sqlite');
 
@@ -520,12 +536,16 @@ describe('GET /api/config', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
-      config: { assistants: { claude: { model: string } } };
+      config: {
+        assistants: { claude: { model: string } };
+        concurrency: { maxConversations: number };
+      };
       database: string;
     };
     expect(body.config).toBeDefined();
     expect(body.database).toBe('sqlite');
     expect(body.config.assistants.claude.model).toBe('sonnet');
+    expect(body.config.concurrency.maxConversations).toBe(3);
   });
 
   test('reflects postgres database type when configured', async () => {
@@ -551,57 +571,6 @@ describe('GET /api/config', () => {
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('Failed to get config');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Tests: GET /api/commands
-// ---------------------------------------------------------------------------
-
-describe('GET /api/commands', () => {
-  test('returns commands array with bundled commands', async () => {
-    const app = makeApp();
-    const response = await app.request('/api/commands');
-    expect(response.status).toBe(200);
-
-    const body = (await response.json()) as { commands: Array<{ name: string; source: string }> };
-    expect(Array.isArray(body.commands)).toBe(true);
-
-    // BUNDLED_COMMANDS mock has 3 entries
-    const bundledCommands = body.commands.filter(c => c.source === 'bundled');
-    expect(bundledCommands.length).toBeGreaterThan(0);
-  });
-
-  test('includes archon-assist as bundled command', async () => {
-    const app = makeApp();
-    const response = await app.request('/api/commands');
-    expect(response.status).toBe(200);
-
-    const body = (await response.json()) as { commands: Array<{ name: string; source: string }> };
-    const archonAssist = body.commands.find(c => c.name === 'archon-assist');
-    expect(archonAssist).toBeDefined();
-    expect(archonAssist?.source).toBe('bundled');
-  });
-
-  test('includes plan and implement as bundled commands', async () => {
-    const app = makeApp();
-    const response = await app.request('/api/commands');
-    expect(response.status).toBe(200);
-
-    const body = (await response.json()) as { commands: Array<{ name: string; source: string }> };
-    const names = body.commands.map(c => c.name);
-    expect(names).toContain('plan');
-    expect(names).toContain('implement');
-  });
-
-  test('returns commands with cwd query param without error', async () => {
-    const app = makeApp();
-    // Use the registered codebase path (/tmp/project from the mock) so validateCwd passes
-    const response = await app.request('/api/commands?cwd=/tmp/project');
-    expect(response.status).toBe(200);
-
-    const body = (await response.json()) as { commands: Array<{ name: string }> };
-    expect(Array.isArray(body.commands)).toBe(true);
   });
 });
 
@@ -655,5 +624,6 @@ describe('GET /api/openapi.json', () => {
     expect(health?.properties?.['wsl_distro']).toBeDefined();
     expect(health?.required).toContain('is_wsl');
     expect(health?.required).not.toContain('wsl_distro');
+    expect(health?.properties?.['storeId']).toBeDefined();
   });
 });

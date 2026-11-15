@@ -1,0 +1,65 @@
+import { z } from 'zod';
+import { workflowRunSchema, workflowRunStatusSchema, type WorkflowRunStatus } from './workflow-run';
+
+// ---------------------------------------------------------------------------
+// DashboardWorkflowRun
+// ---------------------------------------------------------------------------
+
+export const dashboardWorkflowRunSchema = workflowRunSchema.extend({
+  codebase_name: z.string().nullable(),
+  /**
+   * Display name of whoever asked for the run; null when nobody can be named (CLI runs).
+   * Optional rather than merely nullable: a caller that builds a dashboard row without going
+   * through the join — a test, a fixture — should not have to name a person to be valid.
+   */
+  user_display_name: z.string().nullish(),
+  platform_type: z.string().nullable(),
+  worker_platform_id: z.string().nullable(),
+  parent_platform_id: z.string().nullable(),
+  active_nodes: z.array(z.string().min(1)),
+  current_step_name: z.string().nullable(),
+  total_steps: z.number().nullable(),
+  current_step_status: z.enum(['running', 'completed', 'failed']).nullable(),
+  agents_completed: z.number().nullable(),
+  agents_failed: z.number().nullable(),
+  agents_total: z.number().nullable(),
+});
+
+export type DashboardWorkflowRun = z.infer<typeof dashboardWorkflowRunSchema>;
+
+// ---------------------------------------------------------------------------
+// ListDashboardRunsOptions
+// ---------------------------------------------------------------------------
+
+export const listDashboardRunsOptionsSchema = z.object({
+  status: z
+    .union([workflowRunStatusSchema, z.tuple([workflowRunStatusSchema], workflowRunStatusSchema)])
+    .optional(),
+  codebaseId: z.string().optional(),
+  parentRunIds: z.array(z.string()).optional(),
+  excludeLeafStatuses: z.array(workflowRunStatusSchema).optional(),
+  search: z.string().optional(),
+  after: z.string().optional(),
+  before: z.string().optional(),
+  limit: z.number().optional(),
+  offset: z.number().optional(),
+});
+
+export type ListDashboardRunsOptions = z.infer<typeof listDashboardRunsOptionsSchema>;
+
+// ---------------------------------------------------------------------------
+// DashboardRunsResult
+// ---------------------------------------------------------------------------
+
+export const dashboardRunsResultSchema = z.object({
+  runs: z.array(dashboardWorkflowRunSchema),
+  total: z.number(),
+  counts: z.object({
+    all: z.number(),
+    ...(Object.fromEntries(
+      workflowRunStatusSchema.options.map(status => [status, z.number()])
+    ) as Record<WorkflowRunStatus, z.ZodNumber>),
+  }),
+});
+
+export type DashboardRunsResult = z.infer<typeof dashboardRunsResultSchema>;

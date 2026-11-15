@@ -211,16 +211,18 @@ Each test should capture the full command output for the final report. If a test
 - Exit code 0
 - Output contains `Archon CLI v<expected-version>`
 - Output contains `Build: binary` (not `Build: source (bun)`)
-- Output contains a non-`unknown` git commit (i.e., `Git commit: <sha>`)
+- Output contains a `Git commit: <sha>` line
 
 **Common failures:**
 
 - Exit code non-zero → pino-pretty crash (#960) or similar startup failure
 - Wrong version reported → binary is stale or the build script failed to update `bundled-build.ts`
 - `Build: source (bun)` → `BUNDLED_IS_BINARY` was not set to `true` during the build (regression of #979)
-- `Git commit: unknown` → build script did not capture the commit
+- No `Git commit:` line → build script did not capture the commit
 
 ### Test 2 — Bundled workflows load
+
+From 0.12.0, release binaries ship without providers, and a config that names one fails to load until it's installed. Run `"$BINARY" provider add claude codex pi` (the ones the config uses) before this test. That is the documented upgrade step, and it is part of what this test checks.
 
 Create a temporary git repository so the CLI has something to operate on:
 
@@ -236,7 +238,7 @@ git commit -q --allow-empty -m init
 **Pass criteria:**
 
 - Exit code 0
-- Output lists at least 20 bundled workflows (archon-assist, archon-fix-github-issue, archon-comprehensive-pr-review, etc.)
+- Output lists the bundled `sdlc` pack workflows: archon-triage, archon-investigate, archon-plan, archon-implement, archon-pr, archon-review, archon-deliver, archon-ship
 - No errors about missing workflow files or JSON parse failures
 
 **Common failures:**
@@ -245,7 +247,7 @@ git commit -q --allow-empty -m init
 - `Not in a git repository` → working directory handling bug
 - Parse errors → the embedded JSON is corrupt or stale
 
-### Test 3 — SDK path works (assist workflow)
+### Test 3 — SDK path works (archon-investigate workflow)
 
 **Prerequisite.** Compiled binaries require Claude Code installed on the host and a configured binary path. Before running this test, ensure one of:
 
@@ -266,7 +268,7 @@ export CLAUDE_BIN_PATH="$(npm root -g)/@anthropic-ai/claude-code/cli.js"
 Then in the same `$TESTREPO`:
 
 ```bash
-"$BINARY" workflow run assist "say hello and nothing else" 2>&1 | tee /tmp/archon-test-assist.log
+"$BINARY" workflow run archon-investigate --no-worktree "say hello and nothing else" 2>&1 | tee /tmp/archon-test-investigate.log
 ```
 
 **Pass criteria:**
@@ -290,7 +292,7 @@ Then in the same `$TESTREPO`:
 Quickly verify the resolver fails loud when nothing is configured:
 
 ```bash
-(unset CLAUDE_BIN_PATH; "$BINARY" workflow run assist "hello" 2>&1 | tee /tmp/archon-test-no-path.log)
+(unset CLAUDE_BIN_PATH; "$BINARY" workflow run archon-investigate --no-worktree "hello" 2>&1 | tee /tmp/archon-test-no-path.log)
 ```
 
 **Pass criteria (when no `~/.archon/config.yaml` configures `claudeBinaryPath`):**
@@ -312,7 +314,7 @@ cd "$LEAKREPO"
 git init -q
 git commit -q --allow-empty -m init
 printf 'ANTHROPIC_API_KEY=sk-ant-test-fake\n' > .env
-"$BINARY" workflow run assist "hello" 2>&1 | tee /tmp/archon-test-leak.log
+"$BINARY" workflow run archon-investigate --no-worktree "hello" 2>&1 | tee /tmp/archon-test-leak.log
 ```
 
 **Pass criteria** (current behaviour — the guard **strips**, it does not refuse):
@@ -329,7 +331,7 @@ status too: under the strip design the workflow is expected to succeed, so a
 non-zero exit is its own failure.
 
 ```bash
-"$BINARY" workflow run assist "hello" > /tmp/archon-test-leak.log 2>&1
+"$BINARY" workflow run archon-investigate --no-worktree "hello" > /tmp/archon-test-leak.log 2>&1
 leak_exit=$?
 
 # $LEAKREPO may be a symlinked path (/tmp -> /private/tmp on macOS); the binary
@@ -474,7 +476,7 @@ Dev binary:   /Users/rasmus/.bun/bin/archon → ../install/.../cli.ts (unchanged
 
   [PASS]  Test 1  version reports 0.3.1, Build: binary, commit abc1234
   [PASS]  Test 2  workflow list returned 21 bundled workflows
-  [PASS]  Test 3  workflow run assist produced output
+  [PASS]  Test 3  workflow run archon-investigate produced output
   [PASS]  Test 4  env-leak guard stripped exactly the planted key
   [PASS]  Test 5  isolation list executed without errors
   [PASS]  Cleanup brew uninstall + untap clean, dev binary unchanged

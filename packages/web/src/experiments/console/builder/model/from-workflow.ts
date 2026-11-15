@@ -9,6 +9,7 @@
  */
 import type { BuilderNode, BuilderWorkflow, Issue, WireWorkflowDefinition } from '../types';
 import {
+  detectOpaqueKind,
   detectVariantOrNull,
   defaultPromptData,
   partitionNode,
@@ -38,6 +39,22 @@ function nodeFromDag(
 ): BuilderNode {
   const node = toAuthoringNode(servedNode);
   const { id, base, variantSpecific } = partitionNode(node);
+
+  const opaqueKind = detectOpaqueKind(node);
+  if (opaqueKind !== null) {
+    // A valid node the builder cannot edit: show it read-only and carry every
+    // mode field back untouched, rather than degrading it to an empty prompt.
+    issues.push(
+      makeIssue({
+        rule: 'structural.node.read-only',
+        severity: 'info',
+        source: 'client-instant',
+        message: `'${opaqueKind}' nodes have no editor yet; shown read-only and saved unchanged`,
+        path: { nodeId: id },
+      })
+    );
+    return { id, variant: 'opaque', base, data: { kind: opaqueKind, fields: variantSpecific } };
+  }
 
   const variant = detectVariantOrNull(node);
   if (variant === null) {

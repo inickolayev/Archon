@@ -52,14 +52,19 @@ apparmor=unconfined` because the kernel `mount -t overlay` needs it. With
   A transient in-container env file is a tracked follow-up.
 
 - **`$ARTIFACTS_DIR` is the one writable host bind.** The run's artifacts directory
-  is bind-mounted read-write at the same absolute path, so a node's screenshots,
-  reports, and the `evidence_policy` marker land on the host where the engine and the
+  is bind-mounted read-write at the same absolute path, so a node's screenshots
+  and reports land on the host where the engine and the
   operator read them. Everything the container writes there is run output and is
   treated as untrusted data by the host, never executed. In-container root writes
   root-owned files on a rootful Linux daemon; Archon `chown`s the mount back to the
   host user on suspend and destroy, best-effort and logged
   (`isolation.container_artifacts_chown_failed`). The run's frozen workflow source is a
-  separate read-only bind, never under `$ARTIFACTS_DIR`.
+  separate read-only bind, never under `$ARTIFACTS_DIR`. Because the container can
+  plant symlinks there, the engine's own host writes into `$ARTIFACTS_DIR` (typed
+  artifacts and their listings, output spills, checkout manifests, delivered
+  credential files) refuse a parent directory that is a symlink and replace a symlinked
+  file rather than write through it. These checks see links that exist when the write
+  starts; they do not cover a container swapping a directory for a link mid-write.
 
 - **Captured-source integrity is checkpoint detection, not containment.** Archon
   hashes the host capture against the run's pinned identity before dispatching each
@@ -84,7 +89,8 @@ apparmor=unconfined` because the kernel `mount -t overlay` needs it. With
 
 ## Overlay modes and how to get the stronger boundary
 
-The backend picks the **least-privileged mode that mounts**, preferring `fuse`:
+The backend starts with `fuse` and permits native fallback only after the runner
+reports a failed FUSE mount through its dedicated exit status (78):
 
 | Mode                | Flags                                                    | Remount escape?                                          | Where it mounts                                                                                         |
 | ------------------- | -------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
@@ -92,15 +98,24 @@ The backend picks the **least-privileged mode that mounts**, preferring `fuse`:
 | `native` (fallback) | `--cap-add SYS_ADMIN --security-opt apparmor=unconfined` | **Open** — see above                                     | Everywhere (standard rootful daemon)                                                                    |
 
 On a **standard rootful daemon** (e.g. default Docker Desktop, default Docker
-Engine), unprivileged FUSE mounts are denied, so the `fuse` attempt fails fast and
-the backend falls back to `native` — meaning the remount escape is present. To get
+Engine), unprivileged FUSE mounts are denied. If the runner starts and reports
+that mount failure with exit status 78, the backend falls back to `native` —
+meaning the remount escape is present. Startup failures such as a missing
+`/dev/fuse` stop preparation instead. To get
 the hardened boundary (no CAP_SYS_ADMIN), run the daemon **rootless** or with
 **userns-remap**, where the `fuse` mode succeeds and the container never holds
 CAP_SYS_ADMIN.
 
 The mode that actually mounted is recorded on the `isolation_environments` row
 (`metadata.overlayMode`) and logged (`isolation.container_overlay_fallback` warns
-when native was used).
+when native is attempted, including the original FUSE failure).
+
+Docker startup failures (including a missing `/dev/fuse`) and readiness timeouts
+reject preparation without trying native. Failed Docker inspect or log checks
+never authorize native fallback.
+Older runner images that report a generic exit status also fail without fallback;
+rebuild existing and custom runner images after upgrading Archon to use the
+current entrypoint and its dedicated FUSE mount status.
 
 ## Write-back apply hardening
 

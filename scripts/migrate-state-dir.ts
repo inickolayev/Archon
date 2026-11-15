@@ -7,8 +7,8 @@
  * Inside an isolated run it resolved to the *worktree*, so the cross-run memory
  * it held was destroyed at cleanup; in a user's repository it was stageable
  * (Archon never writes a `.gitignore`). `$STATE_DIR` (#2200) is the external,
- * per-project replacement. Archon itself never moves the legacy directory — it
- * warns once and leaves it alone — so this script is the operator's one-shot.
+ * per-project replacement. Archon itself never moves the legacy directory, so
+ * this script is the operator's one-shot.
  *
  * It resolves the destination through the SAME helper the executor, the artifact
  * routes, and the CLI use (`resolveProjectStorageKey` + `getProjectStoragePaths`
@@ -24,23 +24,20 @@
  *   - The pre-flight decides the WHOLE migration before moving a byte, so any
  *     refusal (destination collision, nested directory) leaves the source
  *     untouched — a partial migration can never be reported as success.
- *   - `.initialized` is written ONLY after every entry moved, or when there was
- *     genuinely nothing to migrate. Marking a partial migration complete would
- *     tell the triage workflows' `state-preflight` gate that an incomplete state
- *     directory is authoritative — the exact reset the gate exists to prevent.
  *   - Idempotent: re-running after a successful migration finds nothing to do.
  *   - Copy-then-delete, so an interrupted run leaves the source intact.
  *
  * Exit codes:
  *   0  nothing to do, dry run completed, or migration fully succeeded
  *   1  unexpected error
- *   2  refused — destination collisions and/or nested directories; nothing was
- *      moved and `.initialized` was NOT written
+ *   2  refused — destination collisions, nested directories, or two candidate
+ *      sources; nothing was moved
  */
-import { readdir, mkdir, stat, copyFile, rm, writeFile } from 'fs/promises';
+import { readdir, mkdir, stat, copyFile, rm } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, resolve } from 'path';
 import {
+  canonicalizeProjectPath,
   resolveProjectStorageKey,
   getProjectStoragePaths,
   type ProjectStorageKey,
@@ -53,9 +50,14 @@ import * as codebaseDb from '@archon/core/db/codebases';
  * directory is the exact failure family this script exists to prevent, so a
  * malformed invocation exits non-zero rather than guessing: `--cwd --apply`
  * used to swallow the flag as a path, resolve to `<pwd>/--apply`, find no legacy
- * state, and report success while writing a junk `.initialized` marker.
+ * state, and report success.
  */
-function parseArgs(argv: readonly string[]): { apply: boolean; cwd: string } {
+function parseArgs(argv: readonly string[]): { apply: boolean; cwd: string } | undefined {
+  const invalid = (message: string): undefined => {
+    console.error(message);
+    console.error('Usage: bun run scripts/migrate-state-dir.ts [--cwd <path>] [--apply]');
+    return undefined;
+  };
   let apply = false;
   let cwd: string | undefined;
 
@@ -66,34 +68,29 @@ function parseArgs(argv: readonly string[]): { apply: boolean; cwd: string } {
       continue;
     }
     if (arg === '--cwd') {
-      if (cwd !== undefined) {
-        // Silently taking the last would let a copy-paste slip operate on a
-        // different project than the one the operator is reading in their shell.
-        console.error('--cwd was given more than once; pass it exactly once.');
-        console.error('Usage: bun run scripts/migrate-state-dir.ts [--cwd <path>] [--apply]');
-        process.exit(1);
-      }
       const value = argv[i + 1];
-      if (value === undefined || value.startsWith('-')) {
-        console.error(
-          `--cwd requires a directory path${value === undefined ? '' : `, got '${value}'`}.`
-        );
-        console.error('Usage: bun run scripts/migrate-state-dir.ts [--cwd <path>] [--apply]');
-        process.exit(1);
-      }
+      const error = cwdArgumentError(cwd, value);
+      if (error !== undefined) return invalid(error);
       cwd = value;
       i++; // consume the value
       continue;
     }
-    console.error(`Unknown argument: '${arg}'.`);
-    console.error('Usage: bun run scripts/migrate-state-dir.ts [--cwd <path>] [--apply]');
-    process.exit(1);
+    return invalid(`Unknown argument: '${arg}'.`);
   }
 
   return { apply, cwd: resolve(cwd ?? '.') };
 }
 
-const { apply: APPLY, cwd: CWD } = parseArgs(process.argv.slice(2));
+function cwdArgumentError(cwd: string | undefined, value: string | undefined): string | undefined {
+  if (cwd !== undefined) {
+    // Taking the last value could move state for a different project than the operator intended.
+    return '--cwd was given more than once; pass it exactly once.';
+  }
+  if (value === undefined || value.startsWith('-')) {
+    return `--cwd requires a directory path${value === undefined ? '' : `, got '${value}'`}.`;
+  }
+  return undefined;
+}
 
 /**
  * Where a migration reads from and writes to, resolved from ONE anchor.
@@ -103,10 +100,9 @@ const { apply: APPLY, cwd: CWD } = parseArgs(process.argv.slice(2));
  * SUBDIRECTORY of a registered project, so the destination climbed to the
  * project while the source stayed at the literal cwd. Run from
  * `<project>/packages/foo` and the script looked for legacy state under the
- * subdirectory, found none, declared "nothing to migrate", and wrote
- * `.initialized` into the REAL project's state root — disarming the
- * `state-preflight` gate for a project whose state was never migrated. Deriving
- * both from `anchor` makes that disagreement unrepresentable.
+ * subdirectory, found none, and declared "nothing to migrate" for a project
+ * whose state was never migrated. Deriving both from `anchor` makes that
+ * disagreement unrepresentable.
  */
 interface MigrationTarget {
   key: ProjectStorageKey;
@@ -124,7 +120,7 @@ interface MigrationTarget {
  * so reading the codebase registry on a machine that has never run Archon
  * materialises `archon.db` plus a ~680 KB WAL — from a command whose own output
  * says `Dry run — nothing was moved`. No database means no registered projects,
- * which is already the `_cwd` fallback answer, so the read has nothing to tell
+ * which is already the `@cwd` fallback answer, so the read has nothing to tell
  * us that its side effect does not cost more than.
  *
  * Only sound for SQLite. A Postgres registry's contents cannot be inferred from
@@ -142,7 +138,7 @@ async function resolveTarget(cwd: string): Promise<MigrationTarget> {
   if (registryIsKnownEmpty()) {
     // Said out loud: a silent fallback to a different destination than the
     // operator expects is the failure family this script exists to prevent.
-    console.log(`No codebase registry yet — using the _cwd fallback for ${cwd}.`);
+    console.log(`No codebase registry yet — using the @cwd fallback for ${cwd}.`);
     return { key: { kind: 'cwd', cwd }, anchor: cwd, climbed: false };
   }
   try {
@@ -159,11 +155,12 @@ async function resolveTarget(cwd: string): Promise<MigrationTarget> {
         climbed: anchor !== cwd,
       };
     }
-    console.log(`No registered project matches ${cwd} — using the _cwd fallback.`);
+    console.log(`No registered project matches ${cwd} — using the @cwd fallback.`);
   } catch (error) {
     // A DB that is unreachable must not silently produce the wrong destination.
-    console.error(`Could not read the codebase registry: ${(error as Error).message}`);
-    process.exit(1);
+    throw new Error(`Could not read the codebase registry: ${(error as Error).message}`, {
+      cause: error,
+    });
   }
   return { key: { kind: 'cwd', cwd }, anchor: cwd, climbed: false };
 }
@@ -182,21 +179,6 @@ function plural(n: number): string {
   return `${String(n)} entr${n === 1 ? 'y' : 'ies'}`;
 }
 
-/**
- * Record that this project's `$STATE_DIR` is deliberately in its current shape —
- * either freshly migrated, or confirmed to have nothing to migrate. Stateful
- * workflows read this marker to tell "legitimately empty" from "state is still
- * sitting unmigrated somewhere else".
- *
- * Written ONLY on a fully successful `--apply`: a partial migration must never
- * be marked complete, or the marker waves through exactly the reset it exists
- * to prevent.
- */
-async function markInitialized(stateRoot: string): Promise<void> {
-  await mkdir(stateRoot, { recursive: true });
-  await writeFile(join(stateRoot, '.initialized'), '');
-}
-
 /** True when `path` exists; narrowed to ENOENT so EACCES/EIO surface. */
 async function exists(path: string): Promise<boolean> {
   try {
@@ -209,76 +191,47 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/**
- * Nothing to migrate. On `--apply` this is still a successful outcome, so the
- * destination is marked — otherwise an operator who correctly runs the migration
- * on a project with no legacy state would be left with an unmarked `$STATE_DIR`.
- */
-async function reportNoop(message: string, stateRoot: string): Promise<void> {
-  console.log(message);
-  if (!APPLY) {
-    console.log('Dry run — re-run with --apply to mark $STATE_DIR initialized.');
-    return;
-  }
-  await markInitialized(stateRoot);
-  console.log(`Marked ${join(stateRoot, '.initialized')}`);
-}
-
-async function main(): Promise<void> {
+async function validateWorkingDirectory(cwd: string): Promise<boolean> {
   // The cwd must exist before anything else: `--cwd /typo` otherwise resolves to
-  // the _cwd fallback, finds no legacy state, and reports a confident success
-  // while marking a project directory nobody asked for.
+  // the @cwd fallback, finds no legacy state, and reports a confident success
+  // for a project directory nobody asked for.
   try {
-    if (!(await stat(CWD)).isDirectory()) {
-      console.error(`Not a directory: ${CWD}`);
-      process.exit(1);
+    if (!(await stat(cwd)).isDirectory()) {
+      console.error(`Not a directory: ${cwd}`);
+      return false;
     }
   } catch {
-    console.error(`Directory does not exist: ${CWD}`);
+    console.error(`Directory does not exist: ${cwd}`);
     console.error('Pass an existing project directory with --cwd, or omit it to use the cwd.');
-    process.exit(1);
+    return false;
   }
+  return true;
+}
 
-  const { key, anchor, climbed } = await resolveTarget(CWD);
-  const legacyDir = join(anchor, '.archon', 'state');
-  const { stateRoot } = getProjectStoragePaths(key);
-
-  console.log(`Project:     ${anchor}`);
-  if (climbed) {
-    console.log(`             (invoked from ${CWD}; resolved to the registered project root)`);
-  }
-  console.log(`Legacy dir:  ${legacyDir}`);
-  console.log(`$STATE_DIR:  ${stateRoot}`);
-  console.log('');
-
-  // Climbing means the invocation cwd is NOT where we read from. If that cwd has
-  // its own legacy state, migrating the project's and marking would leave the
-  // subdirectory's unmigrated behind a satisfied marker — C5 all over again, one
-  // level down. Ambiguous input gets a refusal, not a guess.
-  if (climbed && (await hasEntries(join(CWD, '.archon', 'state')))) {
-    console.error('Refusing to migrate — two candidate sources, and only one would be moved:');
-    console.error(`  ${join(CWD, '.archon', 'state')}   (the directory you invoked from)`);
-    console.error(`  ${legacyDir}   (the registered project root)`);
-    console.error('');
-    console.error('Re-run with --cwd pointing at exactly the one you mean.');
-    process.exit(2);
-  }
-
+async function legacyEntries(legacyDir: string): Promise<string[]> {
   let entries: string[];
   try {
     entries = await readdir(legacyDir);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      await reportNoop('Nothing to migrate — no legacy .archon/state/ directory.', stateRoot);
-      return;
+      console.log('Nothing to migrate — no legacy .archon/state/ directory.');
+      return [];
     }
     throw error;
   }
   if (entries.length === 0) {
-    await reportNoop('Nothing to migrate — legacy .archon/state/ is empty.', stateRoot);
-    return;
+    console.log('Nothing to migrate — legacy .archon/state/ is empty.');
+    return [];
   }
 
+  return entries;
+}
+
+async function preflightMigration(
+  entries: readonly string[],
+  legacyDir: string,
+  stateRoot: string
+): Promise<boolean> {
   // Pre-flight: decide the ENTIRE migration before moving a single byte, so
   // every refusal leaves the source untouched and no partial move can be
   // reported as success. Two blocking conditions, reported together:
@@ -293,34 +246,29 @@ async function main(): Promise<void> {
     if (info.isDirectory()) directories.push(name);
   }
 
-  if (conflicts.length > 0 || directories.length > 0) {
-    console.error('Refusing to migrate — nothing was moved.');
-    if (conflicts.length > 0) {
-      console.error('');
-      console.error('Already present in $STATE_DIR (resolve by hand, keep the newer copy):');
-      for (const name of conflicts) console.error(`  ${join(stateRoot, name)}`);
-    }
-    if (directories.length > 0) {
-      console.error('');
-      console.error('Nested directories (move these by hand, then re-run):');
-      for (const name of directories) console.error(`  ${join(legacyDir, name)}`);
-    }
+  if (conflicts.length === 0 && directories.length === 0) return true;
+
+  console.error('Refusing to migrate — nothing was moved.');
+  if (conflicts.length > 0) {
     console.error('');
-    console.error('$STATE_DIR was NOT marked initialized — re-run after resolving.');
-    process.exit(2);
+    console.error('Already present in $STATE_DIR (resolve by hand, keep the newer copy):');
+    for (const name of conflicts) console.error(`  ${join(stateRoot, name)}`);
   }
-
-  if (!APPLY) {
-    for (const name of entries) {
-      console.log(`would move  ${name}`);
-    }
-    console.log('');
-    console.log(
-      `Dry run — nothing was moved. Re-run with --apply to migrate ${plural(entries.length)}.`
-    );
-    return;
+  if (directories.length > 0) {
+    console.error('');
+    console.error('Nested directories (move these by hand, then re-run):');
+    for (const name of directories) console.error(`  ${join(legacyDir, name)}`);
   }
+  console.error('');
+  console.error('Re-run after resolving.');
+  return false;
+}
 
+async function moveEntries(
+  entries: readonly string[],
+  legacyDir: string,
+  stateRoot: string
+): Promise<void> {
   await mkdir(stateRoot, { recursive: true });
   let moved = 0;
   for (const name of entries) {
@@ -333,17 +281,78 @@ async function main(): Promise<void> {
     console.log(`moved  ${name}`);
   }
 
-  // Every entry moved (the pre-flight guarantees no skips), so the destination
-  // is now the complete state — safe to mark.
-  await markInitialized(stateRoot);
-
   console.log('');
   console.log(`Migrated ${plural(moved)} to ${stateRoot}`);
   console.log('Remaining step: confirm the legacy directory is empty, then remove it:');
   console.log(`  rmdir "${legacyDir}"`);
 }
 
-main().catch((error: unknown) => {
-  console.error(`Migration failed: ${(error as Error).message}`);
-  process.exit(1);
-});
+async function migrate(argv: readonly string[]): Promise<number> {
+  const args = parseArgs(argv);
+  if (!args) return 1;
+  if (!(await validateWorkingDirectory(args.cwd))) return 1;
+  // The CLI and registration key on this canonical path; an unregistered
+  // directory's $STATE_DIR digest only matches theirs when this one does too.
+  const CWD = await canonicalizeProjectPath(args.cwd);
+
+  const { key, anchor, climbed } = await resolveTarget(CWD);
+  const legacyDir = join(anchor, '.archon', 'state');
+  const { stateRoot } = getProjectStoragePaths(key);
+
+  console.log(`Project:     ${anchor}`);
+  if (climbed) {
+    console.log(`             (invoked from ${CWD}; resolved to the registered project root)`);
+  }
+  console.log(`Legacy dir:  ${legacyDir}`);
+  console.log(`$STATE_DIR:  ${stateRoot}`);
+  console.log('');
+
+  // Climbing means the invocation cwd is NOT where we read from. If that cwd has
+  // its own legacy state, migrating the project's would report success while
+  // leaving the subdirectory's unmigrated — C5 all over again, one level down.
+  // Ambiguous input gets a refusal, not a guess.
+  if (climbed && (await hasEntries(join(CWD, '.archon', 'state')))) {
+    console.error('Refusing to migrate — two candidate sources, and only one would be moved:');
+    console.error(`  ${join(CWD, '.archon', 'state')}   (the directory you invoked from)`);
+    console.error(`  ${legacyDir}   (the registered project root)`);
+    console.error('');
+    console.error('Re-run with --cwd pointing at exactly the one you mean.');
+    return 2;
+  }
+
+  const entries = await legacyEntries(legacyDir);
+  if (entries.length === 0) return 0;
+  if (!(await preflightMigration(entries, legacyDir, stateRoot))) return 2;
+
+  if (!args.apply) {
+    for (const name of entries) {
+      console.log(`would move  ${name}`);
+    }
+    console.log('');
+    console.log(
+      `Dry run — nothing was moved. Re-run with --apply to migrate ${plural(entries.length)}.`
+    );
+    return 0;
+  }
+
+  await moveEntries(entries, legacyDir, stateRoot);
+  return 0;
+}
+
+export async function main(argv: readonly string[]): Promise<number> {
+  try {
+    return await migrate(argv);
+  } catch (error) {
+    console.error(`Migration failed: ${(error as Error).message}`);
+    return 1;
+  }
+}
+
+if (import.meta.main) {
+  const { closeDatabase } = await import('@archon/core/db/connection');
+  try {
+    process.exitCode = await main(process.argv.slice(2));
+  } finally {
+    await closeDatabase();
+  }
+}

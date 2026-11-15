@@ -6,7 +6,7 @@
  * server resolves it in the workflow's own context — the same resolution a run uses — so what
  * arrives here is the file that would actually be read, with the path it came from.
  */
-import { requestJson } from '../lib/http';
+import { buildApiUrl, requestJson } from '../lib/http';
 import type { components } from '@/lib/api.generated';
 
 /** The resolved file behind one node. `runtime` is present for scripts only. */
@@ -14,8 +14,10 @@ export type NodeSource = components['schemas']['ResourceSourceResponse'];
 
 /** Build the path, encoding both names: a pack-qualified reference carries `:` and `/`. */
 export function buildNodeSourcePath(workflowName: string, nodeId: string, cwd?: string): string {
-  const query = cwd === undefined ? '' : `?cwd=${encodeURIComponent(cwd)}`;
-  return `/api/workflows/${encodeURIComponent(workflowName)}/nodes/${encodeURIComponent(nodeId)}/source${query}`;
+  return buildApiUrl('/api/workflows/{name}/nodes/{nodeId}/source', 'get', {
+    params: { name: workflowName, nodeId },
+    query: { cwd },
+  });
 }
 
 /**
@@ -28,5 +30,8 @@ export function getNodeSource(
   nodeId: string,
   cwd?: string
 ): Promise<NodeSource> {
-  return requestJson<NodeSource>(buildNodeSourcePath(workflowName, nodeId, cwd));
+  return requestJson('/api/workflows/{name}/nodes/{nodeId}/source', 'get', {
+    params: { name: workflowName, nodeId },
+    query: { cwd },
+  });
 }

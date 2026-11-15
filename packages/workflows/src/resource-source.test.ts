@@ -1,12 +1,16 @@
 import { mkdtemp, mkdir, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
-import { dirname, join } from 'path';
-import { getDefaultWorkflowsPath } from '@archon/paths';
+import { join } from 'path';
+import { getBundledWorkflowsPath } from '@archon/paths';
 import { removeTempTree } from '@archon/paths/test-utils';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { resolveCommandFile, resolveScriptFile } from './resource-source';
 import { formatPackagedResourceReference } from './packaged-workflow';
-import type { LiveWorkflowSourceRoots } from './workflow-source';
+import {
+  capturedSourceRoots,
+  type CapturedWorkflowSourceRoots,
+  type LiveWorkflowSourceRoots,
+} from './workflow-source/roots';
 
 const tempDirectories: string[] = [];
 
@@ -35,7 +39,7 @@ async function scopes(): Promise<{
   await Promise.all([
     mkdir(join(project, '.archon', 'commands'), { recursive: true }),
     mkdir(join(home, 'commands'), { recursive: true }),
-    mkdir(join(bundled, 'defaults'), { recursive: true }),
+    mkdir(bundled, { recursive: true }),
   ]);
   return {
     root,
@@ -49,11 +53,39 @@ async function scopes(): Promise<{
       globalCommands: join(home, 'commands'),
       globalScripts: join(home, 'scripts'),
       bundledWorkflows: bundled,
-      bundledCommands: join(bundled, 'defaults'),
       installed: { kind: 'receipts', pluginsDir: join(home, 'plugins') },
       config: { load_default_workflows: true, load_default_commands: true },
     },
   };
+}
+
+/**
+ * A run's frozen capture, laid out the way `capturedSourceRoots` reads it.
+ *
+ * Flat bundled commands (`bundled/commands/defaults/`) exist only in a capture an older
+ * build froze — current builds bundle packaged commands alone and live roots carry no flat
+ * bundled scope — so bundled-scope precedence is pinned against a capture.
+ */
+async function capturedScopes(
+  config: { load_default_commands: boolean } = { load_default_commands: true }
+): Promise<{
+  home: string;
+  bundledCommands: string;
+  roots: CapturedWorkflowSourceRoots;
+}> {
+  const root = await mkdtemp(join(tmpdir(), 'archon-resource-capture-'));
+  tempDirectories.push(root);
+  const roots = capturedSourceRoots({
+    root,
+    digest: 'test-digest',
+    config: { load_default_workflows: true, ...config },
+  });
+  await Promise.all([
+    mkdir(join(roots.project ?? '', '.archon', 'commands'), { recursive: true }),
+    mkdir(roots.globalCommands, { recursive: true }),
+    mkdir(roots.bundledCommands, { recursive: true }),
+  ]);
+  return { home: roots.globalCommands, bundledCommands: roots.bundledCommands, roots };
 }
 
 describe('resolveCommandFile', () => {
@@ -69,22 +101,41 @@ describe('resolveCommandFile', () => {
     });
   });
 
-  test('a repo command wins over the same name in home and bundled', async () => {
-    const { project, home, bundled, roots } = await scopes();
+  test('a repo command wins over the same name in home', async () => {
+    const { project, home, roots } = await scopes();
     await writeFile(join(project, '.archon', 'commands', 'greet.md'), 'repo\n');
     await writeFile(join(home, 'commands', 'greet.md'), 'home\n');
-    await writeFile(join(bundled, 'defaults', 'greet.md'), 'bundled\n');
 
     expect((await resolveCommandFile(roots, 'greet'))?.content).toBe('repo\n');
   });
 
-  test('home wins over bundled when the repo has nothing', async () => {
-    const { home, bundled, roots } = await scopes();
+  test('home answers when the repo has nothing', async () => {
+    const { home, roots } = await scopes();
     await writeFile(join(home, 'commands', 'greet.md'), 'home\n');
-    await writeFile(join(bundled, 'defaults', 'greet.md'), 'bundled\n');
 
     expect(await resolveCommandFile(roots, 'greet')).toEqual({
       path: join(home, 'commands', 'greet.md'),
+      scope: 'global',
+      content: 'home\n',
+    });
+  });
+
+  test('a captured repo command wins over the same name in home and bundled', async () => {
+    const { home, bundledCommands, roots } = await capturedScopes();
+    await writeFile(join(roots.project ?? '', '.archon', 'commands', 'greet.md'), 'repo\n');
+    await writeFile(join(home, 'greet.md'), 'home\n');
+    await writeFile(join(bundledCommands, 'greet.md'), 'bundled\n');
+
+    expect((await resolveCommandFile(roots, 'greet'))?.content).toBe('repo\n');
+  });
+
+  test('captured home wins over bundled when the repo has nothing', async () => {
+    const { home, bundledCommands, roots } = await capturedScopes();
+    await writeFile(join(home, 'greet.md'), 'home\n');
+    await writeFile(join(bundledCommands, 'greet.md'), 'bundled\n');
+
+    expect(await resolveCommandFile(roots, 'greet')).toEqual({
+      path: join(home, 'greet.md'),
       scope: 'global',
       content: 'home\n',
     });
@@ -99,10 +150,11 @@ describe('resolveCommandFile', () => {
   });
 
   test('the bundled scope is skipped when the repo switched defaults off', async () => {
-    const { bundled, roots } = await scopes();
-    await writeFile(join(bundled, 'defaults', 'greet.md'), 'bundled\n');
+    const { bundledCommands, roots } = await capturedScopes({ load_default_commands: false });
+    await writeFile(join(bundledCommands, 'greet.md'), 'bundled\n');
 
-    expect(await resolveCommandFile(roots, 'greet', { loadDefaultCommands: false })).toBeNull();
+    // Read off the capture's own frozen config, as the runtime does.
+    expect(await resolveCommandFile(roots, 'greet')).toBeNull();
   });
 
   test("a configured command folder is searched, since that is where the repo's commands are", async () => {
@@ -115,15 +167,22 @@ describe('resolveCommandFile', () => {
     );
   });
 
-  test('bundled defaults answer when neither the repo nor home has the name', async () => {
-    const { bundled, roots } = await scopes();
-    await writeFile(join(bundled, 'defaults', 'greet.md'), 'bundled\n');
+  test('captured bundled defaults answer when neither the repo nor home has the name', async () => {
+    const { bundledCommands, roots } = await capturedScopes();
+    await writeFile(join(bundledCommands, 'greet.md'), 'bundled\n');
 
     expect(await resolveCommandFile(roots, 'greet')).toEqual({
-      path: join(bundled, 'defaults', 'greet.md'),
+      path: join(bundledCommands, 'greet.md'),
       scope: 'bundled',
       content: 'bundled\n',
     });
+  });
+
+  test('a live bare name has no bundled scope to fall back to', async () => {
+    // Current builds ship packaged commands only; the runtime resolves a bare name from
+    // the repo and home alone, so the console must not claim a bundled file would run.
+    const { roots } = await scopes();
+    expect(await resolveCommandFile(roots, 'greet')).toBeNull();
   });
 
   test('a packaged reference resolves inside its own pack, under its own scope', async () => {
@@ -160,7 +219,7 @@ describe('resolveCommandFile', () => {
  * Command precedence stays on the temp tree above; only these tests need the real tree.
  */
 function withRealBundledWorkflows(roots: LiveWorkflowSourceRoots): LiveWorkflowSourceRoots {
-  return { ...roots, bundledWorkflows: dirname(getDefaultWorkflowsPath()) };
+  return { ...roots, bundledWorkflows: getBundledWorkflowsPath() };
 }
 
 describe('resolveScriptFile', () => {

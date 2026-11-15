@@ -22,7 +22,9 @@ const baseRun: Omit<Run, 'id' | 'workflow' | 'status'> = {
   conversationPlatformId: null,
   workerPlatformId: null,
   origin: 'cli',
+  attention: null,
   outcome: null,
+  terminalRecord: null,
   startedAt: new Date(Date.now() - 4 * 60 * 1000 - 12 * 1000).toISOString(),
   finishedAt: null,
   workingPath: null,
@@ -37,7 +39,6 @@ const SAMPLE_RUNS: Run[] = [
     workflow: 'plan',
     status: 'running',
     activeNodes: ['plan/draft'],
-    currentNode: 'plan/draft',
     lastTool: 'read_file',
   },
   {
@@ -64,7 +65,6 @@ const SAMPLE_RUNS: Run[] = [
     status: 'failed',
     startedAt: new Date(Date.now() - 2 * 60 * 1000 - 41 * 1000).toISOString(),
     finishedAt: new Date().toISOString(),
-    currentNode: 'implement/verify',
   },
   {
     ...baseRun,
@@ -113,9 +113,9 @@ function Swatch({ role, cssVar, note }: SwatchProps): ReactElement {
       <div style={chipStyle} className="h-10 w-10 shrink-0 rounded" aria-hidden="true" />
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium text-text-primary">{role}</div>
-        <div className="font-mono text-[10px] text-text-tertiary">{cssVar}</div>
+        <div className="font-mono text-console-10 text-text-tertiary">{cssVar}</div>
         {note !== undefined ? (
-          <div className="mt-0.5 text-[11px] text-text-secondary">{note}</div>
+          <div className="mt-0.5 text-console-11 text-text-secondary">{note}</div>
         ) : null}
       </div>
     </div>
@@ -131,7 +131,7 @@ function Section({
 }): ReactElement {
   return (
     <section className="flex flex-col gap-3">
-      <h2 className="text-[11px] font-semibold uppercase tracking-[0.2em] text-text-tertiary">
+      <h2 className="text-console-11 font-semibold uppercase tracking-console-display text-text-tertiary">
         {title}
       </h2>
       {children}
@@ -158,7 +158,7 @@ function BuilderPreview(): ReactElement {
             onClick={(): void => {
               setFixtureKey(key);
             }}
-            className={`rounded border px-2.5 py-1 font-mono text-[11.5px] transition-colors ${
+            className={`rounded border px-2.5 py-1 font-mono text-console-12 transition-colors ${
               key === fixtureKey
                 ? 'border-accent-bright/60 bg-surface-elevated text-text-primary'
                 : 'border-border bg-surface text-text-secondary hover:bg-surface-hover'
@@ -168,7 +168,7 @@ function BuilderPreview(): ReactElement {
           </button>
         ))}
       </div>
-      <div className="h-[640px] overflow-hidden rounded border border-border">
+      <div className="h-160 overflow-hidden rounded border border-border">
         {definition !== undefined ? (
           <BuilderPage
             key={fixtureKey}
@@ -176,7 +176,7 @@ function BuilderPreview(): ReactElement {
           />
         ) : null}
       </div>
-      <p className="text-[11px] text-text-tertiary">
+      <p className="text-console-11 text-text-tertiary">
         Fixture-backed only — no server I/O. Drag from the palette, connect nodes, edit in the
         inspector, and watch the YAML tab update.
       </p>
@@ -194,7 +194,7 @@ export function PreviewPage(): ReactElement {
         </p>
       </header>
 
-      <main className="mx-auto flex w-full max-w-[1000px] flex-col gap-10 px-6 py-8">
+      <main className="mx-auto flex w-full max-w-250 flex-col gap-10 px-6 py-8">
         <Section title="Workflow Builder · fixture-backed">
           <BuilderPreview />
         </Section>
@@ -221,7 +221,7 @@ export function PreviewPage(): ReactElement {
               />
             ))}
           </div>
-          <p className="text-[11px] text-text-tertiary">
+          <p className="text-console-11 text-text-tertiary">
             Color seeded deterministically from project id. First tile shown as the
             currently-selected scope.
           </p>

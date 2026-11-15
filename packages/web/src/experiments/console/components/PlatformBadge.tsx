@@ -24,7 +24,7 @@ export function PlatformBadge({
   const telegram = platformType === 'telegram';
   return (
     <span
-      className="shrink-0 rounded border px-[4px] py-[1px] font-mono text-[9px] uppercase leading-[1.4] tracking-[0.08em]"
+      className="shrink-0 rounded border px-1 py-px font-mono text-console-9 uppercase leading-[1.4] tracking-widest"
       style={
         telegram
           ? {

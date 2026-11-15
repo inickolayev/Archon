@@ -10,7 +10,7 @@
  * It walks the scopes itself rather than calling either of those: both return content
  * alone, and threading a path out of them would change a code path every run depends on
  * for the sake of a display. The walk uses the SAME helpers the runtime does
- * (`packagedWorkflowDirectory`, `getCommandFolderSearchPaths`, `bundledDefaultCommandPath`,
+ * (`packagedWorkflowDirectory`, `getCommandFolderSearchPaths`,
  * `discoverScriptsForCwd`), and `resource-source.test.ts` pins the precedence — so a
  * divergence fails there rather than in front of someone reading the wrong file.
  */
@@ -19,7 +19,7 @@ import { readFile } from 'fs/promises';
 import * as archonPaths from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
-import { bundledDefaultCommandPath, bundlesPackagedResources } from './defaults/bundle-inventory';
+import { bundlesPackagedResources } from './defaults/bundle-inventory';
 import {
   parsePackagedResourceReference,
   type PackagedResourceReference,
@@ -171,12 +171,11 @@ export async function resolveCommandFile(
   if (config.loadDefaultCommands === false) return null;
   const embedded = embeddedBundledCommand(roots, commandName);
   if (embedded !== null) return embedded;
-  // Live defaults are the flat selection the bundle index ships, so they resolve by direct
-  // path; a capture keeps whatever layout it froze, subfolders included.
-  const bundledPath =
-    roots.kind === 'captured'
-      ? await findInDir(roots.bundledCommands, commandName)
-      : await bundledDefaultCommandPath(roots.bundledCommands, commandName);
+  // Every bundled command a build ships now is packaged and resolved above. Only a run
+  // captured by an older build may have frozen flat bundled commands, and the runtime keeps
+  // the basename walk over those — so does this.
+  if (roots.kind !== 'captured') return null;
+  const bundledPath = await findInDir(roots.bundledCommands, commandName);
   return bundledPath === null ? null : fileAt(bundledPath, 'bundled');
 }
 

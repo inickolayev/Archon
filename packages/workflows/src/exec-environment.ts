@@ -1,4 +1,7 @@
 import type { NodeExecutionMetadata } from './schemas/node-execution';
+import { USER_CONTROLLED_VARIABLES } from './user-controlled-variables';
+import { currentPackDir } from './workflow-variables';
+import { packDirOrThrow, type PackDirScope } from './pack-dir';
 
 /** The part of a node's execution record its own process may read. */
 export type NodeExecutionIdentity = Pick<
@@ -25,6 +28,8 @@ export interface ExecNodeEnvironmentContext {
    * so a container that mounts it reads the same bytes at the same path.
    */
   typedArtifactsFile: string;
+  /** This invocation's node-outcome listing, required for the same reason. */
+  nodeOutcomesFile: string;
   /**
    * The execution this process belongs to: identity plus the invocation's and this
    * attempt's checkout starts (#3375). Carries manifest pointers and digests, never
@@ -32,40 +37,65 @@ export interface ExecNodeEnvironmentContext {
    * caller with no execution record passes `null`, which delivers an empty value.
    */
   nodeExecution: NodeExecutionIdentity | null;
+  inputEnvKeys: readonly string[];
 }
 
 export function buildExecNodeEnvironment(context: ExecNodeEnvironmentContext): NodeJS.ProcessEnv {
-  const issueContext = context.issueContext ?? '';
-  return {
+  const userVariables: Record<string, string> = {};
+  for (const group of USER_CONTROLLED_VARIABLES) {
+    for (const name of group.names) userVariables[name] = context[group.source] ?? '';
+  }
+  const env: Record<string, string> = {
     ARTIFACTS_DIR: context.artifactsDir,
     STATE_DIR: context.stateDir,
     LOG_DIR: context.logDir,
     ADOPTED_RUN_DIR: context.adoptedRunDir ?? '',
+    // Read from the dispatch scope rather than passed by each caller, so no exec path can
+    // forget it. Empty for a workflow outside a pack, as ADOPTED_RUN_DIR is without one;
+    // a pack the run's source does not hold fails the node instead of reading ''.
+    PACK_DIR: packDirEnvValue(currentPackDir()),
     // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
     // reads os.environ and found it missing while its siblings above were all
     // present. Deliver it the same way.
     WORKFLOW_ID: context.workflowId,
     BASE_BRANCH: context.baseBranch,
-    USER_MESSAGE: context.userMessage,
-    ARGUMENTS: context.userMessage,
-    LOOP_USER_INPUT: context.loopUserInput,
-    LOOP_PREV_OUTPUT: context.loopPrevOutput,
-    REJECTION_REASON: context.rejectionReason,
-    CONTEXT: issueContext,
-    EXTERNAL_CONTEXT: issueContext,
-    ISSUE_CONTEXT: issueContext,
+    ...userVariables,
     // The listing path, delivered like the other engine-reserved keys: configured
     // project env and node bindings spread before this bag, so neither can shadow it.
     TYPED_ARTIFACTS_FILE: context.typedArtifactsFile,
+    NODE_OUTCOMES_FILE: context.nodeOutcomesFile,
+    ARCHON_RUN_ENV_KEYS: '',
     ARCHON_NODE_EXECUTION:
-      context.nodeExecution === null
-        ? ''
-        : JSON.stringify({
-            runId: context.nodeExecution.runId,
-            path: context.nodeExecution.path,
-            invocation: context.nodeExecution.invocation,
-            attempt: context.nodeExecution.attempt,
-          }),
+      context.nodeExecution === null ? '' : nodeExecutionEnvValue(context.nodeExecution),
+  };
+  env.ARCHON_RUN_ENV_KEYS = JSON.stringify([...Object.keys(env), ...context.inputEnvKeys]);
+  return env;
+}
+
+function nodeExecutionEnvValue(execution: NodeExecutionIdentity): string {
+  return JSON.stringify({
+    runId: execution.runId,
+    path: execution.path,
+    invocation: execution.invocation,
+    attempt: execution.attempt,
+  });
+}
+
+/**
+ * The run identity an AI node's provider subprocess carries, so an `archon state`
+ * write from the agent's shell records this run and node (#4059). Spread after the
+ * configured project env so none of these keys can be shadowed by it. `ARCHON_CLI_COMMAND`
+ * is always owned here, empty when the host has none to give (a container does not have the
+ * host executable), so a project-env value never stands in for it.
+ */
+export function buildAiNodeEnvironment(
+  execution: NodeExecutionIdentity,
+  cliCommand: string | undefined
+): Record<string, string> {
+  return {
+    WORKFLOW_ID: execution.runId,
+    ARCHON_NODE_EXECUTION: nodeExecutionEnvValue(execution),
+    ARCHON_CLI_COMMAND: cliCommand ?? '',
   };
 }
 
@@ -82,7 +112,13 @@ export const EXEC_NODE_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set(
       loopPrevOutput: '',
       rejectionReason: '',
       typedArtifactsFile: '',
+      nodeOutcomesFile: '',
       nodeExecution: null,
+      inputEnvKeys: [],
     })
   )
 );
+
+function packDirEnvValue(scope: PackDirScope | undefined): string {
+  return scope === undefined || scope.kind === 'none' ? '' : packDirOrThrow(scope);
+}

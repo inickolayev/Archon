@@ -1,16 +1,25 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { getArchonConfigPath } from '@archon/paths/archon-paths';
-import { getPluginsPath } from '@archon/paths';
-import { dispatchForge, type ForgeOperationAudit } from '@archon/forge/dispatch';
-import { forgePluginConfigSchema } from '@archon/forge/plugin-config';
+import { getArchonConfigPath, getArchonHome } from '@archon/paths/archon-paths';
+import { BUNDLED_IS_BINARY, getPluginsPath } from '@archon/paths';
+import { getSourceGithubForgeEntry } from '@archon/paths/source-tree-paths';
+import { discoverPlugins, type SourcePlugin } from '@archon/forge/discovery';
+import { checkForgeAccess, dispatchForge, type ForgeOperationAudit } from '@archon/forge/dispatch';
+import { type ForgePluginConfig, forgePluginConfigSchema } from '@archon/forge/plugin-config';
 import {
   forgeRequestSchema,
   isMutationRequest,
   mutationTarget,
+  mutationAttempt,
   type ForgeRequest,
-  type ForgeResponse,
 } from '@archon/forge/operations';
+import {
+  cliForgeCheckRequestSchema,
+  cliForgeMetadataRequestSchema,
+  cliForgeResponseSchema,
+  type CliForgeResponse,
+} from '@archon/forge';
+import { z } from '@hono/zod-openapi';
 import { writeJsonLine } from '../utils/stdout';
 
 async function readForgeConfig(configPath: string): Promise<unknown> {
@@ -42,96 +51,301 @@ async function persistAudit(audit: ForgeOperationAudit, runId: string): Promise<
   }
 }
 
+/**
+ * Release binaries carry no forge plugin and load only installed executables. Source
+ * checkouts and Docker run the GitHub plugin from this checkout, as they run the
+ * maintained providers, so the plugin is never older than the host that calls it.
+ */
+export function sourceForgePlugins(isBinary: boolean = BUNDLED_IS_BINARY): SourcePlugin[] {
+  if (isBinary) return [];
+  return [
+    {
+      name: 'github',
+      command: process.execPath,
+      args: ['--no-env-file', getSourceGithubForgeEntry()],
+    },
+  ];
+}
+
+interface ForgeCommandOptions {
+  data?: string;
+  dataFile?: string;
+  configPath?: string;
+  trustedEnv?: NodeJS.ProcessEnv;
+}
+
+interface ForgeCommandDependencies {
+  dispatch?: typeof dispatchForge;
+  readConfig?: () => Promise<unknown>;
+  sourcePlugins?: readonly SourcePlugin[];
+  audit?: typeof persistAudit;
+  write?: typeof writeJsonLine;
+  env?: NodeJS.ProcessEnv;
+}
+
+/** What the failure response may claim depends on how far the operation got. */
+interface ForgeAttempt {
+  request?: ForgeRequest;
+  dispatched: boolean;
+  credentialSource?: string;
+}
+
+interface ForgeCommandContext {
+  operationId: string;
+  env: NodeJS.ProcessEnv;
+  trustedEnv: NodeJS.ProcessEnv;
+  write: (value: CliForgeResponse) => Promise<void>;
+  dependencies: ForgeCommandDependencies;
+  attempt: ForgeAttempt;
+}
+
+type ForgeDispatchResult = Awaited<ReturnType<typeof dispatchForge>>;
+
+interface ForgeInput {
+  archonHome: string;
+  op: string | undefined;
+  supplied: object;
+  config: ForgePluginConfig;
+}
+
 export async function forgeCommand(
   subcommand: string | undefined,
-  options: {
-    data?: string;
-    dataFile?: string;
-    configPath?: string;
-    trustedEnv?: NodeJS.ProcessEnv;
-  },
-  dependencies: {
-    dispatch?: typeof dispatchForge;
-    readConfig?: () => Promise<unknown>;
-    audit?: typeof persistAudit;
-    write?: typeof writeJsonLine;
-    env?: NodeJS.ProcessEnv;
-  } = {}
+  options: ForgeCommandOptions,
+  dependencies: ForgeCommandDependencies = {}
 ): Promise<number> {
-  const write = dependencies.write ?? writeJsonLine;
   const env = dependencies.env ?? process.env;
-  const operationId = randomUUID();
-  let response: ForgeResponse;
-  let request: ForgeRequest | undefined;
-  let dispatched = false;
+  const context: ForgeCommandContext = {
+    operationId: randomUUID(),
+    env,
+    trustedEnv: options.trustedEnv ?? env,
+    write: (value: CliForgeResponse): Promise<void> =>
+      (dependencies.write ?? writeJsonLine)(cliForgeResponseSchema.parse(value)),
+    dependencies,
+    attempt: { dispatched: false },
+  };
+  let response: CliForgeResponse;
   try {
-    const op = subcommand === 'checks' ? 'checks.state' : subcommand;
-    if (options.data !== undefined && options.dataFile !== undefined) {
-      throw new Error('Supply the request through --data or --data-file, not both');
-    }
-    // Authored content — a pull-request body, a review comment — reaches the
-    // operation through a file so it never appears in this process's argv.
-    const source =
-      options.dataFile !== undefined ? await readFile(options.dataFile, 'utf8') : options.data;
-    const supplied: unknown = source !== undefined ? JSON.parse(source) : {};
-    if (typeof supplied !== 'object' || supplied === null || Array.isArray(supplied)) {
-      throw new Error('--data must be a JSON object');
-    }
-    request = forgeRequestSchema.parse({ ...supplied, operationId, op });
-    const config = forgePluginConfigSchema.parse(
-      dependencies.readConfig
-        ? await dependencies.readConfig()
-        : await readForgeConfig(options.configPath ?? getArchonConfigPath())
-    );
-    dispatched = true;
-    const result = await (dependencies.dispatch ?? dispatchForge)(request, {
-      config,
-      env: options.trustedEnv ?? env,
-      // The trusted directory `archon plugin install` writes; repo env cannot move it.
-      pluginsDir: getPluginsPath(),
-      // Repo scope may supply the credential named by trusted user config. It
-      // cannot replace executable discovery or the plugin's runtime identity.
-      credentialEnv: env,
-    });
+    const input = await readForgeInput(subcommand, options, context);
+    if (input.op === 'metadata') return await answerMetadata(input, context);
+    if (input.op === 'check') return await answerCheck(input, context);
+    const result = await dispatchRequest(input, context);
     response = result.response;
-    if (env.WORKFLOW_ID) {
-      try {
-        await (dependencies.audit ?? persistAudit)(result.audit, env.WORKFLOW_ID);
-      } catch {
-        // Retain the actual operation outcome on stdout. Audit failure is a
-        // separate failure and never rewrites an observed result as a refusal.
-        await write(response);
-        process.stderr.write(
-          `Forge operation ${operationId} completed but its run audit could not be persisted.\n`
-        );
-        return 2;
-      }
-    }
+    const auditFailure = await auditOperation(result.audit, response, context);
+    if (auditFailure !== undefined) return auditFailure;
   } catch (error) {
-    // Once dispatch has begun, this process can no longer claim the request was
-    // refused: a mutation may already have reached the forge.
-    response = {
-      operationId,
-      ok: false,
-      error: {
-        kind: dispatched ? 'process_failed' : 'invalid_request',
-        message: dispatched
-          ? 'Forge dispatch failed; reconcile the operation before retrying it'
-          : error instanceof SyntaxError
-            ? 'Invalid JSON input or configuration'
-            : 'Invalid forge request or configuration; see archon forge --help',
-      },
-      ...(request && isMutationRequest(request)
-        ? {
-            mutation: {
-              op: request.op,
-              target: mutationTarget(request),
-              outcome: dispatched ? ('outcome_unknown' as const) : ('refused' as const),
-            },
-          }
-        : {}),
-    };
+    response = failureResponse(error, context);
   }
-  await write(response);
+  await writeResponse(response, context);
   return response.ok ? 0 : 1;
+}
+
+async function readForgeInput(
+  subcommand: string | undefined,
+  options: ForgeCommandOptions,
+  context: ForgeCommandContext
+): Promise<ForgeInput> {
+  // Config and plugin discovery resolve from the same trusted environment the plugin
+  // runs in, never from this process's ambient env.
+  const archonHome = getArchonHome(context.trustedEnv);
+  const op = subcommand === 'checks' ? 'checks.state' : subcommand;
+  if (options.data !== undefined && options.dataFile !== undefined) {
+    throw new Error('Supply the request through --data or --data-file, not both');
+  }
+  // Authored content — a pull-request body, a review comment — reaches the
+  // operation through a file so it never appears in this process's argv.
+  const source =
+    options.dataFile !== undefined ? await readFile(options.dataFile, 'utf8') : options.data;
+  const supplied: unknown = source !== undefined ? JSON.parse(source) : {};
+  if (typeof supplied !== 'object' || supplied === null || Array.isArray(supplied)) {
+    throw new Error('--data must be a JSON object');
+  }
+  const { readConfig } = context.dependencies;
+  const config = forgePluginConfigSchema.parse(
+    readConfig
+      ? await readConfig()
+      : await readForgeConfig(options.configPath ?? getArchonConfigPath(archonHome))
+  );
+  return { archonHome, op, supplied, config };
+}
+
+/**
+ * Where metadata, check and dispatch all find plugins, so a preflight never answers
+ * for a different plugin than the one dispatch runs.
+ */
+function trustedDiscovery(
+  { archonHome, config }: ForgeInput,
+  { trustedEnv, dependencies }: ForgeCommandContext
+): {
+  config: ForgePluginConfig;
+  env: NodeJS.ProcessEnv;
+  pluginsDir: string;
+  sourcePlugins: readonly SourcePlugin[];
+} {
+  return {
+    config,
+    env: trustedEnv,
+    // The trusted directory `archon plugin add` writes; repo env cannot move it.
+    pluginsDir: getPluginsPath(archonHome),
+    sourcePlugins: dependencies.sourcePlugins ?? sourceForgePlugins(),
+  };
+}
+
+/**
+ * Host introspection reads the same trusted discovery metadata as dispatch;
+ * it is not a plugin operation and never resolves a credential.
+ */
+async function answerMetadata(input: ForgeInput, context: ForgeCommandContext): Promise<number> {
+  const { op, supplied } = input;
+  const { operationId, write } = context;
+  const { host } = cliForgeMetadataRequestSchema.parse({ ...supplied, op, operationId });
+  const discovery = await discoverPlugins(trustedDiscovery(input, context));
+  const plugin = discovery.byHost.get(host.toLowerCase());
+  if (plugin) {
+    await write({ operationId, ok: true, result: { op: 'metadata', value: plugin.metadata } });
+    return 0;
+  }
+  const unavailable = discovery.unavailable.length > 0;
+  await write({
+    operationId,
+    ok: false,
+    error: {
+      kind: unavailable ? 'process_failed' : 'no_plugin_for_host',
+      message: unavailable
+        ? discovery.unavailable.map(error => error.message).join('; ')
+        : `no forge plugin claims ${host}`,
+    },
+  });
+  return 1;
+}
+
+/**
+ * A preflight for a workflow about to spend: the plugin, its capabilities and the
+ * credential source, read the way dispatch reads them. No plugin operation runs, so
+ * there is nothing to audit.
+ */
+async function answerCheck(input: ForgeInput, context: ForgeCommandContext): Promise<number> {
+  const { op, supplied } = input;
+  const { operationId, env, write } = context;
+  const request = cliForgeCheckRequestSchema.parse({ ...supplied, op, operationId });
+  const check = await checkForgeAccess(request, {
+    ...trustedDiscovery(input, context),
+    credentialEnv: env,
+  });
+  if (!check.ok) {
+    const { error, unsupported } = check;
+    await write({ operationId, ok: false, error, ...(unsupported ? { unsupported } : {}) });
+    return 1;
+  }
+  const { plugin, credentialSource } = check;
+  await write({
+    operationId,
+    ok: true,
+    result: {
+      op: 'check',
+      value: {
+        host: request.host.toLowerCase(),
+        plugin,
+        operations: request.operations,
+        ...(credentialSource ? { credentialSource } : {}),
+      },
+    },
+  });
+  return 0;
+}
+
+async function dispatchRequest(
+  input: ForgeInput,
+  context: ForgeCommandContext
+): Promise<ForgeDispatchResult> {
+  const { op, supplied } = input;
+  const { attempt, operationId } = context;
+  attempt.request = forgeRequestSchema.parse({ ...supplied, operationId, op });
+  attempt.dispatched = true;
+  const result = await (context.dependencies.dispatch ?? dispatchForge)(attempt.request, {
+    ...trustedDiscovery(input, context),
+    // Repo scope may supply the credential named by trusted user config. It
+    // cannot replace executable discovery or the plugin's runtime identity.
+    credentialEnv: context.env,
+  });
+  attempt.credentialSource = result.credentialSource;
+  return result;
+}
+
+/** Returns the exit code when the run audit could not be persisted. */
+async function auditOperation(
+  audit: ForgeOperationAudit,
+  response: CliForgeResponse,
+  context: ForgeCommandContext
+): Promise<number | undefined> {
+  const runId = context.env.WORKFLOW_ID;
+  if (!runId) return undefined;
+  try {
+    await (context.dependencies.audit ?? persistAudit)(audit, runId);
+    return undefined;
+  } catch {
+    // Retain the actual operation outcome on stdout. Audit failure is a
+    // separate failure and never rewrites an observed result as a refusal.
+    await writeResponse(response, context);
+    process.stderr.write(
+      `Forge operation ${context.operationId} completed but its run audit could not be persisted.\n`
+    );
+    return 2;
+  }
+}
+
+/**
+ * Once dispatch has begun, this process can no longer claim the request was
+ * refused: a mutation may already have reached the forge.
+ */
+function failureResponse(
+  error: unknown,
+  { operationId, attempt: { request, dispatched } }: ForgeCommandContext
+): CliForgeResponse {
+  return {
+    operationId,
+    ok: false,
+    error: {
+      kind: dispatched ? 'process_failed' : 'invalid_request',
+      message: failureMessage(error, dispatched),
+    },
+    ...(request && isMutationRequest(request)
+      ? {
+          mutation: {
+            op: request.op,
+            target: mutationTarget(request),
+            ...mutationAttempt(request),
+            outcome: dispatched ? ('outcome_unknown' as const) : ('refused' as const),
+          },
+        }
+      : {}),
+  };
+}
+
+function failureMessage(error: unknown, dispatched: boolean): string {
+  if (dispatched) return 'Forge dispatch failed; reconcile the operation before retrying it';
+  if (error instanceof SyntaxError) return 'Invalid JSON input or configuration';
+  const fields = error instanceof z.ZodError ? `: ${invalidFields(error)}` : '';
+  return `Invalid forge request or configuration${fields}; see archon forge --help`;
+}
+
+/** How many refused fields a message names before it only counts the rest. */
+const NAMED_FIELDS = 6;
+
+/**
+ * Names each refused field and what the schema expected there, so the caller can correct
+ * the request. Schema messages describe the expected type, never the supplied value.
+ */
+function invalidFields(error: z.ZodError): string {
+  const named = error.issues
+    .slice(0, NAMED_FIELDS)
+    .map(issue => `${issue.path.join('.') || '(request)'}: ${issue.message}`);
+  const rest = error.issues.length - named.length;
+  return [...named, ...(rest > 0 ? [`and ${rest} more`] : [])].join('; ');
+}
+
+function writeResponse(
+  response: CliForgeResponse,
+  { write, attempt: { credentialSource } }: ForgeCommandContext
+): Promise<void> {
+  return write({ ...response, ...(credentialSource ? { credentialSource } : {}) });
 }

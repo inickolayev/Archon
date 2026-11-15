@@ -1,30 +1,38 @@
-import { z } from '@hono/zod-openapi';
-import type { TokenUsage } from '@archon/providers/types';
+import {
+  declaredOutputPathsSchema,
+  rootOutputFields,
+  type DeclaredOutputPaths,
+} from './output-ref';
+import { z } from 'zod';
+import type { TokenUsage } from '@archon/provider-contract';
 import { providerFailureSchema } from '@archon/provider-contract';
 import type { NodeOutput } from './schemas/workflow-run';
+import { fanOutOutcomeSchema } from './schemas/fan-out-outcome';
 import { nodeSkipReasonSchema, skipCauseSchema } from './schemas/node-state';
 import {
-  nodeDescriptorSchema,
-  nodeInvocationSchema,
+  childUsageSchema,
   executionBindingSchema,
   executionSpendSchema,
   nodeExecutionMetadataSchema,
+  nodeExecutionMetadataPayloadSchema,
   nodeFailureKindSchema,
+  mcpUnavailableSchema,
+  type ExecutionDiagnostics,
+  type NodeCacheRecord,
+  type NodeCostScope,
+  type NodeDescriptor,
   type NodeExecutionRecord,
   type NodeStateRecord,
   type ExecutionOutput,
 } from './schemas/node-execution';
 import { executionMetadata } from './node-execution';
+import { attemptSpend } from './run-budget';
+import { unqualifiedResourceName } from './packaged-workflow';
+import type { DagNode } from './schemas';
 
 /** Existing flat wire keys remain readable by older binaries. */
 export const serializedNodeDataSchema = z.object({
-  node: nodeDescriptorSchema.optional(),
-  invocation: nodeInvocationSchema.optional(),
-  attempt: nodeExecutionMetadataSchema.shape.attempt.optional(),
-  binding: executionBindingSchema.optional(),
-  timing: nodeExecutionMetadataSchema.shape.timing.optional(),
-  spend: executionSpendSchema.optional(),
-  accounting: nodeExecutionMetadataSchema.shape.accounting.optional(),
+  ...nodeExecutionMetadataPayloadSchema.partial().shape,
   type: z.string().optional(),
   command: z.string().nullable().optional(),
   runtime: z.string().optional(),
@@ -35,10 +43,14 @@ export const serializedNodeDataSchema = z.object({
   duration_ms: z.number().optional(),
   tokens: executionSpendSchema.shape.tokens.options[0].shape.value.optional(),
   cost_usd: z.number().optional(),
+  /** Carried gate spend; deferred `spend` contains only newly incurred usage. */
+  loopBaseline: executionSpendSchema.optional(),
+  cost_partial: z.literal(true).optional(),
   stop_reason: z.string().optional(),
   num_turns: z.number().optional(),
   model_usage: z.object({ requested: z.string().optional(), resolved: z.string() }).optional(),
   error: z.string().optional(),
+  exit_code: z.number().optional(),
   retryable: z.literal(false).optional(),
   failure_kind: nodeFailureKindSchema.optional(),
   provider_failure: providerFailureSchema.optional(),
@@ -52,6 +64,7 @@ export const serializedNodeDataSchema = z.object({
   node_output_spill_path: z.string().optional(),
   structured_output: z.unknown().optional(),
   declared_fields: z.array(z.string()).optional(),
+  declared_output_paths: declaredOutputPathsSchema.optional(),
   prior_output: z.string().optional(),
   prior_output_truncated: z.boolean().optional(),
   prior_output_original_bytes: z.number().optional(),
@@ -68,30 +81,67 @@ export const serializedNodeDataSchema = z.object({
   session_forked: z.boolean().optional(),
   background_tasks_incomplete: z.array(z.string()).optional(),
   child_run_id: z.string().optional(),
+  child_usage: z.array(childUsageSchema).optional(),
   blocked_on_child_run_id: z.string().optional(),
   fan_out: z.boolean().optional(),
+  fan_out_outcome: fanOutOutcomeSchema.optional(),
   identity: z.string().optional(),
   ordinal: z.number().optional(),
   approval_decision: z.string().optional(),
+  mcp_unavailable: mcpUnavailableSchema.optional(),
+  /** The full provider session id; only this durable row carries it. */
+  session_id: z.string().optional(),
 });
 export type SerializedNodeData = z.infer<typeof serializedNodeDataSchema>;
 
-const executionEventTypes = {
+export const NODE_EXECUTION_EVENT_TYPES = {
   started: 'node_started',
+  suspended: 'node_suspended',
   completed: 'node_completed',
   failed: 'node_failed',
   skipped: 'node_skipped',
-  suspended: 'node_suspended',
 } as const satisfies Record<NodeExecutionRecord['lifecycle']['status'], string>;
 export interface SerializedNodeEvent {
   workflow_run_id: string;
   step_name: string;
   event_type:
-    | (typeof executionEventTypes)[keyof typeof executionEventTypes]
+    | (typeof NODE_EXECUTION_EVENT_TYPES)[keyof typeof NODE_EXECUTION_EVENT_TYPES]
     | 'node_skipped_prior_success'
     | 'node_always_run_reset'
     | 'node_prior_cache_invalidated';
   data: SerializedNodeData;
+}
+
+export const DEFERRED_NODE_USAGE_EVENT_TYPE = 'node_deferred_usage';
+export const serializedDeferredNodeUsageDataSchema = serializedNodeDataSchema.pick({
+  accounting: true,
+  loopBaseline: true,
+  invocation: true,
+  spend: true,
+  aggregate: true,
+  tokens: true,
+  cost_usd: true,
+});
+export type SerializedDeferredNodeUsageEvent = Omit<SerializedNodeEvent, 'event_type' | 'data'> & {
+  event_type: typeof DEFERRED_NODE_USAGE_EVENT_TYPE;
+  data: z.infer<typeof serializedDeferredNodeUsageDataSchema>;
+};
+
+export function serializeDeferredNodeUsage(
+  record: NodeExecutionRecord,
+  loopBaseline?: NodeExecutionRecord['spend']
+): SerializedDeferredNodeUsageEvent {
+  const serialized = serializeNodeStateRecord(record);
+  const data = serializedDeferredNodeUsageDataSchema.parse({
+    ...serialized.data,
+    ...(loopBaseline !== undefined ? { loopBaseline } : {}),
+  });
+  return {
+    workflow_run_id: serialized.workflow_run_id,
+    step_name: serialized.step_name,
+    event_type: DEFERRED_NODE_USAGE_EVENT_TYPE,
+    data,
+  };
 }
 
 function outputFields(
@@ -104,6 +154,7 @@ function outputFields(
   | 'node_output_spill_path'
   | 'structured_output'
   | 'declared_fields'
+  | 'declared_output_paths'
 > {
   return {
     node_output: output.persisted?.text ?? output.text,
@@ -119,165 +170,257 @@ function outputFields(
         }
       : {}),
     ...(output.structured !== undefined ? { structured_output: output.structured } : {}),
-    ...(output.declaredFields !== undefined ? { declared_fields: output.declaredFields } : {}),
+    ...(output.declaredOutputPaths !== undefined
+      ? persistedOutputContract(output.declaredOutputPaths)
+      : {}),
   };
+}
+
+/**
+ * The persisted form of a path contract. `declared_fields` is derived and still written
+ * because older binaries opening the same database read only that key.
+ */
+export function persistedOutputContract(
+  paths: DeclaredOutputPaths
+): Pick<SerializedNodeData, 'declared_fields' | 'declared_output_paths'> {
+  return { declared_fields: rootOutputFields(paths), declared_output_paths: paths };
+}
+
+/**
+ * Whether a node row's spend is its own, or a restatement of spend rows the same run
+ * already carries. `accounting` is the seam: a `loop_group` roll-up sums its body rows, a
+ * composed fan-out wrapper sums its instances, an instance terminal sums its own leaves,
+ * and an amendment re-states the attempt it amends. `serializeNodeStateRecord` marks every
+ * of them `aggregate: true`, and the resume fold skips a marked row because its scope's
+ * own rows already carry that spend — except for a composed-instance terminal, which the
+ * fold keeps as the authoritative source for its scope because its inner rows are
+ * observability writes that can be missing after a crash. So the durable row, the
+ * transcript, the emitter and the run-detail API all report spend on the same terms (#3508).
+ * Rows written before `accounting` existed carry only the `aggregate` marker.
+ * `serializeNodeOutput` is deliberately not gated: the run total is fed by exactly one
+ * aggregation point, and the scope totals it reads are already this record's own.
+ */
+export function nodeCostScope(data: Readonly<Record<string, unknown>>): NodeCostScope {
+  const accounting = nodeExecutionMetadataSchema.shape.accounting.safeParse(data.accounting);
+  if (accounting.success) return accounting.data === 'node' ? 'own' : 'total';
+  return data.aggregate === true ? 'total' : 'own';
+}
+
+function reportsOwnSpend(record: NodeExecutionRecord): boolean {
+  return nodeCostScope(record) === 'own';
+}
+
+const persistedExecTypes = { shell: 'bash', script: 'script' } as const;
+const persistedExecTypeValues = new Set<string>(Object.values(persistedExecTypes));
+
+export function isPersistedExecType(type: string | undefined): boolean {
+  return type !== undefined && persistedExecTypeValues.has(type);
 }
 
 export function serializeNodeStateRecord(record: NodeStateRecord): SerializedNodeEvent {
   const identity = { workflow_run_id: record.runId, step_name: record.path };
-  if ('cache' in record) {
-    const cache = record.cache;
-    if (cache.action === 'replayed')
-      return {
-        ...identity,
-        event_type: 'node_skipped_prior_success',
-        data: { node: record.node, reason: 'prior_success', ...outputFields(cache.output) },
-      };
-    const prior = outputFields(cache.prior);
-    return {
-      ...identity,
-      event_type:
-        cache.action === 'reset' ? 'node_always_run_reset' : 'node_prior_cache_invalidated',
-      data: {
-        node: record.node,
-        prior_output: prior.node_output,
-        ...(prior.node_output_truncated ? { prior_output_truncated: true } : {}),
-        ...(prior.node_output_original_bytes !== undefined
-          ? { prior_output_original_bytes: prior.node_output_original_bytes }
-          : {}),
-        ...(prior.node_output_spill_path !== undefined
-          ? { prior_output_spill_path: prior.node_output_spill_path }
-          : {}),
-        ...(cache.action === 'invalidated'
-          ? {
-              reason: 'stale_dependency',
-              invalidating_deps: cache.invalidatingDeps,
-              ...(cache.prior.structured !== undefined
-                ? { prior_structured_output: cache.prior.structured }
-                : {}),
-            }
-          : {}),
-      },
-    };
-  }
-  const {
-    node,
-    invocation,
-    attempt,
-    binding,
-    timing,
-    spend,
-    accounting,
-    lifecycle,
-    diagnostics: d,
-  } = record;
-  const legacyType = node.kind === 'exec' ? (node.runtime === 'sh' ? 'bash' : 'script') : node.kind;
+  if ('cache' in record) return { ...identity, ...serializeCacheDecision(record) };
   return {
     ...identity,
-    event_type: executionEventTypes[lifecycle.status],
-    data: {
-      node,
-      invocation,
-      attempt,
-      binding,
-      timing,
-      spend,
-      accounting,
-      type: legacyType,
-      ...(node.kind === 'agent'
-        ? { command: node.source.kind === 'command' ? node.source.name : null }
-        : {}),
-      ...(node.kind === 'loop' ? { command: node.command ?? null } : {}),
-      ...(node.kind === 'exec' && node.runtime !== 'sh' ? { runtime: node.runtime } : {}),
-      ...(binding.provider !== undefined ? { provider: binding.provider } : {}),
-      ...(binding.model?.requested !== undefined ? { model: binding.model.requested } : {}),
-      ...(binding.tier !== undefined ? { tier: binding.tier } : {}),
-      ...(binding.effort !== undefined ? { effort: binding.effort } : {}),
-      ...(timing.durationMs !== undefined ? { duration_ms: timing.durationMs } : {}),
-      ...(spend.tokens.source === 'provider' && node.kind !== 'loop_group'
-        ? { tokens: spend.tokens.value }
-        : {}),
-      ...(spend.costUsd.source === 'provider' ? { cost_usd: spend.costUsd.value } : {}),
-      ...(spend.stopReason.source === 'provider' ? { stop_reason: spend.stopReason.value } : {}),
-      ...(spend.numTurns.source === 'provider' ? { num_turns: spend.numTurns.value } : {}),
-      ...(binding.model?.resolved.source === 'provider'
-        ? {
-            model_usage: {
-              requested: binding.model.requested,
-              resolved: binding.model.resolved.value,
-            },
-          }
-        : {}),
-      ...(accounting !== 'node' ? { aggregate: true } : {}),
-      ...(lifecycle.status === 'failed'
-        ? {
-            error: lifecycle.error,
-            ...(lifecycle.retryable === false ? { retryable: false as const } : {}),
-            ...(lifecycle.failureKind !== undefined ? { failure_kind: lifecycle.failureKind } : {}),
-            ...(lifecycle.providerFailure !== undefined
-              ? { provider_failure: lifecycle.providerFailure }
-              : {}),
-          }
-        : {}),
-      ...(lifecycle.status === 'skipped'
-        ? { reason: lifecycle.reason, cause: lifecycle.cause }
-        : {}),
-      ...(lifecycle.status === 'suspended' ? { suspend_point: lifecycle.point } : {}),
-      ...(record.output !== undefined ? outputFields(record.output) : {}),
-      ...(d?.iteration !== undefined ? { iteration: d.iteration } : {}),
-      ...(d?.command !== undefined ? { command: d.command } : {}),
-      ...(d?.outputType !== undefined ? { output_type: d.outputType } : {}),
-      ...(d?.status !== undefined ? { status: d.status } : {}),
-      ...(d?.maxIterations !== undefined ? { maxIterations: d.maxIterations } : {}),
-      ...(d?.sessionSourceNodeId !== undefined
-        ? { session_source_node_id: d.sessionSourceNodeId }
-        : {}),
-      ...(d?.sessionForkRequested !== undefined
-        ? { session_fork_requested: d.sessionForkRequested }
-        : {}),
-      ...(d?.sessionForked !== undefined ? { session_forked: d.sessionForked } : {}),
-      ...(d?.backgroundTasksIncomplete !== undefined
-        ? { background_tasks_incomplete: d.backgroundTasksIncomplete }
-        : {}),
-      ...(d?.childRunId !== undefined ? { child_run_id: d.childRunId } : {}),
-      ...(d?.blockedOnChildRunId !== undefined
-        ? { blocked_on_child_run_id: d.blockedOnChildRunId }
-        : {}),
-      ...(d?.fanOut !== undefined ? { fan_out: d.fanOut } : {}),
-      ...(d?.identity !== undefined ? { identity: d.identity } : {}),
-      ...(d?.ordinal !== undefined ? { ordinal: d.ordinal } : {}),
-      ...(d?.approvalDecision !== undefined ? { approval_decision: d.approvalDecision } : {}),
-      ...(d?.expr !== undefined ? { expr: d.expr } : {}),
-    },
+    event_type: NODE_EXECUTION_EVENT_TYPES[record.lifecycle.status],
+    data: serializeExecutionData(record),
+  };
+}
+
+type SerializedNodeEventBody = Pick<SerializedNodeEvent, 'event_type' | 'data'>;
+
+function serializeCacheDecision({ node, cache }: NodeCacheRecord): SerializedNodeEventBody {
+  switch (cache.action) {
+    case 'replayed':
+      return {
+        event_type: 'node_skipped_prior_success',
+        data: { node, reason: 'prior_success', ...outputFields(cache.output) },
+      };
+    case 'reset':
+      return {
+        event_type: 'node_always_run_reset',
+        data: { node, ...priorOutputFields(cache.prior) },
+      };
+    case 'invalidated':
+      return {
+        event_type: 'node_prior_cache_invalidated',
+        data: {
+          node,
+          ...priorOutputFields(cache.prior),
+          reason: 'stale_dependency',
+          invalidating_deps: cache.invalidatingDeps,
+          ...(cache.prior.structured !== undefined
+            ? { prior_structured_output: cache.prior.structured }
+            : {}),
+        },
+      };
+  }
+}
+
+function priorOutputFields(output: ExecutionOutput): SerializedNodeData {
+  const prior = outputFields(output);
+  return {
+    prior_output: prior.node_output,
+    ...(prior.node_output_truncated ? { prior_output_truncated: true } : {}),
+    ...(prior.node_output_original_bytes !== undefined
+      ? { prior_output_original_bytes: prior.node_output_original_bytes }
+      : {}),
+    ...(prior.node_output_spill_path !== undefined
+      ? { prior_output_spill_path: prior.node_output_spill_path }
+      : {}),
+  };
+}
+
+// Key order is part of the persisted bytes: a later group that repeats a key (a
+// diagnostic `command`) overwrites the value in the position the first group gave it.
+function serializeExecutionData(record: NodeExecutionRecord): SerializedNodeData {
+  return {
+    ...nodeExecutionMetadataPayloadSchema.parse(record),
+    ...nodeKindFields(record.node),
+    ...bindingFields(record.binding),
+    ...usageFields(record),
+    ...lifecycleFields(record.lifecycle),
+    ...(record.output !== undefined ? outputFields(record.output) : {}),
+    ...(record.diagnostics !== undefined ? diagnosticFields(record.diagnostics) : {}),
+    ...(record.sessionId !== undefined ? { session_id: record.sessionId } : {}),
+  };
+}
+
+function nodeKindFields(node: NodeDescriptor): SerializedNodeData {
+  switch (node.kind) {
+    case 'agent':
+      return {
+        type: node.kind,
+        command: node.source.kind === 'command' ? node.source.name : null,
+      };
+    case 'loop':
+      return { type: node.kind, command: node.command ?? null };
+    case 'exec':
+      return node.runtime === 'sh'
+        ? { type: persistedExecTypes.shell }
+        : { type: persistedExecTypes.script, runtime: node.runtime };
+    default:
+      return { type: node.kind };
+  }
+}
+
+function bindingFields(binding: NodeExecutionRecord['binding']) {
+  return {
+    ...(binding.provider !== undefined ? { provider: binding.provider } : {}),
+    ...(binding.model?.requested !== undefined ? { model: binding.model.requested } : {}),
+    ...(binding.tier !== undefined ? { tier: binding.tier } : {}),
+    ...(binding.effort !== undefined ? { effort: binding.effort } : {}),
+  };
+}
+
+function usageFields(record: NodeExecutionRecord): SerializedNodeData {
+  const { node, binding, timing, spend } = record;
+  return {
+    ...(timing.durationMs !== undefined ? { duration_ms: timing.durationMs } : {}),
+    ...(spend.tokens.source === 'provider' && node.kind !== 'loop_group'
+      ? { tokens: spend.tokens.value }
+      : {}),
+    ...(spend.costUsd.source === 'provider' ? { cost_usd: spend.costUsd.value } : {}),
+    ...(spend.stopReason.source === 'provider' ? { stop_reason: spend.stopReason.value } : {}),
+    ...(spend.numTurns.source === 'provider' ? { num_turns: spend.numTurns.value } : {}),
+    ...(binding.model?.resolved.source === 'provider'
+      ? {
+          model_usage: {
+            requested: binding.model.requested,
+            resolved: binding.model.resolved.value,
+          },
+        }
+      : {}),
+    ...(!reportsOwnSpend(record) ? { aggregate: true } : {}),
+  };
+}
+
+function lifecycleFields(lifecycle: NodeExecutionRecord['lifecycle']): SerializedNodeData {
+  switch (lifecycle.status) {
+    case 'failed':
+      return {
+        error: lifecycle.error,
+        ...(lifecycle.exitCode !== undefined ? { exit_code: lifecycle.exitCode } : {}),
+        ...(lifecycle.retryable === false ? { retryable: false as const } : {}),
+        ...(lifecycle.failureKind !== undefined ? { failure_kind: lifecycle.failureKind } : {}),
+        ...(lifecycle.providerFailure !== undefined
+          ? { provider_failure: lifecycle.providerFailure }
+          : {}),
+      };
+    case 'skipped':
+      return { reason: lifecycle.reason, cause: lifecycle.cause };
+    case 'suspended':
+      return { suspend_point: lifecycle.point };
+    case 'started':
+    case 'completed':
+      return {};
+  }
+}
+
+function diagnosticFields(d: ExecutionDiagnostics): SerializedNodeData {
+  return {
+    ...loopDiagnosticFields(d),
+    ...sessionDiagnosticFields(d),
+    ...childRunDiagnosticFields(d),
+    ...(d.approvalDecision !== undefined ? { approval_decision: d.approvalDecision } : {}),
+    ...(d.expr !== undefined ? { expr: d.expr } : {}),
+    ...(d.mcpUnavailable !== undefined ? { mcp_unavailable: d.mcpUnavailable } : {}),
+  };
+}
+
+function loopDiagnosticFields(d: ExecutionDiagnostics): SerializedNodeData {
+  return {
+    ...(d.iteration !== undefined ? { iteration: d.iteration } : {}),
+    ...(d.command !== undefined ? { command: d.command } : {}),
+    ...(d.outputType !== undefined ? { output_type: d.outputType } : {}),
+    ...(d.status !== undefined ? { status: d.status } : {}),
+    ...(d.maxIterations !== undefined ? { maxIterations: d.maxIterations } : {}),
+  };
+}
+
+function sessionDiagnosticFields(d: ExecutionDiagnostics): SerializedNodeData {
+  return {
+    ...(d.sessionSourceNodeId !== undefined
+      ? { session_source_node_id: d.sessionSourceNodeId }
+      : {}),
+    ...(d.sessionForkRequested !== undefined
+      ? { session_fork_requested: d.sessionForkRequested }
+      : {}),
+    ...(d.sessionForked !== undefined ? { session_forked: d.sessionForked } : {}),
+    ...(d.backgroundTasksIncomplete !== undefined
+      ? { background_tasks_incomplete: d.backgroundTasksIncomplete }
+      : {}),
+  };
+}
+
+function childRunDiagnosticFields(d: ExecutionDiagnostics): SerializedNodeData {
+  return {
+    ...(d.childUsage !== undefined ? { child_usage: d.childUsage } : {}),
+    ...(d.childRunId !== undefined ? { child_run_id: d.childRunId } : {}),
+    ...(d.blockedOnChildRunId !== undefined
+      ? { blocked_on_child_run_id: d.blockedOnChildRunId }
+      : {}),
+    ...(d.fanOut !== undefined ? { fan_out: d.fanOut } : {}),
+    ...(d.fanOutOutcome !== undefined ? { fan_out_outcome: d.fanOutOutcome } : {}),
+    ...(d.identity !== undefined ? { identity: d.identity } : {}),
+    ...(d.ordinal !== undefined ? { ordinal: d.ordinal } : {}),
   };
 }
 
 export type NodeExecutionResult = NodeOutput & {
   costUsd?: number;
+  costPartial?: boolean;
   tokens?: TokenUsage;
+  tokensUnknown?: boolean;
   loopIterations?: number;
 };
 
-/** Full session cursors never enter the record or its public projections. */
 export function serializeNodeOutput(
   record: NodeExecutionRecord,
-  continuation: { sessionId?: string; resumed?: boolean } = {}
+  continuation: { resumed?: boolean } = {}
 ): NodeExecutionResult {
-  const common = {
-    output: record.output?.text ?? '',
-    ...(record.output?.structured !== undefined
-      ? { structuredOutput: record.output.structured }
-      : {}),
-    ...(record.output?.declaredFields !== undefined
-      ? { declaredFields: record.output.declaredFields }
-      : {}),
-    ...(record.spend.tokens.source === 'provider' ? { tokens: record.spend.tokens.value } : {}),
-    ...(record.spend.costUsd.source === 'provider' ? { costUsd: record.spend.costUsd.value } : {}),
-    ...(record.diagnostics?.loopIterations !== undefined
-      ? { loopIterations: record.diagnostics.loopIterations }
-      : {}),
-    execution: executionMetadata(record),
-  };
+  const common = nodeOutputFields(record);
+  const session = record.sessionId !== undefined ? { sessionId: record.sessionId } : {};
   const lifecycle = record.lifecycle;
   switch (lifecycle.status) {
     case 'failed':
@@ -294,17 +437,43 @@ export function serializeNodeOutput(
     case 'skipped':
       return { ...common, state: 'skipped', cause: lifecycle.cause };
     case 'completed':
-      return { ...common, ...continuation, state: 'completed' };
+      return { ...common, ...session, ...continuation, state: 'completed' };
     case 'started':
     case 'suspended':
-      return { ...common, ...continuation, state: 'running' };
+      return { ...common, ...session, ...continuation, state: 'running' };
   }
 }
 
-export function nodeRecordName(record: NodeStateRecord): string {
-  return record.node.kind === 'agent' && record.node.source.kind === 'command'
-    ? record.node.source.name
-    : record.node.id;
+function nodeOutputFields(record: NodeExecutionRecord) {
+  return {
+    output: record.output?.text ?? '',
+    ...(record.output?.structured !== undefined
+      ? { structuredOutput: record.output.structured }
+      : {}),
+    ...(record.output?.declaredOutputPaths !== undefined
+      ? { declaredOutputPaths: record.output.declaredOutputPaths }
+      : {}),
+    ...(record.spend.tokens.source === 'provider' ? { tokens: record.spend.tokens.value } : {}),
+    ...(record.spend.tokens.source === 'unavailable' && record.spend.tokens.reason === 'incomplete'
+      ? { tokensUnknown: true }
+      : {}),
+    ...(record.spend.costUsd.source === 'provider' ? { costUsd: record.spend.costUsd.value } : {}),
+    ...(attemptSpend(record).kind === 'unavailable' ? { costPartial: true } : {}),
+    ...(record.diagnostics?.loopIterations !== undefined
+      ? { loopIterations: record.diagnostics.loopIterations }
+      : {}),
+    execution: executionMetadata(record),
+  };
+}
+
+/**
+ * The label progress surfaces show for a node: the command name for a command node, else
+ * the node id. A packaged command's internal reference is reduced to its bare name; the
+ * qualified reference stays in persisted `data.command` and transcript content.
+ */
+export function nodeDisplayName(node: NodeDescriptor | DagNode): string {
+  if (node.kind !== 'agent' || node.source.kind !== 'command') return node.id;
+  return unqualifiedResourceName(node.source.name);
 }
 
 export function serializeNodeTranscript(
@@ -317,20 +486,8 @@ export function serializeNodeTranscript(
   const lifecycle = record.lifecycle;
   const execution = executionMetadata(record);
   const base = { step: record.node.id, execution };
-  const usage = {
-    ...(record.spend.tokens.source === 'provider' ? { tokens: record.spend.tokens.value } : {}),
-    ...(record.spend.costUsd.source === 'provider' ? { cost_usd: record.spend.costUsd.value } : {}),
-  };
-  const content =
-    record.node.kind === 'agent'
-      ? record.node.source.kind === 'command'
-        ? record.node.source.name
-        : '<inline>'
-      : record.node.kind === 'exec'
-        ? record.node.runtime === 'sh'
-          ? '<bash>'
-          : '<script>'
-        : `<${record.node.kind}>`;
+  const usage = transcriptUsage(record);
+  const content = transcriptNodeContent(record.node);
   switch (lifecycle.status) {
     case 'started':
       return { ...base, type: 'node_start', content };
@@ -353,10 +510,33 @@ export function serializeNodeTranscript(
   }
 }
 
+function transcriptUsage(record: NodeExecutionRecord) {
+  return reportsOwnSpend(record)
+    ? {
+        ...(record.spend.tokens.source === 'provider' ? { tokens: record.spend.tokens.value } : {}),
+        ...(record.spend.costUsd.source === 'provider'
+          ? { cost_usd: record.spend.costUsd.value }
+          : {}),
+      }
+    : {};
+}
+
+function transcriptNodeContent(node: NodeExecutionRecord['node']): string {
+  if (node.kind === 'agent') {
+    return node.source.kind === 'command' ? node.source.name : '<inline>';
+  }
+  if (node.kind === 'exec') return node.runtime === 'sh' ? '<bash>' : '<script>';
+  return `<${node.kind}>`;
+}
+
 export function serializeNodeEmitter(
   record: NodeStateRecord
 ): import('./event-emitter').WorkflowEmitterEvent | undefined {
-  const base = { runId: record.runId, nodeId: record.node.id, nodeName: nodeRecordName(record) };
+  const base = {
+    runId: record.runId,
+    nodeId: record.node.id,
+    nodeName: nodeDisplayName(record.node),
+  };
   if ('cache' in record)
     return record.cache.action === 'replayed'
       ? { ...base, type: 'node_skipped_prior_success' }
@@ -369,28 +549,14 @@ export function serializeNodeEmitter(
         ...base,
         execution,
         type: 'node_started',
-        ...(record.binding.provider !== undefined ? { provider: record.binding.provider } : {}),
-        ...(record.binding.model?.requested !== undefined
-          ? { model: record.binding.model.requested }
-          : {}),
-        ...(record.binding.tier !== undefined ? { tier: record.binding.tier } : {}),
-        ...(record.binding.effort !== undefined ? { effort: record.binding.effort } : {}),
+        ...bindingFields(record.binding),
       };
     case 'completed':
       return {
         ...base,
         execution,
         type: 'node_completed',
-        ...(record.timing.durationMs !== undefined ? { duration: record.timing.durationMs } : {}),
-        ...(record.spend.costUsd.source === 'provider'
-          ? { costUsd: record.spend.costUsd.value }
-          : {}),
-        ...(record.spend.stopReason.source === 'provider'
-          ? { stopReason: record.spend.stopReason.value }
-          : {}),
-        ...(record.spend.numTurns.source === 'provider'
-          ? { numTurns: record.spend.numTurns.value }
-          : {}),
+        ...emitterCompletion(record),
       };
     case 'failed':
       return { ...base, execution, type: 'node_failed', error: lifecycle.error };
@@ -407,4 +573,19 @@ export function serializeNodeEmitter(
     case 'suspended':
       return { ...base, execution, type: 'node_suspended' };
   }
+}
+
+function emitterCompletion(record: NodeExecutionRecord) {
+  return {
+    ...(record.timing.durationMs !== undefined ? { duration: record.timing.durationMs } : {}),
+    ...(reportsOwnSpend(record) && record.spend.costUsd.source === 'provider'
+      ? { costUsd: record.spend.costUsd.value }
+      : {}),
+    ...(record.spend.stopReason.source === 'provider'
+      ? { stopReason: record.spend.stopReason.value }
+      : {}),
+    ...(record.spend.numTurns.source === 'provider'
+      ? { numTurns: record.spend.numTurns.value }
+      : {}),
+  };
 }

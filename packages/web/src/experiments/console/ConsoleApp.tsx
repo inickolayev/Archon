@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState, type ReactElement } from 'react';
 import { Navigate, Routes, Route, useLocation, useNavigate } from 'react-router';
 import { ProjectRail } from './components/ProjectRail';
+import { UpdateBanner } from './components/UpdateBanner';
 import { AddProjectDialog } from './components/AddProjectDialog';
 import { ProjectPalette } from './components/ProjectPalette';
 import { KeymapHelp } from './components/KeymapHelp';
 import { BuilderConnected } from './builder/BuilderConnected';
 import { RunsPage } from './routes/RunsPage';
 import { RunDetailPage } from './routes/RunDetailPage';
+import { MetricsPage } from './routes/metrics/MetricsPage';
 import { ChatPage } from './routes/ChatPage';
 import { PreviewPage } from './routes/PreviewPage';
 import { SettingsPage } from './routes/SettingsPage';
@@ -15,8 +17,13 @@ import { LinkTelegramPage } from './routes/LinkTelegramPage';
 import { invalidate } from './store/cache';
 import { K } from './store/keys';
 import { useKeymap, type Binding } from './lib/keymap';
+import { useDashboardSSE } from './lib/sse';
+import { useRunAttentionAlerts } from './lib/attention-alerts';
 import { SHORTCUTS } from './lib/shortcuts';
 import './theme.css';
+
+// console-token-exception max-w-[calc(100vw-3rem)] -- Leave a dismissible strip beside the mobile navigation rail.
+const MOBILE_RAIL = 'fixed inset-y-0 left-0 z-30 flex max-w-[calc(100vw-3rem)] shadow-xl';
 
 export function ConsoleApp(): ReactElement {
   const [addOpen, setAddOpen] = useState(false);
@@ -25,6 +32,7 @@ export function ConsoleApp(): ReactElement {
   const navigate = useNavigate();
   const { pathname } = useLocation();
   const [railOpen, setRailOpen] = useState(false);
+  useDashboardSSE(useRunAttentionAlerts());
   useEffect(() => {
     setRailOpen(false);
   }, [pathname]);
@@ -64,6 +72,7 @@ export function ConsoleApp(): ReactElement {
 
   return (
     <div className="console-root flex h-screen w-screen flex-col bg-surface text-text-primary">
+      <UpdateBanner />
       <header className="flex items-center gap-3 border-b border-border px-3 py-2 md:hidden">
         <button
           type="button"
@@ -91,7 +100,7 @@ export function ConsoleApp(): ReactElement {
         ) : null}
         <div
           id="project-navigation"
-          className={`${railOpen ? 'fixed inset-y-0 left-0 z-30 flex max-w-[calc(100vw-3rem)] shadow-xl' : 'hidden'} md:static md:z-auto md:flex md:max-w-none md:shadow-none`}
+          className={`${railOpen ? MOBILE_RAIL : 'hidden'} md:static md:z-auto md:flex md:max-w-none md:shadow-none`}
         >
           <ProjectRail
             onAddProject={() => {
@@ -103,6 +112,8 @@ export function ConsoleApp(): ReactElement {
         <main className="flex min-w-0 flex-1 flex-col">
           <Routes>
             <Route index element={<RunsPage />} />
+            <Route path="metrics" element={<MetricsPage />} />
+            <Route path="metrics/details" element={<MetricsPage view="details" />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="profile" element={<ProfilePage />} />
             {/* One-time Telegram link handshake (the bot sends this URL). */}
@@ -116,6 +127,8 @@ export function ConsoleApp(): ReactElement {
             <Route path="p/:projectId/chat" element={<ChatPage />} />
             {/* The chat on screen is named in the URL so reload / Back keep it. */}
             <Route path="p/:projectId/chat/:conversationId" element={<ChatPage />} />
+            <Route path="p/:projectId/metrics" element={<MetricsPage />} />
+            <Route path="p/:projectId/metrics/details" element={<MetricsPage view="details" />} />
             <Route path="p/:projectId/r/:runId" element={<RunDetailPage />} />
           </Routes>
         </main>

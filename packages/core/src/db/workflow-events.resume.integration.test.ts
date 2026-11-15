@@ -1,3 +1,5 @@
+// @archon-test-isolated
+import { providerRegistry } from '@archon/providers';
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
 import { mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -5,12 +7,16 @@ import { tmpdir } from 'node:os';
 import { z } from '@hono/zod-openapi';
 import * as paths from '@archon/paths';
 import { removeTempTree } from '@archon/paths/test-utils';
-import { registerBuiltinProviders } from '@archon/providers';
+import { registerBuiltinProviders } from '@archon/providers/in-process';
 import type { WorkflowDeps, WorkflowConfig } from '@archon/workflows/deps';
 import { WORKFLOW_EVENT_TYPES, type IWorkflowStore } from '@archon/workflows/store';
 import { RUN_GRAPH_METADATA_KEY } from '@archon/workflows/schemas/terminal-record';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
-import { buildTerminalRecord, type TerminalRecordEvent } from '@archon/workflows/terminal-record';
+import {
+  buildTerminalRecord,
+  observeRunArtifacts,
+  type TerminalRecordEvent,
+} from '@archon/workflows/terminal-record';
 import { executeTestDagWorkflow, makeTestResolvedWorkflow } from '@archon/workflows/test-utils';
 import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 
@@ -60,9 +66,23 @@ test('a second resume recomputes output invalidated before a rejected node start
     if (sql.startsWith('SELECT step_name, event_type, data')) {
       return createQueryResult(rows.filter(row => params?.includes(row.event_type)));
     }
+    // Every exec invocation reads the run's node-state events for its node-outcome listing.
+    if (sql.startsWith('SELECT * FROM remote_agent_workflow_events')) {
+      return createQueryResult(
+        rows
+          .filter(row => params?.includes(row.event_type))
+          .map((row, index) => ({
+            ...row,
+            id: `event-${String(index)}`,
+            workflow_run_id: params?.[0],
+            created_at: new Date().toISOString(),
+          }))
+      );
+    }
     throw new Error(`Unexpected test query: ${sql}`);
   });
   const run: WorkflowRun = {
+    origin: { conversationId: 'test' },
     id: 'resume-invalidation',
     workflow_name: 'resume-invalidation',
     conversation_id: 'test',
@@ -74,6 +94,7 @@ test('a second resume recomputes output invalidated before a rejected node start
     metadata: {
       [RUN_GRAPH_METADATA_KEY]: { node_ids: ['upstream', 'consumer'], returns: 'consumer' },
     },
+    active_phase_started_at: null,
     started_at: new Date(),
     completed_at: null,
     last_activity_at: null,
@@ -82,6 +103,7 @@ test('a second resume recomputes output invalidated before a rejected node start
     parent_run_id: null,
     output_root: null,
     checkout_baseline: null,
+    item_id: null,
     adopted_from_run_id: null,
   };
   const store: IWorkflowStore = {
@@ -91,8 +113,8 @@ test('a second resume recomputes output invalidated before a rejected node start
     updateWorkflowRun: async () => {},
     updateWorkflowActivity: async () => {},
     completeWorkflowRun: async () => {},
-    failWorkflowRun: async () => {},
-    getWorkflowNodeSession: async () => null,
+    failWorkflowRun: async () => ({ failed: true }),
+    listWorkflowNodeSessions: async () => [],
     listWorkflowRunNodeSessions: async () => [],
   };
   const config: WorkflowConfig = {
@@ -102,6 +124,7 @@ test('a second resume recomputes output invalidated before a rejected node start
     defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
   };
   const deps: WorkflowDeps = {
+    providers: providerRegistry,
     store,
     loadConfig: async () => config,
     getAgentProvider: () => {
@@ -145,7 +168,12 @@ test('a second resume recomputes output invalidated before a rejected node start
       row => row.event_type === 'node_prior_cache_invalidated' && row.step_name === 'consumer'
     )
   ).toBe(true);
-  const failed = await buildTerminalRecord({ run: { ...run, status: 'failed' }, events: rows });
+  const artifacts = await observeRunArtifacts(run);
+  const failed = buildTerminalRecord({
+    run: { ...run, status: 'failed' },
+    events: rows,
+    artifacts,
+  });
   expect(failed.returns).toMatchObject({
     availability: 'unavailable',
     reason: 'node_not_completed',
@@ -155,9 +183,10 @@ test('a second resume recomputes output invalidated before a rejected node start
   const second = await getDagResumeSnapshot(run.id);
   expect(second.completedNodeOutputs.has('consumer')).toBe(false);
   await executeTestDagWorkflow({ ...options, priorCompletedNodes: second.completedNodeOutputs });
-  const completed = await buildTerminalRecord({
+  const completed = buildTerminalRecord({
     run: { ...run, status: 'completed' },
     events: rows,
+    artifacts,
   });
   expect(completed.returns).toEqual({
     availability: 'available',

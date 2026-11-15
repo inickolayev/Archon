@@ -1,10 +1,11 @@
 {
   "name": "@archon/server",
-  "version": "0.11.1",
+  "version": "0.14.0",
   "type": "module",
   "main": "./src/index.ts",
   "scripts": {
     "dev": "bun --watch src/index.ts",
+    "provision:docker": "bun ../../scripts/provision-docker-plugins.ts",
     "start": "bun src/index.ts",
     "test": "bun run ../../scripts/package-tests.ts",
     "type-check": "bun x tsc --noEmit",
@@ -14,6 +15,7 @@
   },
   "dependencies": {
     "@archon/adapters": "workspace:*",
+    "@archon/chat-contract": "workspace:*",
     "@archon/core": "workspace:*",
     "@archon/git": "workspace:*",
     "@archon/paths": "workspace:*",
@@ -25,13 +27,22 @@
     "dotenv": "^17.2.3",
     "hono": "^4.12.16",
     "pg": "^8.11.0",
+    "web-push": "^3.6.7",
+    "yaml": "^2.8.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/pg": "^8.11.0"
+    "@types/pg": "^8.11.0",
+    "@types/web-push": "^3.6.4"
   },
   "testGroups": [
+    [
+      "src/bin.test.ts"
+    ],
+    [
+      "src/host-command.binary.test.ts"
+    ],
     [
       "src/scripts/generate-api-types.test.ts"
     ],
@@ -54,7 +65,31 @@
       "src/routes/api.workflow-runs.test.ts"
     ],
     [
+      "src/routes/api.workflow-run-launch.test.ts"
+    ],
+    [
+      "src/routes/api.run-attention.test.ts"
+    ],
+    [
+      "src/routes/api.attention-stream.test.ts"
+    ],
+    [
+      "src/routes/api.artifacts.test.ts"
+    ],
+    [
+      "src/routes/api.run-control.test.ts"
+    ],
+    [
+      "src/routes/api.run-gates.test.ts"
+    ],
+    [
       "src/routes/api.providers.test.ts"
+    ],
+    [
+      "src/routes/api.metrics.test.ts"
+    ],
+    [
+      "src/routes/api.config.project.test.ts"
     ],
     [
       "src/services/workflow-resume-service.test.ts",
@@ -62,6 +97,15 @@
     ],
     [
       "src/services/resource-start-hosting.integration.test.ts"
+    ],
+    [
+      "src/services/setup-shutdown.integration.test.ts"
+    ],
+    [
+      "src/services/serve-cancel.integration.test.ts"
+    ],
+    [
+      "src/services/server-discovery.integration.test.ts"
     ],
     [
       "src/adapters/web/transport.test.ts"
@@ -74,9 +118,6 @@
     ],
     [
       "src/adapters/web.test.ts"
-    ],
-    [
-      "src/adapters/headless.test.ts"
     ],
     [
       "src/adapters/web/dashboard-event-poller.test.ts"
@@ -94,7 +135,12 @@
       "src/resolve-user-id.test.ts"
     ],
     [
-      "src/boot/claude-auth-posture.test.ts"
+      "src/index.boot.test.ts"
+    ],
+    [
+      "src/boot/claude-auth-posture.test.ts",
+      "src/boot/codex-auth-posture.test.ts",
+      "src/boot/cleanup-env.test.ts"
     ],
     [
       "src/github-auth-bootstrap.test.ts"
@@ -110,6 +156,9 @@
     ],
     [
       "src/routes/api.auth.test.ts"
+    ],
+    [
+      "src/routes/api.conversation-ownership.test.ts"
     ],
     [
       "src/routes/api.provider-keys.test.ts"
@@ -128,6 +177,45 @@
     ],
     [
       "src/static-cache.test.ts"
+    ],
+    [
+      "src/services/workflow-continuation-scheduler.test.ts"
+    ],
+    [
+      "src/routes/schemas/config.schemas.test.ts"
+    ],
+    [
+      "src/routes/workflow-yaml.test.ts"
+    ],
+    [
+      "src/adapters/web/console-attention.integration.test.ts"
+    ],
+    [
+      "src/chat-host/inbound.test.ts"
+    ],
+    [
+      "src/chat-host/supervisor.test.ts"
+    ],
+    [
+      "src/chat-host/run-events.test.ts"
+    ],
+    [
+      "src/chat-host/platform.test.ts"
+    ],
+    [
+      "src/chat-host/runtime.test.ts"
+    ],
+    [
+      "src/services/attention-router.integration.test.ts"
+    ],
+    [
+      "src/chat-host/attention-destination.test.ts"
+    ],
+    [
+      "src/chat-host/attention-route.integration.test.ts"
+    ],
+    [
+      "src/routes/api.title-credentials.test.ts"
     ],
     [
       "src/routes/api.conversation-images.test.ts"

@@ -30,7 +30,7 @@ export function VoiceMessage({ note, transcript, recording }: VoiceMessageProps)
   const hasWords = transcript.length > 0;
 
   return (
-    <div className="flex flex-col gap-[6px]">
+    <div className="flex flex-col gap-1.5">
       <button
         type="button"
         onClick={() => {
@@ -39,9 +39,9 @@ export function VoiceMessage({ note, transcript, recording }: VoiceMessageProps)
         disabled={!hasWords}
         aria-expanded={hasWords ? open : undefined}
         title={hasWords ? (open ? 'Hide the transcript' : 'Show the transcript') : undefined}
-        className="flex items-center gap-[7px] text-left font-mono text-[11px] leading-[1.45] text-text-tertiary transition-colors hover:text-text-secondary disabled:cursor-default disabled:hover:text-text-tertiary"
+        className="flex items-center gap-1.75 text-left font-mono text-console-11 leading-[1.45] text-text-tertiary transition-colors hover:text-text-secondary disabled:cursor-default disabled:hover:text-text-tertiary"
       >
-        <Mic aria-hidden className="h-[13px] w-[13px] shrink-0" />
+        <Mic aria-hidden className="h-3.25 w-3.25 shrink-0" />
         <span className="min-w-0">
           {note}
           {recording === undefined ? null : (
@@ -50,9 +50,9 @@ export function VoiceMessage({ note, transcript, recording }: VoiceMessageProps)
         </span>
         {hasWords ? (
           open ? (
-            <ChevronDown aria-hidden className="h-[13px] w-[13px] shrink-0" />
+            <ChevronDown aria-hidden className="h-3.25 w-3.25 shrink-0" />
           ) : (
-            <ChevronRight aria-hidden className="h-[13px] w-[13px] shrink-0" />
+            <ChevronRight aria-hidden className="h-3.25 w-3.25 shrink-0" />
           )
         ) : null}
       </button>

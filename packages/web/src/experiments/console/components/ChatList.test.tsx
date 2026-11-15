@@ -53,7 +53,9 @@ describe('ChatList', () => {
       />
     );
     expect(html).toContain('Chat ·');
-    expect(html).not.toContain('><span class="truncate text-[12px] text-text-secondary"></span>');
+    expect(html).not.toContain(
+      '><span class="truncate text-console-12 text-text-secondary"></span>'
+    );
   });
 
   test('a chat that was never used says so instead of showing a stale time', () => {

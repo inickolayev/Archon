@@ -1,18 +1,32 @@
+import type { components } from '@/lib/api.generated';
+type RawMessage = Pick<
+  components['schemas']['Message'],
+  'id' | 'role' | 'content' | 'metadata' | 'created_at' | 'user_id'
+>;
 /**
  * Conversation message primitive. Runs have both `workflow_events` (structured)
  * and chat `messages` (the AI's and user's text). The Run detail page merges
  * both into a single timeline keyed by timestamp.
  */
 
+import type { ProviderEvent } from '../lib/provider-events';
+
 export type MessageRole = 'user' | 'assistant' | 'system';
 
 export interface InlineToolCall {
   name: string;
-  input: Record<string, unknown>;
+  input: Extract<ProviderEvent, { type: 'tool_call' }>['rawInput'];
   output?: string;
+  /** The provider cut `output` at the contract's cap. */
+  outputTruncated?: true;
   durationMs?: number;
   /** How the call ended, when the provider reported it. Older messages have none. */
   status?: 'completed' | 'failed' | 'cancelled';
+  /**
+   * The call's node finished and no outcome was recorded for it (its update row was
+   * lost), so the call is not shown as still running.
+   */
+  outcomeUnrecorded?: true;
   exitCode?: number;
 }
 
@@ -61,12 +75,12 @@ export interface WorkflowResultMeta {
 }
 
 export interface Message {
-  id: string;
+  id: RawMessage['id'];
   role: MessageRole;
-  content: string;
-  timestamp: string;
+  content: RawMessage['content'];
+  timestamp: RawMessage['created_at'];
   /** Archon user that wrote it; null for the agent and for pre-account rows. */
-  userId: string | null;
+  userId: RawMessage['user_id'];
   toolCalls: InlineToolCall[];
   error: InlineError | null;
   /** Framework category from metadata (e.g. workflow_dispatch_status, workflow_result). */
@@ -79,20 +93,11 @@ export interface Message {
   files: MessageFile[];
 }
 
-interface RawMessage {
-  id: string;
-  role: string;
-  content: string;
-  metadata: string;
-  created_at: string;
-  user_id?: string | null;
-}
-
 interface ParsedMetadata {
   error?: { message: string; classification?: string };
   toolCalls?: {
     name: string;
-    input?: Record<string, unknown>;
+    input?: InlineToolCall['input'];
     output?: string;
     duration?: number;
     status?: string;
@@ -139,7 +144,7 @@ export function toMessage(raw: RawMessage): Message {
   const meta = parseMetadata(raw.metadata);
   const toolCalls: InlineToolCall[] = (meta.toolCalls ?? []).map(tc => ({
     name: tc.name,
-    input: tc.input ?? {},
+    input: tc.input === undefined ? {} : tc.input,
     output: tc.output,
     durationMs: tc.duration,
     status:
@@ -183,7 +188,7 @@ export function toMessage(raw: RawMessage): Message {
     role: toMessageRole(raw.role),
     content: raw.content,
     timestamp: raw.created_at,
-    userId: raw.user_id ?? null,
+    userId: raw.user_id,
     toolCalls,
     error,
     category: meta.category ?? null,

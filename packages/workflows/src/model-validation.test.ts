@@ -1,5 +1,12 @@
+// @archon-test-isolated
+import {
+  requireProvider,
+  type ProviderRegistry,
+  type ProviderDescriptor,
+} from '@archon/provider-contract';
+import { providerRegistry } from '@archon/providers';
 import { describe, expect, test } from 'bun:test';
-import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers/in-process';
 
 import {
   applyResolvedRunModelOverrides,
@@ -13,13 +20,14 @@ import {
   resolvePresetEffort,
   resolveModelSpec,
   resolveTierWithFallback,
+  selectModelRef,
   TIER_NAMES,
   validEffortsForProvider,
   type ModelAliasPreset,
   type ResolvedAiProfile,
 } from './model-validation';
 import builtInTierDefaults from './defaults/tier-defaults.json';
-import { EFFORT_LEVELS } from './schemas';
+import { EFFORT_LEVELS, modelRefSchema } from './schemas';
 
 // The effort helpers read `effortControl` off the provider registry, so the
 // registry has to be populated the way a real entrypoint populates it.
@@ -341,7 +349,9 @@ describe('per-run model bindings', () => {
   });
 
   test('resolves vendor/model as Pi and changes only the named tier', () => {
-    const run = resolveRunModelOverrides(base, { tiers: { large: 'openai/gpt-5.6' } });
+    const run = resolveRunModelOverrides(providerRegistry, base, {
+      tiers: { large: 'openai/gpt-5.6' },
+    });
     const effective = buildAiProfile('claude', {
       repoAliases: {
         '@planner': { provider: 'claude', model: 'opus', effort: 'high' },
@@ -363,13 +373,78 @@ describe('per-run model bindings', () => {
 
   test('registered agent refs switch provider and Pi refs require their vendor prefix', () => {
     expect(
-      resolveRunModelOverrides(base, { tiers: { large: 'codex/gpt-5.6-sol' } }).tiers?.large
+      resolveRunModelOverrides(providerRegistry, base, { tiers: { large: 'codex/gpt-5.6-sol' } })
+        .tiers?.large
     ).toEqual({ provider: 'codex', model: 'gpt-5.6-sol' });
     expect(
-      resolveRunModelOverrides(base, { tiers: { large: 'pi/openrouter/qwen/qwen3' } }).tiers?.large
+      resolveRunModelOverrides(providerRegistry, base, {
+        tiers: { large: 'pi/openrouter/qwen/qwen3' },
+      }).tiers?.large
     ).toEqual({ provider: 'pi', model: 'openrouter/qwen/qwen3' });
-    expect(() => resolveRunModelOverrides(base, { tiers: { large: 'pi/not-a-model' } })).toThrow(
-      "Pi overrides need a vendor prefix, e.g. 'pi/minimax/minimax-m3'"
+    expect(() =>
+      resolveRunModelOverrides(providerRegistry, base, { tiers: { large: 'pi/not-a-model' } })
+    ).toThrow(
+      "Model override 'large' has invalid pi model 'not-a-model': expected a Pi vendor/model reference such as 'minimax/minimax-m3'."
+    );
+  });
+
+  test('unprefixed refs follow the supplied owner and its parser', () => {
+    const owner: ProviderDescriptor = {
+      ...requireProvider(providerRegistry, 'pi'),
+      id: 'custom',
+      parseConfig: raw => ({ ...raw, model: String(raw.model).toLowerCase() }),
+    };
+    const providers: ProviderRegistry = {
+      get: id => (id === owner.id ? owner : undefined),
+      list: () => [owner],
+    };
+    expect(resolveRunModelOverrides(providers, base, { tiers: { large: 'vendor/MODEL' } })).toEqual(
+      { tiers: { large: { provider: 'custom', model: 'vendor/model' } } }
+    );
+  });
+
+  test('unprefixed refs reject multiple owners regardless of registration order', () => {
+    const first: ProviderDescriptor = { ...requireProvider(providerRegistry, 'pi'), id: 'first' };
+    const second: ProviderDescriptor = { ...first, id: 'second' };
+    for (const owners of [
+      [first, second],
+      [second, first],
+    ]) {
+      const providers: ProviderRegistry = {
+        get: id => owners.find(provider => provider.id === id),
+        list: () => owners,
+      };
+      expect(() =>
+        resolveRunModelOverrides(providers, base, { tiers: { large: 'vendor/model' } })
+      ).toThrow("Model override 'large' has ambiguous unprefixed model ownership: first, second.");
+    }
+  });
+
+  test('unprefixed refs without an owner fail with the provider-neutral message', () => {
+    const providers: ProviderRegistry = {
+      get: id => providerRegistry.get(id),
+      list: () => providerRegistry.list().filter(provider => !provider.ownsUnprefixedModelRefs),
+    };
+    expect(() =>
+      resolveRunModelOverrides(providers, base, { tiers: { large: 'vendor/model' } })
+    ).toThrow(
+      "Model override 'large' has invalid model 'vendor/model'. Expected <agent>/<model> or <vendor>/<model>."
+    );
+  });
+
+  test('an unprefixed owner rejecting a ref produces the provider-neutral message', () => {
+    const owner: ProviderDescriptor = {
+      ...requireProvider(providerRegistry, 'pi'),
+      id: 'custom',
+      parseConfig: () => {
+        throw new Error('unsupported vendor');
+      },
+    };
+    const providers: ProviderRegistry = { get: () => undefined, list: () => [owner] };
+    expect(() =>
+      resolveRunModelOverrides(providers, base, { tiers: { large: 'vendor/model' } })
+    ).toThrow(
+      "Model override 'large' has invalid model 'vendor/model'. Expected <agent>/<model> or <vendor>/<model>."
     );
   });
 
@@ -380,26 +455,30 @@ describe('per-run model bindings', () => {
       },
     });
 
-    expect(() => resolveRunModelOverrides(opencodeBase, { tiers: { large: 'banana' } })).toThrow(
-      /invalid opencode model 'banana'/
-    );
     expect(() =>
-      resolveRunModelOverrides(opencodeBase, { tiers: { large: 'opencode/banana' } })
+      resolveRunModelOverrides(providerRegistry, opencodeBase, { tiers: { large: 'banana' } })
+    ).toThrow(/invalid opencode model 'banana'/);
+    expect(() =>
+      resolveRunModelOverrides(providerRegistry, opencodeBase, {
+        tiers: { large: 'opencode/banana' },
+      })
     ).toThrow(/invalid opencode model 'banana'/);
     expect(
-      resolveRunModelOverrides(opencodeBase, {
+      resolveRunModelOverrides(providerRegistry, opencodeBase, {
         tiers: { large: 'opencode/ openai / gpt-5.6 ' },
       }).tiers?.large
     ).toEqual({ provider: 'opencode', model: 'openai/gpt-5.6' });
     expect(
-      resolveRunModelOverrides(base, {
+      resolveRunModelOverrides(providerRegistry, base, {
         tiers: { large: 'pi/ openai / gpt-5.6 ' },
       }).tiers?.large
     ).toEqual({ provider: 'pi', model: 'openai/gpt-5.6' });
   });
 
   test('applies resolved overrides as a sparse overlay', () => {
-    const overrides = resolveRunModelOverrides(base, { tiers: { large: 'openai/gpt-5.6' } });
+    const overrides = resolveRunModelOverrides(providerRegistry, base, {
+      tiers: { large: 'openai/gpt-5.6' },
+    });
     const effective = applyResolvedRunModelOverrides(base, overrides);
 
     expect(effective.defaultProvider).toBe(base.defaultProvider);
@@ -409,12 +488,16 @@ describe('per-run model bindings', () => {
   });
 
   test('unqualified literals inherit the target provider and preset refs copy options', () => {
-    expect(resolveRunModelOverrides(base, { tiers: { large: 'opus-next' } }).tiers?.large).toEqual({
+    expect(
+      resolveRunModelOverrides(providerRegistry, base, { tiers: { large: 'opus-next' } }).tiers
+        ?.large
+    ).toEqual({
       provider: 'claude',
       model: 'opus-next',
     });
     expect(
-      resolveRunModelOverrides(base, { aliases: { '@cheap': '@planner' } }).aliases?.['@cheap']
+      resolveRunModelOverrides(providerRegistry, base, { aliases: { '@cheap': '@planner' } })
+        .aliases?.['@cheap']
     ).toEqual({ provider: 'claude', model: 'opus', effort: 'high' });
   });
 
@@ -426,21 +509,33 @@ describe('per-run model bindings', () => {
       },
     });
     expect(() =>
-      resolveRunModelOverrides(unsupportedEffort, { aliases: { '@target': '@source' } })
+      resolveRunModelOverrides(providerRegistry, unsupportedEffort, {
+        aliases: { '@target': '@source' },
+      })
     ).toThrow(/cannot apply effort/);
   });
 
+  test('binds an alias nobody configured when the spec names its provider', () => {
+    expect(
+      resolveRunModelOverrides(providerRegistry, base, {
+        aliases: { '@implementer': 'codex/gpt-5.5' },
+      }).aliases?.['@implementer']
+    ).toEqual({ provider: 'codex', model: 'gpt-5.5' });
+  });
+
   test('rejects unknown alias targets and references', () => {
-    expect(() => resolveRunModelOverrides(base, { aliases: { '@missing': 'opus' } })).toThrow(
-      /unknown alias '@missing'/
-    );
-    expect(() => resolveRunModelOverrides(base, { tiers: { large: '@missing' } })).toThrow(
-      /Unknown alias '@missing'/
-    );
+    expect(() =>
+      resolveRunModelOverrides(providerRegistry, base, { aliases: { '@missing': 'opus' } })
+    ).toThrow(/'@missing' is not configured/);
+    expect(() =>
+      resolveRunModelOverrides(providerRegistry, base, { tiers: { large: '@missing' } })
+    ).toThrow(/Unknown alias '@missing'/);
   });
 
   test('metadata round-trips the sparse override and effective snapshot', () => {
-    const overrides = resolveRunModelOverrides(base, { tiers: { large: 'openai/gpt-5.6' } });
+    const overrides = resolveRunModelOverrides(providerRegistry, base, {
+      tiers: { large: 'openai/gpt-5.6' },
+    });
     const effective = buildAiProfile('claude', {
       repoAliases: {
         '@planner': { provider: 'claude', model: 'opus', effort: 'high' },
@@ -450,20 +545,24 @@ describe('per-run model bindings', () => {
     });
     const value = createRunModelBindingsMetadata(overrides, effective);
 
-    expect(readRunModelBindingsMetadata({ model_bindings: value })).toEqual(value);
-    expect(() => readRunModelBindingsMetadata({ model_bindings: 'bad' })).toThrow(/invalid/);
+    expect(readRunModelBindingsMetadata(providerRegistry, { model_bindings: value })).toEqual(
+      value
+    );
+    expect(() => readRunModelBindingsMetadata(providerRegistry, { model_bindings: 'bad' })).toThrow(
+      /invalid/
+    );
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: { ...value, overrides: { tiers: 1 } },
       })
     ).toThrow(/invalid model_bindings tiers/);
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: { ...value, overrides: { aliases: [] } },
       })
     ).toThrow(/invalid model_bindings aliases/);
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           overrides: {
@@ -473,7 +572,7 @@ describe('per-run model bindings', () => {
       })
     ).toThrow(/invalid model_bindings aliases/);
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           overrides: {
@@ -489,7 +588,7 @@ describe('per-run model bindings', () => {
       })
     ).toThrow(/thinking:.*effort:/);
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           effective: {
@@ -503,7 +602,7 @@ describe('per-run model bindings', () => {
       })
     ).toThrow(/invalid effort/);
     expect(
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           effective: {
@@ -521,7 +620,7 @@ describe('per-run model bindings', () => {
       })
     ).toBeDefined();
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           overrides: {
@@ -529,9 +628,9 @@ describe('per-run model bindings', () => {
           },
         },
       })
-    ).toThrow(/unknown provider 'removed-provider'/);
+    ).toThrow(/Unknown provider: 'removed-provider'/);
     expect(
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           overrides: {
@@ -541,7 +640,7 @@ describe('per-run model bindings', () => {
       })?.overrides.tiers?.large
     ).toEqual({ provider: 'pi', model: 'openai/gpt-5' });
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           overrides: {
@@ -557,7 +656,7 @@ describe('per-run model bindings', () => {
       })
     ).toThrow(/thinking:.*effort:/);
     expect(() =>
-      readRunModelBindingsMetadata({
+      readRunModelBindingsMetadata(providerRegistry, {
         model_bindings: {
           ...value,
           overrides: {
@@ -811,19 +910,19 @@ describe('isLiteralSpec type guard', () => {
 describe('validEffortsForProvider', () => {
   test('returns the one ladder for every provider with a reasoning control', () => {
     for (const provider of ['claude', 'codex', 'pi', 'copilot']) {
-      expect(validEffortsForProvider(provider)).toEqual(EFFORT_LEVELS);
+      expect(validEffortsForProvider(providerRegistry, provider)).toEqual(EFFORT_LEVELS);
     }
   });
 
   test('returns null for a provider with no reasoning control', () => {
     // OpenCode configures reasoning in opencode.json, not per request.
-    expect(validEffortsForProvider('opencode')).toBeNull();
+    expect(validEffortsForProvider(providerRegistry, 'opencode')).toBeNull();
   });
 
   test('returns null for an unregistered provider rather than throwing', () => {
     // getProviderCapabilities throws on an unknown id; both write paths call
     // this before their own registration check would fire.
-    expect(validEffortsForProvider('not-a-provider')).toBeNull();
+    expect(validEffortsForProvider(providerRegistry, 'not-a-provider')).toBeNull();
   });
 });
 
@@ -831,12 +930,12 @@ describe('validEffortsForProvider', () => {
 // hand-rolled it, "must stay in step" was a comment; here it is a call.
 describe('resolvePresetEffort', () => {
   test('accepts a rung on a provider that has the control', () => {
-    expect(resolvePresetEffort('codex', 'minimal')).toEqual({ ok: true });
-    expect(resolvePresetEffort('pi', 'max')).toEqual({ ok: true });
+    expect(resolvePresetEffort(providerRegistry, 'codex', 'minimal')).toEqual({ ok: true });
+    expect(resolvePresetEffort(providerRegistry, 'pi', 'max')).toEqual({ ok: true });
   });
 
   test('rejects as unsupported when the provider has no reasoning control', () => {
-    expect(resolvePresetEffort('opencode', 'high')).toEqual({
+    expect(resolvePresetEffort(providerRegistry, 'opencode', 'high')).toEqual({
       ok: false,
       reason: 'unsupported',
       valid: null,
@@ -844,7 +943,7 @@ describe('resolvePresetEffort', () => {
   });
 
   test('rejects as unknown, and reports the vocabulary, for a non-rung', () => {
-    const decision = resolvePresetEffort('claude', 'extreme');
+    const decision = resolvePresetEffort(providerRegistry, 'claude', 'extreme');
     expect(decision.ok).toBe(false);
     if (decision.ok) throw new Error('expected a rejection');
     expect(decision.reason).toBe('unknown');
@@ -864,16 +963,65 @@ describe('isEffortValidForProvider', () => {
       'ultra',
       'persistent',
     ]) {
-      expect(isEffortValidForProvider('codex', rung)).toBe(true);
-      expect(isEffortValidForProvider('claude', rung)).toBe(true);
+      expect(isEffortValidForProvider(providerRegistry, 'codex', rung)).toBe(true);
+      expect(isEffortValidForProvider(providerRegistry, 'claude', rung)).toBe(true);
     }
   });
 
   test('rejects a value that is not a rung', () => {
-    expect(isEffortValidForProvider('claude', 'extreme')).toBe(false);
+    expect(isEffortValidForProvider(providerRegistry, 'claude', 'extreme')).toBe(false);
   });
 
   test('accepts anything for a provider with no vocabulary to validate against', () => {
-    expect(isEffortValidForProvider('opencode', 'ultra')).toBe(true);
+    expect(isEffortValidForProvider(providerRegistry, 'opencode', 'ultra')).toBe(true);
+  });
+});
+
+test('a missing maintained prefix cannot fall through to Pi vendor model ownership', () => {
+  const available = providerRegistry.list().filter(provider => provider.id !== 'claude');
+  const providers: ProviderRegistry = {
+    get: id => available.find(provider => provider.id === id),
+    list: () => available,
+  };
+  const profile = buildAiProfile('codex');
+  expect(() =>
+    resolveRunModelOverrides(providers, profile, { tiers: { large: 'claude/sonnet' } })
+  ).toThrow('archon provider add claude');
+});
+
+describe('model preference lists', () => {
+  const profile = buildAiProfile('claude', {
+    repoAliases: { '@reviewer': { provider: 'codex', model: 'gpt-5.5' } },
+  });
+
+  test('the schema accepts @aliases ending in a tier or model id', () => {
+    expect(modelRefSchema.safeParse(['@review-seams', '@reviewer', 'medium']).success).toBe(true);
+    expect(modelRefSchema.safeParse(['@implementer', 'claude-opus-5-5']).success).toBe(true);
+    expect(modelRefSchema.safeParse('large').success).toBe(true);
+  });
+
+  test('the schema rejects lists that might not resolve or have dead entries', () => {
+    expect(modelRefSchema.safeParse(['@reviewer', '@implementer']).success).toBe(false);
+    expect(modelRefSchema.safeParse(['medium', '@reviewer', 'large']).success).toBe(false);
+    expect(modelRefSchema.safeParse(['medium']).success).toBe(false);
+  });
+
+  test('the first configured alias wins', () => {
+    expect(selectModelRef(['@review-seams', '@reviewer', 'medium'], profile)).toBe('@reviewer');
+    const withLens = buildAiProfile('claude', {
+      repoAliases: {
+        '@reviewer': { provider: 'codex', model: 'gpt-5.5' },
+        '@review-seams': { provider: 'claude', model: 'opus' },
+      },
+    });
+    expect(selectModelRef(['@review-seams', '@reviewer', 'medium'], withLens)).toBe(
+      '@review-seams'
+    );
+  });
+
+  test('a list with no configured alias, or no profile, selects its final entry', () => {
+    expect(selectModelRef(['@implementer', 'large'], profile)).toBe('large');
+    expect(selectModelRef(['@reviewer', 'medium'])).toBe('medium');
+    expect(selectModelRef('@reviewer', profile)).toBe('@reviewer');
   });
 });

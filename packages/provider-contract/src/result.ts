@@ -11,7 +11,7 @@ export const tokenUsageSchema = z.object({
   /** Provider-reported cache-creation input. Absent means unsupported or unknown; zero is known. */
   cacheWrite: z.number().optional(),
   /**
-   * Set only by aggregation (`mergeTokenUsage` in `@archon/providers`), never by a provider.
+   * Set only by aggregation (`mergeTokenUsage` below), never by a provider.
    * When true the cache axes on this usage are a FLOOR: at least one contributing usage did
    * not report that axis, so true cache use is at least the reported total and
    * `input - cacheRead - cacheWrite` is an UPPER bound on full-price input rather than an
@@ -42,10 +42,31 @@ export const providerStopReasonSchema = z.enum([
 ]);
 export type ProviderStopReason = z.infer<typeof providerStopReasonSchema>;
 
+/** Characters of a session id that may appear outside the node record. */
+export const SESSION_PREVIEW_LENGTH = 8;
+
+/**
+ * A session id can resume a conversation, so streams and logs carry only this preview.
+ * The full id is written to the node record alone.
+ */
+export function sessionPreview(sessionId: string): string {
+  return sessionId.slice(0, SESSION_PREVIEW_LENGTH);
+}
+
 /** The terminal result of one provider turn. Providers stream it as the `result` chunk. */
 export const providerResultSchema = z.object({
+  /** Required on every non-failing turn of a provider that declares `sessionResume`. */
   sessionId: z.string().optional(),
+  /** Complete reply for this result, when the runtime reports it. */
+  text: z.string().optional(),
+  /** Usage of this result; consumers sum it unless any result reports tokensUnknown. */
   tokens: tokenUsageSchema.optional(),
+  /**
+   * This result's token measurement is unavailable. Consumers must discard earlier
+   * token totals and keep the same aggregate unknown across subsequent queries.
+   * Omission alone means no measurement was reported and does not invalidate a total.
+   */
+  tokensUnknown: z.literal(true).optional(),
   structuredOutput: z.unknown().optional(),
   /**
    * The provider's classification of a failed turn. Present means the turn failed, and the
@@ -73,5 +94,92 @@ export const providerResultSchema = z.object({
    * use `false` to surface a warning rather than swallow the loss.
    */
   resumed: z.boolean().optional(),
+  /**
+   * Set only on a failed result of a turn that asked to resume a session, when the provider
+   * confirmed through a structured check (never the vendor's error text) that the session no
+   * longer exists, and the rejection did no model work. The engine may retry the turn once on
+   * a fresh session; a provider that cannot tell leaves it out.
+   */
+  sessionNotFound: z.literal(true).optional(),
 });
 export type ProviderResult = z.infer<typeof providerResultSchema>;
+
+/**
+ * Sum usages into one aggregate, keeping every cache figure that was actually reported.
+ *
+ * `input` and `output` always sum across every entry. Each cache axis sums over only the
+ * entries that define it and is emitted when at least one did, so a silent contributor
+ * NARROWS the total instead of erasing it; `cachePartial` then marks the result as a floor.
+ * Withholding the axis entirely, as this once did, left gross `input` standing beside no
+ * cache context at all and read as "nothing was cached" (#2662).
+ *
+ * An axis no entry reports stays absent, which already encodes "unknown" — that case is not
+ * flagged. The two axes are decided independently.
+ *
+ * Pure by design: callers own validation and logging, because their contexts differ (persisted
+ * JSON in @archon/core, non-finite guarding in @archon/workflows). Entries are expected to have
+ * finite `input`/`output` already; `total` and `cost` are not aggregated here.
+ */
+export function mergeTokenUsage(usages: readonly TokenUsage[]): TokenUsage | undefined {
+  if (usages.length === 0) return undefined;
+  const merged: TokenUsage = {
+    input: usages.reduce((sum, usage) => sum + usage.input, 0),
+    output: usages.reduce((sum, usage) => sum + usage.output, 0),
+  };
+  // A contribution that is itself a floor keeps the whole aggregate a floor.
+  let partial = usages.some(usage => usage.cachePartial === true);
+  for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+    const reporters = usages.filter(usage => usage[axis] !== undefined);
+    if (reporters.length === 0) continue;
+    merged[axis] = reporters.reduce((sum, usage) => sum + (usage[axis] ?? 0), 0);
+    if (reporters.length < usages.length) partial = true;
+  }
+  if (partial && (merged.cacheRead !== undefined || merged.cacheWrite !== undefined)) {
+    merged.cachePartial = true;
+  }
+  return merged;
+}
+
+/** Usage summed across the `result` chunks of one turn. */
+export interface ResultUsageTotal {
+  cost?: number;
+  tokens?: TokenUsage;
+  /** Some result reported `tokensUnknown`; `tokens` then stays undefined for the whole turn. */
+  tokensUnknown?: true;
+}
+
+/**
+ * Add one `result` chunk to a turn's running total. A turn can stream several results
+ * (Claude sends another when background agents finish), and each carries only its own
+ * usage. Unknown tokens stay unknown, as the `tokensUnknown` contract requires, and a
+ * non-finite cost or token count contributes nothing. Pure, so callers own logging.
+ */
+export function addResultUsage(
+  total: ResultUsageTotal,
+  result: Pick<ProviderResult, 'cost' | 'tokens' | 'tokensUnknown'>
+): ResultUsageTotal {
+  const next: ResultUsageTotal = {};
+  if (total.tokensUnknown === true || result.tokensUnknown === true) {
+    next.tokensUnknown = true;
+  } else {
+    const incoming = finiteTokenUsage(result.tokens);
+    // The first result passes through untouched; merging is only for the second onward.
+    const tokens =
+      total.tokens === undefined || incoming === undefined
+        ? (total.tokens ?? incoming)
+        : mergeTokenUsage([total.tokens, incoming]);
+    if (tokens) next.tokens = tokens;
+  }
+  const cost =
+    result.cost !== undefined && Number.isFinite(result.cost)
+      ? (total.cost ?? 0) + result.cost
+      : total.cost;
+  if (cost !== undefined) next.cost = cost;
+  return next;
+}
+
+function finiteTokenUsage(tokens: TokenUsage | undefined): TokenUsage | undefined {
+  return tokens !== undefined && Number.isFinite(tokens.input) && Number.isFinite(tokens.output)
+    ? tokens
+    : undefined;
+}

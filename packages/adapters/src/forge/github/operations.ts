@@ -1,25 +1,30 @@
-import { z } from 'zod';
-import { checkPhase, checkResult } from './normalize-event';
 import {
-  type CheckObservation,
+  PR_VIEW_ANY_STATE,
+  RESOLVE_SUBJECT,
   type ForgeError,
+  type ForgeMutationRequest,
   type ForgeRequest,
   type ForgeResponse,
   type PluginMetadata,
-  concludedCheckStates,
   isMutationRequest,
   mutationTarget,
-  summarizeChecks,
+  mutationAttempt,
 } from '@archon/forge/operations';
+import { githubErrorDetail, parseRemote, parseSubjectUrl, type Fetch, type Sleep } from './api';
+import { handleGithubChecksLogs } from './check-logs';
+import { handleGithubChecksCommit, handleGithubChecksState } from './commit-checks';
+import { handleGithubWorkItemComments } from './comments';
+import { handleGithubPrFiles, handleGithubRepoFile } from './files';
+import { handleGithubPrMergeState } from './merge-state';
+import { handleGithubMutation } from './lifecycle';
+import { handleGithubPrReviews, handleGithubPrView } from './pull-requests';
 import {
-  githubErrorDetail,
-  githubPages,
-  githubRequest,
-  location,
-  parseRemote,
-  type Fetch,
-} from './api';
-import { handleGithubMutation, handleGithubPrView, handleGithubWorkItemView } from './lifecycle';
+  handleGithubRepoLabelsList,
+  handleGithubWorkItemList,
+  handleGithubWorkItemView,
+} from './workitems';
+import { handleGithubPrThreads } from './review-threads';
+import { handleGithubWorkItemSearch } from './search';
 
 export const githubPluginMetadata = {
   protocol: 1,
@@ -29,98 +34,96 @@ export const githubPluginMetadata = {
   hosts: ['github.com'],
   capabilities: [
     'resolve',
+    RESOLVE_SUBJECT,
     'checks.state',
+    'checks.commit',
+    'checks.logs',
     'workitem.view',
+    'workitem.comments',
+    'workitem.create',
+    'workitem.labels.set',
+    'workitem.label.add',
+    'workitem.label.remove',
+    'workitem.comment.upsert',
+    'workitem.close',
+    'workitem.edit-body',
+    'workitem.list',
+    'workitem.search',
+    'repo.labels.list',
+    'repo.label.ensure',
     'pr.view',
+    PR_VIEW_ANY_STATE,
     'pr.create',
     'pr.edit-body',
     'pr.ready',
+    'pr.draft',
     'comment.upsert',
+    'pr.merge',
+    'checks.rerun',
+    'pr.reviews',
+    'pr.threads',
+    'pr.merge-state',
+    'pr.files',
+    'repo.file',
+    'pr.thread.reply',
+    'pr.thread.resolve',
   ],
+  mutationConditions: { 'pr.merge': ['head'] },
   token_env: ['GH_TOKEN', 'GITHUB_TOKEN'],
 } satisfies PluginMetadata;
 
 export interface GitHubOperationOptions {
   readonly token: string | undefined;
   readonly fetch?: Fetch;
+  /** The wait inside a write's read-back; tests replace it so they do not sleep. */
+  readonly sleep?: Sleep;
 }
-
-const pullRequestSchema = z.object({ head: z.object({ sha: z.string().min(1) }) });
-const checkRunSchema = z.object({
-  id: z.union([z.string().min(1), z.number().int()]),
-  name: z.string().min(1),
-  status: z.string().min(1),
-  conclusion: z.string().nullable().optional(),
-});
-const checkRunsPageSchema = z.object({ check_runs: z.array(checkRunSchema) });
-const statusSchema = z.object({
-  id: z.union([z.string().min(1), z.number().int()]),
-  context: z.string().min(1),
-  state: z.string().min(1),
-});
-const statusesPageSchema = z.array(statusSchema);
 
 function failure(operationId: string, error: ForgeError): ForgeResponse {
   return { operationId, ok: false, error };
 }
 
-function checkRunObservation(run: z.infer<typeof checkRunSchema>): CheckObservation {
-  const nativeResult = run.conclusion ?? null;
-  const normalizedResult = checkResult(nativeResult);
-  if (run.status === 'queued' || run.status === 'waiting' || run.status === 'pending') {
-    return {
-      unit: { kind: 'check', id: String(run.id), name: run.name },
-      nativeState: run.status,
-      phase: checkPhase(run.status),
-      nativeResult,
-      result: normalizedResult,
-      state: 'pending',
-    };
-  }
-  if (run.status === 'in_progress') {
-    return {
-      unit: { kind: 'check', id: String(run.id), name: run.name },
-      nativeState: run.status,
-      phase: checkPhase(run.status),
-      nativeResult,
-      result: normalizedResult,
-      state: 'pending',
-    };
-  }
-  const state =
-    run.status !== 'completed' || normalizedResult === null
-      ? 'unknown'
-      : concludedCheckStates[normalizedResult];
-  return {
-    unit: { kind: 'check', id: String(run.id), name: run.name },
-    nativeState: run.status,
-    phase: checkPhase(run.status),
-    nativeResult,
-    result: normalizedResult,
-    state,
-  };
-}
+type ReadOp = Exclude<ForgeRequest['op'], 'resolve' | ForgeMutationRequest['op']>;
+type ReadHandler<Op extends ReadOp> = (
+  request: Extract<ForgeRequest, { op: Op }>,
+  fetchImpl: Fetch,
+  token: string
+) => Promise<ForgeResponse>;
 
-function statusObservation(status: z.infer<typeof statusSchema>): CheckObservation {
-  const state =
-    status.state === 'pending'
-      ? 'pending'
-      : status.state === 'success'
-        ? 'green'
-        : status.state === 'failure' || status.state === 'error'
-          ? 'red'
-          : 'unknown';
-  return {
-    unit: { kind: 'commit_status', id: String(status.id), name: status.context },
-    nativeState: status.state,
-    phase: checkPhase(status.state),
-    nativeResult: status.state,
-    result:
-      status.state === 'pending'
-        ? null
-        : checkResult(status.state === 'error' ? 'failure' : status.state),
-    state,
+const readHandlers: { [Op in ReadOp]: ReadHandler<Op> } = {
+  'workitem.view': handleGithubWorkItemView,
+  'workitem.list': handleGithubWorkItemList,
+  'workitem.search': handleGithubWorkItemSearch,
+  'workitem.comments': handleGithubWorkItemComments,
+  'repo.labels.list': handleGithubRepoLabelsList,
+  'pr.view': handleGithubPrView,
+  'pr.reviews': handleGithubPrReviews,
+  'pr.threads': handleGithubPrThreads,
+  'pr.merge-state': handleGithubPrMergeState,
+  'pr.files': handleGithubPrFiles,
+  'repo.file': handleGithubRepoFile,
+  'checks.state': handleGithubChecksState,
+  'checks.commit': handleGithubChecksCommit,
+  'checks.logs': handleGithubChecksLogs,
+};
+
+type ResolveValue = Extract<
+  Extract<ForgeResponse, { ok: true }>['result'],
+  { op: 'resolve' }
+>['value'];
+
+/** A Git remote's repository, or with `web` the issue or pull request a web URL names. */
+function resolveGithub(remote: string | null, web: boolean): ResolveValue {
+  const subject = web ? parseSubjectUrl(remote) : null;
+  const repo = web ? subject?.repo : parseRemote(remote);
+  if (!repo) return { kind: 'none', forge: 'none' };
+  const resolved = {
+    kind: 'resolved' as const,
+    forge: 'github',
+    repo,
+    plugin: githubPluginMetadata,
   };
+  return subject ? { ...resolved, subject: subject.subject } : resolved;
 }
 
 export async function handleGithubOperation(
@@ -129,16 +132,10 @@ export async function handleGithubOperation(
 ): Promise<ForgeResponse> {
   try {
     if (request.op === 'resolve') {
-      const repo = parseRemote(request.remote);
       return {
         operationId: request.operationId,
         ok: true,
-        result: {
-          op: 'resolve',
-          value: repo
-            ? { kind: 'resolved', forge: 'github', repo, plugin: githubPluginMetadata }
-            : { kind: 'none', forge: 'none' },
-        },
+        result: { op: 'resolve', value: resolveGithub(request.remote, request.web === true) },
       };
     }
 
@@ -153,64 +150,25 @@ export async function handleGithubOperation(
             operationId: request.operationId,
             ok: false,
             error,
-            mutation: { op: request.op, target: mutationTarget(request), outcome: 'refused' },
+            mutation: {
+              op: request.op,
+              target: mutationTarget(request),
+              outcome: 'refused',
+              ...mutationAttempt(request),
+            },
           }
         : failure(request.operationId, error);
     }
     const fetchImpl = options.fetch ?? globalThis.fetch;
     const token = options.token;
-    if (isMutationRequest(request)) return await handleGithubMutation(request, fetchImpl, token);
-    if (request.op === 'workitem.view')
-      return await handleGithubWorkItemView(request, fetchImpl, token);
-    if (request.op === 'pr.view') return await handleGithubPrView(request, fetchImpl, token);
-
-    const { root, path } = location(request.ref.repo);
-    const pull = pullRequestSchema.parse(
-      await githubRequest(
-        fetchImpl,
-        token,
-        `${root}/repos/${path}/pulls/${String(request.ref.number)}`
-      )
-    );
-    const revision = pull.head.sha;
-    const ref = encodeURIComponent(revision);
-    const [runs, allStatuses] = await Promise.all([
-      githubPages(
-        fetchImpl,
-        token,
-        `${root}/repos/${path}/commits/${ref}/check-runs?filter=latest`,
-        value => checkRunsPageSchema.parse(value).check_runs
-      ),
-      githubPages(fetchImpl, token, `${root}/repos/${path}/commits/${ref}/statuses`, value =>
-        statusesPageSchema.parse(value)
-      ),
-    ]);
-    // GitHub returns statuses newest first. Context names are case-insensitive, so the
-    // first row for each folded context is the authoritative latest status unit.
-    const contexts = new Set<string>();
-    const statuses = allStatuses.filter(status => {
-      const context = status.context.toLowerCase();
-      if (contexts.has(context)) return false;
-      contexts.add(context);
-      return true;
-    });
-    const units = [...runs.map(checkRunObservation), ...statuses.map(statusObservation)];
-    return {
-      operationId: request.operationId,
-      ok: true,
-      result: {
-        op: 'checks.state',
-        value: {
-          ref: request.ref,
-          revision,
-          units,
-          summary: summarizeChecks(units),
-          // The check-runs and statuses APIs enumerate observations but do not say which
-          // checks branch protection requires. Returning null keeps that absence explicit.
-          required: null,
-        },
-      },
-    };
+    const sleep = options.sleep ?? Bun.sleep;
+    if (isMutationRequest(request))
+      return await handleGithubMutation(request, fetchImpl, token, sleep);
+    // Keyed by the request's own op, the handler takes that request; TypeScript cannot
+    // correlate the table's members with the request union on its own.
+    const read = readHandlers[request.op] as ReadHandler<ReadOp>;
+    // A read that fails temporarily is repeated by the host, which records the repeats.
+    return await read(request, fetchImpl, token);
   } catch (cause) {
     return failure(request.operationId, githubErrorDetail(cause));
   }

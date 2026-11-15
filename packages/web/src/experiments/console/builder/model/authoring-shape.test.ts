@@ -210,17 +210,17 @@ describe('fromWorkflowDefinition on a served definition', () => {
     expect(issues).toEqual([]);
   });
 
-  test('an include node is reported as composition, by name', () => {
+  test('an include node is recognised by its served kind and kept read-only, by name', () => {
     const composed = {
       name: 'chesswin-deliver',
       nodes: [{ id: 'criteria', kind: 'include', include: 'chesswin-criteria' }],
     } as unknown as WireWorkflowDefinition;
 
-    const { issues } = fromWorkflowDefinition(composed);
+    const { workflow, issues } = fromWorkflowDefinition(composed);
 
+    expect(workflow.nodes.map(n => [n.id, n.variant])).toEqual([['criteria', 'opaque']]);
     expect(issues).toHaveLength(1);
-    expect(issues[0]?.message).toContain("composes other work ('include')");
-    expect(issues[0]?.severity).toBe('error');
+    expect(issues[0]?.message).toContain("'include' nodes have no editor yet");
   });
 
   test('the command node carries the command it runs', () => {

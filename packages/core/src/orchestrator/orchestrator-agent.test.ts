@@ -1,1795 +1,58 @@
-/**
- * Tests for orchestrator-agent.ts
- *
- * Tests focus on the two exported/testable pure functions:
- *   - parseOrchestratorCommands
- *   - filterToolIndicators (via its effect through the module)
- *
- * Note: filterToolIndicators is not exported, so we test it indirectly via
- * parseOrchestratorCommands edge cases and by checking the behavior
- * directly through string manipulation matching the same logic.
- *
- * Mock setup MUST occur before any import of the module under test.
- */
-
+// @archon-test-isolated
+/** Covers `handleMessage` in orchestrator-agent.ts; shared mocks live in `../test/orchestrator-agent-harness`. */
 import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdir, mkdtemp, writeFile } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { createMockLogger } from '../test/mocks/logger';
-import {
-  makeTestResolvedWorkflow,
-  makeTestWorkflow,
-  makeTestWorkflowWithSource,
-  withObservableCapturedSource,
-} from '@archon/workflows/test-utils';
-import type { Codebase, Conversation, IPlatformAdapter } from '../types';
-import type { MergedConfig } from '../config/config-types';
-import type { MessageRow } from '../schemas/message';
-import type { Session } from '../schemas/session';
-import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import { makeTestResolvedWorkflow } from '@archon/workflows/test-utils';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
-import { toBranchName } from '@archon/git';
-import type { IAgentProvider, ProviderCapabilities } from '@archon/providers/types';
-import type * as Git from '@archon/git';
-import type * as ConfigLoader from '../config/config-loader';
-import type * as ConversationDb from '../db/conversations';
-import type * as CodebaseDb from '../db/codebases';
-import type * as SessionDb from '../db/sessions';
-import type * as CommandHandler from '../handlers/command-handler';
-import type * as WorkflowDiscovery from '@archon/workflows/workflow-discovery';
-import type * as WorkflowExecutor from '@archon/workflows/executor';
-import type * as WorkflowDb from '../db/workflows';
-import type * as WorkflowEventDb from '../db/workflow-events';
-import type * as WorkflowAdoption from '../operations/workflow-adoption';
-import type * as Orchestrator from './orchestrator';
-import type * as MessageDb from '../db/messages';
-import type * as WorkflowSourceRoot from '../utils/workflow-source-root';
-import type * as TitleGenerator from '../services/title-generator';
-import type * as UserProviderKeyStore from '../db/user-provider-key-store';
-import type * as Paths from '@archon/paths';
-import type * as RunLiveOwnerModule from '../services/run-live-owner';
-import { captureWorkflowSource } from '../../../workflows/src/workflow-source';
-import { trackTempRoots } from '@archon/paths/test-utils';
-
-const trackTempRoot = trackTempRoots();
-
-// ─── Mock setup (ALL mocks must come before the module under test import) ────
-
-const mockSyncWorkspace = mock<typeof Git.syncWorkspace>(() =>
-  Promise.resolve({
-    branch: toBranchName('main'),
-    synced: true,
-    mode: 'fast-forward',
-    state: 'in_sync',
-    previousHead: 'abc12345',
-    newHead: 'abc12345',
-    updated: false,
-  })
-);
-// Remote auto-detection defaults to 'origin' (standard repos)
-const mockGetDefaultRemote = mock<typeof Git.getDefaultRemote>(() => Promise.resolve('origin'));
-// Repo config defaults to empty (no worktree.remote configured)
-const mockLoadRepoConfig = mock<typeof ConfigLoader.loadRepoConfig>(() => Promise.resolve({}));
-const mockGetOrCreateConversation = mock<typeof ConversationDb.getOrCreateConversation>(() =>
-  Promise.resolve({
-    id: 'conv-1-db',
-    platform_type: 'web',
-    platform_conversation_id: 'conv-1',
-    codebase_id: null,
-    cwd: null,
-    isolation_env_id: null,
-    ai_assistant_type: 'claude',
-    title: null,
-    hidden: false,
-    deleted_at: null,
-    last_activity_at: null,
-    user_id: null,
-    created_at: new Date(),
-    updated_at: new Date(),
-  })
-);
-const mockGetCodebase = mock<typeof CodebaseDb.getCodebase>(() => Promise.resolve(null));
-// Simulates the rename-then-adopt order real `executeWorkflow` runs (#2690): adoption
-// happens INSIDE the executor at the rename success site, not from the caller. The
-// rename (and therefore the adopt) only runs for a non-continuation with a prepared
-// source — a continuation re-uses the capture its own row recorded and never re-adopts
-// here. Tests that observe `capturedSourceOwnerCalls` see the wrap finally behave the
-// same way the real one would.
-const mockExecuteWorkflow = mock<typeof WorkflowExecutor.executeWorkflow>((...args) => {
-  const opts = args[7];
-  if (opts?.preparedSource) {
-    opts.capturedSourceOwner?.adopt();
-  }
-  return Promise.resolve({ success: true, workflowRunId: 'run-1' });
-});
-const mockHandleCommand = mock<typeof CommandHandler.handleCommand>(() =>
-  Promise.resolve({ success: true, message: 'ok' })
-);
-const mockSendQuery = mock<IAgentProvider['sendQuery']>(async function* () {
-  yield { type: 'agent_message_chunk', text: 'test response' };
-  yield { type: 'result', sessionId: 'session-1' };
-});
-const mockGetCodebaseEnvVars = mock(() => Promise.resolve({}));
-const mockLoadConfig = mock<typeof ConfigLoader.loadConfig>(() => Promise.resolve(makeConfig()));
-
-const mockLogger = createMockLogger();
-
-const mockCloseRunLiveOwner = mock(() => Promise.resolve());
-const mockRunLiveOwner: RunLiveOwnerModule.RunLiveOwner = {
-  close: mockCloseRunLiveOwner,
-  isStopRequested: () => false,
-};
-const mockStartRunLiveOwner = mock<typeof RunLiveOwnerModule.startRunLiveOwner>(() =>
-  Promise.resolve(mockRunLiveOwner)
-);
-const mockWithRunLiveOwner = mock<typeof RunLiveOwnerModule.withRunLiveOwner>(
-  async (_runId, _options, body) => body(mockRunLiveOwner)
-);
-mock.module('../services/run-live-owner', () => ({
-  startRunLiveOwner: mockStartRunLiveOwner,
-  withRunLiveOwner: mockWithRunLiveOwner,
-}));
-
-const mockEnsureArchonWorkspacesPath = mock(() => Promise.resolve('/home/test/.archon/workspaces'));
-const mockCaptureChatTurn = mock<typeof Paths.captureChatTurn>(() => undefined);
-const mockCaptureApprovalResolved = mock(() => undefined);
-// The one canonicalizer every `default_cwd` writer resolves through (#2927).
-// Tests below derive their expected path from it rather than from a POSIX
-// literal: it makes a path absolute, and on Windows `resolve('/path')` is
-// drive-qualified (`D:\path`).
-const { canonicalizeProjectPath } = await import('@archon/paths');
-mock.module('@archon/paths', () => ({
-  captureApprovalResolved: mockCaptureApprovalResolved,
-  createLogger: mock(() => mockLogger),
-  getArchonWorkspacesPath: mock(() => '/home/test/.archon/workspaces'),
-  ensureArchonWorkspacesPath: mockEnsureArchonWorkspacesPath,
-  getArchonHome: mock(() => '/home/test/.archon'),
-  getCredentialKeyPath: mock(() => '/home/test/.archon/credential-key'),
-  captureChatTurn: mockCaptureChatTurn,
-  captureCodebaseRegistered: mock(() => undefined),
-}));
-
-const mockUpdateConversation = mock<typeof ConversationDb.updateConversation>(() =>
-  Promise.resolve()
-);
-mock.module('../db/conversations', () => ({
-  // handleMessage resolves the conversation through getOrAdopt (which falls
-  // back to getOrCreate); the mock keeps returning the same row either way.
-  getOrAdoptConversation: mockGetOrCreateConversation,
-  getOrCreateConversation: mockGetOrCreateConversation,
-  // An unowned row is claimed by the first sender we can name; the fixture
-  // rows already have an owner, so this answers "nothing to claim".
-  claimConversationOwner: mock(() => Promise.resolve(false)),
-  getConversationByPlatformId: mock(() => Promise.resolve(null)),
-  updateConversation: mockUpdateConversation,
-  touchConversation: mock(() => Promise.resolve()),
-}));
-
-const mockListCodebases = mock<typeof CodebaseDb.listCodebases>(() => Promise.resolve([]));
-const mockCreateCodebase = mock<typeof CodebaseDb.createCodebase>(() =>
-  Promise.resolve({
-    id: 'new-codebase-id',
-    name: 'test-project',
-    repository_url: null,
-    default_cwd: '/repos/test-project',
-    default_branch: null,
-    ai_assistant_type: 'claude',
-    kind: 'repo',
-    commands: {},
-    created_at: new Date(),
-    updated_at: new Date(),
-  })
-);
-const mockUpdateCodebase = mock<typeof CodebaseDb.updateCodebase>(() => Promise.resolve());
-class MockCodebaseNotFoundError extends Error {
-  constructor(public codebaseId: string) {
-    super(`Codebase ${codebaseId} not found`);
-    this.name = 'CodebaseNotFoundError';
-  }
-}
-mock.module('../db/codebases', () => ({
-  getCodebase: mockGetCodebase,
-  listCodebases: mockListCodebases,
-  createCodebase: mockCreateCodebase,
-  updateCodebase: mockUpdateCodebase,
-  CodebaseNotFoundError: MockCodebaseNotFoundError,
-}));
-
-const mockGetActiveSession = mock<typeof SessionDb.getActiveSession>(() => Promise.resolve(null));
-const mockDeactivateSession = mock<typeof SessionDb.deactivateSession>(() => Promise.resolve());
-const mockUpdateSession = mock<typeof SessionDb.updateSession>(() => Promise.resolve());
-const mockTransitionSession = mock<typeof SessionDb.transitionSession>(() =>
-  Promise.resolve({
-    id: 'session-1',
-    conversation_id: 'conv-1-db',
-    codebase_id: null,
-    ai_assistant_type: 'claude',
-    assistant_session_id: null,
-    active: true,
-    metadata: {},
-    started_at: new Date(),
-    ended_at: null,
-    parent_session_id: null,
-    transition_reason: null,
-    ended_reason: null,
-  })
-);
-class MockSessionNotFoundError extends Error {
-  constructor(sessionId: string) {
-    super(`Session not found: ${sessionId}`);
-    this.name = 'SessionNotFoundError';
-  }
-}
-mock.module('../db/sessions', () => ({
-  getActiveSession: mockGetActiveSession,
-  deactivateSession: mockDeactivateSession,
-  updateSession: mockUpdateSession,
-  transitionSession: mockTransitionSession,
-  SessionNotFoundError: MockSessionNotFoundError,
-}));
-
-const mockParseCommand = mock<typeof CommandHandler.parseCommand>(() => ({
-  command: 'help',
-  args: [],
-}));
-mock.module('../handlers/command-handler', () => ({
-  parseCommand: mockParseCommand,
-  handleCommand: mockHandleCommand,
-}));
-
-mock.module('@archon/workflows/utils/tool-formatter', () => ({
-  formatToolCall: mock((toolName: string) => `🔧 ${toolName}`),
-}));
-const mockDiscoverWorkflowsWithConfig = mock<typeof WorkflowDiscovery.discoverWorkflowsWithConfig>(
-  () => Promise.resolve({ workflows: [], errors: [] })
-);
-const { discoverWorkflowsWithConfig: realDiscoverWorkflowsWithConfig } =
-  await import('@archon/workflows/workflow-discovery');
-mock.module('@archon/workflows/workflow-discovery', () => ({
-  discoverWorkflowsWithConfig: mockDiscoverWorkflowsWithConfig,
-}));
-mock.module('@archon/workflows/router', () => ({
-  findWorkflow: mock((name: string, workflows: WorkflowDefinition[]) =>
-    workflows.find(w => w.name === name)
-  ),
-}));
-const mockHydrateResumableRun = mock<typeof WorkflowExecutor.hydrateResumableRun>(
-  async (_deps, candidate) => ({
-    preCreatedRun: { ...candidate, status: 'running' },
-    priorCompletedNodes: new Map([['n1', { output: 'v1' }]]),
-    priorUsage: { costUsd: 0 },
-    priorNodeSessions: [],
-  })
-);
-const mockInspectResumableRun = mock<typeof WorkflowExecutor.inspectResumableRun>(() =>
-  Promise.resolve({
-    priorCompletedNodes: new Map([['n1', { output: 'v1' }]]),
-    priorUsage: { costUsd: 0 },
-  })
-);
-const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
-  project: '/capture/project',
-  globalWorkflows: '/capture/global/workflows',
-  globalCommands: '/capture/global/commands',
-  globalScripts: '/capture/global/scripts',
-  bundledWorkflows: '/capture/bundled/workflows',
-  bundledCommands: '/capture/bundled/commands/defaults',
-  installed: { kind: 'captured', captureRoot: '/capture' },
-  kind: 'captured',
-  anchor: {
-    root: '/capture',
-    digest: 'test-digest',
-    config: {
-      load_default_workflows: true,
-      load_default_commands: true,
-    },
-  },
-};
-const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSource>(() =>
-  Promise.resolve({
-    runId: 'prepared-run-id',
-    origin: '/origin',
-    manifest: {
-      version: 1,
-      engine_version: 'test',
-      origin: '/origin',
-      captured_at: '2026-08-21T00:00:00.000Z',
-      digest: 'test-digest',
-      file_count: 0,
-      byte_count: 0,
-      scopes: [],
-      source_config: {
-        load_default_workflows: true,
-        load_default_commands: true,
-      },
-    },
-    anchor: CAPTURED_SOURCE_ROOTS.anchor,
-    roots: CAPTURED_SOURCE_ROOTS,
-  })
-);
-const { resolveContinuationWorkflow: realResolveContinuationWorkflow } =
-  await import('@archon/workflows/executor');
-const mockResolveContinuationWorkflow = mock<typeof WorkflowExecutor.resolveContinuationWorkflow>(
-  () => Promise.resolve(undefined)
-);
-/** Ownership calls the dispatch path makes on its capture, in order. */
-const capturedSourceOwnerCalls: string[] = [];
-
-mock.module('@archon/workflows/executor', () => ({
-  executeWorkflow: mockExecuteWorkflow,
-  hydrateResumableRun: mockHydrateResumableRun,
-  inspectResumableRun: mockInspectResumableRun,
-  // Source capture runs before dispatch and does real filesystem work; stub it so these
-  // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
-  // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
-  prepareWorkflowSource: mockPrepareWorkflowSource,
-  recordSelectedWorkflow: mock(() => Promise.resolve()),
-  disposeWorkflowSource: mock(() => Promise.resolve()),
-  resolveContinuationWorkflow: mockResolveContinuationWorkflow,
-  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
-    withObservableCapturedSource(capturedSourceOwnerCalls, body)
-  ),
-}));
-
-/** Baseline capabilities the mocked registry reports. Tests that narrow this
- *  must restore THIS object, not a hand-written subset — dropping a flag here
- *  leaks into every later test in the file (it is how `effortControl` went
- *  missing for `resolveTitleRequest`). */
-const DEFAULT_PROVIDER_CAPS: ProviderCapabilities = {
-  sessionResume: false,
-  mcp: false,
-  hooks: false,
-  skills: false,
-  plugins: false,
-  agents: false,
-  toolRestrictions: false,
-  structuredOutput: false,
-  envInjection: true,
-  costControl: false,
-  costReporting: false,
-  effortControl: true,
-  fallbackModel: false,
-  sandbox: false,
-  settingSources: false,
-  nativeTools: false,
-  containerExec: false,
-  requiresAllPropertiesRequired: false,
-};
-
-mock.module('@archon/providers', () => ({
-  getAgentProvider: mock(() => ({
-    sendQuery: mockSendQuery,
-    getType: mock(() => 'claude'),
-    getCapabilities: mock(() => ({})),
-  })),
-  // `effortControl` decides whether a tier's `effort` reaches the provider, and
-  // `isRegisteredProvider` gates that lookup — both read by
-  // `validEffortsForProvider` (@archon/workflows/model-validation, #2556).
-  // Omitting either lets the REAL implementation run against an empty registry.
-  getProviderCapabilities: mock(() => ({ ...DEFAULT_PROVIDER_CAPS })),
-  isRegisteredProvider: mock(() => true),
-  getRegisteredProviders: mock(() => []),
-  // Vendor → env-var map consumed by credentials/delivery (#1955). A realistic
-  // subset of the generated map (the chat inject tests deliver through it).
-  PI_PROVIDER_ENV_VARS: {
-    anthropic: 'ANTHROPIC_API_KEY',
-    openai: 'OPENAI_API_KEY',
-    'github-copilot': 'COPILOT_GITHUB_TOKEN',
-    openrouter: 'OPENROUTER_API_KEY',
-    google: 'GEMINI_API_KEY',
-    huggingface: 'HF_TOKEN',
-  },
-  PI_AMBIENT_VENDORS: ['amazon-bedrock', 'google-vertex'],
-}));
-
-mock.module('../db/env-vars', () => ({
-  getCodebaseEnvVars: mockGetCodebaseEnvVars,
-}));
-
-mock.module('../utils/error-formatter', () => ({
-  classifyAndFormatError: mock((err: Error) => `Error: ${err.message}`),
-}));
-
-mock.module('../utils/error', () => ({
-  toError: mock((e: unknown) => (e instanceof Error ? e : new Error(String(e)))),
-}));
-
-mock.module('../workflows/store-adapter', () => ({
-  createWorkflowDeps: mock(() => ({})),
-}));
-
-const mockGetPausedWorkflowRun = mock<typeof WorkflowDb.getPausedWorkflowRun>(() =>
-  Promise.resolve(null)
-);
-const mockFindResumableRunByParentConversation = mock<
-  typeof WorkflowDb.findResumableRunByParentConversation
->(() => Promise.resolve(null));
-const mockUpdateWorkflowRun = mock<typeof WorkflowDb.updateWorkflowRun>(() => Promise.resolve());
-// approveWorkflow stamps the resolution atomically via this CAS (#2113), not
-// updateWorkflowRun. Defaults to "won the race".
-const mockResolveApprovalGate = mock<typeof WorkflowDb.resolveApprovalGate>(() =>
-  Promise.resolve({ resolved: true })
-);
-// approveWorkflow (operations/workflow-operations, called by the NL approval
-// path) re-reads the run via getWorkflowRun before recording the resolution.
-const mockGetWorkflowRunDb = mock<typeof WorkflowDb.getWorkflowRun>(() => Promise.resolve(null));
-// rejectWorkflow's terminal path (no on_reject staged) resolves + cancels in one CAS.
-const mockResolveAndCancelApprovalGate = mock<typeof WorkflowDb.resolveAndCancelApprovalGate>(() =>
-  Promise.resolve({ resolved: true })
-);
-// manage_run resolves every by-id action through this project-scoped prefix lookup.
-const mockFindWorkflowRunsByIdPrefix = mock<typeof WorkflowDb.findWorkflowRunsByIdPrefix>(() =>
-  Promise.resolve([])
-);
-const mockListDashboardRuns = mock<typeof WorkflowDb.listDashboardRuns>(() =>
-  Promise.resolve({
-    runs: [],
-    total: 0,
-    counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
-  })
-);
-class MockWorkflowNotResumableError extends Error {
-  constructor(
-    readonly runId: string,
-    readonly currentStatus: WorkflowRun['status']
-  ) {
-    super(`Workflow run is not resumable (id: ${runId}, status: ${currentStatus}).`);
-    this.name = 'WorkflowNotResumableError';
-  }
-}
-mock.module('../db/workflows', () => ({
-  getPausedWorkflowRun: mockGetPausedWorkflowRun,
-  getWorkflowRun: mockGetWorkflowRunDb,
-  findResumableRunByParentConversation: mockFindResumableRunByParentConversation,
-  updateWorkflowRun: mockUpdateWorkflowRun,
-  resolveApprovalGate: mockResolveApprovalGate,
-  resolveAndCancelApprovalGate: mockResolveAndCancelApprovalGate,
-  findWorkflowRunsByIdPrefix: mockFindWorkflowRunsByIdPrefix,
-  listDashboardRuns: mockListDashboardRuns,
-  WorkflowNotResumableError: MockWorkflowNotResumableError,
-}));
-
-const mockCreateWorkflowEvent = mock<typeof WorkflowEventDb.createWorkflowEvent>(() =>
-  Promise.resolve()
-);
-mock.module('../db/workflow-events', () => ({
-  createWorkflowEvent: mockCreateWorkflowEvent,
-}));
-
-mock.module('../config/config-loader', () => ({
-  loadConfig: mockLoadConfig,
-  loadRepoConfig: mockLoadRepoConfig,
-}));
-
-const mockGenerateAndSetTitle = mock<typeof TitleGenerator.generateAndSetTitle>(() =>
-  Promise.resolve()
-);
-mock.module('../services/title-generator', () => ({
-  generateAndSetTitle: mockGenerateAndSetTitle,
-}));
-
-const mockDispatchBackgroundWorkflow = mock<typeof Orchestrator.dispatchBackgroundWorkflow>(() =>
-  Promise.resolve()
-);
-const mockValidateAndResolveIsolation = mock<typeof Orchestrator.validateAndResolveIsolation>(() =>
-  Promise.resolve({ cwd: '/test/cwd', status: 'none', env: null })
-);
-mock.module('./orchestrator', () => ({
-  validateAndResolveIsolation: mockValidateAndResolveIsolation,
-  dispatchBackgroundWorkflow: mockDispatchBackgroundWorkflow,
-}));
-
-const mockResolveWorkflowAdoption = mock<typeof WorkflowAdoption.resolveWorkflowAdoption>(() =>
-  Promise.reject(new Error('Workflow adoption mock is not configured'))
-);
-mock.module('../operations/workflow-adoption', () => ({
-  resolveWorkflowAdoption: mockResolveWorkflowAdoption,
-  WorkflowAdoptionError: class WorkflowAdoptionError extends Error {
-    constructor(message: string) {
-      super(message);
-      this.name = 'WorkflowAdoptionError';
-    }
-  },
-}));
-
-mock.module('./prompt-builder', () => ({
-  buildOrchestratorPrompt: mock(() => 'orchestrator system prompt'),
-  buildProjectScopedPrompt: mock(() => 'project scoped system prompt'),
-  buildOrchestratorSystemAppend: mock(() => 'orchestrator system append'),
-  buildRunManagementSection: mock(() => '## Managing Workflow Runs\n(mocked)'),
-  formatWorkflowContextSection: mock((results: unknown[]) =>
-    results.length > 0 ? '## Recent Workflow Results\n\n...' : ''
-  ),
-}));
-
-const mockAddMessage = mock<typeof MessageDb.addMessage>((conversationId, role, content) =>
-  Promise.resolve(makeMessage({ conversation_id: conversationId, role, content }))
-);
-const mockListMessages = mock<typeof MessageDb.listMessages>(() => Promise.resolve([]));
-const mockGetRecentWorkflowResultMessages = mock<typeof MessageDb.getRecentWorkflowResultMessages>(
-  () => Promise.resolve([])
-);
-mock.module('../db/messages', () => ({
-  addMessage: mockAddMessage,
-  listMessages: mockListMessages,
-  getRecentWorkflowResultMessages: mockGetRecentWorkflowResultMessages,
-}));
-
-mock.module('@archon/isolation', () => ({
-  IsolationBlockedError: class IsolationBlockedError extends Error {
-    public reason: string;
-    constructor(reason: string) {
-      super(reason);
-      this.reason = reason;
-      this.name = 'IsolationBlockedError';
-    }
-  },
-  // Loaded transitively via orchestrator-agent → child-isolation-resolver (PR-A).
-  getIsolationProvider: mock(() => ({})),
-  classifyIsolationError: (err: Error) => err.message,
-}));
-
-const mockResolveWorkflowSourceRoot = mock<typeof WorkflowSourceRoot.resolveWorkflowSourceRoot>(
-  () => Promise.resolve(undefined)
-);
-mock.module('../utils/workflow-source-root', () => ({
-  resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
-}));
-
-mock.module('@archon/git', () => ({
-  getDefaultRemote: mockGetDefaultRemote,
-  syncWorkspace: mockSyncWorkspace,
-  // /register-project probes git-ness via findRepoRoot; a non-null root marks
-  // the registered path as a repo project (kind: 'repo').
-  findRepoRoot: mock((p: string) => Promise.resolve(p)),
-  // Stubs for post-message-reminder (loaded transitively by orchestrator-agent).
-  // Return null/0/false so the reminder short-circuits without emitting an event.
-  getCurrentBranch: mock(() => Promise.resolve(null)),
-  countCommitsAhead: mock(() => Promise.resolve(0)),
-  hasUncommittedChanges: mock(() => Promise.resolve(false)),
-}));
-
-// Hoisted so individual tests can make a specific path report as missing (the
-// conversation-cwd guard in handleMessage). Default: everything exists.
-const mockExistsSync = mock((_path: string) => true);
-
-mock.module('fs', () => ({
-  existsSync: mockExistsSync,
-  // token-crypto.ts imports these from node:fs for the auto-provisioned credential
-  // key. readFileSync returns a valid 64-hex key so getEncryptionKey() resolves
-  // without any real disk write when the per-user credential path is exercised.
-  readFileSync: mock(() => 'a'.repeat(64)),
-  writeFileSync: mock(() => undefined),
-  mkdirSync: mock(() => undefined),
-  chmodSync: mock(() => undefined),
-}));
-
-// Credential feature mocks (per-user AI-provider credentials).
-// Default: feature disabled — existing tests are unaffected.
-const mockIsPerUserProviderKeysEnabled = mock(() => false);
-mock.module('../credentials/config', () => ({
-  isPerUserProviderKeysEnabled: mockIsPerUserProviderKeysEnabled,
-}));
-
-const mockListDecryptedUserProviderCredentials = mock<
-  typeof UserProviderKeyStore.listDecryptedUserProviderCredentials
->(async () => []);
-mock.module('../db/user-provider-key-store', () => ({
-  listDecryptedUserProviderCredentials: mockListDecryptedUserProviderCredentials,
-  saveUserProviderKey: mock(() => Promise.resolve()),
-  getUserProviderKeyRecord: mock(() => Promise.resolve(null)),
-  listUserProviderKeys: mock(() => Promise.resolve([])),
-  deleteUserProviderKey: mock(() => Promise.resolve()),
-  getDecryptedProviderCredential: mock(() => Promise.resolve(null)),
-}));
-
-// Per-user AI prefs (Phase 3). Default: empty — config-only behavior.
-const mockGetUserAiPrefsDb = mock(async (_userId: string) => ({}) as Record<string, unknown>);
-mock.module('../db/user-ai-prefs-store', () => ({
-  getUserAiPrefs: mockGetUserAiPrefsDb,
-  setUserTiers: mock(() => Promise.resolve()),
-  setUserAliases: mock(() => Promise.resolve()),
-  setUserDefault: mock(() => Promise.resolve()),
-  clearUserAiPrefs: mock(() => Promise.resolve()),
-}));
-
-// ─── Import module under test (AFTER all mocks) ───────────────────────────────
+import type { NativeTool } from '@archon/providers/types';
 
 import {
-  parseOrchestratorCommands,
-  handleMessage,
-  resolveChatModelRequest,
-  resolveTitleRequest,
-  continueResolvedGateRun,
-} from './orchestrator-agent';
+  DEFAULT_PROVIDER_CAPS,
+  canonicalizeProjectPath,
+  makeCodebase,
+  makeCodebaseForSync,
+  makeConfig,
+  makeConversation,
+  makePlatform,
+  makeRun,
+  makeSession,
+  makeMessage,
+  mockAddMessage,
+  mockCaptureApprovalResolved,
+  mockCaptureWorkflowNoMatch,
+  mockCreateWorkflowEvent,
+  mockDiscoverWorkflowsWithConfig,
+  mockDispatchBackgroundWorkflow,
+  mockEnsureArchonWorkspacesPath,
+  mockExecuteWorkflow,
+  mockExistsSync,
+  mockFindResumableRunByParentConversation,
+  mockFindWorkflowRunsByIdPrefix,
+  mockGetActiveSession,
+  mockGetCodebase,
+  mockGetCodebaseEnvVars,
+  mockGetOrCreateConversation,
+  mockGetPausedWorkflowRun,
+  mockGetWorkflowRunDb,
+  mockHandleCommand,
+  mockHydrateResumableRun,
+  mockListCodebases,
+  mockLoadConfig,
+  mockLogger,
+  mockParseCommand,
+  mockRegisterFolder,
+  mockResolveAndCancelApprovalGate,
+  mockResolveApprovalGate,
+  mockSendQuery,
+  mockTransitionSession,
+  mockUpdateWorkflowRun,
+  mockValidateAndResolveIsolation,
+  operator,
+  makeDispatchConversation,
+  makeForegroundPlatform,
+  resetDispatchMocks,
+} from '../test/orchestrator-agent-harness';
+import { handleMessage } from './orchestrator-agent';
 import { isTurnRunning, stopTurn, TURN_STOPPED_NOTICE } from './turn-control';
-import { buildAiProfile } from '@archon/workflows/model-validation';
-import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/** The only `Codebase` literal in this file. Every variant is an override of it. */
-function makeCodebase(overrides: Partial<Codebase> = {}): Codebase {
-  return {
-    id: 'codebase-1',
-    name: 'test-repo',
-    repository_url: null,
-    default_cwd: '/repos/test-repo',
-    default_branch: null,
-    ai_assistant_type: 'claude',
-    kind: 'repo',
-    commands: {},
-    created_at: new Date(),
-    updated_at: new Date(),
-    ...overrides,
-  };
-}
-
-/** Positional form for tests that identify a project by name: the name drives id and cwd. */
-function makeNamedCodebase(name: string, id = `id-${name}`): Codebase {
-  return makeCodebase({ id, name, default_cwd: `/repos/${name}` });
-}
-
-/** The only `WorkflowRun` literal in this file. Every variant is an override of it. */
-function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
-  return {
-    id: 'run-1',
-    workflow_name: 'test-workflow',
-    conversation_id: 'conv-1',
-    parent_conversation_id: null,
-    codebase_id: 'codebase-1',
-    status: 'paused',
-    outcome: null,
-    user_message: 'original prompt',
-    metadata: {},
-    started_at: new Date(),
-    completed_at: null,
-    last_activity_at: null,
-    working_path: '/repos/test-repo',
-    user_id: null,
-    parent_run_id: null,
-    adopted_from_run_id: null,
-    output_root: null,
-    checkout_baseline: null,
-    ...overrides,
-  };
-}
-
-// `existsSync` is one shared mock for the whole file, so whatever predicate the
-// last test left behind is what the next one inherits. Resetting it inside a
-// single describe is not enough: everything below that block would run against a
-// leaked predicate, including the `/setproject` and `/update-project` suites,
-// which drive the existsSync call sites in handleSetProject and
-// handleUpdateProject. Today a leak is survivable only because the predicates
-// here reject one literal path — that is luck, not a guarantee, and it stops
-// being true the moment a test rejects something broader. Reset before every
-// test so no describe can poison another.
-//
-// Deliberately no count here: any number rots on the next test added, and the
-// mechanism is the argument.
-beforeEach(() => {
-  mockExistsSync.mockImplementation(() => true);
-});
-
-// ─── parseOrchestratorCommands ────────────────────────────────────────────────
-
-describe('parseOrchestratorCommands', () => {
-  const assistWorkflow = makeTestWorkflow({ name: 'assist' });
-  const implementWorkflow = makeTestWorkflow({ name: 'implement' });
-  const planWorkflow = makeTestWorkflow({ name: 'plan' });
-
-  const myProject = makeNamedCodebase('my-project');
-  const orgProject = makeNamedCodebase('coleam00/Archon');
-
-  const workflows = [assistWorkflow, implementWorkflow, planWorkflow];
-  const codebases = [myProject, orgProject];
-
-  beforeEach(() => {
-    mockLogger.warn.mockClear();
-  });
-
-  // ─── Basic /invoke-workflow parsing ─────────────────────────────────────────
-
-  describe('/invoke-workflow basic parsing', () => {
-    test('parses a simple /invoke-workflow command', () => {
-      const response = '/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).not.toBeNull();
-      expect(result.workflowInvocation?.workflowName).toBe('assist');
-      expect(result.workflowInvocation?.projectName).toBe('my-project');
-    });
-
-    test('parses /invoke-workflow at the start of a multiline response', () => {
-      const response =
-        'Let me help you with that.\n/invoke-workflow implement --project my-project\nSome trailing text.';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).not.toBeNull();
-      expect(result.workflowInvocation?.workflowName).toBe('implement');
-    });
-
-    test('returns remaining text before the command as remainingMessage', () => {
-      const response = 'I will run the workflow now.\n/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.remainingMessage).toBe('I will run the workflow now.');
-    });
-
-    test('remainingMessage is empty string when command is at the start', () => {
-      const response = '/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.remainingMessage).toBe('');
-    });
-
-    test('parses --project with equals sign separator', () => {
-      const response = '/invoke-workflow assist --project=my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).not.toBeNull();
-      expect(result.workflowInvocation?.projectName).toBe('my-project');
-    });
-
-    test('does not capture trailing text after project name (uses \\S+ for project)', () => {
-      // The regex uses (\S+) for project name so trailing text is excluded
-      const response = '/invoke-workflow assist --project my-project some extra stuff here';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      // Should still match since "my-project" is parsed as non-whitespace token
-      expect(result.workflowInvocation).not.toBeNull();
-      expect(result.workflowInvocation?.projectName).toBe('my-project');
-    });
-
-    test('strips markdown bold from /invoke-workflow and parses correctly', () => {
-      const response = '**/invoke-workflow assist --project my-project**';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-      expect(result.workflowInvocation?.workflowName).toBe('assist');
-      expect(result.workflowInvocation?.projectName).toBe('my-project');
-    });
-  });
-
-  // ─── --prompt parameter ──────────────────────────────────────────────────────
-
-  describe('--prompt parameter', () => {
-    test('parses --prompt with double quotes', () => {
-      const response =
-        '/invoke-workflow implement --project my-project --prompt "Add dark mode support"';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.synthesizedPrompt).toBe('Add dark mode support');
-    });
-
-    test('parses --prompt with single quotes', () => {
-      const response =
-        "/invoke-workflow implement --project my-project --prompt 'Add dark mode support'";
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.synthesizedPrompt).toBe('Add dark mode support');
-    });
-
-    test('synthesizedPrompt is undefined when --prompt is absent', () => {
-      const response = '/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.synthesizedPrompt).toBeUndefined();
-    });
-
-    test('synthesizedPrompt is undefined when --prompt has empty string (double quotes)', () => {
-      // The regex [^"]+ requires at least one character so "" does not match the pattern.
-      // promptMatch is null → synthesizedPrompt stays undefined (no warning is logged).
-      const response = '/invoke-workflow assist --project my-project --prompt ""';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.synthesizedPrompt).toBeUndefined();
-    });
-
-    test('does not log synthesized_prompt_empty_discarded warning when --prompt ""', () => {
-      // With --prompt "", the regex [^"]+ does not match so promptMatch is null.
-      // The `if (promptMatch && !synthesizedPrompt)` guard is never entered.
-      const response = '/invoke-workflow assist --project my-project --prompt ""';
-      parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(mockLogger.warn).not.toHaveBeenCalled();
-    });
-
-    test('logs synthesized_prompt_empty_discarded when --prompt has only whitespace', () => {
-      // With --prompt "   ", [^"]+ matches whitespace; after .trim() rawPrompt is "".
-      // The `if (promptMatch && !synthesizedPrompt)` branch executes and logs a warning.
-      const response = '/invoke-workflow assist --project my-project --prompt "   "';
-      parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ workflowName: 'assist', projectName: 'my-project' }),
-        'synthesized_prompt_empty_discarded'
-      );
-    });
-
-    test('does not log warning when --prompt is absent', () => {
-      const response = '/invoke-workflow assist --project my-project';
-      parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(mockLogger.warn).not.toHaveBeenCalled();
-    });
-
-    test('does not log warning when --prompt has a non-empty value', () => {
-      const response = '/invoke-workflow assist --project my-project --prompt "valid prompt"';
-      parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(mockLogger.warn).not.toHaveBeenCalled();
-    });
-
-    test('--prompt must come after --project to match (--project before --prompt)', () => {
-      // The regex requires --project before --prompt per spec
-      const response = '/invoke-workflow assist --project my-project --prompt "test"';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).not.toBeNull();
-      expect(result.workflowInvocation?.synthesizedPrompt).toBe('test');
-    });
-
-    test('command with --prompt before --project does NOT match', () => {
-      // Per comment: "--project MUST appear before --prompt"
-      const response = '/invoke-workflow assist --prompt "test" --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      // The regex won't match when --prompt is before --project
-      expect(result.workflowInvocation).toBeNull();
-    });
-  });
-
-  // ─── Workflow validation ──────────────────────────────────────────────────────
-
-  describe('workflow validation', () => {
-    test('returns null workflowInvocation when workflow does not exist', () => {
-      const response = '/invoke-workflow nonexistent-workflow --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-    });
-
-    test('validates against actual workflow list', () => {
-      const response = '/invoke-workflow plan --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.workflowName).toBe('plan');
-    });
-
-    test('returns null when workflows list is empty', () => {
-      const response = '/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, []);
-
-      expect(result.workflowInvocation).toBeNull();
-    });
-  });
-
-  // ─── Project name matching ────────────────────────────────────────────────────
-
-  describe('project name matching', () => {
-    test('matches project by exact name (case-insensitive)', () => {
-      const response = '/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.projectName).toBe('my-project');
-    });
-
-    test('matches project case-insensitively (uppercase input)', () => {
-      const response = '/invoke-workflow assist --project MY-PROJECT';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.projectName).toBe('my-project');
-    });
-
-    test('matches project by last path segment (partial match)', () => {
-      // "coleam00/Archon" matched by "Archon"
-      const response = '/invoke-workflow assist --project Archon';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).not.toBeNull();
-      expect(result.workflowInvocation?.projectName).toBe('coleam00/Archon');
-    });
-
-    test('partial match is case-insensitive', () => {
-      const response = '/invoke-workflow assist --project archon';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.projectName).toBe('coleam00/Archon');
-    });
-
-    test('returns null workflowInvocation when project does not exist', () => {
-      const response = '/invoke-workflow assist --project nonexistent-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-    });
-
-    test('returns null when codebases list is empty', () => {
-      const response = '/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, [], workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-    });
-
-    test('uses matched codebase name (not the input name) in result', () => {
-      // Input "Archon" should resolve to full name "coleam00/Archon"
-      const response = '/invoke-workflow assist --project Archon';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.projectName).toBe('coleam00/Archon');
-    });
-  });
-
-  // ─── /register-project parsing ────────────────────────────────────────────────
-
-  describe('/register-project parsing', () => {
-    test('parses a basic /register-project command', () => {
-      const response = '/register-project my-app /home/user/projects/my-app';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration).not.toBeNull();
-      expect(result.projectRegistration?.projectName).toBe('my-app');
-      expect(result.projectRegistration?.projectPath).toBe('/home/user/projects/my-app');
-    });
-
-    test('parses /register-project with path containing spaces', () => {
-      const response = '/register-project my-app /home/user/my projects/my-app dir';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration?.projectPath).toBe('/home/user/my projects/my-app dir');
-    });
-
-    test('parses /register-project in a multiline response', () => {
-      const response =
-        'I will register that project now.\n/register-project myapp /path/to/repo\nDone!';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration?.projectName).toBe('myapp');
-      expect(result.projectRegistration?.projectPath).toBe('/path/to/repo');
-    });
-
-    test('returns null projectRegistration when command is absent', () => {
-      const response = 'Just a regular message without any commands.';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration).toBeNull();
-    });
-
-    test('trims projectName and projectPath', () => {
-      const response = '/register-project  myapp  /path/to/repo';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      // The regex \S+ for name means no spaces in name anyway
-      // Path is trimmed via .trim()
-      expect(result.projectRegistration?.projectPath).toBe('/path/to/repo');
-    });
-
-    test('strips markdown bold from /register-project and parses correctly', () => {
-      const response = '**/register-project myapp /home/user/projects/myapp**';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-      expect(result.projectRegistration?.projectName).toBe('myapp');
-      expect(result.projectRegistration?.projectPath).toBe('/home/user/projects/myapp');
-    });
-
-    test('strips markdown bold from /register-project with quoted path', () => {
-      const response =
-        '**/register-project SaberEngine "/.archon/workspaces/b1skit/SaberEngine/source"**';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-      expect(result.projectRegistration?.projectName).toBe('SaberEngine');
-      // parseOrchestratorCommands captures the path via (.+)$ which preserves the
-      // surrounding double-quotes. Downstream, handleRegisterProject reconstructs
-      // the command string and calls parseCommand(), which strips the quotes before
-      // calling existsSync(). So the path stored here intentionally includes quotes.
-      expect(result.projectRegistration?.projectPath).toBe(
-        '"/.archon/workspaces/b1skit/SaberEngine/source"'
-      );
-    });
-
-    test('strips markdown bold from /register-project in multiline response', () => {
-      const response =
-        'The project has been set up.\n\n**/register-project SaberEngine "/path/to/repo"**';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-      expect(result.projectRegistration?.projectName).toBe('SaberEngine');
-      // Surrounding quotes are preserved by (.+)$ — see quoted-path test above.
-      expect(result.projectRegistration?.projectPath).toBe('"/path/to/repo"');
-    });
-
-    test('strips single-asterisk italic from /register-project', () => {
-      const response = '*/register-project myapp /path/to/app*';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-      expect(result.projectRegistration?.projectName).toBe('myapp');
-      expect(result.projectRegistration?.projectPath).toBe('/path/to/app');
-    });
-  });
-
-  // ─── No commands ──────────────────────────────────────────────────────────────
-
-  describe('empty and no-command responses', () => {
-    test('returns null for both when response has no commands', () => {
-      const response = 'This is just a regular AI response with no commands.';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-      expect(result.projectRegistration).toBeNull();
-    });
-
-    test('returns null for both when response is empty string', () => {
-      const result = parseOrchestratorCommands('', codebases, workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-      expect(result.projectRegistration).toBeNull();
-    });
-
-    test('returns null for both when response is only whitespace', () => {
-      const result = parseOrchestratorCommands('   \n\n  ', codebases, workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-      expect(result.projectRegistration).toBeNull();
-    });
-  });
-
-  // ─── Both commands present ────────────────────────────────────────────────────
-
-  describe('both commands present in same response', () => {
-    test('can parse both /invoke-workflow and /register-project in same response', () => {
-      const response = [
-        '/register-project newapp /path/to/newapp',
-        '/invoke-workflow assist --project my-project',
-      ].join('\n');
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration?.projectName).toBe('newapp');
-      expect(result.workflowInvocation?.workflowName).toBe('assist');
-    });
-  });
-
-  // ─── Pattern edge cases ───────────────────────────────────────────────────────
-
-  describe('pattern edge cases and invalid inputs', () => {
-    test('does not match /invoke-workflow without --project argument', () => {
-      const response = '/invoke-workflow assist';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-    });
-
-    test('does not match /invoke-workflow mid-line (requires start of line)', () => {
-      // The regex uses /^.../m so it must be at start of a line
-      const response = 'text /invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      // "text " before the command means it's not at the start of the line
-      expect(result.workflowInvocation).toBeNull();
-    });
-
-    test('does not match /register-project mid-line', () => {
-      const response = 'here is /register-project myapp /path';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration).toBeNull();
-    });
-
-    test('does not match /register-project with only one argument', () => {
-      const response = '/register-project only-name-no-path';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration).toBeNull();
-    });
-
-    test('does not match partial command like /invoke-workflo', () => {
-      const response = '/invoke-workflo assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).toBeNull();
-    });
-
-    test('case-sensitive command keywords (/INVOKE-WORKFLOW does not match)', () => {
-      const response = '/INVOKE-WORKFLOW assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      // The regex is case-sensitive for the command keyword
-      expect(result.workflowInvocation).toBeNull();
-    });
-
-    test('case-sensitive command keywords (/REGISTER-PROJECT does not match)', () => {
-      const response = '/REGISTER-PROJECT myapp /path/to/app';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration).toBeNull();
-    });
-
-    test('workflow name is taken from the matched workflow object (not input)', () => {
-      // Even if input has odd casing, the returned workflowName should come from workflow.name
-      const response = '/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      // findWorkflow does exact match, so 'assist' must match workflow.name === 'assist'
-      expect(result.workflowInvocation?.workflowName).toBe('assist');
-    });
-  });
-
-  // ─── Complex real-world responses ────────────────────────────────────────────
-
-  describe('complex real-world response patterns', () => {
-    test('parses command embedded in longer reasoning text', () => {
-      const response = [
-        'Based on your request, I will run the implement workflow on your project.',
-        'This will make the necessary changes.',
-        '',
-        '/invoke-workflow implement --project my-project --prompt "Add authentication support"',
-        '',
-        'The workflow will handle the implementation details.',
-      ].join('\n');
-
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.workflowName).toBe('implement');
-      expect(result.workflowInvocation?.synthesizedPrompt).toBe('Add authentication support');
-      expect(result.workflowInvocation?.remainingMessage).toContain('Based on your request');
-    });
-
-    test('handles response with tool indicator emojis before command', () => {
-      // After batch-mode filtering, tool indicators are removed, but
-      // parseOrchestratorCommands receives the filtered content
-      const response =
-        'I have analyzed the codebase.\n/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation).not.toBeNull();
-    });
-
-    test('remainingMessage trims leading/trailing whitespace', () => {
-      const response = '  \n  \nSome text here.\n\n/invoke-workflow assist --project my-project';
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      // The remaining text (before the command) gets .trim()
-      expect(result.workflowInvocation?.remainingMessage).toBe('Some text here.');
-    });
-
-    test('first /invoke-workflow match wins when multiple appear', () => {
-      // The regex exec() returns the first match
-      const response = [
-        '/invoke-workflow assist --project my-project',
-        '/invoke-workflow implement --project my-project',
-      ].join('\n');
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.workflowInvocation?.workflowName).toBe('assist');
-    });
-
-    test('first /register-project match wins when multiple appear', () => {
-      const response = [
-        '/register-project first-app /path/to/first',
-        '/register-project second-app /path/to/second',
-      ].join('\n');
-      const result = parseOrchestratorCommands(response, codebases, workflows);
-
-      expect(result.projectRegistration?.projectName).toBe('first-app');
-    });
-  });
-});
-
-// ─── filterToolIndicators (tested indirectly through known behavior) ──────────
-//
-// filterToolIndicators is a private function but its logic is straightforward
-// enough to test directly by replicating its behavior with the same regex.
-// We test it by exercising the exact same filtering pattern it uses.
-
-describe('filterToolIndicators logic (replicated regex tests)', () => {
-  // This replicates the exact regex and logic from filterToolIndicators
-  const toolIndicatorRegex =
-    /^(?:\u{1F527}|\u{1F4AD}|\u{1F4DD}|\u{270F}\u{FE0F}|\u{1F5D1}\u{FE0F}|\u{1F4C2}|\u{1F50D})/u;
-
-  function applyFilter(messages: string[]): string {
-    if (messages.length === 0) return '';
-    const allMessages = messages.join('\n\n---\n\n');
-    const sections = allMessages.split('\n\n');
-    const cleanSections = sections.filter(section => {
-      const trimmed = section.trim();
-      return !toolIndicatorRegex.exec(trimmed);
-    });
-    const finalMessage = cleanSections.join('\n\n').trim();
-    return finalMessage || allMessages;
-  }
-
-  test('returns empty string for empty array', () => {
-    expect(applyFilter([])).toBe('');
-  });
-
-  test('preserves non-tool-indicator text unchanged', () => {
-    const result = applyFilter(['This is a regular message.']);
-    expect(result).toBe('This is a regular message.');
-  });
-
-  test('filters 🔧 (U+1F527) tool usage indicator', () => {
-    const result = applyFilter(['🔧 Running tool foo', 'The answer is 42.']);
-    expect(result).not.toContain('🔧');
-    expect(result).toContain('The answer is 42.');
-  });
-
-  test('filters 💭 (U+1F4AD) thinking indicator', () => {
-    const result = applyFilter(['💭 Thinking about the problem...', 'Here is my response.']);
-    expect(result).not.toContain('💭');
-    expect(result).toContain('Here is my response.');
-  });
-
-  test('filters 📝 (U+1F4DD) writing indicator', () => {
-    const result = applyFilter(['📝 Writing file output.txt', 'Done writing.']);
-    expect(result).not.toContain('📝');
-    expect(result).toContain('Done writing.');
-  });
-
-  test('filters ✏️ (U+270F+FE0F) editing indicator', () => {
-    const result = applyFilter(['\u{270F}\u{FE0F} Editing main.ts', 'Edit complete.']);
-    expect(result).not.toContain('\u{270F}');
-    expect(result).toContain('Edit complete.');
-  });
-
-  test('filters 🗑️ (U+1F5D1+FE0F) deleting indicator', () => {
-    const result = applyFilter(['\u{1F5D1}\u{FE0F} Deleting temp file', 'File removed.']);
-    expect(result).not.toContain('\u{1F5D1}');
-    expect(result).toContain('File removed.');
-  });
-
-  test('filters 📂 (U+1F4C2) folder indicator', () => {
-    const result = applyFilter(['📂 Reading directory /src', 'Directory listed.']);
-    expect(result).not.toContain('📂');
-    expect(result).toContain('Directory listed.');
-  });
-
-  test('filters 🔍 (U+1F50D) search indicator', () => {
-    const result = applyFilter(['🔍 Searching for pattern', 'Search complete.']);
-    expect(result).not.toContain('🔍');
-    expect(result).toContain('Search complete.');
-  });
-
-  test('preserves emoji that is not a tool indicator', () => {
-    const result = applyFilter(['🎉 Deployment successful!']);
-    expect(result).toContain('🎉 Deployment successful!');
-  });
-
-  test('preserves text that contains tool emoji but does not START with it', () => {
-    // The regex requires the emoji at the START of the section
-    const result = applyFilter(['Here is a 🔧 wrench emoji mid-text.']);
-    expect(result).toContain('🔧');
-  });
-
-  test('falls back to all messages when everything gets filtered out', () => {
-    // If all sections are tool indicators, return the raw joined messages
-    const messages = ['🔧 Tool call one', '💭 Thinking...'];
-    const result = applyFilter(messages);
-    // The fallback returns allMessages (raw join)
-    expect(result.length).toBeGreaterThan(0);
-  });
-
-  test('handles multiple assistant messages joined with separator', () => {
-    const messages = [
-      'First part of the response.',
-      '🔧 Some tool usage here',
-      'Second part of the response.',
-    ];
-    const result = applyFilter(messages);
-    expect(result).toContain('First part of the response.');
-    expect(result).toContain('Second part of the response.');
-    expect(result).not.toContain('🔧 Some tool usage here');
-  });
-
-  test('sections within a single message are split by double newlines', () => {
-    // A single message with embedded double-newline creates multiple sections
-    const messages = ['Normal text.\n\n🔧 Tool output.\n\nMore normal text.'];
-    const result = applyFilter(messages);
-    expect(result).toContain('Normal text.');
-    expect(result).toContain('More normal text.');
-    expect(result).not.toContain('🔧');
-  });
-
-  test('trims whitespace from the final output', () => {
-    const result = applyFilter(['  Regular text with leading spaces.  ']);
-    expect(result).toBe('Regular text with leading spaces.');
-  });
-
-  test('handles empty strings in message array', () => {
-    const result = applyFilter(['', 'Actual content here.', '']);
-    expect(result).toContain('Actual content here.');
-  });
-});
-
-// ─── Helpers for handleMessage tests ─────────────────────────────────────────
-
-function makePlatform() {
-  return {
-    sendMessage: mock<IPlatformAdapter['sendMessage']>(() => Promise.resolve()),
-    ensureThread: mock<NonNullable<IPlatformAdapter['ensureThread']>>(id => Promise.resolve(id)),
-    getStreamingMode: mock<IPlatformAdapter['getStreamingMode']>(() => 'batch'),
-    getPlatformType: mock<IPlatformAdapter['getPlatformType']>(() => 'web'),
-    start: mock<IPlatformAdapter['start']>(() => Promise.resolve()),
-    stop: mock<IPlatformAdapter['stop']>(() => {}),
-  } satisfies IPlatformAdapter;
-}
-
-function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
-  return {
-    // DB primary key deliberately differs from platform_conversation_id — the
-    // real schemas always generate `id` independently, and identical defaults
-    // masked the /setproject platform-id bug (id-conflating tests passed
-    // against the broken code).
-    id: 'conv-1-db',
-    platform_type: 'web',
-    platform_conversation_id: 'conv-1',
-    codebase_id: null,
-    cwd: null,
-    isolation_env_id: null,
-    ai_assistant_type: 'claude',
-    title: 'Test Conversation',
-    hidden: false,
-    deleted_at: null,
-    last_activity_at: null,
-    user_id: null,
-    created_at: new Date(),
-    updated_at: new Date(),
-    ...overrides,
-  };
-}
-
-function makeConfig(overrides: Partial<MergedConfig> = {}): MergedConfig {
-  return {
-    botName: 'Archon',
-    assistant: 'claude',
-    assistants: { claude: {}, codex: {} },
-    streaming: { telegram: 'stream', discord: 'batch', slack: 'batch' },
-    paths: { workspaces: '/tmp', worktrees: '/tmp' },
-    concurrency: { maxConversations: 10 },
-    workflows: {
-      autoResumeOnQuotaReset: false,
-      quotaMaxAttempts: 1,
-      quotaDeadlineMs: 86_400_000,
-    },
-    commands: { autoLoad: true },
-    defaults: { copyDefaults: true, loadDefaultCommands: true, loadDefaultWorkflows: true },
-    envVars: {},
-    ...overrides,
-  };
-}
-
-function makeMessage(overrides: Partial<MessageRow> = {}): MessageRow {
-  return {
-    id: 'message-1',
-    conversation_id: 'conv-1-db',
-    role: 'assistant',
-    content: 'test message',
-    metadata: '{}',
-    user_id: null,
-    created_at: '2026-01-01T00:00:00.000Z',
-    ...overrides,
-  };
-}
-
-function makeSession(overrides: Partial<Session> = {}): Session {
-  return {
-    id: 'session-1',
-    conversation_id: 'conv-1-db',
-    codebase_id: null,
-    ai_assistant_type: 'claude',
-    assistant_session_id: null,
-    active: true,
-    metadata: {},
-    started_at: new Date(),
-    ended_at: null,
-    parent_session_id: null,
-    transition_reason: null,
-    ended_reason: null,
-    ...overrides,
-  };
-}
-
-type AgentIsolationEnvironment = Extract<
-  Awaited<ReturnType<typeof Orchestrator.validateAndResolveIsolation>>,
-  { status: 'new' }
->['env'];
-
-function makeIsolationEnvironment(
-  overrides: Partial<AgentIsolationEnvironment> = {}
-): AgentIsolationEnvironment {
-  return {
-    id: 'env-1',
-    codebase_id: 'codebase-1',
-    workflow_type: 'task',
-    workflow_id: 'workflow-1',
-    provider: 'worktree',
-    working_path: '/wt/from-branch',
-    branch_name: 'feature/adopted',
-    status: 'active',
-    created_at: new Date(),
-    created_by_platform: 'web',
-    created_by_user_id: null,
-    metadata: {},
-    ...overrides,
-  };
-}
-
-/** The sync suites need a codebase with a remote; nothing else differs. */
-function makeCodebaseForSync(): Codebase {
-  return makeCodebase({ repository_url: 'https://github.com/test/repo' });
-}
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-describe('module constants (MAX_BATCH_ASSISTANT_CHUNKS, MAX_BATCH_TOTAL_CHUNKS)', () => {
-  // These constants are not exported but their values are defined in the source.
-  // We verify them by checking the documented values.
-  test('MAX_BATCH_ASSISTANT_CHUNKS is 20 per source documentation', () => {
-    // This test documents the expected constant value.
-    // If the constant changes, this test acts as a regression guard.
-    expect(20).toBe(20); // Symbolic — the actual value is in source line 46
-  });
-
-  test('MAX_BATCH_TOTAL_CHUNKS is 200 per source documentation', () => {
-    expect(200).toBe(200); // Symbolic — the actual value is in source line 48
-  });
-});
-
-// ─── Type shape tests ─────────────────────────────────────────────────────────
-
-describe('WorkflowInvocation and ProjectRegistration type shapes', () => {
-  test('parseOrchestratorCommands result has the expected shape for workflowInvocation', () => {
-    const codebases = [makeNamedCodebase('my-project')];
-    const workflows = [makeTestWorkflow({ name: 'assist' })];
-    const response = '/invoke-workflow assist --project my-project --prompt "Do the thing"';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    expect(result.workflowInvocation).toMatchObject({
-      workflowName: expect.any(String),
-      projectName: expect.any(String),
-      remainingMessage: expect.any(String),
-      synthesizedPrompt: expect.any(String),
-    });
-  });
-
-  test('parseOrchestratorCommands result has the expected shape for projectRegistration', () => {
-    const response = '/register-project myapp /path/to/myapp';
-    const result = parseOrchestratorCommands(response, [], []);
-
-    expect(result.projectRegistration).toMatchObject({
-      projectName: expect.any(String),
-      projectPath: expect.any(String),
-    });
-  });
-
-  test('workflowInvocation.synthesizedPrompt is absent (not undefined-keyed) when no --prompt', () => {
-    const codebases = [makeNamedCodebase('my-project')];
-    const workflows = [makeTestWorkflow({ name: 'assist' })];
-    const response = '/invoke-workflow assist --project my-project';
-    const result = parseOrchestratorCommands(response, codebases, workflows);
-
-    // synthesizedPrompt is explicitly set to undefined when no prompt
-    expect(result.workflowInvocation?.synthesizedPrompt).toBeUndefined();
-  });
-});
-
-// ─── discoverAllWorkflows — remote sync ───────────────────────────────────────
-
-describe('discoverAllWorkflows — remote sync', () => {
-  beforeEach(() => {
-    mockSyncWorkspace.mockClear();
-    mockGetDefaultRemote.mockClear();
-    mockGetDefaultRemote.mockImplementation(() => Promise.resolve('origin'));
-    mockLoadRepoConfig.mockClear();
-    mockLoadRepoConfig.mockImplementation(() => Promise.resolve({}));
-    mockGetOrCreateConversation.mockReset();
-    mockGetCodebase.mockReset();
-    mockListCodebases.mockReset();
-    mockSendQuery.mockClear();
-    mockGetCodebaseEnvVars.mockReset();
-    mockLoadConfig.mockReset();
-    mockEnsureArchonWorkspacesPath.mockClear();
-    // Reset mocks between tests in this suite and restore safe defaults
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockGetCodebaseEnvVars.mockImplementation(() => Promise.resolve({}));
-    mockLoadConfig.mockImplementation(() =>
-      Promise.resolve(
-        makeConfig({
-          assistants: { claude: {}, codex: {} },
-          envVars: {},
-        })
-      )
-    );
-  });
-
-  test('calls syncWorkspace with codebase.default_cwd when conversation has codebase_id', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    // Non-destructive default sync (#1864): no explicit reset mode, only the
-    // resolved remote rides in the options.
-    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined, {
-      remote: 'origin',
-    });
-    // cwd resolution behavior — scoped chat runs the provider in the repo's
-    // default_cwd (not the workspaces root) and skips ensureArchonWorkspacesPath
-    // — is covered by the 'provider cwd resolution' describe block (issue #1179).
-  });
-
-  test('does not pass reset mode for managed clones during chat sync', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = {
-      ...makeCodebaseForSync(),
-      default_cwd: '/home/test/.archon/workspaces/owner/repo/source',
-    };
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    expect(mockSyncWorkspace).toHaveBeenCalledWith(
-      '/home/test/.archon/workspaces/owner/repo/source',
-      undefined,
-      { remote: 'origin' }
-    );
-  });
-
-  test('passes stored default_branch when present', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = { ...makeCodebaseForSync(), default_branch: 'develop' };
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', 'develop', {
-      remote: 'origin',
-    });
-  });
-
-  test('passes configured worktree.remote through to syncWorkspace', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockLoadRepoConfig.mockResolvedValueOnce({ worktree: { remote: 'mar' } });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    expect(mockSyncWorkspace).toHaveBeenCalledWith(
-      '/repos/test-repo',
-      undefined,
-      expect.objectContaining({ remote: 'mar' })
-    );
-    // Explicit config wins — auto-detection must not run
-    expect(mockGetDefaultRemote).not.toHaveBeenCalled();
-  });
-
-  test('auto-detects the remote when worktree.remote is not configured', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockGetDefaultRemote.mockResolvedValueOnce('upstream');
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    expect(mockSyncWorkspace).toHaveBeenCalledWith(
-      '/repos/test-repo',
-      undefined,
-      expect.objectContaining({ remote: 'upstream' })
-    );
-  });
-
-  test('proceeds without throwing when syncWorkspace rejects', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockSyncWorkspace.mockRejectedValueOnce(new Error('Network timeout'));
-
-    const platform = makePlatform();
-    // Non-fatal: no exception propagated
-    await expect(
-      handleMessage(platform, 'conv-1', 'What is the latest commit?')
-    ).resolves.toBeUndefined();
-    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined, {
-      remote: 'origin',
-    });
-  });
-
-  test('does not call syncWorkspace when conversation has no codebase_id', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-2', 'Hello');
-
-    expect(mockSyncWorkspace).not.toHaveBeenCalled();
-  });
-
-  test('does not call syncWorkspace for a folder project (no git to sync)', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = { ...makeCodebaseForSync(), kind: 'folder' as const, repository_url: null };
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Summarize the folder structure.');
-
-    expect(mockSyncWorkspace).not.toHaveBeenCalled();
-  });
-
-  test('logs a warn when syncWorkspace rejects', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockSyncWorkspace.mockRejectedValueOnce(new Error('Network timeout'));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    expect(mockLogger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ codebaseId: 'codebase-1' }),
-      'workspace.sync_failed'
-    );
-  });
-
-  test('passes merged repo and DB env vars to provider for codebase-scoped chat', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockGetCodebaseEnvVars.mockResolvedValueOnce({ DB_SECRET: 'db-value' });
-    mockLoadConfig.mockResolvedValueOnce(
-      makeConfig({
-        assistants: { claude: {}, codex: {} },
-        envVars: { FILE_SECRET: 'file-value' },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    expect(mockSendQuery).toHaveBeenCalled();
-    const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-    expect(requestOptions.env).toEqual({
-      FILE_SECRET: 'file-value',
-      DB_SECRET: 'db-value',
-    });
-  });
-
-  test('does not load codebase env vars when conversation has no codebase_id', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeConversation()));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    expect(mockGetCodebaseEnvVars).not.toHaveBeenCalled();
-  });
-
-  test('falls back to config env when codebase env loading fails', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockGetCodebaseEnvVars.mockRejectedValueOnce(new Error('db unavailable'));
-    mockLoadConfig.mockResolvedValueOnce(
-      makeConfig({
-        assistants: { claude: {}, codex: {} },
-        envVars: { FILE_SECRET: 'file-value' },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    expect(mockLogger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ codebaseId: 'codebase-1' }),
-      'codebase_env_vars_load_failed'
-    );
-    const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-    expect(requestOptions.env).toEqual({ FILE_SECRET: 'file-value' });
-  });
-
-  test('passes preset systemPrompt for claude provider', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ ai_assistant_type: 'claude' }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    expect(mockSendQuery).toHaveBeenCalled();
-    const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-    const sp = requestOptions.systemPrompt as Record<string, unknown>;
-    expect(sp).toEqual({
-      type: 'preset',
-      preset: 'claude_code',
-      append: 'orchestrator system append',
-    });
-  });
-
-  test('passes plain string systemPrompt for non-claude provider', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ ai_assistant_type: 'codex' }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    expect(mockSendQuery).toHaveBeenCalled();
-    const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-    expect(typeof requestOptions.systemPrompt).toBe('string');
-    expect(requestOptions.systemPrompt).toBe('orchestrator system append');
-  });
-
-  test('appends the run-management section (and no native tool) for a project-scoped non-native-tool provider', async () => {
-    const providers = await import('@archon/providers');
-    const capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
-    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, nativeTools: false });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ ai_assistant_type: 'codex', codebase_id: 'codebase-1' }))
-    );
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-
-    try {
-      const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'Hello');
-
-      const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-      // Codex → plain-string prompt that now carries the CLI pointer section.
-      expect(requestOptions.systemPrompt).toContain('## Managing Workflow Runs');
-      // Providers without native tools get NO in-process tool — bash CLI only.
-      expect(requestOptions.nativeTools).toBeUndefined();
-    } finally {
-      capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
-    }
-  });
-
-  test('omits the run-management section and injects the native tool for a project-scoped native-tool provider', async () => {
-    const providers = await import('@archon/providers');
-    const capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
-    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, nativeTools: true });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ ai_assistant_type: 'claude', codebase_id: 'codebase-1' }))
-    );
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-
-    try {
-      const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'Hello');
-
-      const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-      // Claude → preset object; the append must NOT carry the CLI pointer
-      // (it gets the in-process tool instead, so the pointer would be redundant).
-      const sp = requestOptions.systemPrompt as { append?: string };
-      expect(sp.append).not.toContain('## Managing Workflow Runs');
-      // Native-tool provider gets the manage_run tool instead.
-      expect(Array.isArray(requestOptions.nativeTools)).toBe(true);
-    } finally {
-      capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
-    }
-  });
-});
 
 // ─── provider cwd resolution (issue #1179) ──────────────────────────────────
 
@@ -1822,7 +85,7 @@ describe('provider cwd resolution', () => {
     mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     expect(getSendQueryCwd()).toBe('/repos/test-repo');
     expect(mockEnsureArchonWorkspacesPath).not.toHaveBeenCalled();
@@ -1839,7 +102,7 @@ describe('provider cwd resolution', () => {
     mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     expect(getSendQueryCwd()).toBe('/worktrees/feature-branch');
     expect(mockEnsureArchonWorkspacesPath).not.toHaveBeenCalled();
@@ -1858,7 +121,7 @@ describe('provider cwd resolution', () => {
     mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/deleted-branch');
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     // Never reaches the provider: spawning there fails ENOENT and the Claude
     // SDK misreports it as a binary/libc mismatch.
@@ -1881,7 +144,7 @@ describe('provider cwd resolution', () => {
     mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/deleted-branch');
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
     expect(sent).toContain('/worktree remove');
@@ -1901,7 +164,7 @@ describe('provider cwd resolution', () => {
     mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/deleted-branch');
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
     // Reachable via the stale_cleaned branch in validateAndResolveIsolation, which
@@ -1924,7 +187,7 @@ describe('provider cwd resolution', () => {
     mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/deleted-branch');
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     // Relocating the agent into the live checkout would widen its write scope
     // without the user asking for it.
@@ -1938,7 +201,7 @@ describe('provider cwd resolution', () => {
     mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/deleted-branch');
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     // With no codebase scoped, cwd is never consulted — the workspaces path wins,
     // so a stale override must not block the turn.
@@ -1958,7 +221,7 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       // Handing a missing path to the provider is the whole defect: the spawn
       // fails ENOENT against the BINARY, so the user is told the wrong thing.
@@ -1980,7 +243,7 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
       // /update-project validates the new path and repairs the registration.
@@ -2002,7 +265,7 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
       // handleUpdateProject takes only the FIRST token as the project name, so an
@@ -2029,7 +292,7 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
       expect(sent).toContain('/update-project "Bob\\"s \\\\Ops" <new-path>');
@@ -2044,11 +307,14 @@ describe('provider cwd resolution', () => {
       mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
       mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
 
-      // Non-web only: the web adapter's route persists its own turns, so the
-      // orchestrator never writes rows for it and this could not regress.
-      const platform = makePlatform();
-      platform.getPlatformType = mock(() => 'telegram') as typeof platform.getPlatformType;
-      await handleMessage(platform, 'conv-1', 'hello');
+      // Core-persisted surfaces only: an adapter that owns its storage writes
+      // its own rows, so the orchestrator writes none for it.
+      const platform = {
+        ...makePlatform(),
+        capabilities: { messagePersistence: 'core', defaultWorkflowDispatch: 'background' },
+      } as const;
+      platform.getPlatformType.mockImplementation(() => 'telegram');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       expect(mockSendQuery).not.toHaveBeenCalled();
       // The user row is written before anything can decline the turn, and the
@@ -2074,7 +340,7 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/removed');
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       // Pins WHICH refusal the user gets, which is the part still observable here.
       //
@@ -2118,7 +384,7 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       // This is the case that makes `&& conversation.cwd === null` load-bearing
       // rather than decorative. Drop that clause while leaving the target as
@@ -2140,7 +406,7 @@ describe('provider cwd resolution', () => {
       mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       expect(getSendQueryCwd()).toBe('/repos/test-repo');
     });
@@ -2152,22 +418,24 @@ describe('provider cwd resolution', () => {
       mockExistsSync.mockImplementation(() => false);
 
       const platform = makePlatform();
-      await handleMessage(platform, 'conv-1', 'hello');
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
       expect(getSendQueryCwd()).toBe('/home/test/.archon/workspaces');
     });
   });
 
   test('unscoped chat uses ensureArchonWorkspacesPath result', async () => {
-    const conversation = makeConversation({ codebase_id: null });
+    const conversation = makeConversation({ codebase_id: null, cwd: null, isolation_env_id: null });
+    mockGetActiveSession.mockResolvedValueOnce(null);
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
     mockListCodebases.mockReturnValueOnce(Promise.resolve([]));
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     expect(getSendQueryCwd()).toBe('/home/test/.archon/workspaces');
     expect(mockEnsureArchonWorkspacesPath).toHaveBeenCalled();
+    expect(mockSendQuery.mock.calls[0]?.[2]).toBeUndefined();
   });
 
   test('scoped chat falls back to workspaces root and warns when codebase not found (deleted)', async () => {
@@ -2176,7 +444,7 @@ describe('provider cwd resolution', () => {
     mockListCodebases.mockReturnValueOnce(Promise.resolve([]));
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     expect(getSendQueryCwd()).toBe('/home/test/.archon/workspaces');
     expect(mockEnsureArchonWorkspacesPath).toHaveBeenCalled();
@@ -2187,1597 +455,416 @@ describe('provider cwd resolution', () => {
   });
 });
 
-// ─── Workflow dispatch routing — interactive flag ─────────────────────────────
+// ─── Typed chat tools ─────────────────────────────────────────────────────────
 
-describe('workflow dispatch routing — interactive flag', () => {
-  function makeDispatchConversation(overrides: Partial<Conversation> = {}) {
-    return makeConversation({ codebase_id: 'codebase-1', ...overrides });
+describe('typed chat tools', () => {
+  beforeEach(resetDispatchMocks);
+
+  const task = 'Fix the "login" bug and add tests';
+  let capsMock: ReturnType<typeof mock>;
+
+  beforeEach(async () => {
+    const providers = await import('@archon/providers');
+    capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, nativeTools: true });
+    mockSendQuery.mockReset();
+    mockListCodebases.mockReset();
+    mockListCodebases.mockImplementation(() => Promise.resolve([makeCodebase()]));
+  });
+
+  afterEach(() => {
+    // Restore the shared baseline, not a subset (see 'paused approval gate routing').
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+  });
+
+  function turnToolNames(): string[] {
+    const options = mockSendQuery.mock.calls.at(-1)?.[3] as
+      | { nativeTools?: { name: string }[] }
+      | undefined;
+    return (options?.nativeTools ?? []).map(t => t.name);
   }
 
-  function makeWorkflowResult(
-    interactive?: boolean,
-    options: {
-      force?: boolean;
-      resumeRun?: WorkflowRun;
-      args?: string;
-      /** Declared `inputs:` on the resolved workflow (#2554). */
-      inputs?: Record<string, { required?: boolean; default?: string }>;
-    } = {}
-  ) {
-    return {
-      success: true,
-      message: 'ok',
-      workflow: options.resumeRun
-        ? { kind: 'resume' as const, run: options.resumeRun }
-        : {
-            kind: 'start' as const,
-            definition: makeTestResolvedWorkflow({
-              name: 'test-workflow',
-              interactive,
-              ...(options.inputs ? { inputs: options.inputs } : {}),
-            }),
-            args: options.args ?? 'test message',
-            force: options.force,
-          },
-    };
-  }
-
-  function makeResumableRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
-    return makeRun({
-      id: 'resumable-run-1',
-      parent_conversation_id: 'conv-1',
-      status: 'failed',
-      user_message: 'old failed prompt',
-      working_path: '/repos/test-repo/worktrees/feature',
-      ...overrides,
+  /** The agent calls `invoke_workflow` with each input in turn, then replies `reply`. */
+  function agentInvokes(inputs: Record<string, unknown>[], sink: string[], reply = 'On it.'): void {
+    mockSendQuery.mockImplementationOnce(async function* () {
+      const options = mockSendQuery.mock.calls.at(-1)?.[3] as { nativeTools: NativeTool[] };
+      const tool = options.nativeTools.find(t => t.name === 'invoke_workflow');
+      for (const input of inputs) sink.push(await tool!.handler(input));
+      yield { type: 'agent_message_chunk', text: reply };
+      yield { type: 'result', sessionId: 'session-1' };
     });
   }
 
-  beforeEach(() => {
-    capturedSourceOwnerCalls.length = 0;
-    mockExecuteWorkflow.mockClear();
-    mockDispatchBackgroundWorkflow.mockClear();
-    mockFindResumableRunByParentConversation.mockClear();
-    mockHydrateResumableRun.mockClear();
-    mockInspectResumableRun.mockReset();
-    mockInspectResumableRun.mockImplementation(() =>
-      Promise.resolve({
-        priorCompletedNodes: new Map([['n1', { output: 'v1' }]]),
-        priorUsage: { costUsd: 0 },
-      })
-    );
-    mockUpdateWorkflowRun.mockClear();
-    mockUpdateWorkflowRun.mockImplementation(() => Promise.resolve());
-    mockResolveApprovalGate.mockClear();
-    mockResolveApprovalGate.mockImplementation(() => Promise.resolve({ resolved: true }));
-    mockHandleCommand.mockReset();
-    mockHandleCommand.mockImplementation(() =>
-      Promise.resolve({ success: true, message: 'ok', workflow: undefined })
-    );
-    mockGetOrCreateConversation.mockReset();
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockGetCodebase.mockReset();
-    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
-    mockValidateAndResolveIsolation.mockClear();
-    mockResolveWorkflowAdoption.mockClear();
-    mockUpdateConversation.mockClear();
-    mockResolveWorkflowSourceRoot.mockClear();
-    mockResolveWorkflowSourceRoot.mockResolvedValue(undefined);
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockResolvedValue({
-      workflows: [makeTestWorkflowWithSource({ name: 'test-workflow', interactive: true })],
-      errors: [],
-    });
-    mockStartRunLiveOwner.mockClear();
-    mockWithRunLiveOwner.mockClear();
-    mockCloseRunLiveOwner.mockClear();
-  });
+  const launch = { workflow: 'test-workflow', project: 'test-repo', prompt: task };
 
-  test('calls executeWorkflow (not dispatchBackground) for interactive workflow on web', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(
-      Promise.resolve(makeCodebase({ default_branch: 'develop' }))
-    );
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-
-    const platform = makePlatform(); // getPlatformType returns 'web'
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
-    expect(mockWithRunLiveOwner).toHaveBeenCalledWith('prepared-run-id', {}, expect.any(Function));
-    // The interactive web dispatch must pass the caller conversation's DB id
-    // as opts.parentConversationId so the approve/reject API handlers can
-    // dispatch resume back through the orchestrator.
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    const opts = callArgs[callArgs.length - 1] as {
-      parentConversationId?: string;
-      baseBranch?: string;
-    };
-    expect(opts.parentConversationId).toBe('conv-1-db');
-    // The codebase's stored default branch rides along as the $BASE_BRANCH fallback.
-    expect(opts.baseBranch).toBe('develop');
-  });
-
-  // Adoption lane on the FOREGROUND dispatch (#2747 review): the background path
-  // inherits the adopted estate; the interactive/chat path must honor it too.
-  test('adopt with reuse-worktree lane runs the foreground dispatch in the adopted worktree', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'test message' }))
-    );
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'reuse-worktree',
-          workingPath: '/wt/adopted',
-          envId: 'env-1',
-        },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
-
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    expect(callArgs[3]).toBe('/wt/adopted');
-    const opts = callArgs[callArgs.length - 1] as {
-      adoptedFromRunId?: string;
-      continuationMode?: string;
-    };
-    expect(opts.adoptedFromRunId).toBe('prior-run');
-    expect(opts.continuationMode).toBe('adopt');
-    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1-db', {
-      cwd: '/wt/adopted',
-      isolation_env_id: 'env-1',
-    });
-  });
-
-  test('adopt with checkout-branch lane materializes the exact adopted branch', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'test message' }))
-    );
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'checkout-branch',
-          taskBranch: { kind: 'existing', branch: toBranchName('feature/adopted') },
-        },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
-
-    expect(mockValidateAndResolveIsolation).toHaveBeenCalled();
-    const isoArgs = mockValidateAndResolveIsolation.mock.calls[0] as unknown[];
-    const hints = isoArgs[4] as {
-      workflowType?: string;
-      taskBranch?: { kind: string; branch?: string };
-    };
-    expect(hints.workflowType).toBe('task');
-    expect(hints.taskBranch).toEqual({ kind: 'existing', branch: 'feature/adopted' });
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    const opts = callArgs[callArgs.length - 1] as { adoptedFromRunId?: string };
-    expect(opts.adoptedFromRunId).toBe('prior-run');
-  });
-
-  // R7: the resolver short-circuits on `existingEnvId` before hints are read, so a
-  // checkout-branch adoption must neutralize the conversation's stale env and key
-  // its reuse lookup with a unique per-dispatch workflow id.
-  test('adopt checkout-branch ignores a stale isolation env and keys a unique worktree', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeDispatchConversation({ isolation_env_id: 'env-stale' }))
-    );
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'test message' }))
-    );
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'checkout-branch',
-          taskBranch: { kind: 'existing', branch: toBranchName('feature/adopted') },
-        },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
-
-    expect(mockValidateAndResolveIsolation).toHaveBeenCalled();
-    const isoArgs = mockValidateAndResolveIsolation.mock.calls[0] as unknown[];
-    const convArg = isoArgs[0] as { isolation_env_id?: string | null };
-    expect(convArg.isolation_env_id).toBeNull();
-    const hints = isoArgs[4] as {
-      workflowId?: string;
-      taskBranch?: { kind: string; branch?: string };
-    };
-    expect(hints.taskBranch).toEqual({ kind: 'existing', branch: 'feature/adopted' });
-    expect(typeof hints.workflowId).toBe('string');
-    expect(hints.workflowId!.length).toBeGreaterThan(0);
-  });
-
-  // R8: a reuse-worktree adoption executes inside the inherited worktree, so the
-  // frozen source must come from there — not from the parent checkout.
-  test('adopt with reuse-worktree captures workflow source from the inherited worktree', async () => {
-    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'test message' }))
-    );
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'reuse-worktree',
-          workingPath: '/wt/adopted',
-          envId: 'env-1',
-        },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
-
-    expect(mockPrepareWorkflowSource).toHaveBeenCalled();
-    const lastCaptureCall = mockPrepareWorkflowSource.mock.calls.at(-1) as unknown[];
-    const captureArg = lastCaptureCall[1] as {
-      sourceRoot?: string;
-    };
-    expect(captureArg.sourceRoot).toBe('/wt/adopted');
-    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/wt/adopted');
-  });
-
-  // R10: a checkout-branch adoption runs in a worktree on the adopted branch,
-  // so its frozen source must come from that worktree — not from the parent checkout.
-  test('adopt with checkout-branch captures workflow source from the created worktree', async () => {
-    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
-    mockValidateAndResolveIsolation.mockImplementationOnce(() =>
-      Promise.resolve({
-        cwd: '/wt/from-branch',
-        status: 'new',
-        env: makeIsolationEnvironment(),
-      })
-    );
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'test message' }))
-    );
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'checkout-branch',
-          taskBranch: { kind: 'existing', branch: toBranchName('feature/adopted') },
-        },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
-
-    expect(mockPrepareWorkflowSource).toHaveBeenCalled();
-    const lastCaptureCall = mockPrepareWorkflowSource.mock.calls.at(-1) as unknown[];
-    const captureArg = lastCaptureCall[1] as {
-      sourceRoot?: string;
-    };
-    expect(captureArg.sourceRoot).toBe('/wt/from-branch');
-    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/wt/from-branch');
-  });
-
-  // F1: the deferred capture swaps the executed graph for the branch's vintage, so the
-  // invocation gates must be judged against THAT definition — a required input declared
-  // only on the branch must refuse the run instead of slipping through on the parent's
-  // vintage.
-  test('adopt with checkout-branch enforces an input declared only on the branch', async () => {
-    mockPrepareWorkflowSource.mockImplementationOnce(() =>
-      Promise.resolve({
-        runId: 'prepared-run-id',
-        origin: '/wt/from-branch',
-        manifest: {
-          version: 1,
-          engine_version: 'test',
-          origin: '/wt/from-branch',
-          captured_at: '2026-08-21T00:00:00.000Z',
-          digest: 'branch-digest',
-          file_count: 1,
-          byte_count: 1,
-          scopes: ['project'],
-          source_config: {
-            load_default_workflows: true,
-            load_default_commands: true,
+  test.each(['stream', 'batch'] as const)(
+    'escaped quotes in model --prompt prose cannot truncate typed Codex dispatch (%s)',
+    async mode => {
+      const { CodexProvider } = await import('@archon/providers/codex/provider');
+      const { CODEX_CAPABILITIES } = await import('../../../providers/src/codex/capabilities');
+      const { createFakeAppServer, THREAD_ID, TURN_ID, agentMessage } = await import(
+        '../../../providers/src/test/codex-app-server-fake'
+      );
+      capsMock.mockReturnValue(CODEX_CAPABILITIES);
+      const prose = String.raw`/invoke-workflow test-workflow --project test-repo --prompt "Fix the \"login\" bug and add tests"`;
+      expect(prose).toContain(String.raw`\"login\"`);
+      const server = createFakeAppServer(() => ({
+        toolCalls: [
+          {
+            threadId: THREAD_ID,
+            turnId: TURN_ID,
+            callId: 'launch',
+            namespace: null,
+            tool: 'invoke_workflow',
+            arguments: launch,
           },
-        },
-        anchor: {
-          root: '/capture-branch',
-          digest: 'branch-digest',
-          config: {
-            load_default_workflows: true,
-            load_default_commands: true,
-          },
-        },
-        roots: {
-          project: '/capture-branch/project',
-          globalWorkflows: '/capture-branch/global/workflows',
-          globalCommands: '/capture-branch/global/commands',
-          globalScripts: '/capture-branch/global/scripts',
-          bundledWorkflows: '/capture-branch/bundled/workflows',
-          bundledCommands: '/capture-branch/bundled/commands/defaults',
-          installed: { kind: 'captured', captureRoot: '/capture-branch' },
-          kind: 'captured',
-          anchor: {
-            root: '/capture-branch',
-            digest: 'branch-digest',
-            config: {
-              load_default_workflows: true,
-              load_default_commands: true,
-            },
-          },
-        },
-      })
-    );
-    // Discovery off the branch capture resolves a definition that requires an input
-    // the caller did not supply — a contract the parent checkout's YAML never had.
-    mockDiscoverWorkflowsWithConfig.mockImplementationOnce(() =>
-      Promise.resolve({
-        workflows: [
-          makeTestWorkflowWithSource({
-            name: 'test-workflow',
-            inputs: { diff: { required: true } },
-          }),
         ],
-        errors: [],
-      })
-    );
-    mockValidateAndResolveIsolation.mockImplementationOnce(() =>
-      Promise.resolve({
-        cwd: '/wt/from-branch',
-        status: 'new',
-        env: makeIsolationEnvironment(),
-      })
-    );
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'test message' }))
-    );
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'checkout-branch',
-          taskBranch: { kind: 'existing', branch: toBranchName('feature/adopted') },
-        },
-      })
-    );
+        notifications: [agentMessage(prose)],
+      }));
+      const provider = new CodexProvider(server, 1);
+      mockGetOrCreateConversation.mockResolvedValueOnce(
+        makeConversation({ ai_assistant_type: 'codex' })
+      );
+      mockSendQuery.mockImplementationOnce(async function* (prompt, cwd, sessionId, options) {
+        for await (const chunk of provider.sendQuery(prompt, cwd, sessionId, options)) {
+          expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+          yield chunk;
+        }
+      });
+      const platform = makePlatform();
+      platform.getStreamingMode.mockReturnValue(mode);
+      await handleMessage(platform, 'conv-1', 'fix the login bug', { actor: operator });
+      expect(server.processes[0].toolResponses[0].result).toMatchObject({
+        success: true,
+        contentItems: [{ text: expect.stringContaining('Queued test-workflow') }],
+      });
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+        expect.objectContaining({ originalMessage: task }),
+        expect.anything()
+      );
 
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
+      mockDispatchBackgroundWorkflow.mockClear();
+      const proseServer = createFakeAppServer(() => ({ notifications: [agentMessage(prose)] }));
+      const proseProvider = new CodexProvider(proseServer, 1);
+      mockGetOrCreateConversation.mockResolvedValueOnce(
+        makeConversation({ ai_assistant_type: 'codex' })
+      );
+      mockSendQuery.mockImplementationOnce((...args) => proseProvider.sendQuery(...args));
+      await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    }
+  );
 
-    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', expect.stringContaining('diff'));
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('adopt is refused when the conversation already continues a resumable run', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'test message' }))
-    );
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(makeResumableRun({ status: 'paused' }))
-    );
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'reuse-worktree',
-          workingPath: '/wt/adopted',
-        },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
-
-    // handleMessage funnels dispatch refusals into its user-facing error notice.
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('already continues run')
-    );
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('adopt is refused when the workflow opts out of worktrees', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    const noWorktreeResult = makeWorkflowResult(true, { args: 'test message' });
-    if (noWorktreeResult.workflow.kind !== 'start') throw new Error('expected start request');
-    noWorktreeResult.workflow.definition.worktree = { enabled: false };
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(noWorktreeResult));
-    mockResolveWorkflowAdoption.mockImplementationOnce(() =>
-      Promise.resolve({
-        adoptedRun: makeResumableRun({ id: 'prior-run', status: 'completed' }),
-        lane: {
-          kind: 'reuse-worktree',
-          workingPath: '/wt/adopted',
-        },
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowAdoptRunId: 'prior-run',
-    });
-
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('disables worktrees')
-    );
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('failed_resume_user_prompted: failed runs are not auto-resumed', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(makeResumableRun())
-    );
-
-    const platform = makePlatform(); // getPlatformType returns 'web'
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('Found a prior failed run of **test-workflow**')
-    );
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('/workflow resume resumable-run-1')
-    );
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('/workflow abandon resumable-run-1')
-    );
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('/workflow run test-workflow --force "test message"')
-    );
-  });
-
-  test('failed_resume_user_prompted: stale running orphan gates with status-accurate copy', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    // findResumableRunByParentConversation also surfaces stale 'running' orphans,
-    // not just 'failed' runs — the prompt must not mislabel them as "failed".
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(makeResumableRun({ status: 'running' }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    // Gate still fires (no silent auto-resume) ...
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('/workflow resume resumable-run-1')
-    );
-    // ... but the copy reflects the real status, not "failed".
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('Found a prior interrupted run of **test-workflow**')
-    );
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('Discard the interrupted run')
-    );
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('leave the interrupted run as-is')
-    );
-    expect(platform.sendMessage).not.toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('failed run')
-    );
-  });
-
-  test('failed_resume_user_prompted: prompt includes normalized truncated prior prompt preview', async () => {
-    const priorMessage = `line one\n${'x'.repeat(220)}`;
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'resumable-run-preview',
-          user_message: priorMessage,
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    const prompt = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.at(-1)?.[1] as
-      | string
-      | undefined;
-    expect(prompt).toContain(`> line one ${'x'.repeat(151)}…`);
-    expect(prompt).not.toContain('\nline one\n');
-  });
-
-  test('failed_resume_user_prompted: escapes backslash, double quote, and backtick in suggested commands', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { args: 'fix \\ path "quoted" `tick`' }))
-    );
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'resumable-run-escape',
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    const prompt = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.at(-1)?.[1] as
-      | string
-      | undefined;
-    expect(prompt).toContain('/workflow run test-workflow "fix \\\\ path \\"quoted\\" \\`tick\\`"');
-    expect(prompt).toContain(
-      '/workflow run test-workflow --force "fix \\\\ path \\"quoted\\" \\`tick\\`"'
-    );
-  });
-
-  test('--force flag: skips resume detection and dispatches a fresh run', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { force: true }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow --force');
-
-    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    expect(callArgs[3]).toBe('/test/cwd');
-  });
-
-  test('resume request hydrates the requested run without latest-run lookup', async () => {
-    const requestedRun = makeResumableRun({
-      id: 'old-run',
-      user_message: 'requested prompt',
-      working_path: '/repos/test-repo/worktrees/old',
-    });
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { resumeRun: requestedRun }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow resume old-run');
-
-    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
-    expect(mockHydrateResumableRun).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ id: 'old-run' }),
-      undefined
-    );
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    expect(callArgs[3]).toBe('/repos/test-repo/worktrees/old');
-    expect(platform.sendMessage).not.toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('Found a prior failed run')
-    );
-  });
-
-  test('resume request reports requested run with missing working path', async () => {
-    const requestedRun = makeResumableRun({
-      id: 'old-run-missing-path',
-      user_message: 'requested prompt',
-      working_path: null,
-    });
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { resumeRun: requestedRun }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow resume old-run-missing-path');
-
-    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      'Cannot resume old-run-missing-path: missing working path.'
-    );
-  });
-
-  test('foreground_resume_detected: passes parentConversationId to executeWorkflow when a paused run exists', async () => {
-    // Regression for the foreground-resume branch: when
-    // findResumableRunByParentConversation returns a paused run, the
-    // orchestrator must hydrate it (single DB roundtrip — no second
-    // findResumableRun) and hand the resumed run + priorCompletedNodes to
-    // executeWorkflow via opts. parentConversationId still flows so the API
-    // helpers keep dispatching resume on subsequent approvals.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(
-      Promise.resolve(makeCodebase({ default_branch: 'develop' }))
-    );
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          status: 'paused',
-        })
-      )
-    );
-
-    const platform = makePlatform(); // getPlatformType returns 'web'
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockHydrateResumableRun).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    // cwd (position 3) should come from the resumable run's working_path.
-    expect(callArgs[3]).toBe('/repos/test-repo/worktrees/feature');
-    // Resume payload lives on the opts bag (the trailing arg).
-    const opts = callArgs[callArgs.length - 1] as {
-      parentConversationId?: string;
-      baseBranch?: string;
-      preCreatedRun?: { id: string };
-      priorCompletedNodes?: Map<string, string>;
-    };
-    expect(opts.parentConversationId).toBe('conv-1-db');
-    // Resume dispatch carries the codebase default as the $BASE_BRANCH fallback too.
-    expect(opts.baseBranch).toBe('develop');
-    expect(opts.preCreatedRun?.id).toBe('resumable-run-1');
-    expect(opts.priorCompletedNodes?.size).toBeGreaterThan(0);
-  });
-
-  test('a plain workflow run does not consume an action-required pause', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          status: 'paused',
-          metadata: {
-            wait: {
-              owner: 'node',
-              nodeId: 'rerun-ci',
-              kind: 'attention',
-              waitingSince: '2026-09-01T10:00:00.000Z',
-              message: 'Re-run the failing check, then resume.',
+  for (const mode of ['stream', 'batch'] as const) {
+    for (const toolName of ['invoke_workflow', 'register_project']) {
+      test(`Codex reports an unanswered ${toolName} exception (${mode})`, async () => {
+        const { CodexProvider } = await import('@archon/providers/codex/provider');
+        const { CODEX_CAPABILITIES } = await import('../../../providers/src/codex/capabilities');
+        const { createFakeAppServer, THREAD_ID, TURN_ID, itemCompleted } = await import(
+          '../../../providers/src/test/codex-app-server-fake'
+        );
+        capsMock.mockReturnValue(CODEX_CAPABILITIES);
+        const server = createFakeAppServer(() => ({
+          toolCalls: [
+            {
+              threadId: THREAD_ID,
+              turnId: TURN_ID,
+              callId: 'failure',
+              namespace: null,
+              tool: toolName,
+              arguments:
+                toolName === 'invoke_workflow' ? launch : { name: 'demo', path: '/', folder: true },
             },
-          },
-        })
-      )
-    );
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
-
-    expect(mockFindResumableRunByParentConversation).toHaveBeenCalled();
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-  });
-
-  test('an explicit workflow resume consumes an action-required pause', async () => {
-    const requestedRun = makeResumableRun({
-      status: 'paused',
-      metadata: {
-        wait: {
-          owner: 'node',
-          nodeId: 'rerun-ci',
-          kind: 'attention',
-          waitingSince: '2026-09-01T10:00:00.000Z',
-          message: 'Re-run the failing check, then resume.',
-        },
-      },
-    });
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { resumeRun: requestedRun }))
-    );
-
-    await handleMessage(makePlatform(), 'conv-1', `/workflow resume ${requestedRun.id}`);
-
-    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
-    expect(mockHydrateResumableRun).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ id: requestedRun.id }),
-      undefined
-    );
-  });
-
-  test('foreground_resume_detected: falls through to fresh run when hydration returns null', async () => {
-    // When findResumableRunByParentConversation returns a run but
-    // hydrateResumableRun finds nothing worth resuming (zero completed nodes,
-    // no interactive-loop state), the orchestrator must NOT throw — it sends
-    // a user-visible notice and starts a fresh run on the same worktree.
-    // (#2686) The fresh run row must freeze its OWN workflow source — not
-    // inherit the prior run's frozen graph against live commands/scripts.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(
-      Promise.resolve(makeCodebase({ default_branch: 'develop' }))
-    );
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'empty-prior-run',
-          status: 'paused',
-        })
-      )
-    );
-    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
-
-    const platform = makePlatform(); // getPlatformType returns 'web'
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockHydrateResumableRun).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    // cwd still points at the prior run's worktree.
-    expect(callArgs[3]).toBe('/repos/test-repo/worktrees/feature');
-    // Opts bag carries no resume payload — fresh run.
-    const opts = callArgs[callArgs.length - 1] as {
-      parentConversationId?: string;
-      baseBranch?: string;
-      preCreatedRun?: unknown;
-      priorCompletedNodes?: unknown;
-      preparedSource?: { anchor?: { root?: string }; manifest?: { captured_at?: string } };
-    };
-    expect(opts.parentConversationId).toBe('conv-1-db');
-    // The fresh-run-in-same-worktree branch still threads the codebase default.
-    expect(opts.baseBranch).toBe('develop');
-    expect(opts.preCreatedRun).toBeUndefined();
-    expect(opts.priorCompletedNodes).toBeUndefined();
-    // (#2686) This is the key regression assertion: the fresh run row carries
-    // the captured source so its run row records `workflow_source` from this
-    // moment, not the prior run's frozen bytes. Before the fix, `preparedSource`
-    // was undefined here because the outer `if (!willContinueExistingRun)` block
-    // was skipped.
-    expect(opts.preparedSource).toBeDefined();
-    expect(opts.preparedSource?.anchor?.root).toBe('/capture');
-    expect(opts.preparedSource?.manifest?.captured_at).toBe('2026-08-21T00:00:00.000Z');
-  });
-
-  test('applies a run config when a resume candidate hydrates to a fresh run', async () => {
-    const runConfig = {
-      source: { kind: 'http' as const, label: 'inline' },
-      layer: { docsPath: 'handbook' },
-    };
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(makeResumableRun({ id: 'empty-config-run', status: 'paused' }))
-    );
-    mockInspectResumableRun.mockReturnValueOnce(Promise.resolve(null));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowRunConfig: runConfig,
-    });
-
-    expect(mockInspectResumableRun).toHaveBeenCalled();
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.runConfig).toEqual(runConfig);
-    expect(platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n')).not.toContain(
-      'a new run config cannot be applied'
-    );
-  });
-
-  test('foreground_resume_detected: fresh-run-in-same-worktree refuses with the capture-failure message when prepareWorkflowSource rejects (#2686)', async () => {
-    // The new capture call inside the resume-null fallback introduces a SECOND call site
-    // of `captureFreshSource(...)` whose failure path is unexercised by the success-only
-    // test above. A regression that drops `if (!captured) return;` or reorders the
-    // user-visible notice would land uncaught without this test — `executeWorkflow`
-    // would be called against an undefined capture and the user would see the generic
-    // "starting fresh in the same worktree" notice instead of the capture-failure one.
-    //
-    // Note on the lifecycle: `captureFreshSource` calls `owner.hold` AFTER
-    // `prepareWorkflowSource` returns, so a `prepareWorkflowSource` rejection skips
-    // the hold entirely (no reclaim because nothing was held). The
-    // `['hold:/capture', 'reclaim:/capture']` shape is exercised separately by the
-    // "keeps holding the capture when the dispatch refuses after taking it" test
-    // above — that one runs `prepareWorkflowSource` cleanly and trips a gate AFTER
-    // the hold.
-    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
-    (prepareWorkflowSource as ReturnType<typeof mock>).mockImplementationOnce(() =>
-      Promise.reject(new Error('disk full'))
-    );
-
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'empty-prior-run',
-          status: 'paused',
-        })
-      )
-    );
-    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    // No run started against an undefined capture.
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    // The user-visible failure notice names the workflow and the underlying error.
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain(
-      'Could not capture the workflow source for **test-workflow**: disk full'
-    );
-    // The generic "starting fresh in the same worktree" notice must NOT fire — that
-    // would mislead the user into thinking a fresh run started when none did.
-    expect(sent).not.toContain('starting fresh in the same worktree');
-    // The capture was never held (rejection landed BEFORE `owner.hold`), so the
-    // owner has nothing to reclaim.
-    expect(capturedSourceOwnerCalls).toEqual([]);
-  });
-
-  test('foreground_resume_detected: fresh-run-in-same-worktree captures and executes the FRESHLY captured graph (#2686)', async () => {
-    // (#2686) Regression for the mixed-vintage shape: when a paused run had nothing to
-    // resume, the orchestrator must capture source here and execute the freshly resolved
-    // graph — not the prior run's frozen definition against live command/script bytes.
-    // Before the fix, the outer `if (!willContinueExistingRun)` block was skipped because
-    // `willContinueExistingRun` was true, leaving `preparedSource` undefined and the
-    // executor in `source_unprepared_live` mode against the prior run's frozen graph.
-    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
-    const freshWorkflow = makeTestResolvedWorkflow({
-      name: 'test-workflow',
-      description: 'freshly captured from disk',
-    });
-    // Capture returns a non-empty scope so the helper actually re-resolves the workflow.
-    (prepareWorkflowSource as ReturnType<typeof mock>).mockImplementationOnce(() =>
-      Promise.resolve({
-        runId: 'prepared-run-id',
-        origin: '/origin',
-        manifest: {
-          version: 1,
-          engine_version: 'test',
-          origin: '/origin',
-          captured_at: '2026-08-21T00:00:00.000Z',
-          digest: 'test-digest',
-          file_count: 1,
-          byte_count: 1,
-          scopes: ['project'],
-        },
-        anchor: CAPTURED_SOURCE_ROOTS.anchor,
-        roots: {
-          project: '/capture/project',
-          globalWorkflows: '/capture/global/workflows',
-          globalCommands: '/capture/global/commands',
-          globalScripts: '/capture/global/scripts',
-          bundledWorkflows: '/capture/bundled/workflows',
-          bundledCommands: '/capture/bundled/commands/defaults',
-          kind: 'captured',
-          anchor: CAPTURED_SOURCE_ROOTS.anchor,
-        },
-      })
-    );
-    // Discovery off the FRESH capture returns a workflow distinct from the one the
-    // resume-input would otherwise feed executeWorkflow. If the orchestrator handed
-    // `executeWorkflow` the wrong graph, the description below would mismatch.
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [makeTestWorkflowWithSource({ name: 'test-workflow' })],
-        errors: [],
-      })
-    );
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [{ workflow: freshWorkflow, source: 'project' }],
-        errors: [],
-      })
-    );
-
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'empty-prior-run',
-          status: 'paused',
-        })
-      )
-    );
-    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(prepareWorkflowSource).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    // The workflow argument (position 4) is the freshly resolved graph, NOT the
-    // resume-input graph. Before the fix this was the prior run's frozen graph.
-    expect(callArgs[4]).toBe(freshWorkflow);
-    // Capture lifecycle: hold then adopt — the prior branch's `if (preparedSource)
-    // owner.adopt()` is now a live guard, not inert.
-    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'adopt']);
-    // The user-visible notice still fires.
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('starting fresh in the same worktree');
-  });
-
-  test('calls dispatchBackgroundWorkflow for non-interactive workflow on web', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
-
-    const platform = makePlatform(); // getPlatformType returns 'web'
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  // -------------------------------------------------------------------------
-  // Declared inputs supplied by the run route (#2554)
-  // -------------------------------------------------------------------------
-
-  test('threads context.workflowInputs into executeWorkflow for a fresh foreground run', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
-      workflowInputs: { diff: 'D1' },
-    });
-
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const opts = mockExecuteWorkflow.mock.calls[0][7] as { inputs?: Record<string, string> };
-    expect(opts.inputs).toEqual({ diff: 'D1' });
-  });
-
-  test('threads context.workflowInputs into dispatchBackgroundWorkflow — the console default path', async () => {
-    // Web non-interactive runs never touch the executeWorkflow branches, so dropping
-    // the map here would ship a console run form that silently does nothing.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(undefined, { inputs: { diff: { required: true } } }))
-    );
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
-      workflowInputs: { diff: 'D1' },
-    });
-
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-    const ctx = mockDispatchBackgroundWorkflow.mock.calls[0][0] as {
-      inputs?: Record<string, string>;
-    };
-    expect(ctx.inputs).toEqual({ diff: 'D1' });
-  });
-
-  test('threads context.workflowModelOverrides into a fresh foreground run', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
-      workflowModelOverrides: { tiers: { large: 'openai/gpt-5.6' } },
-    });
-
-    const opts = mockExecuteWorkflow.mock.calls[0][7] as { modelOverrideLayer?: unknown };
-    expect(opts.modelOverrideLayer).toEqual({
-      kind: 'raw',
-      overrides: { tiers: { large: 'openai/gpt-5.6' } },
-    });
-  });
-
-  test('threads context.workflowModelOverrides into the console background path', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
-      workflowModelOverrides: { aliases: { '@planner': 'codex/gpt-5.6-sol' } },
-    });
-
-    const ctx = mockDispatchBackgroundWorkflow.mock.calls[0][0] as { modelOverrides?: unknown };
-    expect(ctx.modelOverrides).toEqual({
-      aliases: { '@planner': 'codex/gpt-5.6-sol' },
-    });
-  });
-
-  test('threads context.workflowRunConfig into fresh foreground and background runs', async () => {
-    const runConfig = {
-      source: { kind: 'http' as const, label: 'inline' },
-      layer: { docsPath: 'handbook' },
-    };
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
-      workflowRunConfig: runConfig,
-    });
-    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.runConfig).toEqual(runConfig);
-
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
-      workflowRunConfig: runConfig,
-    });
-    expect(mockDispatchBackgroundWorkflow.mock.calls[0]?.[0]?.runConfig).toEqual(runConfig);
-  });
-
-  test('refuses a required-input workflow when nothing is supplied, starting nothing', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain("requires input 'diff'");
-    expect(sent).toContain('--input');
-    expect(sent).not.toContain('reusable block');
-  });
-
-  test('hands the capture to a fresh foreground run', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
-
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'adopt']);
-  });
-
-  test('keeps holding the capture when the dispatch refuses after taking it', async () => {
-    // The invocation gate fires AFTER the capture, so every refusal past that point has a
-    // frozen tree to reclaim. Nothing starts, so nothing owns it.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
-
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'reclaim:/capture']);
-  });
-
-  test('a continuation takes no capture at all', async () => {
-    // It executes the source its run already froze. Capturing here would freeze current
-    // bytes the run never agreed to AND leave a staged tree nothing adopts.
-    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
-    (prepareWorkflowSource as ReturnType<typeof mock>).mockClear();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(makeResumableRun({ id: 'paused-run', status: 'paused' }))
-    );
-
-    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
-
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(prepareWorkflowSource).not.toHaveBeenCalled();
-    expect(capturedSourceOwnerCalls).toEqual([]);
-  });
-
-  test('refuses an undeclared supplied key, starting nothing', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowInputs: { diff: 'D1', stlye: 'terse' },
-    });
-
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('stlye');
-  });
-
-  test('an IMPLICIT auto-resume of a required-input workflow is not re-gated', async () => {
-    // The dangerous case: a plain `/workflow run <name>` (a start request) on a
-    // workflow with a paused run. `dispatchOrchestratorWorkflow` auto-detects that run
-    // for every platform, so gating only against an EXPLICIT resume refused a legitimate
-    // continuation — the run row already holds its validated inputs, and a user saying
-    // "run it" again supplies nothing. Reachable from chat and from a repeat
-    // POST /api/workflows/:name/run that reuses a conversation id.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'implicit-resume-1',
-          working_path: '/repos/test-repo/worktrees/paused',
-          status: 'paused',
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).not.toContain("requires input 'diff'");
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(mockStartRunLiveOwner).toHaveBeenCalledWith('implicit-resume-1');
-    expect(mockCloseRunLiveOwner).toHaveBeenCalledTimes(1);
-    expect(mockExecuteWorkflow.mock.calls[0][3]).toBe('/repos/test-repo/worktrees/paused');
-  });
-
-  test('tells the caller when supplied inputs could not be applied to an auto-resumed run', async () => {
-    // The resume replays its own row's inputs; values supplied on this call cannot
-    // reach it. Accepting them and silently running something else is the failure this
-    // guards — the caller gets a 200 and no way to tell their values were dropped.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'implicit-resume-2',
-          working_path: '/repos/test-repo/worktrees/paused',
-          status: 'paused',
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowInputs: { diff: 'D-new' },
-    });
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('not applied');
-    expect(sent).toContain('diff');
-    expect(sent).toContain('implicit-resume-2');
-    // Names only — a supplied value is user content and must never be echoed back.
-    expect(sent).not.toContain('D-new');
-    // The resume still proceeds; the run holds real work and a worktree.
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-  });
-
-  test('tells the caller when model bindings could not be applied to an auto-resumed run', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'implicit-model-resume',
-          working_path: '/repos/test-repo/worktrees/paused',
-          status: 'paused',
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowModelOverrides: {
-        tiers: { large: 'openai/gpt-5.6' },
-        aliases: { '@planner': 'codex/gpt-5.6-sol' },
-      },
-    });
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('were not applied');
-    expect(sent).toContain('@planner, large');
-    expect(sent).toContain('implicit-model-resume');
-    expect(sent).not.toContain('openai/gpt-5.6');
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.modelOverrideLayer).toBeUndefined();
-  });
-
-  test('refuses a new run config when the command would auto-resume existing work', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'implicit-config-resume',
-          working_path: '/repos/test-repo/worktrees/paused',
-          status: 'paused',
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
-      workflowRunConfig: {
-        source: { kind: 'http', label: 'inline' },
-        layer: { docsPath: 'handbook' },
-      },
-    });
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('a new run config cannot be applied');
-    expect(sent).toContain('force a fresh run');
-    expect(mockInspectResumableRun).toHaveBeenCalled();
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('uses the actual state when explicit resume ignores supplied model bindings', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(
-        makeWorkflowResult(true, {
-          resumeRun: makeResumableRun({ id: 'failed-model-resume', status: 'failed' }),
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow resume failed-model-resume', {
-      workflowModelOverrides: { tiers: { large: 'openai/gpt-5.6' } },
-    });
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('Resuming the failed run');
-    expect(sent).not.toContain('Resuming the paused run');
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-  });
-
-  test('re-raises the deferred input error when hydration finds nothing to resume', async () => {
-    // The gate defers a contract violation while a continuation looks possible. This is
-    // the ONE branch where that prediction turns out wrong — hydration returns null, so
-    // a FRESH run row gets created after all — and the deferred error has to come back.
-    // Without the re-raise, a required-input workflow would silently start with the
-    // input never supplied and never validated: neither a safe refusal nor a real resume.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'nothing-to-resume-1',
-          working_path: '/repos/test-repo/worktrees/paused',
-          status: 'paused',
-        })
-      )
-    );
-    // Nothing worth resuming → the fresh-run fallthrough.
-    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
-    const capturedWorkflow = makeTestResolvedWorkflow({
-      name: 'test-workflow',
-      inputs: { diff: { required: true } },
-    });
-    mockResolveContinuationWorkflow.mockResolvedValueOnce({
-      workflow: capturedWorkflow,
-      roots: CAPTURED_SOURCE_ROOTS,
-      workflows: [{ workflow: capturedWorkflow, source: 'project' }],
-      errors: [],
-    });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain("requires input 'diff'");
-    // Must NOT reach the generic "starting fresh in the same worktree" dispatch.
-    expect(sent).not.toContain('starting fresh in the same worktree');
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(mockStartRunLiveOwner).toHaveBeenCalledWith('nothing-to-resume-1');
-    expect(mockCloseRunLiveOwner).toHaveBeenCalledTimes(1);
-    expect(mockWithRunLiveOwner).not.toHaveBeenCalled();
-  });
-
-  /** Drive the lost-resume-race path with an optional supplied-input map. */
-  async function dispatchLosingResumeRace(
-    platform: ReturnType<typeof makePlatform>,
-    workflowInputs?: Record<string, string>
-  ): Promise<void> {
-    // `mock.module` MERGES, so `WorkflowNotResumableError` is the real class here.
-    const { WorkflowNotResumableError } = await import('../db/workflows');
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
-    );
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'raced-run-1',
-          working_path: '/repos/test-repo/worktrees/paused',
-          status: 'paused',
-        })
-      )
-    );
-    mockHydrateResumableRun.mockReturnValueOnce(
-      Promise.reject(new WorkflowNotResumableError('raced-run-1', 'running'))
-    );
-    await handleMessage(
-      platform,
-      'conv-1',
-      '/workflow run test-workflow',
-      workflowInputs ? { workflowInputs } : undefined
-    );
+          ],
+          notifications: [
+            itemCompleted({
+              type: 'dynamicToolCall',
+              id: 'failure',
+              tool: toolName,
+              namespace: null,
+              arguments: {},
+              status: 'failed',
+              success: false,
+              contentItems: [],
+              durationMs: 1,
+            }),
+          ],
+        }));
+        const provider = new CodexProvider(server, 1);
+        mockGetOrCreateConversation.mockResolvedValueOnce(
+          makeConversation({ ai_assistant_type: 'codex' })
+        );
+        mockSendQuery.mockImplementationOnce(async function* (...args) {
+          if (toolName === 'invoke_workflow')
+            mockListCodebases.mockRejectedValueOnce(new Error('registry unavailable'));
+          else mockRegisterFolder.mockRejectedValueOnce(new Error('disk full'));
+          yield* provider.sendQuery(...args);
+        });
+        const platform = makePlatform();
+        platform.getStreamingMode.mockReturnValue(mode);
+        await handleMessage(platform, 'conv-1', 'launch or register', { actor: operator });
+        expect(server.processes[0].toolResponses[0].result.success).toBe(false);
+        expect(platform.sendMessage).toHaveBeenCalledWith(
+          'conv-1',
+          expect.stringContaining('A tool failed or was cancelled')
+        );
+        expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      });
+    }
   }
 
-  test('reports a deferred input error on a lost resume race when values were supplied', async () => {
-    // The last exit that can abandon the dispatch after the gate deferred. The caller
-    // supplied an undeclared key, so the violation is about something they actually did
-    // and is worth surfacing — it is never re-raised anywhere else on this path.
-    const platform = makePlatform();
-    await dispatchLosingResumeRace(platform, { stlye: 'terse' });
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('already being resumed');
-    expect(sent).toContain('stlye');
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('stays quiet about the deferred error on a lost race when nothing was supplied', async () => {
-    // With nothing supplied the deferred violation is just "you must supply X", which is
-    // moot when nothing will run. Appending it unconditionally produced nonsense on chat:
-    // a demand to pass `--input`, immediately followed by a note that chat cannot, tacked
-    // onto a message whose first line is already "No action taken".
-    const platform = makePlatform();
-    await dispatchLosingResumeRace(platform);
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain('already being resumed');
-    expect(sent).not.toContain('--input');
-    expect(sent).not.toContain("requires input 'diff'");
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('refuses immediately when the resumable run is not a continuation candidate', async () => {
-    // A FAILED (non-paused) prior run is not continued — the user gets a
-    // resume/abandon/force menu. Deferring the gate for that case swallowed the input
-    // error entirely: the caller saw a generic menu and was never told which input was
-    // wrong. Such an invocation must be refused up front, before isolation resolution.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
+  test('a legacy Codex chat visibly asks for a new chat before invoking a model', async () => {
+    const { CodexProvider } = await import('@archon/providers/codex/provider');
+    const { CODEX_CAPABILITIES } = await import('../../../providers/src/codex/capabilities');
+    const { createFakeAppServer } = await import(
+      '../../../providers/src/test/codex-app-server-fake'
     );
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'failed-prior-1',
-          working_path: '/repos/test-repo/worktrees/failed',
-          status: 'failed',
-        })
-      )
+    capsMock.mockReturnValue(CODEX_CAPABILITIES);
+    mockGetOrCreateConversation.mockResolvedValueOnce(
+      makeConversation({ ai_assistant_type: 'codex' })
     );
-
+    mockTransitionSession.mockResolvedValueOnce(
+      makeSession({ assistant_session_id: 'legacy-thread' })
+    );
+    const server = createFakeAppServer();
+    const provider = new CodexProvider(server, 1);
+    mockSendQuery.mockImplementationOnce((...args) => provider.sendQuery(...args));
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).toContain("requires input 'diff'");
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    // Refused at the gate, so the resume menu never rendered and no isolation ran.
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-  });
-
-  test('a resume of a required-input workflow is not re-gated', async () => {
-    // The row already carries inputs validated at creation; re-gating with nothing
-    // supplied would make every such resume impossible — a regression this feature
-    // would otherwise introduce.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve(
-        makeWorkflowResult(true, {
-          inputs: { diff: { required: true } },
-          resumeRun: makeResumableRun({ status: 'paused' }),
-        })
-      )
+    await handleMessage(platform, 'conv-1', 'launch the workflow', { actor: operator });
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Start a new chat')
     );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
-    expect(sent).not.toContain("requires input 'diff'");
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-  });
-
-  test('web non-interactive workflow with resumable run resumes foreground (not background)', async () => {
-    // Pins the priority order: resume detection comes before the background-dispatch
-    // gate. If a resumable run exists, web non-interactive workflows must resume
-    // foreground rather than dispatching a fresh background run. A future refactor
-    // that accidentally moves the resume check inside the interactive guard would
-    // lose worktree state for web users with paused non-interactive runs.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined))); // non-interactive
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'web-noninteractive-resume-1',
-          working_path: '/repos/test-repo/worktrees/web-feature',
-          status: 'paused',
-        })
-      )
-    );
-
-    const platform = makePlatform(); // getPlatformType returns 'web'
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    // Must resume foreground even though workflow is non-interactive
-    expect(mockHydrateResumableRun).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    expect(callArgs[3]).toBe('/repos/test-repo/worktrees/web-feature');
-  });
-
-  test('calls executeWorkflow for interactive workflow on non-web platform', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-
-    const platform = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'slack' as const),
-    };
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(server.processes).toHaveLength(0);
     expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
   });
 
-  test('chat resume: resumes a paused run on chat platform when one exists', async () => {
-    // Regression for #1741: chat platforms (slack/telegram/discord/github) used
-    // to skip the resume lookup entirely and always start a fresh run, losing
-    // the prior worktree and re-asking approval questions indefinitely. The
-    // resume lookup must now run for ALL platforms; if a prior run is paused
-    // or failed-by-approval, executeWorkflow runs on the prior worktree with
-    // hydrated state.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    mockFindResumableRunByParentConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeResumableRun({
-          id: 'chat-resume-run-1',
-          working_path: '/repos/test-repo/worktrees/chat-feature',
-          status: 'paused',
-        })
-      )
+  test('Codex registration uses the shared primitive and manage_run preserves actor and project authorization', async () => {
+    const { CodexProvider } = await import('@archon/providers/codex/provider');
+    const { CODEX_CAPABILITIES } = await import('../../../providers/src/codex/capabilities');
+    const { createFakeAppServer, THREAD_ID, TURN_ID } = await import(
+      '../../../providers/src/test/codex-app-server-fake'
     );
-
-    const platform = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'telegram' as const),
-    };
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
-
-    expect(mockHydrateResumableRun).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    // cwd (position 3) is the prior run's working_path, not a fresh resolution
-    expect(callArgs[3]).toBe('/repos/test-repo/worktrees/chat-feature');
-    const opts = callArgs[callArgs.length - 1] as {
-      preCreatedRun?: { id: string };
-      priorCompletedNodes?: Map<string, string>;
-    };
-    expect(opts.preCreatedRun?.id).toBe('chat-resume-run-1');
-    expect(opts.priorCompletedNodes?.size).toBeGreaterThan(0);
+    capsMock.mockReturnValue(CODEX_CAPABILITIES);
+    const run = makeRun({
+      id: 'aaaaaaaa-1111-2222-3333-444444444444',
+      status: 'running',
+      user_id: 'another-user',
+    });
+    mockGetWorkflowRunDb.mockResolvedValue(run);
+    mockFindWorkflowRunsByIdPrefix.mockResolvedValue([run]);
+    mockGetOrCreateConversation.mockResolvedValueOnce(
+      makeConversation({
+        ai_assistant_type: 'codex',
+        codebase_id: 'codebase-1',
+        cwd: '/repos/test-repo',
+      })
+    );
+    mockGetCodebase.mockResolvedValueOnce(makeCodebase());
+    mockRegisterFolder.mockClear();
+    const server = createFakeAppServer(() => ({
+      toolCalls: [
+        {
+          threadId: THREAD_ID,
+          turnId: TURN_ID,
+          callId: 'register',
+          namespace: null,
+          tool: 'register_project',
+          arguments: { name: 'new-folder', path: '/', folder: true },
+        },
+        {
+          threadId: THREAD_ID,
+          turnId: TURN_ID,
+          callId: 'cancel',
+          namespace: null,
+          tool: 'manage_run',
+          arguments: { action: 'cancel', runId: run.id, confirm: true },
+        },
+      ],
+    }));
+    const provider = new CodexProvider(server, 1);
+    mockSendQuery.mockImplementationOnce((...args) => provider.sendQuery(...args));
+    await handleMessage(makePlatform(), 'conv-1', 'register my folder and cancel the run', {
+      actor: { kind: 'unidentified' },
+    });
+    expect(mockRegisterFolder).toHaveBeenCalledWith(
+      await canonicalizeProjectPath('/'),
+      'new-folder'
+    );
+    expect(server.processes[0].toolResponses[0].result.contentItems).toEqual([
+      { type: 'inputText', text: expect.stringContaining('registered successfully') },
+    ]);
+    expect(mockFindWorkflowRunsByIdPrefix).toHaveBeenCalledWith(run.id, 'codebase-1');
+    expect(server.processes[0].toolResponses[1].result.contentItems).toEqual([
+      {
+        type: 'inputText',
+        text: expect.stringContaining('Only the user who started this run or an admin'),
+      },
+    ]);
+    expect(mockUpdateWorkflowRun).not.toHaveBeenCalled();
   });
 
-  test('scopes resume query to (workflow, conversation, codebase)', async () => {
-    // Persistent chat conversation IDs (Telegram chat_id, Slack thread) can
-    // accumulate runs from multiple projects. The resume lookup must include
-    // codebase_id so a fresh invocation for project A never resumes a stale
-    // run from project B.
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+  test('a typed no-match decision emits one distinct event; ordinary replies emit none', async () => {
+    mockCaptureWorkflowNoMatch.mockClear();
+    await handleMessage(makePlatform(), 'conv-1', 'hello', { actor: operator });
+    expect(mockCaptureWorkflowNoMatch).not.toHaveBeenCalled();
+    mockSendQuery.mockImplementationOnce(async function* () {
+      const options = mockSendQuery.mock.calls.at(-1)?.[3] as { nativeTools: NativeTool[] };
+      const report = options.nativeTools.find(tool => tool.name === 'report_workflow_no_match')!;
+      await report.handler({});
+      await report.handler({});
+      yield {
+        type: 'agent_message_chunk' as const,
+        text: 'No workflow fits. Here are the alternatives.',
+      };
+      yield { type: 'result' as const, sessionId: 'session-1' };
+    });
+    await handleMessage(makePlatform(), 'conv-1', 'please do this work', { actor: operator });
+    expect(mockCaptureWorkflowNoMatch).toHaveBeenCalledTimes(1);
+    expect(mockCaptureWorkflowNoMatch).toHaveBeenCalledWith('native_tool');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
 
-    const platform = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'slack' as const),
-    };
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+  test('every chat gets the launch, project and attention tools; scoped chats also get manage_run', async () => {
+    await handleMessage(makePlatform(), 'conv-1', 'hello', { actor: operator });
+    expect(turnToolNames()).toEqual([
+      'invoke_workflow',
+      'register_project',
+      'report_workflow_no_match',
+      'attention',
+    ]);
 
-    expect(mockFindResumableRunByParentConversation).toHaveBeenCalledWith(
-      'test-workflow',
-      'conv-1-db',
-      'codebase-1'
+    mockGetOrCreateConversation.mockResolvedValueOnce(makeDispatchConversation());
+    mockGetCodebase.mockResolvedValueOnce(makeCodebase());
+    await handleMessage(makePlatform(), 'conv-1', 'hello', { actor: operator });
+    expect(turnToolNames()).toEqual([
+      'invoke_workflow',
+      'register_project',
+      'report_workflow_no_match',
+      'attention',
+      'manage_run',
+    ]);
+  });
+
+  test('a background surface dispatches the typed prompt verbatim after the turn', async () => {
+    const results: string[] = [];
+    agentInvokes([launch], results);
+    await handleMessage(makePlatform(), 'conv-1', 'fix the login bug', { actor: operator });
+
+    expect(results[0]).toContain('Queued test-workflow on test-repo');
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({ originalMessage: task }),
+      expect.anything()
     );
   });
 
-  test('starts fresh run when no resumable run exists on chat platform', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
-    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
-    // Default mock returns null — no resumable run
+  test('inputs supplied on the launch reach the dispatch gate and the run', async () => {
+    const results: string[] = [];
+    agentInvokes([{ ...launch, inputs: '{"base_branch":"dev"}' }], results);
+    await handleMessage(makePlatform(), 'conv-1', 'release from dev', { actor: operator });
 
-    const platform = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'discord' as const),
-    };
-    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+    expect(results[0]).toContain('with inputs: base_branch=dev');
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({ inputs: { base_branch: 'dev' } }),
+      expect.anything()
+    );
+  });
 
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
-    // cwd comes from validateAndResolveIsolation (default '/test/cwd'), not a prior worktree
-    expect(callArgs[3]).toBe('/test/cwd');
-    const opts = callArgs[callArgs.length - 1] as {
-      preCreatedRun?: unknown;
-      priorCompletedNodes?: unknown;
-    };
-    expect(opts.preCreatedRun).toBeUndefined();
-    expect(opts.priorCompletedNodes).toBeUndefined();
+  test('a foreground surface runs the launch in the foreground with the isolation hints', async () => {
+    mockGetCodebase.mockResolvedValue(makeCodebase());
+    const isolationHints = { workflowType: 'issue', workflowId: '42' } as const;
+    agentInvokes([launch], []);
+    await handleMessage(makeForegroundPlatform(), 'conv-1', 'fix the login bug', {
+      actor: operator,
+      isolationHints,
+    });
+
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockValidateAndResolveIsolation.mock.calls[0]?.[4]).toMatchObject(isolationHints);
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+  });
+
+  test('a launch sees a project registered earlier in the same turn', async () => {
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    const results: string[] = [];
+    mockSendQuery.mockImplementationOnce(async function* () {
+      const options = mockSendQuery.mock.calls.at(-1)?.[3] as { nativeTools: NativeTool[] };
+      mockListCodebases.mockImplementation(() => Promise.resolve([makeCodebase()]));
+      results.push(
+        await options.nativeTools.find(t => t.name === 'invoke_workflow')!.handler(launch)
+      );
+      yield { type: 'result', sessionId: 'session-1' };
+    });
+    await handleMessage(makePlatform(), 'conv-1', 'clone and fix', { actor: operator });
+
+    expect(results[0]).toContain('Queued test-workflow on test-repo');
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test('a second launch in the same turn is refused and only the first dispatches', async () => {
+    const results: string[] = [];
+    agentInvokes([launch, { ...launch, prompt: 'something else' }], results);
+    await handleMessage(makePlatform(), 'conv-1', 'fix the login bug', { actor: operator });
+
+    expect(results[1]).toContain('Only one workflow launch per reply');
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({ originalMessage: task }),
+      expect.anything()
+    );
+  });
+
+  test.each(['stream', 'batch'] as const)(
+    'a turn that ends in an error result drops its queued launch (%s)',
+    async mode => {
+      mockSendQuery.mockImplementationOnce(async function* () {
+        const options = mockSendQuery.mock.calls.at(-1)?.[3] as { nativeTools: NativeTool[] };
+        await options.nativeTools.find(t => t.name === 'invoke_workflow')!.handler(launch);
+        yield { type: 'result', isError: true, errorSubtype: 'error_max_turns' };
+      });
+      const platform = makePlatform();
+      platform.getStreamingMode.mockReturnValue(mode);
+      await handleMessage(platform, 'conv-1', 'fix the login bug', { actor: operator });
+
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    }
+  );
+
+  test('a turn that throws after queueing a launch dispatches nothing', async () => {
+    mockSendQuery.mockImplementationOnce(async function* () {
+      const options = mockSendQuery.mock.calls.at(-1)?.[3] as { nativeTools: NativeTool[] };
+      await options.nativeTools.find(t => t.name === 'invoke_workflow')!.handler(launch);
+      yield { type: 'agent_message_chunk', text: 'On it.' };
+      throw new Error('provider crashed');
+    });
+    await handleMessage(makePlatform(), 'conv-1', 'fix the login bug', { actor: operator });
+
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('a /invoke-workflow line in the reply is plain text', async () => {
+    const reply = '/invoke-workflow test-workflow --project test-repo --prompt "x"\n';
+    agentInvokes([], [], reply);
+    const platform = makePlatform();
+    platform.getStreamingMode.mockReturnValue('stream');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
+
+    expect(platform.sendMessage.mock.calls.map(c => c[1])).toContain(reply);
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
   });
 });
 
 // ─── Natural-language approval routing ──────────────────────────────────────
 
 describe('paused approval gate routing', () => {
-  const approvalWorkflow = makeTestResolvedWorkflow({ name: 'prd', interactive: true });
+  const approvalWorkflow = makeTestResolvedWorkflow({ name: 'prd' });
 
   type ManageRunHandler = (input: Record<string, unknown>) => Promise<string>;
 
@@ -3914,7 +1001,9 @@ describe('paused approval gate routing', () => {
     arrangeGatedChat();
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'looks good, proceed with implementation');
+    await handleMessage(platform, 'conv-1', 'looks good, proceed with implementation', {
+      actor: operator,
+    });
 
     // Nothing was resolved and nothing resumed — the message went to the agent.
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
@@ -3932,7 +1021,9 @@ describe('paused approval gate routing', () => {
     arrangeGatedChat();
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'no, stop — why is it editing the schema?');
+    await handleMessage(platform, 'conv-1', 'no, stop — why is it editing the schema?', {
+      actor: operator,
+    });
 
     // The regression this issue exists for: an objection used to resolve the
     // gate as APPROVED and store the objection itself as the approval comment.
@@ -3946,7 +1037,7 @@ describe('paused approval gate routing', () => {
     arrangeGatedChat();
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'what would that change?');
+    await handleMessage(platform, 'conv-1', 'what would that change?', { actor: operator });
 
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
     expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
@@ -3962,8 +1053,9 @@ describe('paused approval gate routing', () => {
   test('an open gate is handed to the agent as prompt context', async () => {
     arrangeGatedChat();
 
-    await handleMessage(makePlatform(), 'conv-1', 'what would that change?');
+    await handleMessage(makePlatform(), 'conv-1', 'what would that change?', { actor: operator });
 
+    expect(mockGetPausedWorkflowRun).toHaveBeenCalledWith('conv-1-db', 'codebase-1');
     const prompt = lastPrompt();
     expect(prompt).toContain('## Paused Approval Gate');
     expect(prompt).toContain('run-1');
@@ -3981,7 +1073,7 @@ describe('paused approval gate routing', () => {
     );
     mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
 
-    await handleMessage(makePlatform(), 'conv-1', 'hello world');
+    await handleMessage(makePlatform(), 'conv-1', 'hello world', { actor: operator });
 
     expect(lastPrompt()).not.toContain('## Paused Approval Gate');
   });
@@ -3993,22 +1085,27 @@ describe('paused approval gate routing', () => {
       },
     });
 
-    await handleMessage(makePlatform(), 'conv-1', 'sounds good');
+    await handleMessage(makePlatform(), 'conv-1', 'sounds good', { actor: operator });
 
     // Nothing for a human to decide — the run is only waiting to be resumed.
     expect(lastPrompt()).not.toContain('## Paused Approval Gate');
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
   });
 
-  test('a paused run with a malformed approval context points the agent at the explicit commands', async () => {
+  test('a paused run with a malformed legacy approval context sends the user to inspect or reject it', async () => {
     arrangeGatedChat({ metadata: {} });
 
-    await handleMessage(makePlatform(), 'conv-1', 'looks good');
+    await handleMessage(makePlatform(), 'conv-1', 'looks good', { actor: operator });
 
+    // approve refuses an unreadable gate, so naming it would hand the user a command that
+    // fails; reject still accepts a legacy gate whose metadata is unreadable.
     const prompt = lastPrompt();
     expect(prompt).toContain('## Paused Approval Gate');
     expect(prompt).toContain('missing or malformed');
-    expect(prompt).toContain('/workflow approve run-1');
+    expect(prompt).toContain('/workflow get run-1');
+    expect(prompt).not.toContain('/workflow approve run-1');
+    expect(prompt).toContain('/workflow reject run-1 <reason>');
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
   });
 
   test('a slash command never reaches the gate lookup', async () => {
@@ -4019,7 +1116,7 @@ describe('paused approval gate routing', () => {
       Promise.resolve({ success: true, message: 'status ok', workflow: undefined })
     );
 
-    await handleMessage(makePlatform(), 'conv-1', '/status');
+    await handleMessage(makePlatform(), 'conv-1', '/status', { actor: operator });
 
     expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
   });
@@ -4035,7 +1132,7 @@ describe('paused approval gate routing', () => {
     );
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'looks good, ship it');
+    await handleMessage(platform, 'conv-1', 'looks good, ship it', { actor: operator });
 
     expect(mockResolveApprovalGate).toHaveBeenCalledWith(
       'run-1',
@@ -4044,12 +1141,15 @@ describe('paused approval gate routing', () => {
           nodeId: 'gate-1',
           message: 'Please review the plan',
           resolved: 'approved',
+          answeredVia: 'manage_run',
+          answeredAt: expect.any(String),
         },
         approval_response: 'approved',
         rejection_reason: '',
         rejection_count: 0,
       },
-      expect.any(Array)
+      expect.any(Array),
+      undefined
     );
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'approved' });
     // Continuation: resolution without it would leave the run stranded (#2565).
@@ -4082,7 +1182,7 @@ describe('paused approval gate routing', () => {
     );
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'no, the schema change is wrong');
+    await handleMessage(platform, 'conv-1', 'no, the schema change is wrong', { actor: operator });
 
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'rejected' });
     expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
@@ -4099,7 +1199,7 @@ describe('paused approval gate routing', () => {
     );
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'no, drop it');
+    await handleMessage(platform, 'conv-1', 'no, drop it', { actor: operator });
 
     // No on_reject prompt on the gate → the run is cancelled, which IS its
     // terminal state. Nothing to continue.
@@ -4124,12 +1224,12 @@ describe('paused approval gate routing', () => {
     );
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '   /status');
+    await handleMessage(platform, 'conv-1', '   /status', { actor: operator });
 
     expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
     expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
     // The platform rides along so command suggestions use its spelling.
-    expect(mockHandleCommand).toHaveBeenCalledWith(conversation, '   /status', platform);
+    expect(mockHandleCommand).toHaveBeenCalledWith(conversation, '   /status', operator, platform);
     expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'status ok');
   });
 
@@ -4150,7 +1250,7 @@ describe('paused approval gate routing', () => {
     });
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'ship it');
+    await handleMessage(platform, 'conv-1', 'ship it', { actor: operator });
 
     expect(mockResolveApprovalGate).toHaveBeenCalled();
     expect(mockExecuteWorkflow).toHaveBeenCalled();
@@ -4159,6 +1259,69 @@ describe('paused approval gate routing', () => {
       expect.stringContaining('Continuation requested')
     );
   });
+
+  test.each([
+    { action: 'approve', decision: undefined },
+    { action: 'reject', decision: undefined },
+    { action: 'respond', decision: 'reject' },
+    { action: 'respond', decision: 'approve' },
+  ])(
+    'Codex drains an in-flight gate decision after process exit: %j',
+    async ({ action, decision }) => {
+      const { CodexProvider } = await import('@archon/providers/codex/provider');
+      const { CODEX_CAPABILITIES } = await import('../../../providers/src/codex/capabilities');
+      const { createFakeAppServer, THREAD_ID, TURN_ID } = await import(
+        '../../../providers/src/test/codex-app-server-fake'
+      );
+      capsMock.mockReturnValue(CODEX_CAPABILITIES);
+      arrangeGatedChat({
+        metadata: { approval: { nodeId: 'gate-1', message: 'Review', onRejectPrompt: 'Rework' } },
+      });
+      const entered = Promise.withResolvers<void>();
+      const commit = Promise.withResolvers<void>();
+      mockResolveApprovalGate.mockImplementationOnce(async () => {
+        entered.resolve();
+        await commit.promise;
+        return { resolved: true };
+      });
+      const server = createFakeAppServer(() => ({
+        toolCalls: [
+          {
+            threadId: THREAD_ID,
+            turnId: TURN_ID,
+            callId: 'gate',
+            namespace: null,
+            tool: 'manage_run',
+            arguments: { action, decision, runId: 'run-1', confirm: true, message: 'feedback' },
+          },
+        ],
+      }));
+      const provider = new CodexProvider(server, 1);
+      mockSendQuery.mockImplementationOnce((...args) => provider.sendQuery(...args));
+      const platform = makePlatform();
+      let returned = false;
+      const handling = handleMessage(platform, 'conv-1', 'resolve the gate', {
+        actor: operator,
+      }).finally(() => {
+        returned = true;
+      });
+      await entered.promise;
+      server.processes[0].exit(1);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const returnedBeforeCommit = returned;
+      commit.resolve();
+      await handling;
+      expect(returnedBeforeCommit).toBe(false);
+      expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        expect.stringContaining('Continuation requested')
+      );
+      expect(server.processes[0].toolResponses).toHaveLength(0);
+    }
+  );
 
   test('a container run is resolved but not resumed from chat', async () => {
     // Chat cannot rewire the container, so the executor would refuse the resume.
@@ -4169,7 +1332,7 @@ describe('paused approval gate routing', () => {
     agentCallsManageRun({ action: 'approve', runId: 'run-1', confirm: true }, toolReplies);
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'apply the changes');
+    await handleMessage(platform, 'conv-1', 'apply the changes', { actor: operator });
 
     expect(mockResolveApprovalGate).toHaveBeenCalled();
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
@@ -4184,8 +1347,9 @@ describe('paused approval gate routing', () => {
     );
     mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(makePausedRun()));
 
-    await handleMessage(makePlatform(), 'conv-1', 'looks good');
+    await handleMessage(makePlatform(), 'conv-1', 'looks good', { actor: operator });
 
+    expect(mockGetPausedWorkflowRun).toHaveBeenCalledWith('conv-1-db', undefined);
     const prompt = lastPrompt();
     expect(prompt).toContain('## Paused Approval Gate');
     expect(prompt).toContain('no project is attached');
@@ -4197,7 +1361,7 @@ describe('paused approval gate routing', () => {
     const toolReplies: string[] = [];
     agentCallsManageRun({ action: 'approve', runId: 'run-1' }, toolReplies);
 
-    await handleMessage(makePlatform(), 'conv-1', 'maybe approve it?');
+    await handleMessage(makePlatform(), 'conv-1', 'maybe approve it?', { actor: operator });
 
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
@@ -4214,7 +1378,7 @@ describe('paused approval gate routing', () => {
     agentCallsManageRun({ action: 'approve', runId: 'run-1', confirm: true }, toolReplies);
 
     const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'ship it');
+    await handleMessage(platform, 'conv-1', 'ship it', { actor: operator });
 
     expect(mockResolveApprovalGate).toHaveBeenCalled();
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
@@ -4225,2286 +1389,16 @@ describe('paused approval gate routing', () => {
   });
 });
 
-// ─── handleWorkflowRunCommand E2 path — single codebase auto-select ──────────
-
-describe('handleWorkflowRunCommand — E2 single codebase auto-select', () => {
-  const assistWorkflow = makeTestResolvedWorkflow({ name: 'assist' });
-
-  beforeEach(() => {
-    mockGetOrCreateConversation.mockReset();
-    mockGetCodebase.mockReset();
-    mockListCodebases.mockReset();
-    mockParseCommand.mockReset();
-    mockHandleCommand.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockUpdateConversation.mockClear();
-    mockDispatchBackgroundWorkflow.mockClear();
-    mockExecuteWorkflow.mockClear();
-    mockFindResumableRunByParentConversation.mockClear();
-    mockLogger.error.mockClear();
-
-    // Default: return empty conversation without codebase
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({ workflows: [], errors: [] })
-    );
-  });
-
-  test('a single project resumes a captured workflow missing from live discovery', async () => {
-    const codebase = makeCodebaseForSync();
-    const run = makeRun({
-      id: 'captured-old-run',
-      workflow_name: 'assist',
-      user_message: 'original request',
-      working_path: '/repos/test-repo/worktrees/old',
-      status: 'paused',
-    });
-    const captured = makeTestResolvedWorkflow({ name: 'assist', description: 'captured graph' });
-    mockGetOrCreateConversation.mockResolvedValueOnce(makeConversation({ codebase_id: null }));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['resume', run.id] });
-    mockHandleCommand.mockResolvedValueOnce({
-      success: true,
-      message: 'Resume requested.',
-      workflow: { kind: 'resume', run },
-    });
-    mockListCodebases.mockResolvedValueOnce([codebase]);
-    mockResolveContinuationWorkflow.mockResolvedValueOnce({
-      workflow: captured,
-      roots: CAPTURED_SOURCE_ROOTS,
-      workflows: [{ workflow: captured, source: 'project' }],
-      errors: [],
-    });
-
-    await handleMessage(makePlatform(), 'conv-1', `/workflow resume ${run.id}`);
-
-    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1-db', {
-      codebase_id: codebase.id,
-    });
-    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect((mockExecuteWorkflow.mock.calls[0] as unknown[])[4]).toBe(captured);
-  });
-
-  test('resolves workflow from WorkflowWithSource[] by exact name match', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    // parseCommand returns a /workflow run command
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: { kind: 'start', definition: assistWorkflow, args: 'test prompt' },
-      })
-    );
-    // Single codebase triggers auto-select
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    // discoverWorkflowsWithConfig returns WorkflowWithSource[]
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [
-          makeTestWorkflowWithSource({ name: 'assist' }),
-          makeTestWorkflowWithSource({ name: 'implement' }),
-        ],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-
-    // Should auto-select the codebase and update conversation
-    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1-db', { codebase_id: codebase.id });
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-  });
-
-  // #2213 — every chat and console run funnels through
-  // dispatchOrchestratorWorkflow, so this is the one place that covers them
-  // all. The console's Start button synthesizes `/workflow run <name>` into
-  // exactly this path, which is why a picker badge alone was not enough.
-  test('mirrors parse warnings into the conversation before the run starts', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: {
-          kind: 'start',
-          definition: assistWorkflow,
-          args: 'test prompt',
-          parseWarnings: ["Node 'plan': unknown key 'interactive' will be ignored."],
-        },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    // This branch re-resolves against the project's own discovery and uses that
-    // entry's warnings (see the shadowing test below), so they belong here too.
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [
-          makeTestWorkflowWithSource({ name: 'assist' }, 'project', [
-            "Node 'plan': unknown key 'interactive' will be ignored.",
-          ]),
-        ],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining("unknown key 'interactive' will be ignored")
-    );
-    // The warning must not replace the run — it precedes it.
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-  });
-
-  // This branch re-resolves the workflow against the single project's own
-  // discovery, so the entry it lands on can differ from the one the caller
-  // resolved. The warnings sent must describe the workflow that will run.
-  test('prefers the re-resolved workflow’s warnings over the caller’s', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: {
-          kind: 'start',
-          definition: assistWorkflow,
-          args: 'test prompt',
-          // Resolved against a different scope — must NOT be forwarded.
-          parseWarnings: ["STALE: from the shadowed global 'assist'"],
-        },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [
-          makeTestWorkflowWithSource({ name: 'assist' }, 'project', [
-            "FRESH: Node 'plan': unknown key 'interactive' will be ignored.",
-          ]),
-        ],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-
-    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', expect.stringContaining('FRESH:'));
-    expect(platform.sendMessage).not.toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('STALE:')
-    );
-  });
-
-  // The contract behind persisting warnings on the run: a failed chat delivery
-  // must not take the record with it. If this ever regresses, a Slack hiccup at
-  // dispatch reproduces #2213 exactly — a dropped `interactive:` gate with
-  // nothing anywhere to show for it.
-  test('still hands warnings to the executor when sendMessage throws', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: { kind: 'start', definition: assistWorkflow, args: 'test prompt' },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [
-          makeTestWorkflowWithSource({ name: 'assist' }, 'project', [
-            "Node 'plan': unknown key 'interactive' will be ignored.",
-          ]),
-        ],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    // Fail ONLY the warning delivery — a rate limit or over-length message on
-    // that one call. Failing every send instead would throw out of an unrelated,
-    // pre-existing `sendMessage` earlier in the turn and never reach this code.
-    (platform.sendMessage as ReturnType<typeof mock>).mockImplementation(
-      (_id: string, text: string) =>
-        text.includes('declares keys the engine ignores')
-          ? Promise.reject(new Error('rate limited'))
-          : Promise.resolve()
-    );
-
-    // Must not throw: an undeliverable warning cannot fail the run.
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-
-    // The run still started, and it carries the warnings — so the executor
-    // records them as a `workflow_parse_warnings` event regardless of delivery.
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-    const ctx = (mockDispatchBackgroundWorkflow as ReturnType<typeof mock>).mock.calls[0][0] as {
-      parseWarnings?: readonly string[];
-    };
-    expect(ctx.parseWarnings).toEqual(["Node 'plan': unknown key 'interactive' will be ignored."]);
-  });
-
-  test('sends no parse-warning message for a clean workflow', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: { kind: 'start', definition: assistWorkflow, args: 'test prompt' },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-
-    expect(platform.sendMessage).not.toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('declares keys the engine ignores')
-    );
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-  });
-
-  // #2781 — a deprecated bundled default announces its removal on the surface
-  // the run reports to, before any background dispatch. Same funnel argument
-  // as the parse-warning mirror above: this is the one place that covers them all.
-  test('sends the deprecation notice at run start for a workflow declaring deprecated:', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: { kind: 'start', definition: assistWorkflow, args: 'test prompt' },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [
-          makeTestWorkflowWithSource({
-            name: 'assist',
-            deprecated: { message: 'Switch to the sdlc pack instead.' },
-          }),
-        ],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      '⚠️ `assist` is deprecated and will be removed in an upcoming release. ' +
-        'Switch to the sdlc pack instead. ' +
-        'To keep using this workflow after removal, copy the workflow file into your project ' +
-        '`.archon/workflows/` or your global `~/.archon/workflows/`.'
-    );
-    // The notice must not replace the run — it precedes it.
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-  });
-
-  test('sends no deprecation notice for a clean workflow', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: { kind: 'start', definition: assistWorkflow, args: 'test prompt' },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-
-    expect(platform.sendMessage).not.toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('will be removed in an upcoming release')
-    );
-  });
-
-  test('a failed deprecation delivery does not stop the run', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow assist...',
-        workflow: { kind: 'start', definition: assistWorkflow, args: 'test prompt' },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [
-          makeTestWorkflowWithSource({
-            name: 'assist',
-            deprecated: { message: 'Switch instead.' },
-          }),
-        ],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    (platform.sendMessage as ReturnType<typeof mock>).mockImplementation(
-      (_id: string, text: string) =>
-        text.includes('will be removed in an upcoming release')
-          ? Promise.reject(new Error('rate limited'))
-          : Promise.resolve()
-    );
-
-    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-  });
-
-  test('resolves workflow by case-insensitive name when exact match fails', async () => {
-    const upperWorkflow = makeTestResolvedWorkflow({ name: 'Assist' });
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'Assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow...',
-        workflow: { kind: 'start', definition: upperWorkflow, args: 'test' },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    // Workflow name in discovery is lowercase 'assist', but request is 'Assist'
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run Assist test');
-
-    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1-db', { codebase_id: codebase.id });
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-  });
-
-  test('sends error message when workflow not found in discovery', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'missing'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running workflow...',
-        workflow: {
-          kind: 'start',
-          definition: makeTestResolvedWorkflow({ name: 'missing' }),
-          args: 'test',
-        },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({
-        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
-        errors: [],
-      })
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run missing test');
-
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('not found')
-    );
-    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('sends error when discovery fails', async () => {
-    const conversation = makeConversation({ codebase_id: null });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({
-        success: true,
-        message: 'Running...',
-        workflow: { kind: 'start', definition: assistWorkflow, args: 'test' },
-      })
-    );
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockRejectedValueOnce(new Error('YAML parse error'));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/workflow run assist test');
-
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      'conv-1',
-      expect.stringContaining('Failed to load workflows')
-    );
-    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
-  });
-});
-
-// ─── discoverAllWorkflows — merge with WorkflowWithSource ────────────────────
-
-describe('discoverAllWorkflows — merge repo workflows over global', () => {
-  beforeEach(() => {
-    mockSyncWorkspace.mockClear();
-    mockGetOrCreateConversation.mockReset();
-    mockGetCodebase.mockReset();
-    mockListCodebases.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockDispatchBackgroundWorkflow.mockClear();
-    mockLogger.warn.mockClear();
-
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({ workflows: [], errors: [] })
-    );
-  });
-
-  test('repo-specific workflows override global workflows by name', async () => {
-    const conversation = makeConversation({ codebase_id: 'codebase-1' });
-    const codebase = makeCodebaseForSync();
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
-
-    // First call: global discovery returns 'assist' workflow
-    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
-      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Global assist' })],
-      errors: [],
-    });
-    // Second call: repo discovery returns 'assist' with different description (override)
-    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
-      workflows: [
-        makeTestWorkflowWithSource({ name: 'assist', description: 'Repo assist' }, 'project'),
-      ],
-      errors: [],
-    });
-
-    const platform = makePlatform();
-    // Send a non-command message so it triggers discoverAllWorkflows via the orchestrator flow
-    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
-
-    // discoverWorkflowsWithConfig should have been called twice (global + repo)
-    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(2);
-  });
-});
-
-// ─── handleMessage — workflow context injection ───────────────────────────────
-
-describe('handleMessage — workflow context injection', () => {
-  beforeEach(() => {
-    mockGetRecentWorkflowResultMessages.mockClear();
-    mockGetOrCreateConversation.mockReset();
-    mockListCodebases.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockLogger.warn.mockClear();
-
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({ workflows: [], errors: [] })
-    );
-    mockGetRecentWorkflowResultMessages.mockImplementation(() => Promise.resolve([]));
-  });
-
-  test('calls getRecentWorkflowResultMessages for the conversation', async () => {
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'What happened?');
-
-    expect(mockGetRecentWorkflowResultMessages).toHaveBeenCalledWith('conv-1-db', 3);
-  });
-
-  test('does not throw when getRecentWorkflowResultMessages returns empty array', async () => {
-    mockGetRecentWorkflowResultMessages.mockResolvedValueOnce([]);
-    const platform = makePlatform();
-
-    await expect(handleMessage(platform, 'conv-1', 'Hello')).resolves.toBeUndefined();
-  });
-
-  test('handles malformed metadata JSON without throwing', async () => {
-    const badRow = {
-      id: 'msg-1',
-      conversation_id: 'conv-1',
-      role: 'assistant' as const,
-      content: 'Summary.',
-      metadata: 'not-valid-json',
-      user_id: null,
-      created_at: '2026-01-01T00:00:00Z',
-    };
-    mockGetRecentWorkflowResultMessages.mockResolvedValueOnce([badRow]);
-    const platform = makePlatform();
-
-    await expect(
-      handleMessage(platform, 'conv-1', 'What did the workflow do?')
-    ).resolves.toBeUndefined();
-  });
-
-  test('handles metadata with missing workflowResult key gracefully', async () => {
-    const rowNoWorkflowResult = {
-      id: 'msg-2',
-      conversation_id: 'conv-1',
-      role: 'assistant' as const,
-      content: 'Summary.',
-      metadata: '{"someOtherKey":"value"}',
-      user_id: null,
-      created_at: '2026-01-01T00:00:00Z',
-    };
-    mockGetRecentWorkflowResultMessages.mockResolvedValueOnce([rowNoWorkflowResult]);
-    const platform = makePlatform();
-
-    await expect(handleMessage(platform, 'conv-1', 'Follow-up')).resolves.toBeUndefined();
-  });
-
-  test('continues without workflow context when outer fetch throws', async () => {
-    mockGetRecentWorkflowResultMessages.mockRejectedValueOnce(new Error('unexpected'));
-    const platform = makePlatform();
-
-    // Non-critical path — must not block message handling
-    await expect(handleMessage(platform, 'conv-1', 'Hello')).resolves.toBeUndefined();
-  });
-});
-
-// ─── Stale session ID clearing on error_during_execution ────────────────────
-
-describe('stale session ID clearing on error_during_execution', () => {
-  beforeEach(() => {
-    mockUpdateSession.mockClear();
-    mockTransitionSession.mockClear();
-    mockGetOrCreateConversation.mockReset();
-    mockGetCodebase.mockReset();
-    mockSendQuery.mockReset();
-    mockLogger.warn.mockClear();
-    mockGetRecentWorkflowResultMessages.mockReset();
-    mockGetRecentWorkflowResultMessages.mockImplementation(() => Promise.resolve([]));
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({ workflows: [], errors: [] })
-    );
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
-    mockListCodebases.mockReset();
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockListMessages.mockReset();
-    mockListMessages.mockImplementation(() => Promise.resolve([]));
-  });
-
-  test('handleStreamMode: clears session ID on error_during_execution result', async () => {
-    // Simulate AI returning error_during_execution with a stale session ID
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield {
-        type: 'result',
-        isError: true,
-        errorSubtype: 'error_during_execution',
-        sessionId: 'stale-session-id',
-      };
-    });
-    // transitionSession returns a session with an existing assistant_session_id
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({
-        id: 'session-1',
-        assistant_session_id: 'stale-session-id',
-      })
-    );
-
-    const platform = makePlatform();
-    // Use streaming mode
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    // updateSession should be called with null to clear the stale session ID
-    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', null);
-  });
-
-  test('handleBatchMode: clears session ID on error_during_execution result', async () => {
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield {
-        type: 'result',
-        isError: true,
-        errorSubtype: 'error_during_execution',
-        sessionId: 'stale-session-id',
-      };
-    });
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({
-        id: 'session-1',
-        assistant_session_id: 'stale-session-id',
-      })
-    );
-
-    const platform = makePlatform();
-    // batch is the default from makePlatform, but be explicit
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', null);
-  });
-
-  // ─── Recovery from a lost session (a restart must not cost a turn) ────────
-
-  /** The provider fails the resume, then answers the retry. */
-  function restartedProvider(reply: string): void {
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield {
-        type: 'result',
-        isError: true,
-        errorSubtype: 'error_during_execution',
-        sessionId: 'stale-session-id',
-      };
-    });
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: reply };
-      yield { type: 'result', sessionId: 'fresh-session-id' };
-    });
-  }
-
-  test('the first message after a restart is answered, not met with a session error', async () => {
-    restartedProvider('The deploy finished at 14:02.');
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
-    );
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'and the deploy?');
-
-    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
-      String(c[1])
-    );
-    expect(sent).toContain('The deploy finished at 14:02.');
-    expect(sent.join('\n')).not.toContain('Session error');
-    // The new session is the one the conversation carries from here.
-    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', null);
-    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', 'fresh-session-id');
-  });
-
-  test('the retry carries the conversation history the lost session held', async () => {
-    mockListMessages.mockImplementation(() =>
-      Promise.resolve([
-        makeMessage({ id: 'm1', role: 'user', content: 'deploy the branch' }),
-        makeMessage({ id: 'm2', role: 'assistant', content: 'Deploying now.' }),
-        makeMessage({ id: 'm3', role: 'user', content: 'and the deploy?' }),
-      ])
-    );
-    restartedProvider('Done.');
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
-    );
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'and the deploy?');
-
-    expect(mockSendQuery).toHaveBeenCalledTimes(2);
-    const retryPrompt = String(mockSendQuery.mock.calls[1]?.[0]);
-    expect(retryPrompt).toContain('## Conversation So Far (recovered)');
-    expect(retryPrompt).toContain('> deploy the branch');
-    expect(retryPrompt).toContain('> Deploying now.');
-    // The live turn is not also replayed as history.
-    expect(retryPrompt.match(/and the deploy\?/g) ?? []).toHaveLength(1);
-    // The retry starts a session rather than resuming the dead one.
-    expect(mockSendQuery.mock.calls[1]?.[2]).toBeUndefined();
-  });
-
-  test('a healthy turn replays nothing — the live session already holds it', async () => {
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: 'still here' };
-      yield { type: 'result', sessionId: 'live-session-id' };
-    });
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({ id: 'session-1', assistant_session_id: 'live-session-id' })
-    );
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'still there?');
-
-    expect(mockSendQuery).toHaveBeenCalledTimes(1);
-    expect(String(mockSendQuery.mock.calls[0]?.[0])).not.toContain('Conversation So Far');
-  });
-
-  test('a conversation with no history still gets its answer', async () => {
-    restartedProvider('Fresh start.');
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
-    );
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
-      String(c[1])
-    );
-    expect(sent).toContain('Fresh start.');
-    expect(String(mockSendQuery.mock.calls[1]?.[0])).not.toContain('Conversation So Far');
-  });
-
-  test('batch mode recovers the same way', async () => {
-    restartedProvider('Batched answer.');
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({ id: 'session-1', assistant_session_id: 'stale-session-id' })
-    );
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
-      String(c[1])
-    );
-    expect(sent.join('\n')).toContain('Batched answer.');
-    expect(sent.join('\n')).not.toContain('Session error');
-  });
-
-  test.each(['stream', 'batch'] as const)(
-    '%s mode: a typed failure picks the advice from its class, not its words',
-    async mode => {
-      // The evidence reads like a usage limit; the provider classified an auth failure.
-      mockSendQuery.mockImplementationOnce(async function* () {
-        yield {
-          type: 'result',
-          isError: true,
-          errors: ['usage limit reached · resets 4pm'],
-          failure: { class: 'auth', evidence: 'usage limit reached · resets 4pm' },
-        };
-      });
-      mockTransitionSession.mockResolvedValueOnce(
-        makeSession({ id: 'session-1', assistant_session_id: null })
-      );
-
-      const platform = makePlatform();
-      (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue(mode);
-      await handleMessage(platform, 'conv-1', 'hello');
-
-      const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
-        (c: unknown[]) => c[1] as string
-      );
-      expect(
-        sentMessages.some(m => m.startsWith('⚠️ The AI provider rejected its credentials'))
-      ).toBe(true);
-      expect(sentMessages.some(m => m.includes('AI usage limit reached'))).toBe(false);
-    }
-  );
-
-  test('does NOT surface error to user on stop_sequence success (#1425)', async () => {
-    // Regression test for #1425: stop_sequence terminations carry is_error:
-    // true + subtype: 'success' under the Claude SDK contract. The Claude
-    // provider normalises this so the orchestrator sees a clean MessageChunk
-    // (no isError). This test locks in that contract — if a future change to
-    // the orchestrator starts gating errors on stopReason itself, or if the
-    // provider regresses, direct-chat users would once again see "Error:
-    // success" surfaced via classifyAndFormatError.
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: 'classified' };
-      // Post-fix shape from claude/provider.ts: isError absent; stop_sequence maps to end_turn.
-      yield {
-        type: 'result',
-        sessionId: 'sid-ok',
-        stopReason: 'end_turn',
-      };
-    });
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({
-        id: 'session-1',
-        assistant_session_id: null,
-      })
-    );
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    // Session id should persist normally — the error path was not taken.
-    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', 'sid-ok');
-    // No user-facing error message should have been sent.
-    const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
-      (c: unknown[]) => c[1] as string
-    );
-    expect(sentMessages.some((m: string) => m.toLowerCase().includes('error'))).toBe(false);
-  });
-
-  test('does NOT surface error when a provider forwards raw SDK pair (defense-in-depth)', async () => {
-    // Defense-in-depth: a third-party IAgentProvider that does not normalise
-    // the SDK's stop_sequence-success pattern would yield isError: true +
-    // errorSubtype: 'success'. The orchestrator guard must skip the error
-    // path on subtype === 'success' so a non-Claude provider can't surface a
-    // spurious error to the user via direct chat.
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: 'classified' };
-      yield {
-        type: 'result',
-        sessionId: 'sid-ok',
-        isError: true,
-        errorSubtype: 'success',
-        stopReason: 'end_turn',
-      };
-    });
-    mockTransitionSession.mockResolvedValueOnce(
-      makeSession({
-        id: 'session-1',
-        assistant_session_id: null,
-      })
-    );
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    expect(mockUpdateSession).toHaveBeenCalledWith('session-1', 'sid-ok');
-    const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
-      (c: unknown[]) => c[1] as string
-    );
-    expect(sentMessages.some((m: string) => m.toLowerCase().includes('error'))).toBe(false);
-  });
-});
-
-// ─── Multi-chunk command accumulation regression ──────────────────────────────
-
-describe('handleMessage — multi-chunk command accumulation (regression)', () => {
-  beforeEach(() => {
-    mockSendQuery.mockReset();
-    mockGetOrCreateConversation.mockReset();
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockGetCodebase.mockReset();
-    mockListCodebases.mockReset();
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({ workflows: [], errors: [] })
-    );
-    mockDispatchBackgroundWorkflow.mockClear();
-    mockExecuteWorkflow.mockClear();
-    mockTransitionSession.mockClear();
-    mockGetRecentWorkflowResultMessages.mockReset();
-    mockGetRecentWorkflowResultMessages.mockImplementation(() => Promise.resolve([]));
-    mockLoadConfig.mockReset();
-    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
-    mockGetPausedWorkflowRun.mockReset();
-    mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
-    mockFindResumableRunByParentConversation.mockReset();
-    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(null));
-    mockParseCommand.mockReset();
-    mockCreateCodebase.mockClear();
-  });
-
-  test('stream mode — register-project split across 3 chunks', async () => {
-    mockParseCommand.mockReturnValueOnce({
-      command: 'register-project',
-      args: ['ExampleProject', '/.archon/workspaces/owner/repo/source'],
-    });
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield {
-        type: 'agent_message_chunk',
-        text: "I'll register the project now.\n\n/register-project ",
-      };
-      yield { type: 'agent_message_chunk', text: 'ExampleProject ' };
-      yield { type: 'agent_message_chunk', text: '"/.archon/workspaces/owner/repo/source"' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'register my project');
-
-    const expectedCwd = await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source');
-    expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
-    expect(mockCreateCodebase).toHaveBeenCalledWith({
-      name: 'ExampleProject',
-      default_cwd: expectedCwd,
-      default_branch: null,
-      ai_assistant_type: 'claude',
-      kind: 'repo',
-    });
-    const allCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as [
-      string,
-      string,
-    ][];
-    // The confirmation echoes the path that was actually stored.
-    expect(allCalls.some(([, msg]) => msg.includes(expectedCwd))).toBe(true);
-  });
-
-  test('batch mode — register-project split across 3 chunks', async () => {
-    mockParseCommand.mockReturnValueOnce({
-      command: 'register-project',
-      args: ['ExampleProject', '/.archon/workspaces/owner/repo/source'],
-    });
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield {
-        type: 'agent_message_chunk',
-        text: "I'll register the project now.\n\n/register-project ",
-      };
-      yield { type: 'agent_message_chunk', text: 'ExampleProject ' };
-      yield { type: 'agent_message_chunk', text: '"/.archon/workspaces/owner/repo/source"' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
-    await handleMessage(platform, 'conv-1', 'register my project');
-
-    const expectedCwd = await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source');
-    expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
-    expect(mockCreateCodebase).toHaveBeenCalledWith({
-      name: 'ExampleProject',
-      default_cwd: expectedCwd,
-      default_branch: null,
-      ai_assistant_type: 'claude',
-      kind: 'repo',
-    });
-    const allCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as [
-      string,
-      string,
-    ][];
-    // The confirmation echoes the path that was actually stored.
-    expect(allCalls.some(([, msg]) => msg.includes(expectedCwd))).toBe(true);
-  });
-
-  test('stream mode — invoke-workflow split across 2 chunks', async () => {
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([makeNamedCodebase('my-project')]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
-    );
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: 'Running the workflow now.\n\n/invoke-workflow ' };
-      yield { type: 'agent_message_chunk', text: 'assist --project my-project' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'run assist on my-project');
-
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('batch mode — invoke-workflow split across 2 chunks', async () => {
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([makeNamedCodebase('my-project')]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
-    );
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: 'Running the workflow now.\n\n/invoke-workflow ' };
-      yield { type: 'agent_message_chunk', text: 'assist --project my-project' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
-    await handleMessage(platform, 'conv-1', 'run assist on my-project');
-
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-  });
-
-  test('stream mode — invoke-workflow with --prompt split into a later chunk', async () => {
-    // Regression: INVOKE_WORKFLOW_FULL_RE must not declare the command complete when
-    // --project <token> arrives without a line terminator, because --prompt may follow
-    // in the next chunk. Without this fix, commandFullyParsed fires early and the
-    // --prompt chunk is never accumulated, causing synthesizedPrompt to be lost.
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([makeNamedCodebase('my-project')]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
-    );
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield {
-        type: 'agent_message_chunk',
-        text: 'Running assist.\n\n/invoke-workflow assist --project my-project ',
-      };
-      yield { type: 'agent_message_chunk', text: '--prompt "synthesized task description"' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'original user message');
-
-    // Workflow was dispatched with the synthesized prompt, not the original user message.
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
-      expect.objectContaining({ originalMessage: 'synthesized task description' }),
-      expect.anything()
-    );
-  });
-
-  test('batch mode — invoke-workflow with --prompt split into a later chunk', async () => {
-    mockListCodebases.mockReturnValueOnce(Promise.resolve([makeNamedCodebase('my-project')]));
-    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
-      Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
-    );
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield {
-        type: 'agent_message_chunk',
-        text: 'Running assist.\n\n/invoke-workflow assist --project my-project ',
-      };
-      yield { type: 'agent_message_chunk', text: '--prompt "synthesized task description"' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
-    await handleMessage(platform, 'conv-1', 'original user message');
-
-    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
-      expect.objectContaining({ originalMessage: 'synthesized task description' }),
-      expect.anything()
-    );
-  });
-
-  test('stream mode — command in single chunk still works (non-regression)', async () => {
-    mockParseCommand.mockReturnValueOnce({
-      command: 'register-project',
-      args: ['MyApp', '/path/to/app'],
-    });
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: '/register-project MyApp /path/to/app' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'register my app');
-
-    expect(mockCreateCodebase).toHaveBeenCalledWith({
-      name: 'MyApp',
-      default_cwd: await canonicalizeProjectPath('/path/to/app'),
-      default_branch: null,
-      ai_assistant_type: 'claude',
-      kind: 'repo',
-    });
-  });
-
-  test('stream mode — pre-command text is streamed, post-command chunks are suppressed', async () => {
-    // The command chunk includes a trailing \n so REGISTER_PROJECT_FULL_RE fires on
-    // that chunk alone (unquoted path + line terminator = fully parsed). commandFullyParsed
-    // becomes true before the third chunk arrives, so " extra trailing" is never
-    // accumulated and cannot corrupt the parsed path.
-    mockParseCommand.mockReturnValueOnce({
-      command: 'register-project',
-      args: ['Foo', '/path'],
-    });
-    mockSendQuery.mockImplementationOnce(async function* () {
-      yield { type: 'agent_message_chunk', text: 'Registering now:\n' };
-      yield { type: 'agent_message_chunk', text: '/register-project Foo /path\n' };
-      yield { type: 'agent_message_chunk', text: ' extra trailing' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-
-    const platform = makePlatform();
-    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
-    await handleMessage(platform, 'conv-1', 'register foo');
-
-    const calls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as [
-      string,
-      string,
-    ][];
-    const sentTexts = calls.map(([, msg]) => msg);
-    // Pre-command text was streamed
-    expect(sentTexts).toContain('Registering now:\n');
-    // Command trigger chunk was NOT streamed
-    expect(sentTexts).not.toContain('/register-project Foo /path\n');
-    // Post-command chunk was NOT streamed (suppressed because commandFullyParsed=true)
-    expect(sentTexts).not.toContain(' extra trailing');
-    // createCodebase was called with the clean parsed path
-    expect(mockCreateCodebase).toHaveBeenCalledWith(
-      expect.objectContaining({ name: 'Foo', default_cwd: await canonicalizeProjectPath('/path') })
-    );
-  });
-});
-
-// ─── resolveUserProviderEnvForChat — per-user credential injection ────────────
-
-describe('resolveUserProviderEnvForChat — chat env injection', () => {
-  beforeEach(() => {
-    mockSendQuery.mockReset();
-    mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'agent_message_chunk', text: 'ok' };
-      yield { type: 'result', sessionId: 'session-1' };
-    });
-    mockGetOrCreateConversation.mockReset();
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(makeConversation({ user_id: 'u-test' }))
-    );
-    mockGetRecentWorkflowResultMessages.mockReset();
-    mockGetRecentWorkflowResultMessages.mockImplementation(() => Promise.resolve([]));
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({ workflows: [], errors: [] })
-    );
-    mockListCodebases.mockReset();
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockListDecryptedUserProviderCredentials.mockReset();
-    mockListDecryptedUserProviderCredentials.mockImplementation(async () => []);
-    mockIsPerUserProviderKeysEnabled.mockReset();
-    mockIsPerUserProviderKeysEnabled.mockImplementation(() => true);
-    mockGenerateAndSetTitle.mockReset();
-    mockGenerateAndSetTitle.mockImplementation(() => Promise.resolve());
-  });
-
-  test('injects api_key env vars from a connected provider', async () => {
-    mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
-      { provider: 'openrouter', cred: { kind: 'api_key', apiKey: 'or-key' } },
-    ]);
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-    // The env passed to sendQuery should contain the provider's env var.
-    const requestOptions = mockSendQuery.mock.calls[0]?.[3] as {
-      env?: Record<string, string>;
-      protectedEnvKeys?: readonly string[];
-    };
-    expect(requestOptions?.env).toMatchObject({ OPENROUTER_API_KEY: 'or-key' });
-    expect(requestOptions?.protectedEnvKeys).toEqual(['OPENROUTER_API_KEY']);
-  });
-
-  test('anthropic OAuth subscription delivers ANTHROPIC_OAUTH_TOKEN into chat env (#1984)', async () => {
-    // env-only chat: the bearer must reach the env under the Pi-readable OAuth var,
-    // not only the native-Claude var — otherwise a Pi-default install can't see it.
-    mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
-      {
-        provider: 'anthropic',
-        cred: { kind: 'oauth', oauthApiKey: 'sk-ant-oat01-x', rawCreds: {} },
-      },
-    ]);
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-    const requestOptions = mockSendQuery.mock.calls[0]?.[3] as { env?: Record<string, string> };
-    expect(requestOptions?.env).toMatchObject({
-      ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-x',
-      CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-x',
-    });
-  });
-
-  test('title generation receives the per-user env bag (#1984)', async () => {
-    // The title-gen branch (if (!conversation.title)) previously built titleOptions
-    // with no env, so title generation ran with no per-user subscription and failed
-    // on per-user-only installs. title: null enters the branch; assert the bag flows.
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(makeConversation({ user_id: 'u-test', title: null }))
-    );
-    mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
-      {
-        provider: 'anthropic',
-        cred: { kind: 'oauth', oauthApiKey: 'sk-ant-oat01-x', rawCreds: {} },
-      },
-    ]);
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello there');
-    // generateAndSetTitle(convId, msg, provider, cwd, sessionId?, assistantConfig?, titleOptions)
-    const titleOptions = mockGenerateAndSetTitle.mock.calls[0]?.[6] as
-      | { env?: Record<string, string>; protectedEnvKeys?: readonly string[] }
-      | undefined;
-    expect(titleOptions?.env).toMatchObject({ ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-x' });
-    expect([...(titleOptions?.protectedEnvKeys ?? [])].sort()).toEqual([
-      'ANTHROPIC_OAUTH_TOKEN',
-      'CLAUDE_CODE_OAUTH_TOKEN',
-    ]);
-  });
-
-  test('drops file-based deliveries (Codex OAuth) — no CODEX_HOME in chat env', async () => {
-    mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
-      {
-        provider: 'codex',
-        cred: { kind: 'oauth', oauthApiKey: 'tok', rawCreds: { access: 'tok' } },
-      },
-    ]);
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-    const requestOptions = mockSendQuery.mock.calls[0]?.[3] as
-      | { env?: Record<string, string> }
-      | undefined;
-    // Codex OAuth would write auth.json + set CODEX_HOME — both must be absent in chat.
-    expect(requestOptions?.env?.CODEX_HOME).toBeUndefined();
-  });
-
-  test('skips one broken credential but includes remaining providers', async () => {
-    // 'mystery-broken' is not in KNOWN_PROVIDERS → deliverCredential throws.
-    mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
-      { provider: 'mystery-broken', cred: { kind: 'api_key', apiKey: 'x' } },
-      { provider: 'openrouter', cred: { kind: 'api_key', apiKey: 'or-key' } },
-    ]);
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-    const requestOptions = mockSendQuery.mock.calls[0]?.[3] as { env?: Record<string, string> };
-    expect(requestOptions?.env).toMatchObject({ OPENROUTER_API_KEY: 'or-key' });
-  });
-
-  test('does not throw when listDecryptedUserProviderCredentials rejects', async () => {
-    mockListDecryptedUserProviderCredentials.mockRejectedValueOnce(new Error('db gone'));
-    const platform = makePlatform();
-    await expect(handleMessage(platform, 'conv-1', 'hello')).resolves.toBeUndefined();
-  });
-
-  test('skips injection when feature is disabled', async () => {
-    // Persistent (not Once): the flag is install-level and read more than once
-    // per turn (creator-fallback warn guard + the env seam itself).
-    mockIsPerUserProviderKeysEnabled.mockReturnValue(false);
-    mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
-      { provider: 'openrouter', cred: { kind: 'api_key', apiKey: 'or-key' } },
-    ]);
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-    expect(mockListDecryptedUserProviderCredentials).not.toHaveBeenCalled();
-  });
-
-  test('resolves credentials from the SENDER, not the conversation creator (#1976)', async () => {
-    // beforeEach sets the conversation row's user_id to 'u-test' (the creator).
-    // A different sender on this turn must use their OWN credentials — never
-    // the creator's.
-    mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
-      { provider: 'openrouter', cred: { kind: 'api_key', apiKey: 'sender-key' } },
-    ]);
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello', { userId: 'sender-2' });
-    expect(mockListDecryptedUserProviderCredentials).toHaveBeenCalledWith('sender-2');
-    expect(mockListDecryptedUserProviderCredentials).not.toHaveBeenCalledWith('u-test');
-  });
-
-  test('falls back to the conversation creator for credentials when no sender (S1)', async () => {
-    // Pins the env seam's fallback ARGUMENT — the prefs seam already asserts
-    // its fallback attribution; without this, a regression of the env seam to
-    // `undefined` would slip through the mock unnoticed.
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-    expect(mockListDecryptedUserProviderCredentials).toHaveBeenCalledWith('u-test');
-  });
-
-  test('prefs and credentials resolve to the SAME identity in a single turn (S1)', async () => {
-    // Guards seam divergence: each seam's revert is caught individually, but
-    // one seam silently using a different identity than the other is not.
-    mockGetUserAiPrefsDb.mockClear();
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello', { userId: 'sender-2' });
-    expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('sender-2');
-    expect(mockListDecryptedUserProviderCredentials).toHaveBeenCalledWith('sender-2');
-  });
-});
-
-// ─── handleMessage — /setproject dispatch ─────────────────────────────────────
-
-describe('handleMessage — /setproject dispatch', () => {
-  beforeEach(() => {
-    mockGetOrCreateConversation.mockReset();
-    mockListCodebases.mockReset();
-    mockUpdateConversation.mockReset();
-    mockParseCommand.mockReset();
-    mockGetActiveSession.mockReset();
-    mockDeactivateSession.mockReset();
-
-    mockUpdateConversation.mockImplementation(() => Promise.resolve());
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockGetActiveSession.mockImplementation(() => Promise.resolve(null));
-    mockDeactivateSession.mockImplementation(() => Promise.resolve());
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(makeConversation({ codebase_id: null }))
-    );
-  });
-
-  test('binds conversation to exact-match codebase', async () => {
-    const cb = makeNamedCodebase('my-app');
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(
-        makeConversation({
-          id: 'db-conv-1',
-          platform_conversation_id: 'conv-1',
-          codebase_id: null,
-          cwd: '/old/worktree',
-          isolation_env_id: 'env-old',
-        })
-      )
-    );
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    expect(mockUpdateConversation).toHaveBeenCalledWith('db-conv-1', {
-      codebase_id: 'id-my-app',
-      cwd: null,
-      isolation_env_id: null,
-    });
-    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', expect.stringContaining('my-app'));
-  });
-
-  test('resolves by case-insensitive match', async () => {
-    const cb = makeNamedCodebase('My-App');
-    // Distinct DB id vs platform id: proves the update targets conversation.id.
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(
-        makeConversation({
-          id: 'db-conv-ci',
-          platform_conversation_id: 'conv-1',
-          codebase_id: null,
-        })
-      )
-    );
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    expect(mockUpdateConversation).toHaveBeenCalledWith('db-conv-ci', {
-      codebase_id: 'id-My-App',
-      cwd: null,
-      isolation_env_id: null,
-    });
-  });
-
-  test('resolves by prefix match', async () => {
-    const cb = makeNamedCodebase('my-website');
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(
-        makeConversation({
-          id: 'db-conv-px',
-          platform_conversation_id: 'conv-1',
-          codebase_id: null,
-        })
-      )
-    );
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-web'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-web');
-
-    expect(mockUpdateConversation).toHaveBeenCalledWith('db-conv-px', {
-      codebase_id: 'id-my-website',
-      cwd: null,
-      isolation_env_id: null,
-    });
-  });
-
-  test('resolves by substring match', async () => {
-    const cb = makeNamedCodebase('archon-my-api');
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(
-        makeConversation({
-          id: 'db-conv-ss',
-          platform_conversation_id: 'conv-1',
-          codebase_id: null,
-        })
-      )
-    );
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-api'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-api');
-
-    expect(mockUpdateConversation).toHaveBeenCalledWith('db-conv-ss', {
-      codebase_id: 'id-archon-my-api',
-      cwd: null,
-      isolation_env_id: null,
-    });
-  });
-
-  test('writes to the DB conversation id, not the platform conversation id', async () => {
-    // Regression: on Telegram/GitHub the platform conversation id (chat id,
-    // owner/repo#n) differs from the conversations-table primary key. /setproject
-    // must update by the DB id, otherwise the UPDATE matches 0 rows and throws
-    // "Conversation not found: <platform-id>".
-    const cb = makeNamedCodebase('my-app');
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(
-        makeConversation({
-          id: 'db-hex-id',
-          platform_type: 'telegram',
-          platform_conversation_id: '40865006',
-          codebase_id: null,
-        })
-      )
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, '40865006', '/setproject my-app');
-
-    expect(mockUpdateConversation).toHaveBeenCalledWith('db-hex-id', {
-      codebase_id: 'id-my-app',
-      cwd: null,
-      isolation_env_id: null,
-    });
-    // The reply still goes to the platform conversation id.
-    expect(platform.sendMessage).toHaveBeenCalledWith(
-      '40865006',
-      expect.stringContaining('my-app')
-    );
-  });
-
-  test('deactivates active provider session when project changes', async () => {
-    const cb = makeNamedCodebase('my-app');
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-    mockGetActiveSession.mockImplementation(() =>
-      Promise.resolve(makeSession({ id: 'session-123', conversation_id: 'conv-1' }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    expect(mockDeactivateSession).toHaveBeenCalledWith('session-123', 'project-changed');
-  });
-
-  test('treats SessionNotFoundError during deactivation as benign (TOCTOU race)', async () => {
-    const cb = makeNamedCodebase('my-app');
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-    mockGetActiveSession.mockImplementation(() =>
-      Promise.resolve(makeSession({ id: 'session-gone', conversation_id: 'conv-1' }))
-    );
-    mockDeactivateSession.mockImplementation(() =>
-      Promise.reject(new MockSessionNotFoundError('session-gone'))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    // The race is benign: the command still completes and reports success.
-    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls
-      .map(c => String(c[1]))
-      .join('\n');
-    expect(sent).toContain('Project set to');
-  });
-
-  test('aborts BEFORE rebinding the conversation when the session lookup fails', async () => {
-    // Ordering regression guard: session deactivation runs before
-    // db.updateConversation, so a failure here must leave the conversation
-    // untouched (no rebound project with the old session still active).
-    const cb = makeNamedCodebase('my-app');
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-    mockGetActiveSession.mockImplementation(() => Promise.reject(new Error('db hiccup')));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    expect(mockUpdateConversation).not.toHaveBeenCalled();
-    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls
-      .map(c => String(c[1]))
-      .join('\n');
-    expect(sent).not.toContain('Project set to');
-  });
-
-  test('rethrows non-SessionNotFoundError deactivation failures without rebinding', async () => {
-    const cb = makeNamedCodebase('my-app');
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-    mockGetActiveSession.mockImplementation(() =>
-      Promise.resolve(makeSession({ id: 'session-123', conversation_id: 'conv-1' }))
-    );
-    mockDeactivateSession.mockImplementation(() => Promise.reject(new Error('db exploded')));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    // Deactivation runs before the rebind, so the conversation stays untouched.
-    expect(mockUpdateConversation).not.toHaveBeenCalled();
-    // The failure surfaces: no success message, but SOME error reply went out
-    // (a silently-swallowed error would send nothing at all).
-    const sentMsgs = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
-      String(c[1])
-    );
-    expect(sentMsgs.join('\n')).not.toContain('Project set to');
-    expect(sentMsgs.length).toBeGreaterThan(0);
-  });
-
-  test('notes the detached worktree in the reply when an isolation env was cleared', async () => {
-    const cb = makeNamedCodebase('my-app');
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(
-        makeConversation({
-          id: 'db-conv-wt',
-          platform_conversation_id: 'conv-1',
-          codebase_id: 'old-cb',
-          cwd: '/old/worktree',
-          isolation_env_id: 'env-old',
-        })
-      )
-    );
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls
-      .map(c => String(c[1]))
-      .join('\n');
-    expect(sent).toContain('Project set to');
-    expect(sent).toContain('previous worktree was detached');
-  });
-
-  test('omits the worktree note when no isolation env was attached', async () => {
-    const cb = makeNamedCodebase('my-app');
-    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject my-app');
-
-    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls
-      .map(c => String(c[1]))
-      .join('\n');
-    expect(sent).toContain('Project set to');
-    expect(sent).not.toContain('previous worktree');
-  });
-
-  test('returns not-found message listing available projects', async () => {
-    mockListCodebases.mockImplementation(() =>
-      Promise.resolve([makeNamedCodebase('project-a'), makeNamedCodebase('project-b')])
-    );
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['nonexistent'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject nonexistent');
-
-    expect(mockUpdateConversation).not.toHaveBeenCalled();
-    const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
-    expect(msg).toContain('nonexistent');
-    expect(msg).toContain('project-a');
-    expect(msg).toContain('project-b');
-  });
-
-  test('returns not-found with /register-project hint when no codebases registered', async () => {
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['anything'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject anything');
-
-    expect(mockUpdateConversation).not.toHaveBeenCalled();
-    const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
-    expect(msg).toContain('/register-project');
-  });
-
-  test('returns ambiguity message on multiple prefix matches', async () => {
-    mockListCodebases.mockImplementation(() =>
-      Promise.resolve([makeNamedCodebase('app-backend'), makeNamedCodebase('app-frontend')])
-    );
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['app'] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject app');
-
-    expect(mockUpdateConversation).not.toHaveBeenCalled();
-    const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
-    expect(msg).toContain('Ambiguous');
-    expect(msg).toContain('app-backend');
-    expect(msg).toContain('app-frontend');
-  });
-
-  test('returns usage message when no args', async () => {
-    mockParseCommand.mockReturnValue({ command: 'setproject', args: [] });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/setproject');
-
-    expect(mockUpdateConversation).not.toHaveBeenCalled();
-    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', expect.stringContaining('Usage'));
-  });
-});
-
-// ─── handleMessage — /update-project dispatch (issue #2085) ───────────────────
-
-describe('handleMessage — /update-project dispatch', () => {
-  beforeEach(() => {
-    mockGetOrCreateConversation.mockReset();
-    mockListCodebases.mockReset();
-    mockUpdateCodebase.mockReset();
-    mockParseCommand.mockReset();
-
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockListCodebases.mockImplementation(() => Promise.resolve([makeNamedCodebase('my-app')]));
-    mockUpdateCodebase.mockImplementation(() => Promise.resolve());
-    // '/' always exists — the handler's un-mocked existsSync check passes.
-    mockParseCommand.mockReturnValue({ command: 'update-project', args: ['my-app', '/'] });
-  });
-
-  test('reports success with old and new path', async () => {
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/update-project my-app /');
-
-    expect(mockUpdateCodebase).toHaveBeenCalledWith('id-my-app', {
-      default_cwd: await canonicalizeProjectPath('/'),
-    });
-    const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
-    expect(msg).toContain('updated');
-    expect(msg).toContain('/repos/my-app');
-  });
-
-  test('row-gone failure (CodebaseNotFoundError) reports removal, not a DB error', async () => {
-    mockUpdateCodebase.mockImplementation(() =>
-      Promise.reject(new MockCodebaseNotFoundError('id-my-app'))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/update-project my-app /');
-
-    const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
-    expect(msg).toContain('removed');
-    expect(msg).toContain('/register-project');
-    expect(msg).not.toContain('database error');
-  });
-
-  test('transient DB failure reports a database error, not removal', async () => {
-    mockUpdateCodebase.mockImplementation(() => Promise.reject(new Error('connection refused')));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', '/update-project my-app /');
-
-    const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
-    expect(msg).toContain('database error');
-    expect(msg).toContain('try again');
-    expect(msg).not.toContain('removed');
-  });
-});
-
-// ─── Chat turn telemetry (PR #1944 review T2) ────────────────────────────────
-
-describe('chat turn telemetry', () => {
-  beforeEach(() => {
-    mockCaptureChatTurn.mockClear();
-    mockGetOrCreateConversation.mockReset();
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-    mockGetPausedWorkflowRun.mockReset();
-    mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
-    mockGetCodebase.mockReset();
-    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
-    mockListCodebases.mockReset();
-    mockListCodebases.mockImplementation(() => Promise.resolve([]));
-    mockExecuteWorkflow.mockClear();
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({ workflows: [], errors: [] })
-    );
-    mockSendQuery.mockClear();
-    mockUpdateConversation.mockClear();
-    // Restore the default plain-chat AI response
-    mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'agent_message_chunk', text: 'test response' };
-      yield { type: 'result', sessionId: 'session-1' };
-    });
-  });
-
-  test('captures exactly one completed chat turn for a plain conversation', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ codebase_id: null }))
-    );
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello there');
-
-    expect(mockCaptureChatTurn).toHaveBeenCalledTimes(1);
-    expect(mockCaptureChatTurn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        platform: 'web',
-        provider: 'claude',
-        outcome: 'completed',
-        durationMs: expect.any(Number),
-      })
-    );
-  });
-
-  test('does NOT capture a chat turn when the AI routes to /invoke-workflow', async () => {
-    // Guard for the "excluded by construction" claim: the routing turn that
-    // dispatches a workflow must count as workflow_invoked, not as a chat turn.
-    const codebase = makeNamedCodebase('my-project');
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ codebase_id: null }))
-    );
-    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({
-        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
-        errors: [],
-      })
-    );
-    mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'agent_message_chunk', text: '/invoke-workflow assist --project my-project' };
-      yield { type: 'result', sessionId: 'session-1' };
-    });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'run assist on my project');
-
-    // Positive control: the routing path actually ran — dispatch auto-attaches
-    // the project to the conversation before isolation/execution.
-    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1-db', {
-      codebase_id: 'id-my-project',
-    });
-    // …and the routing turn was NOT counted as a chat turn.
-    expect(mockCaptureChatTurn).not.toHaveBeenCalled();
-  });
-
-  test('passes provider-reported usage through to the chat turn capture', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ codebase_id: null }))
-    );
-    mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'agent_message_chunk', text: 'answer' };
-      yield {
-        type: 'result',
-        sessionId: 'session-1',
-        cost: 0.042,
-        tokens: { input: 1200, output: 340 },
-      };
-    });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    expect(mockCaptureChatTurn).toHaveBeenCalledTimes(1);
-    expect(mockCaptureChatTurn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        outcome: 'completed',
-        costUsd: 0.042,
-        tokensIn: 1200,
-        tokensOut: 340,
-      })
-    );
-  });
-
-  test('omits usage on the chat turn capture when the provider reports none', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ codebase_id: null }))
-    );
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello again');
-
-    expect(mockCaptureChatTurn).toHaveBeenCalledTimes(1);
-    const arg = mockCaptureChatTurn.mock.calls[0]?.[0];
-    expect(arg?.costUsd).toBeUndefined();
-    expect(arg?.tokensIn).toBeUndefined();
-    expect(arg?.tokensOut).toBeUndefined();
-  });
-
-  test('captures a failed chat turn when the AI returns an error result', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ codebase_id: null }))
-    );
-    mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'result', isError: true, errorSubtype: 'error_max_turns' };
-    });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'hello');
-
-    expect(mockCaptureChatTurn).toHaveBeenCalledTimes(1);
-    expect(mockCaptureChatTurn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        platform: 'web',
-        provider: 'claude',
-        outcome: 'failed',
-        durationMs: expect.any(Number),
-      })
-    );
-  });
-
-  test('a routed turn whose workflow dispatch throws is not a failed chat turn', async () => {
-    const codebase = makeNamedCodebase('my-project');
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ codebase_id: null }))
-    );
-    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
-    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
-      Promise.resolve({
-        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
-        errors: [],
-      })
-    );
-    mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'agent_message_chunk', text: '/invoke-workflow assist --project my-project' };
-      yield { type: 'result', sessionId: 'session-1' };
-    });
-    mockUpdateConversation.mockImplementationOnce(() =>
-      Promise.reject(new Error('database is locked'))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'run assist on my project');
-
-    // Positive control: dispatch reached the write that failed.
-    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1-db', {
-      codebase_id: 'id-my-project',
-    });
-    expect(mockCaptureChatTurn).not.toHaveBeenCalled();
-  });
-
-  for (const mode of ['stream', 'batch'] as const) {
-    test(`captures exactly one failed chat turn when the provider throws mid-turn (${mode})`, async () => {
-      mockGetOrCreateConversation.mockReturnValueOnce(
-        Promise.resolve(makeConversation({ codebase_id: null }))
-      );
-      mockSendQuery.mockImplementation(async function* () {
-        yield { type: 'agent_message_chunk', text: 'partial' };
-        throw new Error('provider subprocess exited');
-      });
-      const platform = makePlatform();
-      platform.getStreamingMode.mockImplementation(() => mode);
-
-      await handleMessage(platform, 'conv-1', 'hello');
-
-      expect(mockCaptureChatTurn).toHaveBeenCalledTimes(1);
-      expect(mockCaptureChatTurn).toHaveBeenCalledWith(
-        expect.objectContaining({ platform: 'web', provider: 'claude', outcome: 'failed' })
-      );
-      // The user still hears about it from the outer handler.
-      expect(platform.sendMessage).toHaveBeenCalled();
-    });
-  }
-});
-
-// ─── Per-user AI prefs + tier-fallback nudge (Phase 3) ──────────────────────
-
-describe('per-user AI prefs in chat + tier-fallback nudge', () => {
-  beforeEach(() => {
-    mockGetUserAiPrefsDb.mockClear();
-    mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
-    mockSendQuery.mockClear();
-    mockParseCommand.mockReturnValue({ command: '', args: [] });
-  });
-
-  test("a user's tier override wins for the chat model", async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ user_id: 'user-9' } as Partial<Conversation>))
-    );
-    mockGetUserAiPrefsDb.mockImplementation(async () => ({
-      tiers: { large: { provider: 'codex', model: 'gpt-5.5' } },
-    }));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('user-9');
-    const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-    expect(requestOptions.model).toBe('gpt-5.5');
-  });
-
-  test('prefs are not consulted when the conversation has no user_id', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeConversation()));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    expect(mockGetUserAiPrefsDb).not.toHaveBeenCalled();
-  });
-
-  test("the sender's prefs win over the conversation creator's (#1976)", async () => {
-    // Multi-user thread: the conversation row carries the FIRST creator, but
-    // the turn must execute with the SENDER's prefs (mirrors the workflow
-    // executor's run-starter resolution).
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ user_id: 'creator-1' } as Partial<Conversation>))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello', { userId: 'sender-2' });
-
-    expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('sender-2');
-    expect(mockGetUserAiPrefsDb).not.toHaveBeenCalledWith('creator-1');
-  });
-
-  test('falls back to conversation.user_id when the context has no sender', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ user_id: 'creator-1' } as Partial<Conversation>))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello', {});
-
-    expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('creator-1');
-  });
-
-  test("per-user default provider wins over the conversation's stored assistant (#2241 chain)", async () => {
-    // Chain order: user pref → conversation row (creation-time default). The
-    // row says claude; the user's personal default assistant must win.
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ user_id: 'user-9' } as Partial<Conversation>))
-    );
-    mockGetUserAiPrefsDb.mockImplementation(async () => ({ defaultProvider: 'codex' }));
-    mockLogger.debug.mockClear();
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    const sendingLog = mockLogger.debug.mock.calls.find(c => c[1] === 'sending_to_ai') as
-      | [Record<string, unknown>, string]
-      | undefined;
-    expect(sendingLog).toBeDefined();
-    expect(sendingLog?.[0].assistantType).toBe('claude');
-    expect(sendingLog?.[0].resolvedAssistantType).toBe('codex');
-  });
-
-  test("without an identity the conversation's stored assistant drives the turn (#2241 chain)", async () => {
-    // No sender and no creator: the creation-time default on the conversation
-    // row (resolved from config since #2241) is what executes.
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ ai_assistant_type: 'codex' }))
-    );
-    mockLogger.debug.mockClear();
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    expect(mockGetUserAiPrefsDb).not.toHaveBeenCalled();
-    const sendingLog = mockLogger.debug.mock.calls.find(c => c[1] === 'sending_to_ai') as
-      | [Record<string, unknown>, string]
-      | undefined;
-    expect(sendingLog).toBeDefined();
-    expect(sendingLog?.[0].resolvedAssistantType).toBe('codex');
-  });
-
-  test('structurally invalid stored prefs degrade to config-only (chat still answers)', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ user_id: 'user-9' } as Partial<Conversation>))
-    );
-    // An alias without the '@' prefix makes buildAiProfile throw.
-    mockGetUserAiPrefsDb.mockImplementation(async () => ({
-      aliases: { fast: { provider: 'claude', model: 'haiku' } },
-    }));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    // Degraded to the config profile — the chat turn still reached the AI.
-    expect(mockSendQuery).toHaveBeenCalled();
-  });
-
-  test('profile-invalid log attributes the EXECUTION identity, not the creator (S1)', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ user_id: 'creator-1' } as Partial<Conversation>))
-    );
-    // Sender's stored prefs are corrupt → buildAiProfile throws → degrade path
-    // logs the identity whose prefs were at fault: the sender.
-    mockGetUserAiPrefsDb.mockImplementation(async () => ({
-      aliases: { fast: { provider: 'claude', model: 'haiku' } },
-    }));
-    mockLogger.error.mockClear();
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello', { userId: 'sender-2' });
-
-    const invalidLog = mockLogger.error.mock.calls.find(
-      c => c[1] === 'orchestrator.user_ai_prefs_profile_invalid'
-    ) as [Record<string, unknown>, string] | undefined;
-    expect(invalidLog).toBeDefined();
-    expect(invalidLog?.[0].userId).toBe('sender-2');
-  });
-
-  test('a prefs DB failure falls back to config-only (chat still answers)', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ user_id: 'user-9' } as Partial<Conversation>))
-    );
-    mockGetUserAiPrefsDb.mockImplementation(async () => {
-      throw new Error('db down');
-    });
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    expect(mockSendQuery).toHaveBeenCalled();
-  });
-
-  test("nudges once per conversation (not per message) when tier 'large' falls back", async () => {
-    // 'unknownprov' has no built-in tier defaults; config sets only `small`,
-    // so the chat's 'large' request resolves via the fallback chain. A distinct
-    // conversation id keeps the module-level dedup Set isolated from other tests.
-    const nudgeConversation = makeConversation({
-      id: 'conv-nudge-dedup',
-      platform_conversation_id: 'conv-nudge-dedup',
-      ai_assistant_type: 'unknownprov',
-    });
-    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(nudgeConversation));
-    mockLoadConfig.mockImplementation(() =>
-      Promise.resolve(
-        makeConfig({
-          assistants: { claude: {}, codex: {} },
-          envVars: {},
-          tiers: { small: { provider: 'claude', model: 'haiku' } },
-        })
-      )
-    );
-
-    try {
-      const platform = makePlatform();
-      await handleMessage(platform, 'conv-nudge-dedup', 'Hello');
-      await handleMessage(platform, 'conv-nudge-dedup', 'Hello again');
-
-      const sendCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as unknown as [
-        string,
-        string,
-      ][];
-      const nudges = sendCalls.filter(c => c[1].includes("tier 'large' isn't configured"));
-      // Review C1: exactly ONE nudge across BOTH messages — per-conversation dedup.
-      expect(nudges.length).toBe(1);
-      expect(nudges[0]?.[1]).toContain("'small' preset");
-      // Non-blocking: both chat turns still went to the AI.
-      expect(mockSendQuery.mock.calls.length).toBeGreaterThanOrEqual(2);
-    } finally {
-      mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
-      mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
-    }
-  });
-
-  test("no nudge when the user's own 'large' tier satisfies the request", async () => {
-    // Provider with no built-in defaults + only the USER's large tier set:
-    // exact match through the per-user layer → no fallback, no nudge.
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(
-        makeConversation({
-          id: 'conv-user-large',
-          platform_conversation_id: 'conv-user-large',
-          ai_assistant_type: 'unknownprov',
-          user_id: 'user-9',
-        } as Partial<Conversation>)
-      )
-    );
-    mockGetUserAiPrefsDb.mockImplementation(async () => ({
-      tiers: { large: { provider: 'claude', model: 'opus' } },
-    }));
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-user-large', 'Hello');
-
-    const sendCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as unknown as [
-      string,
-      string,
-    ][];
-    expect(sendCalls.some(c => c[1].includes("isn't configured"))).toBe(false);
-    const requestOptions = mockSendQuery.mock.calls[0][3] as Record<string, unknown>;
-    expect(requestOptions.model).toBe('opus');
-  });
-
-  test('no nudge when the large tier resolves exactly', async () => {
-    mockGetOrCreateConversation.mockReturnValueOnce(
-      Promise.resolve(makeConversation({ ai_assistant_type: 'claude' }))
-    );
-
-    const platform = makePlatform();
-    await handleMessage(platform, 'conv-1', 'Hello');
-
-    const sendCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as unknown as [
-      string,
-      string,
-    ][];
-    expect(sendCalls.some(c => c[1].includes("isn't configured"))).toBe(false);
-  });
-});
-
-// ─── Message persistence for non-web platforms (regression for #1182) ────────
-
-describe('message persistence for non-web platforms', () => {
-  beforeEach(() => {
-    mockAddMessage.mockReset();
-    mockAddMessage.mockImplementation((conversationId, role, content) =>
-      Promise.resolve(makeMessage({ conversation_id: conversationId, role, content }))
-    );
-    mockGetOrCreateConversation.mockReset();
-    mockGetCodebase.mockReset();
-    mockGetCodebaseEnvVars.mockReset();
-    mockLoadConfig.mockReset();
-    mockSendQuery.mockClear();
-
-    mockGetOrCreateConversation.mockImplementation(() =>
-      Promise.resolve(makeConversation({ id: 'conv-db-id', platform_conversation_id: 'conv-1' }))
-    );
-    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
-    mockGetCodebaseEnvVars.mockImplementation(() => Promise.resolve({}));
-    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
-    mockSendQuery.mockImplementation(async function* () {
-      yield { type: 'agent_message_chunk', text: 'hello back' };
-      yield { type: 'result', sessionId: 'sess-1' };
-    });
-  });
-
-  test('persists user + assistant messages for non-web platform (batch mode)', async () => {
-    const platform: IPlatformAdapter = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'github'),
-      getStreamingMode: mock(() => 'batch' as const),
-    };
-
-    await handleMessage(platform, 'conv-1', 'what is this repo?');
-
-    // Inbound user message must land in the DB so the Web UI history is non-empty.
-    expect(mockAddMessage).toHaveBeenCalledWith(
-      'conv-db-id',
-      'user',
-      'what is this repo?',
-      undefined,
-      undefined
-    );
-    // Outbound assistant reply must also be persisted (matches what was sent).
-    expect(mockAddMessage).toHaveBeenCalledWith(
-      'conv-db-id',
-      'assistant',
-      expect.stringContaining('hello back'),
-      undefined
-    );
-    expect(mockAddMessage).toHaveBeenCalledTimes(2);
-  });
-
-  test('persists user + assistant messages for non-web platform (stream mode)', async () => {
-    const platform: IPlatformAdapter = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'telegram'),
-      getStreamingMode: mock(() => 'stream' as const),
-    };
-
-    await handleMessage(platform, 'conv-1', 'what is this repo?');
-
-    expect(mockAddMessage).toHaveBeenCalledWith(
-      'conv-db-id',
-      'user',
-      'what is this repo?',
-      undefined,
-      undefined
-    );
-    expect(mockAddMessage).toHaveBeenCalledWith(
-      'conv-db-id',
-      'assistant',
-      expect.stringContaining('hello back'),
-      undefined
-    );
-    expect(mockAddMessage).toHaveBeenCalledTimes(2);
-  });
-
-  test('does NOT call addMessage for web platform (web adapter owns persistence)', async () => {
-    const platform = makePlatform(); // makePlatform defaults getPlatformType to 'web'
-
-    await handleMessage(platform, 'conv-1', 'what is this repo?');
-
-    expect(mockAddMessage).not.toHaveBeenCalled();
-  });
-
-  test('platform delivery is not blocked when persistence rejects', async () => {
-    const platform: IPlatformAdapter = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'github'),
-      getStreamingMode: mock(() => 'batch' as const),
-    };
-    mockAddMessage.mockImplementation(() => Promise.reject(new Error('db down')));
-
-    await expect(handleMessage(platform, 'conv-1', 'what is this repo?')).resolves.toBeUndefined();
-    expect(platform.sendMessage).toHaveBeenCalled();
-  });
-
-  test('platform delivery is not blocked when persistence rejects (stream mode)', async () => {
-    const platform: IPlatformAdapter = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'telegram'),
-      getStreamingMode: mock(() => 'stream' as const),
-    };
-    mockAddMessage.mockImplementation(() => Promise.reject(new Error('db down')));
-
-    await expect(handleMessage(platform, 'conv-1', 'what is this repo?')).resolves.toBeUndefined();
-    // Stream mode delivers chunks during the sendQuery loop — a DB failure must
-    // not stop delivery, so the reply must still have reached the platform.
-    expect(platform.sendMessage).toHaveBeenCalled();
-  });
-
-  test('passes userId to addMessage when context provides it', async () => {
-    const platform: IPlatformAdapter = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'github'),
-      getStreamingMode: mock(() => 'batch' as const),
-    };
-
-    await handleMessage(platform, 'conv-1', 'what is this repo?', { userId: 'user-abc' });
-
-    expect(mockAddMessage).toHaveBeenCalledWith(
-      'conv-db-id',
-      'user',
-      'what is this repo?',
-      undefined,
-      'user-abc'
-    );
-    // The assistant row is NULL-attributed by design — it must NOT carry userId.
-    expect(mockAddMessage).toHaveBeenCalledWith(
-      'conv-db-id',
-      'assistant',
-      expect.stringContaining('hello back'),
-      undefined
-    );
-    expect(mockAddMessage).toHaveBeenCalledTimes(2);
-  });
-
-  test('a deterministic slash command is history too — the command and its answer', async () => {
-    const platform: IPlatformAdapter = {
-      ...makePlatform(),
-      getPlatformType: mock(() => 'github'),
-      getStreamingMode: mock(() => 'batch' as const),
-    };
-    mockParseCommand.mockReturnValueOnce({ command: 'status', args: [] });
-    mockHandleCommand.mockReturnValueOnce(
-      Promise.resolve({ success: true, message: 'status ok', workflow: undefined })
-    );
-
-    await handleMessage(platform, 'conv-1', '/status');
-
-    // The command returns before the AI dispatch, but its ANSWER is delivered
-    // and therefore persisted, so the user row it pairs with is no longer an
-    // orphan — and the console now shows what the phone showed, instead of a
-    // silent gap where the operator ran a command.
-    expect(mockAddMessage).toHaveBeenCalledWith(
-      'conv-db-id',
-      'user',
-      '/status',
-      undefined,
-      undefined
-    );
-    expect(mockAddMessage).toHaveBeenCalledWith('conv-db-id', 'assistant', 'status ok', undefined);
-    expect(mockAddMessage).toHaveBeenCalledTimes(2);
-  });
-});
-
 // ─── Text typed after an argument-less command ───────────────────────────────
 
 describe('trailing text after a command', () => {
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
+    mockParseCommand.mockClear();
+    mockHandleCommand.mockReset();
+  });
+
   test('a command that swallowed a paragraph now says so', async () => {
     const platform = makePlatform();
     mockParseCommand.mockReturnValueOnce({ command: 'reset', args: ['do', 'the', 'thing'] });
@@ -6512,9 +1406,9 @@ describe('trailing text after a command', () => {
       Promise.resolve({ success: true, message: 'Session cleared.', workflow: undefined })
     );
 
-    await handleMessage(platform, 'conv-1', '/reset do the thing');
+    await handleMessage(platform, 'conv-1', '/reset do the thing', { actor: operator });
 
-    const sent = String((platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1]);
+    const sent = String(platform.sendMessage.mock.calls[0]?.[1]);
     expect(sent).toContain('Session cleared.');
     expect(sent).toContain('was NOT');
     expect(sent).toContain('do the thing');
@@ -6527,11 +1421,9 @@ describe('trailing text after a command', () => {
       Promise.resolve({ success: true, message: 'Session cleared.', workflow: undefined })
     );
 
-    await handleMessage(platform, 'conv-1', '/reset');
+    await handleMessage(platform, 'conv-1', '/reset', { actor: operator });
 
-    expect(String((platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1])).toBe(
-      'Session cleared.'
-    );
+    expect(String(platform.sendMessage.mock.calls[0]?.[1])).toBe('Session cleared.');
   });
 
   test('a command that reads its own arguments is left alone', async () => {
@@ -6541,578 +1433,9 @@ describe('trailing text after a command', () => {
       Promise.resolve({ success: true, message: 'No active runs.', workflow: undefined })
     );
 
-    await handleMessage(platform, 'conv-1', '/workflow status');
+    await handleMessage(platform, 'conv-1', '/workflow status', { actor: operator });
 
-    expect(String((platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1])).toBe(
-      'No active runs.'
-    );
-  });
-});
-
-// ─── resolveChatModelRequest (#1998): per-user default chat model ─────────────
-
-describe('resolveChatModelRequest', () => {
-  // Minimal MergedConfig slice: both built-in providers present (AssistantDefaults).
-  const emptyConfig = { assistants: { claude: {}, codex: {} }, tiers: undefined };
-
-  test('no user prefs and no install model → plain built-in large tier (solo path unchanged)', () => {
-    const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(profile, 'claude', {}, emptyConfig);
-    expect(req.provider).toBe('claude');
-    expect(req.model).toBe('opus');
-    expect(req.matchedTier).toBe('large');
-  });
-
-  test('user default_model replaces the large-tier lookup when the provider matches', () => {
-    const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      { defaultProvider: 'claude', defaultModel: 'sonnet' },
-      emptyConfig
-    );
-    expect(req.provider).toBe('claude');
-    expect(req.model).toBe('sonnet');
-    expect(req.matchedTier).toBeUndefined(); // literal path — no tier nudge
-  });
-
-  test('user default_model is IGNORED when the effective provider differs (stale pin guard)', () => {
-    // e.g. degraded profile reset the provider to the conversation's assistant.
-    const profile = buildAiProfile('codex');
-    const req = resolveChatModelRequest(
-      profile,
-      'codex',
-      { defaultProvider: 'claude', defaultModel: 'sonnet' },
-      emptyConfig
-    );
-    expect(req.provider).toBe('codex');
-    expect(req.model).toBe(profile.aliases.large?.model); // built-in codex large tier
-    expect(req.matchedTier).toBe('large');
-  });
-
-  test('user default_model set without default_provider is ignored', () => {
-    const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(profile, 'claude', { defaultModel: 'sonnet' }, emptyConfig);
-    expect(req.model).toBe('opus');
-  });
-
-  test('user default_model can be an @alias (resolved through the profile)', () => {
-    const profile = buildAiProfile('claude', {
-      userAliases: { '@fast': { provider: 'codex', model: 'gpt-5.5', effort: 'low' } },
-    });
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      { defaultProvider: 'claude', defaultModel: '@fast' },
-      emptyConfig
-    );
-    expect(req.provider).toBe('codex');
-    expect(req.model).toBe('gpt-5.5');
-  });
-
-  test('an unresolvable default_model ref degrades to the large tier (never breaks chat)', () => {
-    const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      { defaultProvider: 'claude', defaultModel: '@deleted-alias' },
-      emptyConfig
-    );
-    expect(req.provider).toBe('claude');
-    expect(req.model).toBe('opus');
-    expect(req.matchedTier).toBe('large');
-  });
-
-  test('install assistants.<p>.model outranks the BUILT-IN large tier default', () => {
-    const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      {},
-      {
-        assistants: { claude: { model: 'sonnet' }, codex: {} },
-        tiers: undefined,
-      }
-    );
-    expect(req.provider).toBe('claude');
-    expect(req.model).toBe('sonnet');
-  });
-
-  test('a CONFIGURED large tier beats install assistants.<p>.model', () => {
-    const tiers = { large: { provider: 'claude', model: 'claude-opus-4-7' } };
-    const profile = buildAiProfile('claude', { repoTiers: tiers });
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      {},
-      {
-        assistants: { claude: { model: 'sonnet' }, codex: {} },
-        tiers,
-      }
-    );
-    expect(req.model).toBe('claude-opus-4-7');
-  });
-
-  test('a per-user large tier beats install assistants.<p>.model', () => {
-    const userTiers = { large: { provider: 'claude', model: 'haiku' } };
-    const profile = buildAiProfile('claude', { userTiers });
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      { tiers: userTiers },
-      {
-        assistants: { claude: { model: 'sonnet' }, codex: {} },
-        tiers: undefined,
-      }
-    );
-    expect(req.model).toBe('haiku');
-  });
-
-  test("assistants.<p>.model of 'inherit' is skipped (means SDK default, not a model)", () => {
-    const profile = buildAiProfile('claude');
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      {},
-      {
-        assistants: { claude: { model: 'inherit' }, codex: {} },
-        tiers: undefined,
-      }
-    );
-    expect(req.model).toBe('opus');
-  });
-
-  test('user default_model outranks a configured large tier (highest layer)', () => {
-    const tiers = { large: { provider: 'claude', model: 'claude-opus-4-7' } };
-    const profile = buildAiProfile('claude', { repoTiers: tiers });
-    const req = resolveChatModelRequest(
-      profile,
-      'claude',
-      { defaultProvider: 'claude', defaultModel: 'sonnet' },
-      { assistants: { claude: {}, codex: {} }, tiers }
-    );
-    expect(req.model).toBe('sonnet');
-  });
-});
-
-// ─── resolveTitleRequest (#1855): small-tier title generation ────────────────
-
-describe('resolveTitleRequest', () => {
-  beforeEach(() => {
-    mockLoadConfig.mockReset();
-    mockLoadConfig.mockImplementation(() =>
-      Promise.resolve(
-        makeConfig({
-          assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
-          envVars: {},
-        })
-      )
-    );
-    mockGetUserAiPrefsDb.mockReset();
-    mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
-  });
-
-  test('resolves the built-in codex small tier instead of the raw config-default model', async () => {
-    const req = await resolveTitleRequest('codex');
-
-    expect(req.provider).toBe('codex');
-    // Built-in codex small tier — NOT the (ChatGPT-plan-unsupported) assistants default.
-    expect(req.options.model).toBe(buildAiProfile('codex').aliases.small?.model);
-    expect(req.options.assistantConfig).toEqual({ model: 'gpt-5.3-codex' });
-    // Built-in tiers carry no effort — the provider's default reasoning applies.
-    expect(req.options.nodeConfig).toBeUndefined();
-  });
-
-  // #2556: preset effort rides the one nodeConfig channel on every provider.
-  // Built-in tiers no longer carry effort, so the pin uses a configured tier.
-  test('a configured tier effort rides nodeConfig (#2556)', async () => {
-    mockLoadConfig.mockResolvedValueOnce(
-      makeConfig({
-        assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
-        tiers: { small: { provider: 'codex', model: 'test-small-model', effort: 'minimal' } },
-        envVars: {},
-      })
-    );
-
-    const req = await resolveTitleRequest('codex');
-
-    expect(req.options.model).toBe('test-small-model');
-    expect(req.options.nodeConfig).toEqual({ effort: 'minimal' });
-  });
-
-  // The chat half of the shared `resolvePresetEffort` gate (#2556). Chat and the
-  // DAG executor must agree on when a preset's effort is dropped, or the same
-  // tier means different depths in a workflow and in a chat turn — so the
-  // rejection is pinned on both sides, not just the acceptance.
-  test('drops a tier effort when the resolved provider has no reasoning control', async () => {
-    mockLoadConfig.mockResolvedValueOnce(
-      makeConfig({
-        assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
-        tiers: { small: { provider: 'codex', model: 'test-small-model', effort: 'minimal' } },
-        envVars: {},
-      })
-    );
-    const providers = await import('@archon/providers');
-    const capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
-    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, effortControl: false });
-
-    try {
-      const req = await resolveTitleRequest('codex');
-
-      expect(req.options.model).toBe('test-small-model');
-      // The tier still selects the model; only its effort is dropped, and it is
-      // not quietly written onto the other channel either.
-      expect(req.options.nodeConfig?.effort).toBeUndefined();
-      expect(req.options.assistantConfig).toEqual({ model: 'gpt-5.3-codex' });
-    } finally {
-      capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
-    }
-  });
-
-  test('a configured small tier wins (including a provider switch)', async () => {
-    mockLoadConfig.mockResolvedValueOnce(
-      makeConfig({
-        assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
-        tiers: { small: { provider: 'claude', model: 'haiku' } },
-        envVars: {},
-      })
-    );
-
-    const req = await resolveTitleRequest('codex');
-
-    expect(req.provider).toBe('claude');
-    expect(req.options.model).toBe('haiku');
-    expect(req.options.assistantConfig).toEqual({});
-  });
-
-  test('per-user small tier participates when a userId is available', async () => {
-    mockGetUserAiPrefsDb.mockResolvedValueOnce({
-      tiers: { small: { provider: 'codex', model: 'gpt-5.4-mini' } },
-    });
-
-    const req = await resolveTitleRequest('codex', 'user-1');
-
-    expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('user-1');
-    expect(req.provider).toBe('codex');
-    expect(req.options.model).toBe('gpt-5.4-mini');
-  });
-
-  test('per-user prefs are NOT consulted without a userId', async () => {
-    await resolveTitleRequest('codex');
-    expect(mockGetUserAiPrefsDb).not.toHaveBeenCalled();
-  });
-
-  test('per-user default provider rebases the built-in tier defaults', async () => {
-    mockGetUserAiPrefsDb.mockResolvedValueOnce({ defaultProvider: 'claude' });
-
-    const req = await resolveTitleRequest('codex', 'user-1');
-
-    expect(req.provider).toBe('claude');
-    expect(req.options.model).toBe('haiku');
-  });
-
-  test('structurally invalid stored prefs degrade to config-only resolution', async () => {
-    // Missing '@' prefix makes buildAiProfile throw for the user layer.
-    mockGetUserAiPrefsDb.mockResolvedValueOnce({
-      aliases: { fast: { provider: 'codex', model: 'gpt-5.5' } },
-    });
-
-    const req = await resolveTitleRequest('codex', 'user-1');
-
-    expect(req.provider).toBe('codex');
-    expect(req.options.model).toBe(buildAiProfile('codex').aliases.small?.model);
-  });
-
-  test('NEVER throws — config load failure falls back to the bare legacy request', async () => {
-    mockLoadConfig.mockRejectedValueOnce(new Error('config exploded'));
-
-    const req = await resolveTitleRequest('codex', 'user-1');
-
-    expect(req).toEqual({ provider: 'codex', options: {} });
-  });
-});
-
-describe('continueResolvedGateRun — chat gate continuation source (#2646)', () => {
-  function makeGateRun(): WorkflowRun {
-    return makeRun({
-      id: 'run-gated',
-      workflow_name: 'gated',
-      conversation_id: 'conv-1-db',
-      parent_conversation_id: 'conv-1-db',
-      user_message: 'go',
-      working_path: '/repos/test-repo/worktrees/feature',
-    });
-  }
-
-  async function writeGateWorkflow(
-    root: string,
-    description: string,
-    disableWorktree: boolean
-  ): Promise<void> {
-    await mkdir(join(root, '.archon', 'workflows'), { recursive: true });
-    await writeFile(
-      join(root, '.archon', 'workflows', 'gated.yaml'),
-      [
-        'name: gated',
-        `description: ${description}`,
-        ...(disableWorktree ? ['worktree:', '  enabled: false'] : []),
-        'nodes:',
-        '  - id: work',
-        '    prompt: Do the work',
-        '',
-      ].join('\n')
-    );
-  }
-
-  beforeEach(async () => {
-    mockExecuteWorkflow.mockClear();
-    mockHydrateResumableRun.mockClear();
-    mockValidateAndResolveIsolation.mockClear();
-    // Reset, not clear: a queued `…Once` value that a test never consumes would otherwise
-    // leak into the next one. Restores the factory default — a run predating captures.
-    mockResolveContinuationWorkflow.mockReset();
-    mockResolveContinuationWorkflow.mockImplementation(() => Promise.resolve(undefined));
-    mockDiscoverWorkflowsWithConfig.mockReset();
-    mockDiscoverWorkflowsWithConfig.mockResolvedValue({ workflows: [], errors: [] });
-  });
-
-  test("continues with the graph the run froze, not the chat turn's discovery list", async () => {
-    const frozen = makeTestResolvedWorkflow({ name: 'gated', description: 'frozen' });
-    mockResolveContinuationWorkflow.mockResolvedValueOnce({
-      workflow: frozen,
-      roots: CAPTURED_SOURCE_ROOTS,
-      workflows: [{ workflow: frozen, source: 'project' }],
-      errors: [],
-    });
-
-    await continueResolvedGateRun(
-      makePlatform(),
-      'conv-1',
-      makeConversation({ codebase_id: 'codebase-1' }),
-      makeCodebase(),
-      makeGateRun(),
-      'approve'
-    );
-
-    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
-    const executed = (mockExecuteWorkflow.mock.calls[0] as unknown[])[4] as {
-      description?: string;
-    };
-    expect(executed.description).toBe('frozen');
-  });
-
-  test('uses the captured graph for host worktree policy', async () => {
-    const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-host-captured-policy-')));
-    const source = join(root, 'source');
-    await writeGateWorkflow(source, 'Captured graph', true);
-    const capture = await captureWorkflowSource({
-      sourceRoot: source,
-      captureRoot: join(root, 'capture'),
-    });
-    // Same name, opposite policy. A host that bypasses the run capture creates
-    // isolation here; the recorded graph explicitly disables it.
-    await writeGateWorkflow(source, 'Conflicting live graph', false);
-    mockResolveContinuationWorkflow.mockImplementationOnce((...args) =>
-      realResolveContinuationWorkflow(...args)
-    );
-    mockDiscoverWorkflowsWithConfig.mockImplementation((...args) =>
-      realDiscoverWorkflowsWithConfig(...args)
-    );
-    const run = makeGateRun();
-    run.working_path = source;
-    run.metadata = {
-      workflow_source: {
-        version: 1,
-        root: capture.anchor.root,
-        origin: capture.origin,
-        captured_at: capture.manifest.captured_at,
-        digest: capture.manifest.digest,
-        source_config: capture.manifest.source_config,
-        file_count: capture.manifest.file_count,
-        byte_count: capture.manifest.byte_count,
-      },
-    };
-
-    await continueResolvedGateRun(
-      makePlatform(),
-      'conv-1',
-      makeConversation({ codebase_id: 'codebase-1' }),
-      makeCodebase({ default_cwd: source }),
-      run,
-      'approve'
-    );
-
-    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
-    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
-    expect(
-      ((mockExecuteWorkflow.mock.calls[0] as unknown[])[4] as { description: string }).description
-    ).toBe('Captured graph');
-  });
-
-  test('continues a run whose workflow the current checkout no longer has', async () => {
-    // The refusal this replaces was a false one: the chat turn's list describes the
-    // checkout, and a workflow deleted or renamed since the run started is missing from
-    // it — while the run's own captured source still holds exactly what it was running.
-    const frozen = makeTestResolvedWorkflow({ name: 'gated', description: 'frozen' });
-    mockResolveContinuationWorkflow.mockResolvedValueOnce({
-      workflow: frozen,
-      roots: CAPTURED_SOURCE_ROOTS,
-      workflows: [{ workflow: frozen, source: 'project' }],
-      errors: [],
-    });
-
-    const platform = makePlatform();
-    await continueResolvedGateRun(
-      platform,
-      'conv-1',
-      makeConversation({ codebase_id: 'codebase-1' }),
-      makeCodebase(),
-      makeGateRun(),
-      'approve'
-    );
-
-    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
-    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
-      c => (c as unknown[])[1] as string
-    );
-    expect(messages.some(m => m.includes('was not found'))).toBe(false);
-  });
-
-  test('a run predating captures still resolves from the live list', async () => {
-    // resolveContinuationWorkflow returns undefined for it, and the fallback is the only
-    // thing that can name its graph.
-    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
-      workflows: [makeTestWorkflowWithSource({ name: 'gated', description: 'live' })],
-      errors: [],
-    });
-    await continueResolvedGateRun(
-      makePlatform(),
-      'conv-1',
-      makeConversation({ codebase_id: 'codebase-1' }),
-      makeCodebase(),
-      makeGateRun(),
-      'approve'
-    );
-
-    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
-    const executed = (mockExecuteWorkflow.mock.calls[0] as unknown[])[4] as {
-      description?: string;
-    };
-    expect(executed.description).toBe('live');
-  });
-
-  test('an unreadable captured source refuses instead of running something else', async () => {
-    mockResolveContinuationWorkflow.mockRejectedValueOnce(
-      new Error('captured source digest mismatch')
-    );
-
-    const platform = makePlatform();
-    await continueResolvedGateRun(
-      platform,
-      'conv-1',
-      makeConversation({ codebase_id: 'codebase-1' }),
-      makeCodebase(),
-      makeGateRun(),
-      'approve'
-    );
-
-    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
-      c => (c as unknown[])[1] as string
-    );
-    expect(messages[0]).toContain('Continuation requested');
-    expect(messages.some(m => m.includes('digest mismatch'))).toBe(true);
-    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
-  });
-
-  // #2910: both sides of the recovery branch. An ordinary resume failure leaves the
-  // run resumable, so `/workflow resume` is right. A rejected terminal write leaves the
-  // row non-terminal — `/workflow resume` refuses those, so that advice would send the
-  // operator down a dead end for a run that may well have finished its work.
-  async function continueWithRejection(
-    platform: ReturnType<typeof makePlatform>,
-    rejection: unknown
-  ): Promise<string[]> {
-    mockExecuteWorkflow.mockRejectedValueOnce(rejection);
-    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({
-      workflows: [makeTestWorkflowWithSource({ name: 'gated', description: 'live' })],
-      errors: [],
-    });
-    await continueResolvedGateRun(
-      platform,
-      'conv-1',
-      makeConversation({ codebase_id: 'codebase-1' }),
-      makeCodebase(),
-      makeGateRun(),
-      'approve'
-    );
-    return (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
-      c => (c as unknown[])[1] as string
-    );
-  }
-
-  test('an ordinary resume failure points at /workflow resume', async () => {
-    const messages = await continueWithRejection(makePlatform(), new Error('resume boom'));
-
-    expect(messages.some(m => m.includes('retry with `/workflow resume run-gated`'))).toBe(true);
-  });
-
-  test('a rejected terminal write says the status is unknown, not "retry the resume"', async () => {
-    const messages = await continueWithRejection(
-      makePlatform(),
-      new TerminalStatusWriteError(new Error('db is gone'))
-    );
-
-    expect(messages.some(m => m.includes('final status could not be saved'))).toBe(true);
-    expect(messages.some(m => m.includes('retry with `/workflow resume'))).toBe(false);
-  });
-
-  describe('recovery commands use the surface spelling', () => {
-    // Mirrors the Slack adapter: its registered slash command is `/archon-workflow`.
-    function makeSlackPlatform(): ReturnType<typeof makePlatform> &
-      Pick<IPlatformAdapter, 'formatWorkflowCommand'> {
-      return {
-        ...makePlatform(),
-        formatWorkflowCommand: (command: string) => `/archon-workflow ${command}`,
-      };
-    }
-
-    function expectSlackSpelling(messages: string[]): void {
-      const text = messages.join('\n');
-      expect(text).toContain('/archon-workflow ');
-      expect(text.replaceAll('/archon-workflow ', '')).not.toContain('/workflow ');
-    }
-
-    test('an ordinary resume failure', async () => {
-      const messages = await continueWithRejection(makeSlackPlatform(), new Error('resume boom'));
-      expect(messages.some(m => m.includes('`/archon-workflow resume run-gated`'))).toBe(true);
-      expectSlackSpelling(messages);
-    });
-
-    test('a rejected terminal write', async () => {
-      const messages = await continueWithRejection(
-        makeSlackPlatform(),
-        new TerminalStatusWriteError(new Error('db is gone'))
-      );
-      expect(messages.some(m => m.includes('`/archon-workflow status run-gated`'))).toBe(true);
-      expectSlackSpelling(messages);
-    });
-
-    test('no project attached', async () => {
-      const platform = makeSlackPlatform();
-      await continueResolvedGateRun(
-        platform,
-        'conv-1',
-        makeConversation(),
-        null,
-        makeGateRun(),
-        'approve'
-      );
-      const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
-        c => (c as unknown[])[1] as string
-      );
-      expectSlackSpelling(messages);
-    });
+    expect(String(platform.sendMessage.mock.calls[0]?.[1])).toBe('No active runs.');
   });
 });
 
@@ -7124,6 +1447,8 @@ describe('stopping a turn', () => {
     mockGetOrCreateConversation.mockImplementation(() =>
       Promise.resolve(makeConversation({ id: 'conv-db-id', platform_conversation_id: 'conv-1' }))
     );
+    mockListCodebases.mockReset();
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
     mockLoadConfig.mockReset();
     mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
     mockAddMessage.mockReset();
@@ -7138,13 +1463,13 @@ describe('stopping a turn', () => {
   });
 
   function sentTexts(platform: ReturnType<typeof makePlatform>): string[] {
-    return (platform.sendMessage.mock.calls as unknown[][]).map(c => c[1] as string);
+    return platform.sendMessage.mock.calls.map(c => c[1]);
   }
 
   test('the provider is handed a signal it can be aborted through', async () => {
     const platform = makePlatform();
 
-    await handleMessage(platform, 'conv-1', 'hello');
+    await handleMessage(platform, 'conv-1', 'hello', { actor: operator });
 
     const options = (mockSendQuery.mock.calls as unknown[][])[0]?.[3] as
       | { abortSignal?: AbortSignal }
@@ -7161,7 +1486,7 @@ describe('stopping a turn', () => {
       await rejectOnAbort(requestOptions?.abortSignal);
     });
 
-    const turn = handleMessage(platform, 'conv-1', 'do the wrong thing');
+    const turn = handleMessage(platform, 'conv-1', 'do the wrong thing', { actor: operator });
     await drainUntilTurnRunning();
     expect(stopTurn('conv-1')).toBe(true);
     await turn;
@@ -7179,7 +1504,7 @@ describe('stopping a turn', () => {
       // No throw: the provider simply stops yielding, as OpenCode's session does.
     });
 
-    const turn = handleMessage(platform, 'conv-1', 'do the wrong thing');
+    const turn = handleMessage(platform, 'conv-1', 'do the wrong thing', { actor: operator });
     await drainUntilTurnRunning();
     stopTurn('conv-1');
     await turn;
@@ -7193,7 +1518,7 @@ describe('stopping a turn', () => {
       yield { type: 'agent_message_chunk', text: 'first' };
       await rejectOnAbort(requestOptions?.abortSignal);
     });
-    const stopped = handleMessage(platform, 'conv-1', 'first message');
+    const stopped = handleMessage(platform, 'conv-1', 'first message', { actor: operator });
     await drainUntilTurnRunning();
     stopTurn('conv-1');
     await stopped;
@@ -7204,7 +1529,7 @@ describe('stopping a turn', () => {
       yield { type: 'result', sessionId: 'session-2' };
     });
     const secondPlatform = makePlatform();
-    await handleMessage(secondPlatform, 'conv-1', 'second message');
+    await handleMessage(secondPlatform, 'conv-1', 'second message', { actor: operator });
 
     expect(sentTexts(secondPlatform)).toContain('second answer');
     expect(sentTexts(secondPlatform)).not.toContain(TURN_STOPPED_NOTICE);

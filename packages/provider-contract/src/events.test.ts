@@ -12,6 +12,7 @@ import {
 
 const oneOfEach: ProviderEvent[] = [
   { type: 'agent_message_chunk', text: 'Done.' },
+  { type: 'agent_message_chunk', text: 'continued', continuesPreviousBlock: true },
   { type: 'agent_thought_chunk', text: 'Check the tests first.' },
   {
     type: 'tool_call',
@@ -57,6 +58,7 @@ const oneOfEach: ProviderEvent[] = [
     status: 'succeeded',
     exitCode: 0,
   },
+  { type: 'heartbeat' },
   { type: 'state_update', state: 'requires_action' },
 ];
 
@@ -68,6 +70,38 @@ describe('provider event vocabulary', () => {
       expect(providerChunkSchema.parse(event)).toEqual(event);
     }
   );
+
+  test.each(['patch text', 0, false, null, ['a', 1]].map(value => [value] as const))(
+    'preserves non-object tool input %j',
+    rawInput => {
+      const event: ProviderEvent = {
+        type: 'tool_call',
+        toolCallId: 't1',
+        name: 'apply_patch',
+        rawInput,
+      };
+      expect(providerEventSchema.parse(event)).toEqual(event);
+    }
+  );
+
+  test.each([NaN, Infinity, 1n, () => {}, { nested: undefined }].map(value => [value] as const))(
+    'rejects non-JSON tool input %#',
+    rawInput => {
+      expect(
+        providerEventSchema.safeParse({
+          type: 'tool_call',
+          toolCallId: 't1',
+          name: 'tool',
+          rawInput,
+        }).success
+      ).toBe(false);
+    }
+  );
+
+  test('the result seam preserves an unavailable token measurement', () => {
+    const result = { type: 'result', tokensUnknown: true, cost: 0.2 } as const;
+    expect(providerChunkSchema.parse(result)).toEqual(result);
+  });
 
   test('the chunk union also carries result and settled', () => {
     expect(providerChunkSchema.parse({ type: 'result', sessionId: 's' })).toEqual({

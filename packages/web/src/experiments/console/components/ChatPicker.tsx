@@ -4,6 +4,9 @@ import { PlatformBadge } from './PlatformBadge';
 import { conversationLabel, type ConversationSummary } from '../primitives/conversation';
 import type { Directory } from '../primitives/author';
 
+// console-token-exception w-[min(320px,calc(100vw-40px))] -- The menu narrows on a phone and keeps a margin from the viewport edge.
+const MENU_WIDTH = 'w-[min(320px,calc(100vw-40px))]';
+
 interface ChatPickerProps {
   conversations: ConversationSummary[];
   /** The chat on screen, or null while an unsent new chat is open. */
@@ -65,12 +68,12 @@ export function ChatPicker({
         aria-haspopup="menu"
         aria-expanded={open}
         title="Switch chat"
-        className="flex max-w-[220px] items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] text-text-secondary transition-colors hover:text-text-primary"
+        className="flex max-w-55 items-center gap-1.5 rounded-md border px-2.5 py-1 text-console-11 text-text-secondary transition-colors hover:text-text-primary"
         style={{ borderColor: 'var(--border-bright)' }}
       >
         {active !== null ? <PlatformBadge platformType={active.platformType} hideWeb /> : null}
         <span className="truncate">{label}</span>
-        <span aria-hidden className="font-mono text-[9px] text-text-tertiary">
+        <span aria-hidden className="font-mono text-console-9 text-text-tertiary">
           ▾
         </span>
       </button>
@@ -81,7 +84,7 @@ export function ChatPicker({
           onNewChat();
         }}
         title="Start a new chat"
-        className="rounded-md border px-2.5 py-1 text-[11px] text-text-secondary transition-colors hover:text-text-primary"
+        className="rounded-md border px-2.5 py-1 text-console-11 text-text-secondary transition-colors hover:text-text-primary"
         style={{ borderColor: 'var(--border-bright)' }}
       >
         + New chat
@@ -90,7 +93,7 @@ export function ChatPicker({
         <div
           role="menu"
           aria-label="Project chats"
-          className="absolute right-0 top-full z-30 mt-1.5 w-[min(320px,calc(100vw-40px))] rounded-lg border bg-[color:var(--surface-elevated)] shadow-lg"
+          className={`absolute right-0 top-full z-30 mt-1.5 ${MENU_WIDTH} rounded-lg border bg-[color:var(--surface-elevated)] shadow-lg`}
           style={{ borderColor: 'var(--border-bright)' }}
         >
           <ChatList

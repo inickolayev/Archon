@@ -1,0 +1,2207 @@
+// @archon-test-isolated
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  mock,
+  setSystemTime,
+  type Mock,
+} from 'bun:test';
+import { mkdir, writeFile } from 'fs/promises';
+import { removeTempTree, testTimeout } from '@archon/paths/test-utils';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import {
+  mockLogFn,
+  createMockStore,
+  mockClaudeCapabilities,
+  mockSendQueryDag,
+  mockGetAgentProviderDag,
+  createMockDeps,
+  createMockPlatform,
+  persistedEvents,
+  runUsageWrites,
+  dagOptions,
+  makeWorkflowRun,
+} from '../../test-utils';
+import { executeDagWorkflow } from '../../../dag-executor';
+import { ParentStatusReadError } from '../../../parent-status-read';
+import { foldDagResumeSnapshot } from '../../../dag-resume-snapshot';
+import { workflowRunStatusSchema } from '../../../schemas/workflow-run';
+import { providerEventEnvelopeSchema } from '../../../schemas/provider-event';
+import type { DagNode } from '../../../schemas';
+import type { IWorkflowStore } from '../../../store';
+import { buildAiProfile } from '../../../model-validation';
+
+describe('loop node execution', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-loop-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'step1.md'), 'Step 1 prompt');
+    await writeFile(join(commandsDir, 'step2.md'), 'Step 2 prompt using $step1.output');
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'AI response' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      checkCredential: async () => ({ state: 'not_checked' as const, source: 'native' as const }),
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    await removeTempTree(testDir);
+  });
+
+  for (const usageWriteFails of [false, true]) {
+    it.each(['between iterations', 'before retry'] as const)(
+      `interrupts an unreadable parent %s without recording failure (usage write fails: ${usageWriteFails})`,
+      async boundary => {
+        const store = createMockStore();
+        store.getDagResumeSnapshot.mockImplementation(async runId =>
+          foldDagResumeSnapshot(persistedEvents(store), runId)
+        );
+        const usageError = new Error('usage storage unavailable');
+        if (usageWriteFails) {
+          const persistEvent = store.persistWorkflowEvent;
+          store.persistWorkflowEvent = mock(async event => {
+            if (event.event_type === 'node_deferred_usage') throw usageError;
+            await persistEvent(event);
+          });
+        }
+        mockLogFn.mockClear();
+        const cause = new Error('parent status unavailable');
+        const runId = 'loop-unreadable-parent';
+        const boundaryEvent =
+          boundary === 'between iterations' ? 'loop_iteration_completed' : 'node_retry_scheduled';
+        let rejected = false;
+        store.getWorkflowRunStatus.mockImplementation(async () => {
+          if (
+            !rejected &&
+            persistedEvents(store).some(event => event.event_type === boundaryEvent)
+          ) {
+            rejected = true;
+            throw cause;
+          }
+          return 'running';
+        });
+        mockSendQueryDag.mockImplementation(async function* () {
+          yield { type: 'agent_message_chunk', text: 'Working' };
+          yield {
+            type: 'result',
+            sessionId: 'paid-attempt',
+            cost: 0.02,
+            tokens: { input: 2, output: 1 },
+            ...(boundary === 'before retry'
+              ? {
+                  isError: true,
+                  failure: { class: 'transient' as const, evidence: 'provider unavailable' },
+                }
+              : {}),
+          };
+        });
+
+        const error: unknown = await executeDagWorkflow(
+          dagOptions({
+            deps: createMockDeps(store),
+            cwd: testDir,
+            workflowRun: makeWorkflowRun(runId),
+            workflow: {
+              name: 'loop-unreadable-parent',
+              nodes: [
+                {
+                  id: 'my-loop',
+                  kind: 'loop',
+                  retry: { max_attempts: 1, delay_ms: 0 },
+                  loop: {
+                    prompt: 'Work',
+                    until: 'COMPLETE',
+                    max_iterations: 2,
+                    fresh_context: false,
+                  },
+                },
+              ],
+            },
+          })
+        ).catch((error: unknown) => error);
+
+        expect(error).toBeInstanceOf(ParentStatusReadError);
+        if (!(error instanceof ParentStatusReadError)) throw new Error('Expected interruption');
+        expect(error.cause).toBe(cause);
+        expect(error.workflowRunId).toBe(runId);
+        expect(error.nodeId).toBe('my-loop');
+        expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+        const events = persistedEvents(store);
+        expect(events.some(event => event.event_type === boundaryEvent)).toBe(true);
+        expect(events.some(event => event.event_type === 'node_failed')).toBe(false);
+        expect(events.some(event => event.event_type === 'node_completed')).toBe(false);
+        expect(store.failWorkflowRun).not.toHaveBeenCalled();
+        expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+        expect(store.pauseWorkflowRun).not.toHaveBeenCalled();
+        expect(store.cancelWorkflowRun).not.toHaveBeenCalled();
+        if (usageWriteFails) {
+          expect(mockLogFn).toHaveBeenCalledWith(
+            expect.objectContaining({
+              err: expect.objectContaining({ cause: usageError }),
+              workflowRunId: runId,
+              nodeId: 'my-loop',
+            }),
+            'loop_node.interrupted_usage_write_failed'
+          );
+        } else {
+          expect(runUsageWrites(store).at(-1)).toMatchObject({
+            total_cost_usd: 0.02,
+            total_tokens_in: 2,
+            total_tokens_out: 1,
+          });
+        }
+        const snapshot = await foldDagResumeSnapshot(events, runId);
+        expect(snapshot.failedNodes.size).toBe(0);
+        expect(snapshot.completedNodeOutputs.size).toBe(0);
+        expect(snapshot.unresolvedNodeStarts.has('my-loop')).toBe(true);
+      }
+    );
+  }
+
+  for (const boundary of ['between iterations', 'before retry'] as const) {
+    it.each([...workflowRunStatusSchema.options, null])(
+      `preserves supported parent status %s ${boundary}`,
+      async status => {
+        const store = createMockStore();
+        const boundaryEvent =
+          boundary === 'between iterations' ? 'loop_iteration_completed' : 'node_retry_scheduled';
+        store.getWorkflowRunStatus.mockImplementation(async () =>
+          persistedEvents(store).some(event => event.event_type === boundaryEvent)
+            ? status
+            : 'running'
+        );
+        let attempts = 0;
+        mockSendQueryDag.mockImplementation(async function* () {
+          attempts++;
+          yield {
+            type: 'agent_message_chunk',
+            text: attempts === 2 ? '<promise>COMPLETE</promise>' : 'Working',
+          };
+          yield {
+            type: 'result',
+            sessionId: 'loop-status',
+            cost: 0.02,
+            tokens: { input: 2, output: 1 },
+            ...(boundary === 'before retry' && attempts === 1
+              ? {
+                  isError: true,
+                  failure: { class: 'transient' as const, evidence: 'provider unavailable' },
+                }
+              : {}),
+          };
+        });
+
+        await executeDagWorkflow(
+          dagOptions({
+            deps: createMockDeps(store),
+            cwd: testDir,
+            workflowRun: makeWorkflowRun('loop-parent-status'),
+            workflow: {
+              name: 'loop-parent-status',
+              nodes: [
+                {
+                  id: 'my-loop',
+                  kind: 'loop',
+                  retry: { max_attempts: 1, delay_ms: 0 },
+                  loop: {
+                    prompt: 'Work',
+                    until: 'COMPLETE',
+                    max_iterations: 2,
+                    fresh_context: false,
+                  },
+                },
+              ],
+            },
+          })
+        );
+
+        const continues = status === 'running' || status === 'paused';
+        expect(attempts).toBe(continues ? 2 : 1);
+        const terminal = persistedEvents(store).filter(
+          event => event.event_type === 'node_failed' || event.event_type === 'node_completed'
+        );
+        expect(terminal).toHaveLength(1);
+        expect(terminal[0]?.event_type).toBe(continues ? 'node_completed' : 'node_failed');
+        expect(terminal[0]?.data).toMatchObject({
+          cost_usd: continues ? 0.04 : 0.02,
+          tokens: { input: continues ? 4 : 2, output: continues ? 2 : 1 },
+          ...(!continues
+            ? { failure_kind: 'cancelled', error: `Workflow ${status ?? 'deleted'}` }
+            : {}),
+        });
+      }
+    );
+  }
+
+  it('records the subtasks and hooks a loop iteration streams', async () => {
+    const store = createMockStore();
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'subtask', taskId: 't-1', status: 'started', description: 'research' };
+      yield {
+        type: 'hook',
+        hookId: 'h-1',
+        hookName: 'PreToolUse',
+        hookEvent: 'PreToolUse',
+        status: 'succeeded',
+      };
+      yield { type: 'subtask', taskId: 't-1', status: 'completed', summary: 'found it' };
+      yield { type: 'agent_message_chunk', text: 'Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-sess-activity' };
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        platform: createMockPlatform(),
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-activity',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-activity-run'),
+      })
+    );
+
+    const recorded = persistedEvents(store)
+      .filter(e => e.event_type === 'provider_event')
+      .map(e => providerEventEnvelopeSchema.parse(e.data).event.type);
+    expect(recorded).toEqual(['subtask', 'hook', 'subtask', 'agent_message_chunk']);
+  });
+
+  it('retries an iteration once on a fresh session when its resume is rejected as stale', async () => {
+    const platform = createMockPlatform();
+    mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, resumeSessionId) {
+      const calls = mockSendQueryDag.mock.calls.length;
+      if (resumeSessionId === 'loop-sess-1') {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'error_during_execution',
+          failure: { class: 'unknown', evidence: 'error_during_execution: evidence' },
+          sessionId: resumeSessionId,
+          resumed: true,
+          sessionNotFound: true,
+        };
+        return;
+      }
+      yield {
+        type: 'agent_message_chunk',
+        text: calls === 4 ? 'Done. <promise>COMPLETE</promise>' : 'working',
+      };
+      yield { type: 'result', sessionId: `loop-sess-${String(calls)}` };
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(createMockStore()),
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-stale',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-stale-run'),
+      })
+    );
+
+    // Iteration 2 resumes iteration 1's stale session, retries fresh, and iteration 3
+    // resumes the fresh session.
+    expect(mockSendQueryDag.mock.calls.map(call => call[2])).toEqual([
+      undefined,
+      'loop-sess-1',
+      undefined,
+      'loop-sess-3',
+    ]);
+    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+      String(c[1])
+    );
+    expect(messages.some(m => m.includes('iteration 2: could not resume'))).toBe(true);
+  });
+
+  it('numbers every iteration of a loop attempt from one sequence', async () => {
+    const store = createMockStore();
+    let iteration = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      iteration += 1;
+      yield { type: 'tool_call', toolCallId: `call-${String(iteration)}`, name: 'read_file' };
+      yield {
+        type: 'tool_call_update',
+        toolCallId: `call-${String(iteration)}`,
+        status: 'completed',
+      };
+      yield {
+        type: 'agent_message_chunk',
+        text: iteration === 2 ? 'Done. <promise>COMPLETE</promise>' : 'working',
+      };
+      yield { type: 'result', sessionId: `loop-sess-seq-${String(iteration)}` };
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-seq',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-seq-run'),
+      })
+    );
+
+    expect(iteration).toBe(2);
+    const envelopes = persistedEvents(store)
+      .filter(e => e.event_type === 'provider_event')
+      .map(e => providerEventEnvelopeSchema.parse(e.data));
+    expect(envelopes.map(e => e.seq)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(new Set(envelopes.map(e => e.attemptId)).size).toBe(1);
+  });
+
+  it.each([
+    ['zero', { max_attempts: 1, delay_ms: 0 }, [0], true, 'transient'],
+    ['default', undefined, [3000, 6000], false, 'transient'],
+    ['declared default delay', { max_attempts: 3 }, [3000, 6000, 12000], false, 'transient'],
+    ['configured', { max_attempts: 3, delay_ms: 17 }, [17, 34, 68], false, 'transient'],
+    [
+      'capacity',
+      { max_attempts: 1, delay_ms: 0 },
+      [45000, 90000, 180000, 300000, 300000],
+      false,
+      'overloaded',
+    ],
+    [
+      'rate limit',
+      { max_attempts: 1, delay_ms: 0 },
+      [45000, 45000, 45000, 45000, 45000],
+      false,
+      'rate_limited',
+    ],
+  ] as const)(
+    'uses the %s loop iteration retry policy',
+    async (_name, retry, delays, recover, failureClass) => {
+      const realSetTimeout = globalThis.setTimeout;
+      const realRandom = Math.random;
+      Math.random = () => 0.5;
+      let waiting = false;
+      const waitRequests: number[][] = [];
+      globalThis.setTimeout = ((fn: () => void, delay?: number) => {
+        if (waiting) {
+          waitRequests.at(-1)!.push(delay ?? 0);
+          return realSetTimeout(fn, recover ? delay : 0);
+        }
+        return realSetTimeout(fn, delay);
+      }) as typeof setTimeout;
+      try {
+        let calls = 0;
+        mockSendQueryDag.mockImplementation(async function* () {
+          waiting = false;
+          calls++;
+          if (recover && calls === 2) {
+            yield { type: 'result', sessionId: 'recovered', text: '<promise>COMPLETE</promise>' };
+          } else {
+            yield {
+              type: 'result',
+              isError: true,
+              errors: ['opaque transient failure'],
+              failure: { class: failureClass, evidence: 'opaque transient failure' },
+            };
+          }
+        });
+        const store = createMockStore();
+        const createEvent = store.createWorkflowEvent;
+        store.createWorkflowEvent = mock(async event => {
+          await createEvent(event);
+          if (event.event_type === 'node_retry_scheduled') {
+            waiting = true;
+            waitRequests.push([]);
+          }
+        });
+        await executeDagWorkflow(
+          dagOptions({
+            deps: createMockDeps(store),
+            platform: createMockPlatform(),
+            cwd: testDir,
+            workflow: {
+              name: 'loop-retry-policy',
+              nodes: [
+                {
+                  id: 'my-loop',
+                  kind: 'loop',
+                  ...(retry ? { retry } : {}),
+                  loop: {
+                    prompt: 'Work',
+                    until: 'COMPLETE',
+                    max_iterations: 2,
+                    fresh_context: false,
+                  },
+                },
+              ],
+            },
+            workflowRun: makeWorkflowRun('loop-retry-policy-run'),
+          })
+        );
+        expect(calls).toBe(delays.length + 1);
+        const events = store.createWorkflowEvent.mock.calls
+          .map(([event]) => event)
+          .filter(event => event.event_type === 'node_retry_scheduled');
+        expect(events.map(event => event.data?.delay_ms)).toEqual([...delays]);
+        expect(events.map(event => event.data?.max_retries)).toEqual(
+          delays.map(() => (failureClass === 'transient' ? (retry?.max_attempts ?? 2) : 5))
+        );
+        expect(events.map(event => event.data?.iteration)).toEqual(delays.map(() => 1));
+        expect(waitRequests.map(requests => requests.reduce((a, b) => a + b, 0))).toEqual([
+          ...delays,
+        ]);
+        if (recover) {
+          expect(waitRequests).toEqual([[]]);
+          expect(store.completeWorkflowRun).toHaveBeenCalled();
+        } else {
+          // Only a rate limit that outlasts its retries pauses on the provider-limit wait;
+          // every other class still fails the run.
+          if (failureClass === 'rate_limited') {
+            expect(store.failWorkflowRun).not.toHaveBeenCalled();
+            expect(store.pauseWorkflowRunForWait).toHaveBeenCalledWith(
+              'loop-retry-policy-run',
+              expect.objectContaining({ kind: 'quota', nodeId: 'my-loop' }),
+              { kind: 'started', stepName: 'my-loop' }
+            );
+          } else {
+            expect(store.failWorkflowRun).toHaveBeenCalled();
+            expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
+          }
+          const failed = store.persistWorkflowEvent.mock.calls
+            .map(([event]) => event)
+            .find(event => event.event_type === 'node_failed');
+          expect(failed?.data).toMatchObject({
+            failure_kind: failureClass,
+            provider_failure: { class: failureClass, evidence: 'opaque transient failure' },
+            error: expect.stringContaining('opaque transient failure'),
+          });
+        }
+      } finally {
+        globalThis.setTimeout = realSetTimeout;
+        Math.random = realRandom;
+      }
+    }
+  );
+
+  it('persists a partial cost when an unpriced transient attempt recovers on retry', async () => {
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      if (++calls === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          failure: { class: 'transient', evidence: 'temporary' },
+          errors: ['temporary'],
+        };
+      } else {
+        yield {
+          type: 'result',
+          sessionId: 'recovered-session',
+          text: '<promise>COMPLETE</promise>',
+          cost: 0.02,
+        };
+      }
+    });
+    const deps = createMockDeps();
+    await executeDagWorkflow(
+      dagOptions({
+        deps,
+        cwd: testDir,
+        workflow: {
+          name: 'retry-cost',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              retry: { max_attempts: 1, delay_ms: 0 },
+              loop: {
+                prompt: 'Work.',
+                until: 'COMPLETE',
+                max_iterations: 1,
+                fresh_context: false,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('retry-cost-run'),
+      })
+    );
+    expect(calls).toBe(2);
+    const completed = persistedEvents(deps.store).find(e => e.event_type === 'node_completed');
+    expect(completed?.data).toMatchObject({
+      cost_usd: 0.02,
+      spend: { costUsd: { source: 'provider', value: 0.02, partial: true } },
+    });
+  });
+
+  it('resets the retry budget after a successful iteration', async () => {
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      calls++;
+      if (calls % 2 === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          failure: { class: 'transient', evidence: 'temporary' },
+          errors: ['temporary'],
+        };
+      } else {
+        yield {
+          type: 'result',
+          sessionId: 'loop-session',
+          text: calls === 4 ? '<promise>COMPLETE</promise>' : 'Keep working',
+        };
+      }
+    });
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        platform: createMockPlatform(),
+        cwd: testDir,
+        workflow: {
+          name: 'iteration-budget',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              retry: { max_attempts: 1, delay_ms: 0 },
+              loop: {
+                prompt: 'Work',
+                until: 'COMPLETE',
+                max_iterations: 2,
+                fresh_context: false,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('iteration-budget-run'),
+      })
+    );
+    expect(calls).toBe(4);
+    expect(store.completeWorkflowRun).toHaveBeenCalled();
+    expect(
+      persistedEvents(store)
+        .filter(event => event.event_type === 'node_retry_scheduled')
+        .map(event => event.data)
+    ).toEqual([
+      expect.objectContaining({ iteration: 1, retry_attempt: 1, max_retries: 1, delay_ms: 0 }),
+      expect.objectContaining({ iteration: 2, retry_attempt: 1, max_retries: 1, delay_ms: 0 }),
+    ]);
+    expect(
+      persistedEvents(store)
+        .filter(event => event.event_type === 'loop_iteration_completed')
+        .map(event => event.data?.iteration)
+    ).toEqual([1, 2]);
+  });
+
+  it(
+    'retries an iteration whose typed transient failure reads as fatal — #3520',
+    async () => {
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(async function* () {
+        callCount++;
+        if (callCount === 1) {
+          yield {
+            type: 'result',
+            isError: true,
+            errorSubtype: 'error_during_execution',
+            errors: ['403 forbidden from the upstream gateway'],
+            failure: {
+              class: 'transient',
+              evidence: '403 forbidden from the upstream gateway',
+            },
+          };
+          return;
+        }
+        yield {
+          type: 'agent_message_chunk',
+          text: 'Did the task. <promise>COMPLETE</promise>',
+        };
+        yield { type: 'result', sessionId: 'loop-typed-retry-sess' };
+      });
+
+      const store = createMockStore();
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          platform: createMockPlatform(),
+          cwd: testDir,
+          workflow: {
+            name: 'loop-typed-retry',
+            nodes: [
+              {
+                id: 'my-loop',
+                kind: 'loop',
+                retry: { max_attempts: 1, delay_ms: 0 },
+                loop: {
+                  fresh_context: false,
+                  prompt: 'Complete the task.',
+                  until: 'COMPLETE',
+                  max_iterations: 3,
+                },
+              },
+            ],
+          },
+          workflowRun: makeWorkflowRun('loop-typed-retry-run'),
+        })
+      );
+
+      expect(callCount).toBe(2);
+      expect(store.completeWorkflowRun).toHaveBeenCalled();
+      expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    },
+    testTimeout(10_000)
+  );
+
+  it('does not retry an iteration whose untyped error reads as a rate limit', async () => {
+    // The loop catch-all is its own site: an error that is not a NodeFailure is
+    // unknown there too, whatever its message says. Clamp the sleep so a regression
+    // to text classification fails fast instead of waiting out the rate-limit backoff.
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void) => realSetTimeout(fn, 1)) as typeof setTimeout;
+    try {
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(async function* () {
+        callCount++;
+        throw new Error('429 too many requests: provider overloaded');
+      });
+
+      const store = createMockStore();
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          platform: createMockPlatform(),
+          cwd: testDir,
+          workflow: {
+            name: 'loop-untyped-error',
+            nodes: [
+              {
+                id: 'my-loop',
+                kind: 'loop',
+                retry: { max_attempts: 1, delay_ms: 0 },
+                loop: {
+                  fresh_context: false,
+                  prompt: 'Complete the task.',
+                  until: 'COMPLETE',
+                  max_iterations: 3,
+                },
+              },
+            ],
+          },
+          workflowRun: makeWorkflowRun('loop-untyped-error-run'),
+        })
+      );
+
+      expect(callCount).toBe(1);
+      expect(
+        persistedEvents(store).filter(event => event.event_type === 'node_retry_scheduled')
+      ).toHaveLength(0);
+      expect(store.failWorkflowRun).toHaveBeenCalled();
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+  });
+
+  it('records a failed iteration’s typed failure on the loop node, unchanged', async () => {
+    const failure = { class: 'auth', evidence: 'Invalid API key' } as const;
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'result', isError: true, errors: [failure.evidence], failure };
+    });
+
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        platform: createMockPlatform(),
+        cwd: testDir,
+        workflow: {
+          name: 'loop-typed-failure',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              retry: { max_attempts: 1, delay_ms: 0 },
+              loop: {
+                fresh_context: false,
+                prompt: 'Complete the task.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-typed-failure-run'),
+      })
+    );
+
+    const failed = persistedEvents(store).find(
+      event => event.event_type === 'node_failed' && event.step_name === 'my-loop'
+    );
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(
+      persistedEvents(store).filter(event => event.event_type === 'node_retry_scheduled')
+    ).toHaveLength(0);
+    expect(failed?.data?.failure_kind).toBe('fatal');
+    expect(failed?.data?.provider_failure).toEqual(failure);
+  });
+
+  it('names the cost cap when a loop iteration hits its spend limit', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_max_budget_usd',
+        failure: { class: 'budget_exceeded', evidence: 'error_max_budget_usd' },
+      };
+    });
+
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        platform: createMockPlatform(),
+        cwd: testDir,
+        workflow: {
+          name: 'loop-budget',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              maxBudgetUsd: 1.5,
+              loop: {
+                fresh_context: false,
+                prompt: 'Complete the task.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-budget-run'),
+      })
+    );
+
+    const failed = persistedEvents(store).find(
+      event => event.event_type === 'node_failed' && event.step_name === 'my-loop'
+    );
+    expect(failed?.data?.error).toContain("Loop 'my-loop' iteration 1 exceeded cost cap of $1.50.");
+  });
+
+  it('completes on <promise>COMPLETE</promise> signal in first iteration', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'Did the task. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-session-1' };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-test',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    // Should have called sendQuery exactly once (completed on iteration 1)
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    // Workflow should be marked completed with node counts metadata
+    const completeCalls = (
+      mockDeps.store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>
+    ).mock.calls;
+    expect(completeCalls.length).toBe(1);
+    expect(completeCalls[0][1]?.duration_ms).toBeNumber();
+    expect(completeCalls[0][2]).toEqual({
+      node_counts: { completed: 1, failed: 0, skipped: 0, total: 1 },
+    });
+    expect(mockDeps.store.createWorkflowEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'workflow_completed' })
+    );
+  });
+
+  it('records requested model/tier on node_started and the resolved model on node_completed (#2314)', async () => {
+    // Loop nodes own their sendQuery loop, so they need their own half of the
+    // #2314 record: the requested alias on node_started, the concrete model
+    // the provider reported on node_completed.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'Did the task. <promise>COMPLETE</promise>' };
+      yield {
+        type: 'result',
+        sessionId: 'loop-model-sid',
+        resolvedModel: { id: 'claude-opus-5-20260501' },
+        tokens: { input: 100, output: 10 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-model-run');
+    const aiProfile = buildAiProfile('claude', {
+      repoTiers: { large: { provider: 'claude', model: 'opus', effort: 'max' } },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-model-usage',
+          nodes: [
+            {
+              id: 'my-loop',
+              model: 'large',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        aiProfile,
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; step_name: string; data?: Record<string, unknown> }]
+    >;
+    const startedEvent = eventCalls.find(
+      ([arg]) => arg.event_type === 'node_started' && arg.step_name === 'my-loop'
+    );
+    expect(startedEvent).toBeDefined();
+    expect(startedEvent?.[0].data?.provider).toBe('claude');
+    expect(startedEvent?.[0].data?.model).toBe('opus');
+    expect(startedEvent?.[0].data?.tier).toBe('large');
+    expect(startedEvent?.[0].data?.effort).toBe('max');
+
+    const completedEvent = eventCalls.find(
+      ([arg]) => arg.event_type === 'node_completed' && arg.step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeDefined();
+    expect(completedEvent?.[0].data?.model_usage).toEqual({
+      requested: 'opus',
+      resolved: 'claude-opus-5-20260501',
+    });
+    expect(completedEvent?.[0].data?.tokens).toEqual({ input: 100, output: 10 });
+  });
+
+  it('omits model_usage on node_completed when the provider reports no resolved model (#2314)', async () => {
+    // Codex cannot report a concrete model — absence must stay absent rather
+    // than being back-filled with the requested alias.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'Did the task. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-no-model-sid' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-no-model-run');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-no-model-usage',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; step_name: string; data?: Record<string, unknown> }]
+    >;
+    const completedEvent = eventCalls.find(
+      ([arg]) => arg.event_type === 'node_completed' && arg.step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeDefined();
+    expect(completedEvent?.[0].data).not.toHaveProperty('model_usage');
+    expect(completedEvent?.[0].data).not.toHaveProperty('tokens');
+  });
+
+  it('clears a resolved model when a later result omits it, rather than reporting the stale one', async () => {
+    // Pi/Copilot reask loops emit several result chunks and Pi omits resolvedModel
+    // when its later assistant message carries no responseModel. A guarded
+    // assignment would leave the FIRST chunk's model recorded as the node's answer
+    // -- fabricated attribution, which is the defect #2314 exists to prevent.
+    // Two results in ONE iteration, via the background-task wait (same shape as the
+    // #2083 cost test): the first reports a model, the final one does not.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'subtask',
+        taskId: 't-1',
+        status: 'started',
+        taskType: 'local_agent',
+        description: 'bg work',
+      };
+      yield { type: 'agent_message_chunk', text: 'Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'stale-sid', resolvedModel: { id: 'claude-haiku-4-5' } };
+      yield { type: 'subtask', taskId: 't-1', status: 'completed' };
+      // Final result reports NO model, so the node must record none -- not
+      // 'claude-haiku-4-5' retained from the earlier chunk.
+      yield { type: 'result', sessionId: 'stale-sid' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-stale-model-run');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-stale-model',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; step_name: string; data?: Record<string, unknown> }]
+    >;
+    const completedEvent = eventCalls.find(
+      ([arg]) => arg.event_type === 'node_completed' && arg.step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeDefined();
+    expect(completedEvent?.[0].data).not.toHaveProperty('model_usage');
+  });
+
+  it('ends an iteration on settled, not at a result reported before its background work — #3524', async () => {
+    // The completion signal only arrives after the first result; an iteration that
+    // stopped at that result would never see it and burn another iteration.
+    let settledReached = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'Working.' };
+      yield { type: 'result', sessionId: 'loop-sid' };
+      yield {
+        type: 'subtask',
+        taskId: 't-1',
+        status: 'started',
+        taskType: 'local_agent',
+        description: 'bg work',
+      };
+      yield { type: 'subtask', taskId: 't-1', status: 'completed' };
+      yield { type: 'agent_message_chunk', text: ' Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-sid' };
+      yield { type: 'settled' };
+      settledReached = true;
+    });
+
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        platform: createMockPlatform(),
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-late-report',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-late-report-run'),
+      })
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(store.completeWorkflowRun).toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(settledReached).toBe(false);
+  });
+
+  it('fails an iteration whose stream ends after its result without settling — #3524', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-sid' };
+    });
+
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: { ...createMockDeps(store), getAgentProvider: mockGetAgentProviderDag },
+        platform: createMockPlatform(),
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-unsettled',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-unsettled-run'),
+      })
+    );
+
+    const failed = persistedEvents(store).find(
+      event => event.event_type === 'node_failed' && event.step_name === 'my-loop'
+    );
+    expect(failed?.data?.failure_kind).toBe('unknown');
+    expect(failed?.data?.error).toBe(
+      'Loop iteration 1 failed: the provider stream ended without signalling that its turn settled. Its work may be incomplete.'
+    );
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    // Like any failed iteration, it is recorded as one.
+    expect(
+      persistedEvents(store).some(
+        event => event.event_type === 'loop_iteration_failed' && event.data?.iteration === 1
+      )
+    ).toBe(true);
+  });
+
+  it.each([
+    { costs: [-0.01, 0.02], expected: 0.02, partial: true },
+    { costs: [0.02, -0.01], expected: 0.02, partial: true },
+    { costs: [Number.POSITIVE_INFINITY, 0.02], expected: 0.02, partial: true },
+    { costs: [Number.NEGATIVE_INFINITY, 0.02], expected: 0.02, partial: true },
+    { costs: [undefined, 0.02], expected: 0.02, partial: true },
+    { costs: [0.02, undefined], expected: 0.02, partial: true },
+    { costs: [0.01, 0.02], expected: 0.03, partial: false },
+    { costs: [0, 0], expected: 0, partial: false },
+    { costs: [undefined, 0], expected: 0, partial: true },
+    { costs: [undefined, undefined], expected: undefined, partial: true },
+  ])(
+    'preserves cost completeness across iterations: $costs',
+    async ({ costs, expected, partial }) => {
+      let iteration = 0;
+      mockSendQueryDag.mockImplementation(async function* () {
+        const cost = costs[iteration++];
+        yield {
+          type: 'agent_message_chunk',
+          text: iteration === costs.length ? '<promise>COMPLETE</promise>' : 'Working.',
+        };
+        yield { type: 'result', sessionId: 'cost-session', cost };
+      });
+      const deps = createMockDeps();
+      await executeDagWorkflow(
+        dagOptions({
+          deps,
+          cwd: testDir,
+          workflow: {
+            name: 'loop-cost',
+            nodes: [
+              {
+                id: 'cost-loop',
+                kind: 'loop',
+                loop: {
+                  fresh_context: false,
+                  prompt: 'Work.',
+                  until: 'COMPLETE',
+                  max_iterations: 2,
+                },
+              },
+            ],
+          },
+          workflowRun: makeWorkflowRun(),
+        })
+      );
+      expect(iteration).toBe(2);
+      const completed = persistedEvents(deps.store).find(e => e.event_type === 'node_completed');
+      expect(completed).toBeDefined();
+      if (expected === undefined) {
+        expect(completed?.data).not.toHaveProperty('cost_usd');
+        expect(completed?.data).toMatchObject({ spend: { costUsd: { source: 'unavailable' } } });
+      } else {
+        expect(completed?.data?.cost_usd).toBeCloseTo(expected, 5);
+        expect(completed?.data).toMatchObject({
+          spend: { costUsd: { source: 'provider', value: expected } },
+        });
+        if (partial) expect(completed?.data).toHaveProperty('spend.costUsd.partial', true);
+        else expect(completed?.data).not.toHaveProperty('spend.costUsd.partial');
+      }
+    }
+  );
+
+  it('keeps the priced floor partial when a later iteration throws before reporting cost', async () => {
+    let iteration = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      if (++iteration === 2) throw new Error('Stream failed');
+      yield { type: 'agent_message_chunk', text: 'Working.' };
+      yield { type: 'result', sessionId: 'cost-session', cost: 0.02 };
+    });
+    const deps = createMockDeps();
+    await executeDagWorkflow(
+      dagOptions({
+        deps,
+        cwd: testDir,
+        workflow: {
+          name: 'loop-failed-cost',
+          nodes: [
+            {
+              id: 'cost-loop',
+              kind: 'loop',
+              loop: { fresh_context: false, prompt: 'Work.', until: 'COMPLETE', max_iterations: 2 },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun(),
+      })
+    );
+    expect(iteration).toBe(2);
+    const failed = persistedEvents(deps.store).find(e => e.event_type === 'node_failed');
+    expect(failed?.data).toMatchObject({
+      spend: { costUsd: { source: 'provider', value: 0.02, partial: true } },
+    });
+  });
+
+  it('sums per-result cost when background work wakes another turn', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'subtask',
+        taskId: 't-1',
+        status: 'started',
+        taskType: 'local_agent',
+        description: 'bg work',
+      };
+      yield { type: 'agent_message_chunk', text: 'Done. <promise>COMPLETE</promise>' };
+      // Providers report each result's own spend.
+      yield { type: 'result', sessionId: 'loop-sid', cost: 0.1 };
+      yield { type: 'subtask', taskId: 't-1', status: 'completed' };
+      yield { type: 'result', sessionId: 'loop-sid', cost: 0.3 };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-bg-cost-run');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-bg-cost',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed' &&
+        (c[0] as { step_name: string }).step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeDefined();
+    expect((completedEvent![0] as { data: { cost_usd?: number } }).data.cost_usd).toBe(0.4);
+  });
+
+  it('keeps a finite loop cost when a later result in the same iteration is non-finite', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'subtask',
+        taskId: 't-1',
+        status: 'started',
+        taskType: 'local_agent',
+        description: 'bg work',
+      };
+      yield { type: 'agent_message_chunk', text: 'Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-sid', cost: 0.1 };
+      yield { type: 'subtask', taskId: 't-1', status: 'completed' };
+      yield { type: 'result', sessionId: 'loop-sid', cost: Number.NaN };
+    });
+
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-nan-cost',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('loop-nan-cost-run'),
+      })
+    );
+
+    const completedEvent = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeDefined();
+    expect((completedEvent![0] as { data: { cost_usd?: number } }).data.cost_usd).toBe(0.1);
+    expect(completedEvent?.[0].data).toMatchObject({ spend: { costUsd: { partial: true } } });
+    expect(
+      (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+        call => call[1] === 'loop_node.usage_cost_invalid_ignored'
+      )
+    ).toBe(true);
+  });
+
+  it('records the cross-iteration union of dangling background tasks on node_completed (#2083)', async () => {
+    // Iterations 1 and 2 each end with a different task still live (subprocess
+    // death analog); iteration 3 finishes cleanly and signals completion. The
+    // node_completed event must carry the UNION of dangling ids — last-iteration
+    // reporting would hide t-a and t-b behind the clean final iteration.
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      if (callCount === 1) {
+        yield {
+          type: 'subtask',
+          taskId: 't-a',
+          status: 'started',
+          taskType: 'local_agent',
+          description: 'never drains',
+        };
+        yield { type: 'agent_message_chunk', text: 'first pass' };
+        yield { type: 'result', sessionId: 'sid-1' };
+        // Generator ends with t-a live
+      } else if (callCount === 2) {
+        yield {
+          type: 'subtask',
+          taskId: 't-b',
+          status: 'started',
+          taskType: 'local_agent',
+          description: 'never drains',
+        };
+        yield { type: 'agent_message_chunk', text: 'second pass' };
+        yield { type: 'result', sessionId: 'sid-2' };
+        // Generator ends with t-b live
+      } else {
+        yield { type: 'agent_message_chunk', text: 'All done! <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'sid-3' };
+      }
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-bg-union-run');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-bg-union',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(3);
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed' &&
+        (c[0] as { step_name: string }).step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeDefined();
+    const data = (completedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.background_tasks_incomplete).toEqual(['t-a', 't-b']);
+  });
+
+  it('omits background_tasks_incomplete from node_completed when every iteration drains cleanly', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'subtask',
+        taskId: 't-1',
+        status: 'started',
+        taskType: 'local_agent',
+        description: 'bg work',
+      };
+      yield { type: 'agent_message_chunk', text: 'Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'sid-clean' };
+      yield { type: 'subtask', taskId: 't-1', status: 'completed' };
+      yield { type: 'result', sessionId: 'sid-clean' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-bg-clean-run');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-bg-clean',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed' &&
+        (c[0] as { step_name: string }).step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeDefined();
+    expect(
+      (completedEvent![0] as { data: Record<string, unknown> }).data.background_tasks_incomplete
+    ).toBeUndefined();
+  });
+
+  it('cancellation mid-stream aborts the iteration and suppresses the incompleteness warning', async () => {
+    // Mirrors the AI-node cancellation-exemption test: the run is cancelled
+    // while an iteration is streaming with a live background task. The new
+    // mid-stream status check must abort the iteration (previously the loop
+    // only noticed cancellation BETWEEN iterations), fail the node with the
+    // observed status, and suppress the incompleteness warning.
+    let tasksDelivered = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'subtask',
+        taskId: 't-loop',
+        status: 'started',
+        taskType: 'local_agent',
+        description: 'still running',
+      };
+      tasksDelivered = true;
+      setSystemTime(new Date(Date.now() + 11_000));
+      yield { type: 'agent_message_chunk', text: 'working' };
+      yield { type: 'agent_message_chunk', text: 'MUST NOT BE REACHED' };
+    });
+
+    const store = createMockStore();
+    // 'running' for the between-iteration check, 'cancelled' once the task
+    // set has been delivered mid-stream.
+    (store.getWorkflowRunStatus as Mock<() => Promise<string | null>>).mockImplementation(() =>
+      Promise.resolve(tasksDelivered ? 'cancelled' : 'running')
+    );
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-bg-cancel-run');
+
+    try {
+      await executeDagWorkflow(
+        dagOptions({
+          deps: mockDeps,
+          platform,
+          cwd: testDir,
+          workflow: {
+            name: 'dag-loop-bg-cancel',
+            nodes: [
+              {
+                id: 'my-loop',
+                kind: 'loop',
+                loop: {
+                  fresh_context: false,
+                  prompt: 'Do tasks.',
+                  until: 'COMPLETE',
+                  max_iterations: 5,
+                },
+              },
+            ],
+          },
+          workflowRun,
+        })
+      );
+    } finally {
+      setSystemTime(); // restore the real clock
+    }
+
+    // Aborted during iteration 1 — no second iteration
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    // The loop never completed
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed' &&
+        (c[0] as { step_name: string }).step_name === 'my-loop'
+    );
+    expect(completedEvent).toBeUndefined();
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+      String(c[1])
+    );
+    // The stop is surfaced with the observed status…
+    expect(sent.some(m => m.includes('stopped during iteration 1 (cancelled)'))).toBe(true);
+    // …and the incompleteness warning is suppressed as noise
+    expect(sent.some(m => m.includes('output may be missing'))).toBe(false);
+  });
+
+  it('strips completion tags from the whole reply, keeping text across reply blocks', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'All ' };
+      yield { type: 'agent_message_chunk', text: 'done. <promise>COMP' };
+      yield { type: 'agent_message_chunk', text: 'LETE</promise>', continuesPreviousBlock: true };
+      yield { type: 'result', sessionId: 'loop-blocks' };
+    });
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-blocks',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: { fresh_context: false, prompt: 'Work.', until: 'COMPLETE', max_iterations: 3 },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun(),
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const completed = persistedEvents(mockDeps.store).find(
+      e => e.event_type === 'node_completed' && e.step_name === 'my-loop'
+    );
+    expect(completed?.data?.node_output).toBe('All done.');
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+      String(c[1])
+    );
+    expect(sent).toContain('All done.');
+  });
+
+  it('substitutes $LOOP_PREV_OUTPUT with previous iteration output (empty on iter 1)', async () => {
+    // Iteration 1 emits a distinctive output, iteration 2 emits the completion signal.
+    // We then assert the prompt sent to the AI: iteration 1 strips $LOOP_PREV_OUTPUT
+    // to empty, iteration 2 receives iteration 1's cleaned output.
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      if (callCount === 1) {
+        yield { type: 'agent_message_chunk', text: 'Iter1 output: 2 type errors in users.ts' };
+        yield { type: 'result', sessionId: 'loop-session-1' };
+      } else {
+        yield { type: 'agent_message_chunk', text: 'All fixed. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'loop-session-2' };
+      }
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-prev-output',
+          nodes: [
+            {
+              id: 'fix-loop',
+              kind: 'loop',
+              loop: {
+                prompt: 'Previous output: <<$LOOP_PREV_OUTPUT>>. Fix and emit COMPLETE.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+                fresh_context: true,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    const promptIter1 = mockSendQueryDag.mock.calls[0][0] as string;
+    const promptIter2 = mockSendQueryDag.mock.calls[1][0] as string;
+    // Iteration 1: $LOOP_PREV_OUTPUT substitutes to empty string.
+    expect(promptIter1).toContain('Previous output: <<>>.');
+    // Iteration 2: receives iteration 1's cleaned output.
+    expect(promptIter2).toContain('Previous output: <<Iter1 output: 2 type errors in users.ts>>.');
+  });
+
+  it('strips <promise> tags from $LOOP_PREV_OUTPUT (uses cleaned output)', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      if (callCount === 1) {
+        // Iteration 1 includes a non-completion XML tag in its output. The cleaned
+        // output (after stripCompletionTags) drops <promise>...</promise> blocks.
+        // We use a non-matching signal here so iteration 1 does NOT complete.
+        yield {
+          type: 'agent_message_chunk',
+          text: 'Real work output. <promise>NOT_DONE_YET</promise>',
+        };
+        yield { type: 'result', sessionId: 'loop-session-1' };
+      } else {
+        yield { type: 'agent_message_chunk', text: 'Done. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'loop-session-2' };
+      }
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-prev-clean',
+          nodes: [
+            {
+              id: 'fix-loop',
+              kind: 'loop',
+              loop: {
+                prompt: 'PREV=[$LOOP_PREV_OUTPUT]',
+                until: 'COMPLETE',
+                max_iterations: 5,
+                fresh_context: true,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    const promptIter2 = mockSendQueryDag.mock.calls[1][0] as string;
+    // The previous-output payload must be the *cleaned* output — no <promise> tags.
+    expect(promptIter2).toContain('PREV=[Real work output.');
+    expect(promptIter2).not.toContain('<promise>');
+  });
+
+  it('$LOOP_PREV_OUTPUT is empty on the first iteration after interactive resume', async () => {
+    // Regression guard for the resume-from-approval path: when an interactive
+    // loop pauses at the approval gate, the prior `lastIterationOutput` lives
+    // in a separate process and is not persisted. On resume, the executor must
+    // substitute $LOOP_PREV_OUTPUT to '' on the first resumed iteration —
+    // never to whatever the paused run produced.
+    //
+    // Wirasm-suggested shape (PR #1367 review): two executeDagWorkflow calls.
+    // The first call pauses at the gate after iteration 1; the second call
+    // resumes with metadata.approval populated and runs iteration 2.
+
+    // ---- Call 1: fresh run, iteration 1 emits no completion → pauses at gate
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield { type: 'agent_message_chunk', text: 'Iter1 output: 2 type errors in users.ts' };
+      yield { type: 'result', sessionId: 'loop-session-1' };
+    });
+    const mockDeps1 = createMockDeps();
+    const platform1 = createMockPlatform();
+    const freshRun = makeWorkflowRun('resume-prev-fresh-run');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps1,
+        platform: platform1,
+        cwd: testDir,
+        workflow: {
+          name: 'interactive-loop-resume-prev-output',
+          nodes: [
+            {
+              id: 'refine',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt:
+                  'User: $LOOP_USER_INPUT. PREV=<<$LOOP_PREV_OUTPUT>>. Continue or emit COMPLETE.',
+                until: 'COMPLETE',
+                max_iterations: 10,
+                interactive: true,
+                gate_message: 'Review and provide feedback.',
+              },
+            },
+          ],
+        },
+        workflowRun: freshRun,
+      })
+    );
+
+    // First iteration of a fresh interactive loop: $LOOP_PREV_OUTPUT empty;
+    // $LOOP_USER_INPUT empty (no user has spoken yet).
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const promptIter1 = mockSendQueryDag.mock.calls[0][0] as string;
+    expect(promptIter1).toContain('PREV=<<>>.');
+    expect(promptIter1).toContain('User: .');
+    // Fresh interactive loop must pause at the gate, not return early.
+    const pauseCalls1 = (
+      mockDeps1.store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>
+    ).mock.calls;
+    expect(pauseCalls1.length).toBe(1);
+    expect(pauseCalls1[0][1]).toMatchObject({
+      type: 'interactive_loop',
+      nodeId: 'refine',
+      iteration: 1,
+    });
+
+    // ---- Call 2: resumed run — metadata carries iter 1 + user input.
+    // iter 2 emits the completion signal so the loop exits cleanly.
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield { type: 'agent_message_chunk', text: 'All clear. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-session-2' };
+    });
+    const mockDeps2 = createMockDeps();
+    const platform2 = createMockPlatform();
+    const resumedRun = makeWorkflowRun('resume-prev-resume-run', {
+      metadata: {
+        approval: {
+          type: 'interactive_loop',
+          nodeId: 'refine',
+          iteration: 1,
+          sessionId: 'loop-session-1',
+          message: 'Review and provide feedback.',
+        },
+        loop_user_input: 'looks good, ship it',
+      },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps2,
+        platform: platform2,
+        cwd: testDir,
+        workflow: {
+          name: 'interactive-loop-resume-prev-output',
+          nodes: [
+            {
+              id: 'refine',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt:
+                  'User: $LOOP_USER_INPUT. PREV=<<$LOOP_PREV_OUTPUT>>. Continue or emit COMPLETE.',
+                until: 'COMPLETE',
+                max_iterations: 10,
+                interactive: true,
+                gate_message: 'Review and provide feedback.',
+              },
+            },
+          ],
+        },
+        workflowRun: resumedRun,
+      })
+    );
+
+    // Second executeDagWorkflow call started a fresh sendQuery generator (mock
+    // call index 1 across the two runs). The resumed iteration must NOT carry
+    // the prior process's iter-1 output through $LOOP_PREV_OUTPUT — it must
+    // substitute to ''.
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    const promptResumeIter = mockSendQueryDag.mock.calls[1][0] as string;
+    expect(promptResumeIter).toContain('PREV=<<>>.');
+    expect(promptResumeIter).not.toContain('Iter1 output: 2 type errors');
+    // The resume's user input flows through on the first resumed iteration.
+    expect(promptResumeIter).toContain('User: looks good, ship it.');
+    // Resume call exits via completion, not via a second pause at the gate.
+    const pauseCalls2 = (
+      mockDeps2.store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>
+    ).mock.calls;
+    expect(pauseCalls2.length).toBe(0);
+  });
+
+  it('completes on final iteration with XML-wrapped signal (<COMPLETE>SIGNAL</COMPLETE>)', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      if (callCount < 3) {
+        yield { type: 'agent_message_chunk', text: `Iteration ${String(callCount)} progress` };
+        yield { type: 'result', sessionId: `loop-session-${String(callCount)}` };
+      } else {
+        // Final iteration uses <COMPLETE> tag instead of <promise>
+        yield { type: 'agent_message_chunk', text: 'All clean! <COMPLETE>ALL_CLEAN</COMPLETE>' };
+        yield { type: 'result', sessionId: `loop-session-${String(callCount)}` };
+      }
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-xml-tag',
+          nodes: [
+            {
+              id: 'fix-and-review',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Fix and review. When done, output <COMPLETE>ALL_CLEAN</COMPLETE>.',
+                until: 'ALL_CLEAN',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    // 3 iterations run, signal found on iteration 3 → completed, NOT failed
+    expect(mockSendQueryDag.mock.calls.length).toBe(3);
+    expect(
+      (mockDeps.store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>).mock.calls
+        .length
+    ).toBe(1);
+    expect(
+      (mockDeps.store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>).mock.calls.length
+    ).toBe(0);
+    // Verify stripping: raw XML completion tags must not appear in user-visible output
+    const allSentMessages = (
+      platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>
+    ).mock.calls
+      .map((call: unknown[]) => call[1] as string)
+      .join('');
+    expect(allSentMessages).not.toContain('<COMPLETE>');
+    expect(allSentMessages).not.toContain('</COMPLETE>');
+  });
+
+  it('fresh_context: true gives each iteration fresh session', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      if (callCount >= 2) {
+        yield { type: 'agent_message_chunk', text: '<promise>DONE</promise>' };
+      } else {
+        yield { type: 'agent_message_chunk', text: 'Progress' };
+      }
+      yield { type: 'result', sessionId: `session-${String(callCount)}` };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-fresh',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                prompt: 'Do stuff.',
+                until: 'DONE',
+                max_iterations: 5,
+                fresh_context: true,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    // Both calls should have undefined resumeSessionId (fresh context)
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    // First call: fresh (iteration 1 always fresh)
+    expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
+    // Second call: also fresh (fresh_context: true)
+    expect(mockSendQueryDag.mock.calls[1][2]).toBeUndefined();
+  });
+
+  it('fresh_context: false threads session between iterations', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      if (callCount >= 2) {
+        yield { type: 'agent_message_chunk', text: '<promise>DONE</promise>' };
+      } else {
+        yield { type: 'agent_message_chunk', text: 'Progress' };
+      }
+      yield { type: 'result', sessionId: `session-${String(callCount)}` };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'dag-loop-stateful',
+          nodes: [
+            {
+              id: 'my-loop',
+              kind: 'loop',
+              loop: {
+                prompt: 'Do stuff.',
+                until: 'DONE',
+                max_iterations: 5,
+                fresh_context: false,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    // First call: fresh (iteration 1 always fresh)
+    expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
+    // Second call: should have session-1 from first iteration
+    expect(mockSendQueryDag.mock.calls[1][2]).toBe('session-1');
+  });
+
+  it('loop iteration fails loudly when SDK returns error_during_execution', async () => {
+    // Regression test for #1208: previously the loop silently broke on isError
+    // results and kept iterating with empty output, producing "5-second crashes"
+    // that masqueraded as successful iterations.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        errors: ['Subprocess crashed mid-turn'],
+        sessionId: 'bad-session',
+        cost: 0.04,
+        tokens: { input: 70, output: 7, cacheRead: 30, cacheWrite: 0 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'loop-iteration-err',
+          nodes: [
+            {
+              id: 'work',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do the work. Say DONE.',
+                until: 'DONE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    // Should fail after one iteration rather than burning through max_iterations
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    // The loop_iteration_failed event should carry the subtype and SDK errors detail
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const iterFailedEvents = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'loop_iteration_failed'
+    );
+    expect(iterFailedEvents.length).toBeGreaterThan(0);
+    const failedData = (iterFailedEvents[0][0] as Record<string, unknown>).data as Record<
+      string,
+      unknown
+    >;
+    expect(failedData.error).toContain('error_during_execution');
+    expect(failedData.error).toContain('Subprocess crashed mid-turn');
+    const nodeFailed = eventCalls.find(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    const nodeFailedData = (nodeFailed?.[0] as { data?: Record<string, unknown> } | undefined)
+      ?.data;
+    expect(nodeFailedData?.cost_usd).toBe(0.04);
+    expect(nodeFailedData?.tokens).toEqual({
+      input: 70,
+      output: 7,
+      cacheRead: 30,
+      cacheWrite: 0,
+    });
+  });
+
+  it('loop iteration does NOT fail on isError: true + errorSubtype: success', async () => {
+    // Regression test for #1425 (loop-branch counterpart of the main-path
+    // test). Stop_sequence terminations carry is_error: true + subtype:
+    // 'success' under the Claude SDK contract; previously, the loop branch
+    // threw "SDK returned success" and aborted the iteration even though
+    // the AI had completed its work correctly.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'Done.\nDONE' };
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'success',
+        stopReason: 'end_turn',
+        sessionId: 'sid-loop-stop',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'loop-success-stop-seq-test',
+          nodes: [
+            {
+              id: 'work',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do the work. Say DONE.',
+                until: 'DONE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvents = eventCalls.filter((call: unknown[]) => {
+      const evt = (call[0] as Record<string, unknown>).event_type as string;
+      return evt === 'node_failed' || evt === 'loop_iteration_failed';
+    });
+    expect(failedEvents).toHaveLength(0);
+  });
+
+  it('closes the loop lifecycle with exactly one node_failed on max-iterations exhaustion', async () => {
+    // Failure finalizer contract: every failed exit after node_started goes
+    // through one finalizer — exactly one node_failed row per started loop
+    // node, paired with its node_started.
+    await writeFile(
+      join(testDir, '.archon', 'commands', 'exhaust-loop.md'),
+      'Body that never signals completion'
+    );
+
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'agent_message_chunk', text: 'still going, no signal' };
+      yield { type: 'result', sessionId: 'sid-exhaust' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflow: {
+          name: 'loop-cmd-exhaust',
+          nodes: [
+            {
+              id: 'exhaust-loop',
+              kind: 'loop',
+              loop: {
+                command: 'exhaust-loop',
+                until: 'COMPLETE',
+                max_iterations: 2,
+                fresh_context: true,
+              },
+            } as unknown as DagNode,
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const started = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_started' &&
+        (call[0] as Record<string, unknown>).step_name === 'exhaust-loop'
+    );
+    const failed = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+        (call[0] as Record<string, unknown>).step_name === 'exhaust-loop'
+    );
+    expect(started).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    const data = (failed[0][0] as Record<string, unknown>).data as Record<string, unknown>;
+    expect(String(data.error)).toContain('exceeded max iterations');
+  });
+});

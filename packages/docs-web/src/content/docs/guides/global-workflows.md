@@ -51,7 +51,7 @@ Shared commands/scripts and legacy grouped workflows support one grouping folder
 
 YAML nested below the workflow folder is not loaded. Inside a pack, a folder with no direct YAML (tests, docs, assets) and any dot directory (`.shared`, `.github`) are not workflow folders and are skipped. A folder with two or more direct YAML files is reported as invalid rather than ignored silently.
 
-Resolution is by **filename without extension** (for commands) or **exact filename** (for workflows), regardless of which subfolder the file lives in. Duplicate basenames within the same scope are a user error -- keep each name unique within `~/.archon/commands/` (or `<repoRoot>/.archon/commands/`), across whatever subfolders you use.
+Commands resolve by **filename without extension**. Project, global, and bundled workflows launch and compose by their exact, case-sensitive YAML **`name:`**, regardless of which subfolder the file lives in. Launch [installed pack entrypoints](#installed-workflow-packs) by their qualified **`owner/plugin:entrypoint`** name; references within that pack can use the YAML `name:`. Duplicate basenames within the same scope are a user error -- keep each name unique within `~/.archon/commands/` (or `<repoRoot>/.archon/commands/`), across whatever subfolders you use.
 
 ## Load Priority
 
@@ -59,18 +59,20 @@ Resolution is by **filename without extension** (for commands) or **exact filena
 2. **Global / home-scoped** -- `~/.archon/workflows/`, `~/.archon/commands/`, `~/.archon/scripts/` (override bundled by filename).
 3. **Repo-specific** -- `<repoRoot>/.archon/workflows/`, `<repoRoot>/.archon/commands/`, `<repoRoot>/.archon/scripts/` (override global by filename).
 
-Same-named legacy/shared files at a higher scope win. Packaged commands and scripts resolve only within their owning package and never fall through to another scope.
+Same-named legacy/shared files at a higher scope win. Packaged commands and scripts resolve only within their owning pack and never fall through to another scope.
 
 ## Installed workflow packs
 
-A workflow pack published on GitHub installs for every project on this Archon with [`archon plugin install`](/reference/cli/#plugin). Installed packs are a fourth source next to bundled, global and project, outside the precedence above.
+A workflow pack published on GitHub installs for every project on this Archon with [`archon plugin add`](/reference/cli/#plugin). Installed packs are a fourth source next to bundled, global and project, outside the precedence above.
 
-A pack repository holds one pack in the packaged layout, with an `archon-plugin.json` at its root (the repository root, or a subdirectory named in the install id):
+A plugin root is a directory containing `archon-plugin.json` and one pack in the packaged layout. A repository can contain one or more plugin roots, at the repository root or in subdirectories. Each root installs independently using `owner/repo[/path]`. This example shows a single plugin root:
 
 ```text
 review-kit/                     # plugin root: owner/repo or owner/repo/<path>
 ├── archon-plugin.json
-├── .shared/                    # modules the pack's scripts import
+├── .shared/                    # modules and documents the pack's scripts use
+│   ├── metric-views.json       # optional overview cards for the console
+│   ├── scripts/preflight.ts    # a script any workflow of the pack can name
 │   └── util.ts
 ├── .github/workflows/ci.yml    # a dot directory: never a workflow folder
 ├── tests/                      # no direct YAML: not a workflow folder
@@ -98,7 +100,7 @@ The whole plugin directory is installed, so a pack at the repository root can ke
 
 - **Identity.** An entrypoint is listed and run as `owner/plugin:entrypoint`: `owner` is the GitHub owner from the install id and `plugin` is the manifest `name`, so the pack above installed from `acme/review-kit` runs as `archon workflow run acme/review-kit:review`. The YAML `name:` is how workflows refer to each other inside the pack.
 - **Support workflows.** Every workflow that is not an entrypoint is support. An entrypoint uses it with `include:` (by its YAML `name:`), and nothing else can run it: not the CLI, chat, the router, the API, another pack, or a project workflow. Inside a pack, a `workflow:` child run may launch another entrypoint of the pack by its YAML `name:`, but not a support workflow, because a child run is dispatch.
-- **Names.** A qualified name matches exactly (ignoring case) and never by suffix or substring, and a project or global workflow that declares an installed name is not loaded.
+- **Names.** A qualified name matches exactly (case-sensitive) and never by suffix or substring, and a project or global workflow that declares an installed name is not loaded. Inside a pack, a reference to a YAML `name:` shared by multiple files fails discovery; when the files have distinct public identities, use a qualified identity such as `acme/review-kit:review` to select the intended target. Qualified identities take precedence over colliding authored names. Support identities use the YAML `name:`, so two support files with the same name also have the same public identity and fail discovery. Rename one support workflow and update its references; qualification cannot distinguish them.
 - **Runs keep their revision.** A run freezes the pack at the commit it started with, and a `workflow:` child takes the packs its parent froze. `archon plugin update` or `remove` affects only runs that start afterwards.
 - **Installed or copied.** An installed pack is read-only and changes only through `archon plugin update`. To change one for a single project, `archon plugin copy <id>` writes it to `.archon/workflows/<name>/`, where it is an ordinary project pack: its workflows run under their own `name:`, and `update` no longer touches it.
 
@@ -233,13 +235,19 @@ browsing.
 
 ## Migrating from the old path
 
-Pre-refactor versions of Archon stored global workflows at `~/.archon/.archon/workflows/` (with an extra nested `.archon/`). That location is no longer read. If you have workflows there, Archon emits a one-time deprecation warning on first use telling you the exact migration command:
+Earlier versions of Archon stored global workflows at `~/.archon/.archon/workflows/`
+(with an extra nested `.archon/`). Archon no longer reads that location or warns about
+it, and does not migrate workflows automatically. Set `ARCHON_HOME` in your shell to
+your Archon home (default `~/.archon`). If `$ARCHON_HOME/workflows` does not exist, move
+the old directory:
 
 ```bash
-mv ~/.archon/.archon/workflows ~/.archon/workflows && rmdir ~/.archon/.archon
+mv "$ARCHON_HOME/.archon/workflows" "$ARCHON_HOME/workflows"
 ```
 
-Run it once; the warning stops firing on subsequent invocations. There was no prior home-scoped commands location, so `~/.archon/commands/` is new capability -- nothing to migrate.
+If the destination already exists, merge the files manually, checking for name conflicts.
+There was no prior home-scoped commands location, so `~/.archon/commands/` has nothing
+to migrate.
 
 ## Troubleshooting
 

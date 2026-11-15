@@ -1,33 +1,49 @@
 import { readFileSync } from 'node:fs';
+import { dirname, join, normalize } from 'node:path';
 
 const DOCS_DIRECTORY = 'packages/docs-web/';
 const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
 
 /**
- * Paths that read as documentation but are build inputs, so changing one must run the suite.
- * Most Markdown in this repository is executable prompt or skill content rather than prose, and
- * the checks that guard it all live inside the job this decision can skip — so a bare `.md` test
- * would let a bundled-prompt edit skip the very check built to catch that drift.
+ * Paths that read as documentation but are build or test inputs, so changing one must run
+ * the test suite and auxiliary build and service jobs. Markdown in bundled prompts and skills is
+ * executable content rather than ordinary prose.
  *
  * An entry ending in `/` matches a directory, anything else matches one file. Each is here
  * because a named check reads it:
- *   - `.archon/commands/`, `.archon/workflows/` are compiled into
- *     `packages/workflows/src/defaults/bundled-defaults.generated.ts` (`check:bundled`).
+ *   - Pack prompts (`commands/`) and `.shared/` documents under `.archon/workflows/` are read
+ *     by the bundle tests and embedded into the binary by `scripts/build-binaries.sh`
+ *     (`serve-binary`); `isPackPrompt` matches them. Pack READMEs and design notes are prose
+ *     unless a test reads them.
+ *     Every other file under `.archon/workflows/` is not Markdown, so it runs the suite anyway.
  *   - `.claude/skills/` is imported as text by `packages/cli/src/bundled-skill.ts`, so it is
- *     compiled into the CLI itself (`check:bundled-skill`).
+ *     compiled into the CLI itself (CLI skill tests).
  *   - `provider-capabilities.md` is generated from the providers' `capabilities.ts`
  *     (`check:capability-matrix`), and lives under the docs site without being prose.
- *   - `adding-a-community-provider.mdx` is read by
- *     `packages/providers/src/community/_template/capabilities.test.ts`, which asserts the page
- *     renders the capabilities template by reference instead of a hand-copied snapshot.
  *   - The docs manifest is copied by the Docker dependency layer.
+ *   - The variables reference contains Docker commands checked by
+ *     `docker-verification-label.test.ts` against the cleanup ownership label.
+ *   - The brand guide holds the console token table that `check-console-tokens.ts` (`lint`)
+ *     compares against the theme in `packages/web/src/index.css`.
+ *   - Directory-qualified tracked Markdown paths named by tests are checked against this gate by
+ *     `markdownTestInputs` in `should-run-test-suite.test.ts`.
  */
 const BUILD_INPUTS = [
-  '.archon/commands/',
-  '.archon/workflows/',
   '.claude/skills/',
+  '.archon/architecture.md',
+  '.archon/workflow-language-constitution.md',
+  '.claude/commands/execute.md',
+  'packages/providers/src/codex/protocol/README.md',
+  'packages/docs-web/src/content/docs/reference/database.md',
+  'packages/docs-web/src/content/docs/reference/variables.md',
+  'packages/docs-web/src/content/docs/reference/api.md',
+  'packages/docs-web/src/content/docs/reference/node-execution.md',
+  'packages/docs-web/src/content/docs/deployment/docker.md',
+  'packages/docs-web/src/content/docs/deployment/reverse-proxy.md',
+  'packages/docs-web/src/content/docs/getting-started/operate.md',
+  'packages/docs-web/src/content/docs/guides/workflow-triggers.md',
   'packages/docs-web/src/content/docs/reference/provider-capabilities.md',
-  'packages/docs-web/src/content/docs/contributing/adding-a-community-provider.mdx',
+  'packages/docs-web/src/content/docs/brand/index.md',
   'packages/docs-web/package.json',
 ];
 
@@ -38,34 +54,276 @@ const BUILD_INPUTS = [
  * found when this list was written was prose in a comment or a fixture string literal.
  *
  * Deliberately absent, each because a named check reads it: `Dockerfile` and friends plus
- * `.dockerignore` (the `docker-build` job), `.prettierrc`/`.prettierignore` (`format:check`),
- * `homebrew/archon.rb` (`build:checksums`), `scripts/install.ps1` (`test:install`), the web
- * assets that feed the Docker image, and anything under `.github/workflows/` — changing the
- * gate must run the gate.
+ * `.dockerignore` (the `docker-build` job), `biome.jsonc` (`lint` and `format:check`),
+ * `homebrew/archon.rb` (`build:checksums`), `scripts/install.ps1` (`test:install`), the web assets that feed the Docker image, and anything under
+ * `.github/workflows/` — changing the gate must run the gate. `Caddyfile.example` is read by
+ * `reverse-proxy.test.ts` and `caddy-recipe.test.ts`, and git applies `.gitattributes` to every
+ * file a test reads from the checkout. `.env.example` is read by `caddy-recipe.test.ts`.
  *
  * An entry ending in `/` matches a directory, anything else matches one file.
  */
-const INERT_PATHS = [
-  '.gitignore',
-  '.gitattributes',
-  'LICENSE',
-  '.env.example',
-  'Caddyfile.example',
-  '.archon/config.example.yaml',
-  'assets/',
-];
+const INERT_PATHS = ['.gitignore', 'LICENSE', '.archon/config.example.yaml', 'assets/'];
 
-const isInert = (file: string): boolean =>
-  INERT_PATHS.some(entry => (entry.endsWith('/') ? file.startsWith(entry) : file === entry));
+/** Whether `file` is one of `entries`: an entry ending in `/` matches a directory. */
+const matches = (entries: readonly string[], file: string): boolean =>
+  entries.some(entry => (entry.endsWith('/') ? file.startsWith(entry) : file === entry));
 
-const isBuildInput = (file: string): boolean =>
-  BUILD_INPUTS.some(input => (input.endsWith('/') ? file.startsWith(input) : file === input));
+const isInert = (file: string): boolean => matches(INERT_PATHS, file);
+
+const isPackPrompt = (file: string): boolean =>
+  file.startsWith('.archon/workflows/') &&
+  file.split('/').some(segment => segment === 'commands' || segment === '.shared');
+
+const isBuildInput = (file: string): boolean => isPackPrompt(file) || matches(BUILD_INPUTS, file);
 
 export function shouldRunTestSuite(files: Iterable<string>): boolean {
   for (const file of files) {
     if (isBuildInput(file)) return true;
     if (isInert(file) || file.endsWith('.md') || file.startsWith(DOCS_DIRECTORY)) continue;
     return true;
+  }
+  return false;
+}
+
+const ROOT_SCRIPTS = 'scripts/';
+
+/** The files the workspace shards' CI step runs before any package test. */
+const WORKSPACE_RUNNER_ENTRY_POINTS = ['scripts/validate.ts', 'scripts/repo-tests.ts'];
+
+function trackedFiles(repo: string, ...paths: string[]): string[] {
+  const result = Bun.spawnSync(['git', 'ls-files', '-z', '--', ...paths], {
+    cwd: repo,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`Could not list tracked files: ${result.stderr.toString().trim()}`);
+  }
+  return result.stdout.toString().split('\0').filter(Boolean);
+}
+
+/**
+ * The root `scripts/` files a workspace package test can read, derived from the tree rather than
+ * listed, so a new reference cannot go stale. A candidate is an input when a tracked non-Markdown
+ * file under `packages/` names its path (a package `test` script, a test that spawns or reads a
+ * root script, or a comment: any mention counts, which keeps this conservative), when it is one
+ * of the workspace shards' entry points, or when an input statically imports it.
+ *
+ * Candidates are the tracked `scripts/` files plus `extraCandidates`, which the caller sets to
+ * the changed files: a deleted script some package still names must count, or deleting it would
+ * skip the very tests that would catch it.
+ */
+export function workspaceTestInputs(
+  repo: string,
+  extraCandidates: Iterable<string> = []
+): Set<string> {
+  const tracked = trackedFiles(repo, 'packages', 'scripts');
+  const candidates = rootScriptCandidates(tracked, extraCandidates);
+  const named = namedWorkspaceInputs(repo, tracked, candidates);
+  return withStaticImports(repo, tracked, candidates, [...named, ...WORKSPACE_RUNNER_ENTRY_POINTS]);
+}
+
+function rootScriptCandidates(
+  tracked: readonly string[],
+  extraCandidates: Iterable<string>
+): Set<string> {
+  return new Set([...tracked, ...extraCandidates].filter(file => file.startsWith(ROOT_SCRIPTS)));
+}
+
+/** `roots` plus every candidate they reach through relative static imports. */
+function withStaticImports(
+  repo: string,
+  tracked: readonly string[],
+  candidates: ReadonlySet<string>,
+  roots: Iterable<string>
+): Set<string> {
+  const inputs = new Set<string>();
+  const queue = [...roots];
+  const transpiler = new Bun.Transpiler({ loader: 'tsx' });
+  for (let file = queue.pop(); file !== undefined; file = queue.pop()) {
+    if (inputs.has(file)) continue;
+    inputs.add(file);
+    if (!/\.tsx?$/.test(file) || !tracked.includes(file)) continue;
+    const source = readFileSync(join(repo, file), 'utf8').replace(/^#!.*/, '');
+    for (const { path } of transpiler.scanImports(source)) {
+      if (!path.startsWith('.')) continue;
+      const target = ['', '.ts', '.tsx', '/index.ts']
+        .map(suffix => normalize(join(dirname(file), path + suffix)).replaceAll('\\', '/'))
+        .find(resolved => candidates.has(resolved));
+      if (target !== undefined) queue.push(target);
+    }
+  }
+  return inputs;
+}
+
+function namedWorkspaceInputs(
+  repo: string,
+  tracked: readonly string[],
+  candidates: ReadonlySet<string>
+): Set<string> {
+  const named = new Set<string>();
+  for (const file of tracked) {
+    if (!file.startsWith('packages/') || file.endsWith('.md') || file.endsWith('.mdx')) continue;
+    const source = readFileSync(join(repo, file), 'utf8');
+    for (const match of source.matchAll(/scripts\/[\w./-]+/g)) {
+      const path = match[0].replace(/\.+$/, '');
+      if (candidates.has(path)) named.add(path);
+    }
+  }
+
+  return named;
+}
+
+/**
+ * Whether the workspace shards (`@archon/cli` and every other package) must run. Only a root
+ * `scripts/` file that no workspace test reads can be left out; every other file the suite would
+ * run for still runs them:
+ *   - root tests read the packages (`scripts/test-inventory.test.ts` walks every package's tests,
+ *     `scripts/validate.ts` imports `@archon/paths`), so a package change never skips the scripts
+ *     shard, and that shard has no gate of its own beyond the suite's;
+ *   - `.archon/scripts/` is discovered by `packages/workflows` from the working directory, and a
+ *     workflows test dry-runs with this repository as that directory, so it is not provably
+ *     outside the package tests;
+ *   - `@archon/cli` and the other packages are not judged apart: packages launch
+ *     `packages/cli/src/cli.ts`, a coupling the manifests do not declare.
+ */
+export function shouldRunWorkspaceTests(
+  files: Iterable<string>,
+  inputs: ReadonlySet<string>
+): boolean {
+  for (const file of files) {
+    if (!shouldRunTestSuite([file])) continue;
+    if (file.startsWith(ROOT_SCRIPTS) && !inputs.has(file)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * What the pack shard (`.archon/scripts/` tests) and the workflow fixtures exercise, besides the
+ * root scripts that run them (`packRunnerInputs`). An entry ending in `/` matches a directory.
+ *   - The pack itself: its workflows, prompts, scripts and their tests, policy files, and the repo
+ *     config the fixtures load. `.archon/commands/` is absent: it holds only Markdown prompts for
+ *     workflows that have no fixtures, which the suite treats as prose.
+ *   - The contracts the pack is written against: `@archon/cli` (the `state`, `workflow` and
+ *     `forge` commands the pack shells to through `ARCHON_CLI_COMMAND`, which pack tests run for
+ *     real), `@archon/workflows` (the workflow language, the script-node environment, and the dry
+ *     run the fixtures use), `@archon/forge` (the plugin protocol behind `archon forge`), and
+ *     `@archon/paths` (where those commands and the test preload find the Archon home, config
+ *     and plugins). `@archon/core` stays out although `archon state` runs on it: it changes on
+ *     most pull requests, and its database and config behaviour is what its own tests guard.
+ *     The other packages below the contracts are likewise left to their own tests.
+ *   - The test preload, which `packRunnerInputs` cannot reach because `bunfig.toml` names it
+ *     instead of a script importing it.
+ * The gate and the install (`test.yml`, the root manifest, the lockfile, `bunfig.toml`) are in
+ * `EVERY_JOB_INPUTS`, which runs these checks with every other job.
+ */
+const PACK_INPUTS = [
+  '.archon/workflows/',
+  '.archon/scripts/',
+  '.archon/sdlc/',
+  '.archon/config.yaml',
+  'packages/cli/',
+  'packages/workflows/',
+  'packages/forge/',
+  'packages/paths/',
+  'scripts/test-preload.ts',
+];
+
+/** The root `scripts/` files that run the pack shard and the fixtures: the runner and its imports. */
+export function packRunnerInputs(
+  repo: string,
+  extraCandidates: Iterable<string> = []
+): Set<string> {
+  const tracked = trackedFiles(repo, 'scripts');
+  const candidates = rootScriptCandidates(tracked, extraCandidates);
+  return withStaticImports(repo, tracked, candidates, WORKSPACE_RUNNER_ENTRY_POINTS);
+}
+
+/**
+ * Whether the pack shard and the workflow fixtures must run. Only a file the suite runs for can
+ * count, so pack prose skips them, and a run that asks for them always has the job that holds them.
+ */
+export function shouldRunPackTests(
+  files: Iterable<string>,
+  runnerInputs: ReadonlySet<string>
+): boolean {
+  for (const file of files) {
+    if (!shouldRunTestSuite([file])) continue;
+    if (runnerInputs.has(file) || matches(PACK_INPUTS, file)) return true;
+  }
+  return false;
+}
+
+/**
+ * A pull request runs the Linux jobs its change can affect. The other platforms and the builds
+ * (`PUSH_ONLY_MODES`) wait for the push to `dev` or `main`, which runs every job. These paths are
+ * the exception: a pull request that changes one runs every job, as a push does, because the
+ * change can break any job on any platform and nothing narrower is safe to assume.
+ *   - `.github/workflows/`: changing the gate must run the gate.
+ *   - The install and the root test configuration: the root manifest, the lockfile, `bunfig.toml`.
+ *   - The scripts that make the decision and judge the result.
+ * The scripts that run the checks (`packRunnerInputs`) count too; the caller passes them.
+ *
+ * To run every job on any other branch, dispatch the workflow on it. A dispatch always runs the
+ * full matrix.
+ */
+const EVERY_JOB_INPUTS = [
+  '.github/workflows/',
+  'package.json',
+  'bun.lock',
+  'bunfig.toml',
+  'scripts/should-run-test-suite.ts',
+  'scripts/test-suite-outcome.ts',
+];
+
+/**
+ * Whether a pull request must run every job, the push-only ones included. Only a file the suite
+ * runs for can count, so prose beside the workflows does not.
+ */
+export function shouldRunEveryJob(
+  files: Iterable<string>,
+  runnerInputs: ReadonlySet<string>
+): boolean {
+  for (const file of files) {
+    if (!shouldRunTestSuite([file])) continue;
+    if (runnerInputs.has(file) || matches(EVERY_JOB_INPUTS, file)) return true;
+  }
+  return false;
+}
+
+/**
+ * The jobs a pull request leaves to the push, each with the paths that bring it back onto the
+ * pull request because the job exists to check them. Only paths a short list can name are here.
+ *   - `full-matrix`: the Windows legs and the macOS job. Platform-dependent code is spread across
+ *     the packages, so no list names it and only `shouldRunEveryJob` selects these.
+ *   - `docker-build`: the image recipe, its entrypoint, and the scripts the build and its
+ *     upgrade test run. The image also copies every package, which is why the push builds it.
+ *   - `serve-binary`: the script that compiles the release binaries and the smoke tests the job
+ *     runs against them.
+ */
+const PUSH_ONLY_MODES = {
+  'full-matrix': [],
+  'docker-build': [
+    'Dockerfile',
+    '.dockerignore',
+    'docker-entrypoint.sh',
+    'scripts/prepare-docker-plugins.ts',
+    'scripts/provision-docker-plugins.ts',
+    'scripts/test-docker-slack-upgrade.sh',
+  ],
+  'serve-binary': [
+    'scripts/build-binaries.sh',
+    'scripts/smoke-serve.ts',
+    'packages/core/src/test/provider-plugin-smoke.ts',
+  ],
+} as const satisfies Record<string, readonly string[]>;
+type PushOnlyMode = keyof typeof PUSH_ONLY_MODES;
+
+/** Whether a pull request that does not run every job still runs this push-only job. */
+export function shouldRunPushOnlyJob(mode: PushOnlyMode, files: Iterable<string>): boolean {
+  for (const file of files) {
+    if (matches(PUSH_ONLY_MODES[mode], file)) return true;
   }
   return false;
 }
@@ -88,7 +346,7 @@ export function shouldRunTestSuite(files: Iterable<string>): boolean {
  */
 export function changedFilesBetween(base: string, head: string, repo = process.cwd()): string[] {
   const result = Bun.spawnSync(
-    ['git', 'diff', '--name-only', '--no-renames', `${base}...${head}`],
+    ['git', 'diff', '--name-only', '-z', '--no-renames', `${base}...${head}`],
     {
       cwd: repo,
       stdout: 'pipe',
@@ -98,7 +356,7 @@ export function changedFilesBetween(base: string, head: string, repo = process.c
   if (result.exitCode !== 0) {
     throw new Error(`Could not read changed files: ${result.stderr.toString().trim()}`);
   }
-  return result.stdout.toString().split('\n').filter(Boolean);
+  return result.stdout.toString().split('\0').filter(Boolean);
 }
 
 /**
@@ -110,12 +368,16 @@ export function changedFilesBetween(base: string, head: string, repo = process.c
  * Only the scan is caught. A bad event is a wiring bug with no safe answer, so it stays a
  * throw and takes the step down with it.
  */
-function decideFromDiff(base: string, head: string): boolean {
+function decideFromDiff(
+  base: string,
+  head: string,
+  predicate: (files: Iterable<string>) => boolean
+): boolean {
   try {
-    return shouldRunTestSuite(changedFilesBetween(base, head));
+    return predicate(changedFilesBetween(base, head));
   } catch (error) {
     const cause = error instanceof Error ? error.message : String(error);
-    console.error(`Could not compare ${base}..${head}, so the test suite runs: ${cause}`);
+    console.error(`Could not compare ${base}..${head}, so the selected checks run: ${cause}`);
     return true;
   }
 }
@@ -125,6 +387,7 @@ export interface EventPayload {
   before?: unknown;
   after?: unknown;
   pull_request?: { base?: { sha?: unknown }; head?: { sha?: unknown } } | null;
+  inputs?: Record<string, unknown> | null;
 }
 
 /** The commits to compare, or `null` when there is nothing to compare and the suite runs. */
@@ -146,8 +409,9 @@ function requireSha(value: unknown, field: string): string {
  * docs-only push cancel the run a code push had started (the workflow's concurrency group
  * cancels the older run) and then skip the suite, leaving the PR head untested.
  *
- * A push is judged on what it added, `before` to `after`. A push that creates a branch has an
- * all-zero `before`, so there is nothing to compare.
+ * A push spans `before` to `after`. Its decision comes from `proofFromPullRequestRun`, never
+ * from the push diff. A push that creates a branch has an all-zero `before`, so there is nothing
+ * to compare.
  */
 export function diffRange(eventName: string, event: EventPayload): DiffRange {
   if (eventName === 'workflow_dispatch') return null;
@@ -165,16 +429,280 @@ export function diffRange(eventName: string, event: EventPayload): DiffRange {
   throw new Error(`Unsupported GitHub event: ${eventName}`);
 }
 
+/** A GitHub REST GET; `path` is relative to `repos/{owner}/{repo}/`. */
+export type GitHubGet = (path: string) => Promise<unknown>;
+
+export type PushProof = { proven: true; evidence: string } | { proven: false; reason: string };
+
+/** The workflow that runs this script, whose pull request runs can prove a push. */
+const TEST_WORKFLOW = 'test.yml';
+
+function field(value: unknown, key: string, what: string): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`${what} is not an object`);
+  }
+  return (value as Record<string, unknown>)[key];
+}
+
+function list(value: unknown, what: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${what} is not a list`);
+  return value;
+}
+
+function text(value: unknown, what: string): string {
+  if (typeof value !== 'string' || value === '') throw new Error(`${what} is not a string`);
+  return value;
+}
+
+/**
+ * Whether a pull request run already passed every job on exactly the tree this push lands, so
+ * running the suite again would retest it. All four must hold:
+ *   1. a pull request was merged as `head`, the pushed commit;
+ *   2. that pull request's head contains its recorded `base.sha`. A `pull_request` run tests the
+ *      merge ref, not the head, and GitHub records the base it merged with as the pull request's
+ *      `base.sha` when the head is pushed. A head that contains that base makes the merge ref's
+ *      tree the head's tree. The branch's previous tip is no substitute: after a reset of the
+ *      branch it can lack commits the run's merge ref contained. Retargeting the base rewrites
+ *      `base.sha` without starting a run, so a pull request whose base ever changed proves
+ *      nothing: its `base.sha` may not be the base any run merged with;
+ *   3. the pushed commit and the pull request head have the same tree;
+ *   4. a successful `pull_request` run of `test.yml` at that head concluded `success` in every
+ *      job of its latest attempt. A prose-only run skipped its gated jobs, so it proves nothing
+ *      and its push runs the suite: that is where the tests that read prose run.
+ *
+ * Any failure to read the evidence is "not proven": an unnecessary run costs minutes, a wrong
+ * skip merges unchecked code.
+ */
+export async function proofFromPullRequestRun(
+  push: { head: string },
+  get: GitHubGet
+): Promise<PushProof> {
+  try {
+    const pulls = list(await get(`commits/${push.head}/pulls`), 'the commit pull list');
+    const pull = pulls.find(
+      candidate => field(candidate, 'merge_commit_sha', 'a pull request') === push.head
+    );
+    if (pull === undefined) {
+      return { proven: false, reason: `no pull request was merged as ${push.head}` };
+    }
+    const number = field(pull, 'number', 'the pull request');
+    const prHead = text(
+      field(field(pull, 'head', 'the pull request'), 'sha', 'its head'),
+      'head.sha'
+    );
+
+    if (await baseEverChanged(number, get)) {
+      return {
+        proven: false,
+        reason: `pull request #${String(number)}'s base was changed, so its base.sha may not be the base its run merged with`,
+      };
+    }
+    const prBase = text(
+      field(field(pull, 'base', 'the pull request'), 'sha', 'its base'),
+      'base.sha'
+    );
+
+    const status = field(await get(`compare/${prBase}...${prHead}`), 'status', 'the comparison');
+    if (status !== 'ahead' && status !== 'identical') {
+      return {
+        proven: false,
+        reason: `pull request #${String(number)}'s head does not contain its base ${prBase} (${String(status)})`,
+      };
+    }
+
+    const treeOf = async (sha: string): Promise<string> =>
+      text(
+        field(field(await get(`git/commits/${sha}`), 'tree', sha), 'sha', `${sha}'s tree`),
+        'tree.sha'
+      );
+    const tree = await treeOf(push.head);
+    if (tree !== (await treeOf(prHead))) {
+      return {
+        proven: false,
+        reason: `the trees of ${push.head} and pull request #${String(number)}'s head ${prHead} differ`,
+      };
+    }
+
+    const runs = list(
+      field(
+        await get(
+          `actions/workflows/${TEST_WORKFLOW}/runs?head_sha=${prHead}&event=pull_request&status=success`
+        ),
+        'workflow_runs',
+        'the run list'
+      ),
+      'workflow_runs'
+    );
+    if (runs.length === 0) {
+      return {
+        proven: false,
+        reason: `no successful pull_request run of ${TEST_WORKFLOW} at ${prHead}`,
+      };
+    }
+    const shortfalls: string[] = [];
+    for (const run of runs) {
+      const url = text(field(run, 'html_url', 'a run'), 'html_url');
+      const page = await get(
+        `actions/runs/${String(field(run, 'id', 'a run'))}/jobs?filter=latest&per_page=100`
+      );
+      const jobs = list(field(page, 'jobs', 'the job list'), 'jobs');
+      const unpassed = jobs
+        .map(job => ({
+          name: String(field(job, 'name', 'a job')),
+          conclusion: String(field(job, 'conclusion', 'a job')),
+        }))
+        .filter(job => job.conclusion !== 'success')
+        .map(job => `${job.name}=${job.conclusion}`);
+      if (field(page, 'total_count', 'the job list') !== jobs.length) {
+        unpassed.push(
+          `${String(field(page, 'total_count', 'the job list'))} jobs, ${jobs.length} read`
+        );
+      }
+      if (unpassed.length === 0) {
+        return {
+          proven: true,
+          evidence: `Pull request #${String(number)} run ${url} passed every job on tree ${tree}, so this push skips the suite.`,
+        };
+      }
+      shortfalls.push(`run ${url} did not pass every job: ${unpassed.join(', ')}`);
+    }
+    return { proven: false, reason: shortfalls.join('; ') };
+  } catch (error) {
+    const cause = error instanceof Error ? error.message : String(error);
+    return { proven: false, reason: `could not check pull request runs: ${cause}` };
+  }
+}
+
+const EVENTS_PAGE = 100;
+
+async function baseEverChanged(number: unknown, get: GitHubGet): Promise<boolean> {
+  for (let page = 1; ; page++) {
+    const events = list(
+      await get(`issues/${String(number)}/events?per_page=${EVENTS_PAGE}&page=${page}`),
+      'the pull request events'
+    );
+    if (events.some(event => field(event, 'event', 'an event') === 'base_ref_changed')) return true;
+    if (events.length < EVENTS_PAGE) return false;
+  }
+}
+
+/** Reads the repository and token GitHub Actions provides. The token is never printed. */
+function githubApi(env: NodeJS.ProcessEnv = process.env): GitHubGet {
+  return async path => {
+    const { GITHUB_TOKEN: token, GITHUB_REPOSITORY: repository, GITHUB_API_URL: api } = env;
+    if (!token || !repository || !api) {
+      throw new Error('GITHUB_TOKEN, GITHUB_REPOSITORY and GITHUB_API_URL must all be set');
+    }
+    const response = await fetch(`${api}/repos/${repository}/${path}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    });
+    if (!response.ok) throw new Error(`GET ${path} answered ${String(response.status)}`);
+    return await response.json();
+  };
+}
+
+const MODES = {
+  '--workspace-tests': 'workspace',
+  '--pack-tests': 'pack-tests',
+  '--pack-fixtures': 'pack-fixtures',
+  '--full-matrix': 'full-matrix',
+  '--docker-build': 'docker-build',
+  '--serve-binary': 'serve-binary',
+} as const;
+export type Mode = 'suite' | (typeof MODES)[keyof typeof MODES];
+
+/** The pack modes, each named after the `test.yml` dispatch input that opts into it. */
+const OPT_IN_MODES: ReadonlySet<Mode> = new Set(['pack-tests', 'pack-fixtures']);
+
+/**
+ * A manual dispatch runs every job on every platform, and the pack checks only when its input asks. The event file
+ * carries a boolean input as `true` or the string `"true"`; any other value but `false`, `"false"`
+ * or an absent input is a wiring bug, so it throws rather than publish a guess.
+ */
+export function dispatchDecision(mode: Mode, event: EventPayload): boolean {
+  if (!OPT_IN_MODES.has(mode)) return true;
+  const value = event.inputs?.[mode];
+  if (value === true || value === 'true') return true;
+  if (value === undefined || value === false || value === 'false') return false;
+  throw new Error(`The dispatch input ${mode} is ${JSON.stringify(value)}, not a boolean`);
+}
+
+function readMode(args: readonly string[]): Mode {
+  if (args.length === 0) return 'suite';
+  const mode =
+    args.length === 1 ? Object.entries(MODES).find(([flag]) => flag === args[0])?.[1] : undefined;
+  if (mode === undefined) {
+    throw new Error(
+      `Usage: bun scripts/should-run-test-suite.ts [${Object.keys(MODES).join(' | ')}]`
+    );
+  }
+  return mode;
+}
+
+const PREDICATES: Record<Mode, (files: Iterable<string>) => boolean> = {
+  suite: shouldRunTestSuite,
+  workspace: files => {
+    const changed = [...files];
+    return shouldRunWorkspaceTests(changed, workspaceTestInputs(process.cwd(), changed));
+  },
+  'pack-tests': packPredicate,
+  'pack-fixtures': packPredicate,
+  'full-matrix': files => shouldRunPushOnlyJob('full-matrix', files),
+  'docker-build': files => shouldRunPushOnlyJob('docker-build', files),
+  'serve-binary': files => shouldRunPushOnlyJob('serve-binary', files),
+};
+
+function packPredicate(files: Iterable<string>): boolean {
+  const changed = [...files];
+  return shouldRunPackTests(changed, packRunnerInputs(process.cwd(), changed));
+}
+
+/** A pull request's decision for `mode`: every job when the change calls for it, else the mode's own. */
+function pullRequestPredicate(mode: Mode): (files: Iterable<string>) => boolean {
+  return files => {
+    const changed = [...files];
+    return (
+      shouldRunEveryJob(changed, packRunnerInputs(process.cwd(), changed)) ||
+      PREDICATES[mode](changed)
+    );
+  };
+}
+
 /** Reads the event GitHub Actions names in `GITHUB_EVENT_NAME` and `GITHUB_EVENT_PATH`. */
-function main(): void {
+async function main(): Promise<void> {
+  const mode = readMode(Bun.argv.slice(2));
   const eventName = process.env.GITHUB_EVENT_NAME;
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventName || !eventPath) {
     throw new Error('GITHUB_EVENT_NAME and GITHUB_EVENT_PATH must both be set');
   }
   const event: EventPayload = JSON.parse(readFileSync(eventPath, 'utf8'));
+  if (eventName === 'workflow_dispatch') {
+    console.log(dispatchDecision(mode, event));
+    return;
+  }
   const range = diffRange(eventName, event);
-  console.log(range === null ? true : decideFromDiff(range.base, range.head));
+  if (range === null) {
+    console.log(true);
+    return;
+  }
+  if (eventName === 'push') {
+    const proof = await proofFromPullRequestRun(range, githubApi());
+    if (proof.proven) {
+      console.error(proof.evidence);
+      console.log(false);
+      return;
+    }
+    console.error(`No pull request run proves this push: ${proof.reason}.`);
+    // A push is never path-filtered.
+    console.log(true);
+    return;
+  }
+  console.log(decideFromDiff(range.base, range.head, pullRequestPredicate(mode)));
 }
 
-if (import.meta.main) main();
+if (import.meta.main) await main();

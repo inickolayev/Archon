@@ -1,24 +1,28 @@
+import type { createRunToolCallAttention, StreamStall } from './tool-call-attention';
 /**
  * What the engine does with each non-terminal event a provider streams. Both AI-node
- * loops in `dag-executor.ts` (the agent node and the loop node) hand every event to one
- * handler, so neither keeps its own per-type branches. The engine reads an event's type
- * only to decide side effects; it never rebuilds the event.
+ * loops (the agent node and the loop node, under `dag/nodes/`) hand every event to one
+ * handler, so neither keeps its own per-type branches.
  *
- * The rows, emitter events and JSONL lines written here are today's
- * `tool_called`/`tool_completed`/`task_activity`/`hook_activity` and `assistant`/`tool`
- * shapes, translated from the event. They are a bridge until the engine records the
- * event itself in an envelope (#3569).
+ * Every event is recorded unchanged inside the engine envelope (see
+ * `schemas/provider-event.ts`): appended to the run's JSONL log as a `provider_event`
+ * line, written to the store as a `provider_event` row, and emitted in-process. The engine
+ * reads an event's type only to decide side effects (what the user sees, the subtask
+ * tracker); it never rebuilds the event.
  */
-import type { ProviderEvent } from '@archon/providers/types';
-import { toolCallDisplayName } from '@archon/provider-contract';
+import type { ProviderEvent } from '@archon/provider-contract';
+import { subtaskTerminalStatusSchema, toolCallDisplayName } from '@archon/provider-contract';
 import { createLogger } from '@archon/paths';
 
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import { getWorkflowEventEmitter } from './event-emitter';
-import { safeSendMessage, type SendMessageContext } from './executor-shared';
-import { logAssistant, logTool } from './logger';
+import { safeSendMessage, type SendMessageContext } from './platform-messages';
+import { logProviderEvent } from './logger';
+import type { ProviderEventEnvelope } from './schemas/provider-event';
 import type { IWorkflowStore } from './store';
 import { formatToolCall } from './utils/tool-formatter';
+
+const terminalSubtaskStatuses: ReadonlySet<string> = new Set(subtaskTerminalStatusSchema.options);
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -26,57 +30,38 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-type SubtaskEvent = Extract<ProviderEvent, { type: 'subtask' }>;
-type HookEvent = Extract<ProviderEvent, { type: 'hook' }>;
-
-const TOOL_OUTCOME = {
-  completed: 'success',
-  failed: 'error',
-  cancelled: 'interrupted',
-} as const;
-
 /**
- * Longest string input value written to the JSONL log and the `tool_called` row. A Write
- * or Edit call carries whole file contents, which neither record needs.
+ * One node attempt's emission order. An attempt can stream more than once (a
+ * structured-output reask, a loop node's iterations), and every pass shares this, so
+ * `seq` stays contiguous across the attempt.
  */
-const TOOL_INPUT_VALUE_MAX_CHARS = 500;
-
-function recordedToolInput(rawInput: Record<string, unknown> | undefined): Record<string, unknown> {
-  if (!rawInput) return {};
-  return Object.fromEntries(
-    Object.entries(rawInput).map(([key, value]) =>
-      typeof value === 'string' && value.length > TOOL_INPUT_VALUE_MAX_CHARS
-        ? [key, `${value.slice(0, TOOL_INPUT_VALUE_MAX_CHARS)}...`]
-        : [key, value]
-    )
-  );
+export interface AttemptEventSequence {
+  readonly attemptId: string;
+  next(): number;
 }
 
-const HOOK_OUTCOME = {
-  succeeded: 'success',
-  failed: 'error',
-  cancelled: 'cancelled',
-} as const;
-
-const SUBTASK_ACTIVITY = {
-  started: 'started',
-  running: 'progress',
-  completed: 'completed',
-  failed: 'failed',
-  stopped: 'stopped',
-} as const;
+export function createAttemptEventSequence(attemptId: string): AttemptEventSequence {
+  let seq = 0;
+  return {
+    attemptId,
+    next: () => seq++,
+  };
+}
 
 export interface ProviderEventHandlerDeps {
+  toolAttention: ReturnType<ReturnType<typeof createRunToolCallAttention>['createStream']>;
   store: Pick<IWorkflowStore, 'createWorkflowEvent'>;
   platform: IWorkflowPlatform;
   conversationId: string;
   messageContext: SendMessageContext;
   logDir: string;
   runId: string;
-  /** The node's id, which in-process emitter payloads carry. */
+  /** The node's id, for logs. */
   nodeId: string;
   /** The persisted step name: the node id behind any loop-body prefix. */
   stepName: string;
+  /** The attempt this stream pass belongs to. */
+  attempt: AttemptEventSequence;
   /** MCP servers the node's `mcp:` file declares. Only their failures reach the user. */
   configuredMcpServers: ReadonlySet<string>;
   /**
@@ -95,28 +80,36 @@ export interface ProviderEventHandler {
   handle(event: ProviderEvent): Promise<void>;
   /** Subtasks that started and have not ended: the work a stream cut short would lose. */
   liveSubtaskIds(): string[];
+  /** This pass's attention stall while its stalled calls are on the run row. */
+  stall(): StreamStall | undefined;
+  hasOpenTools(): boolean;
+  refreshAttention(): Promise<void>;
+  clearAttention(): Promise<void>;
 }
 
-/** One handler per provider stream pass: its tool and subtask state belongs to that pass. */
+/** One handler per provider stream pass: its subtask state belongs to that pass. */
 export function createProviderEventHandler(deps: ProviderEventHandlerDeps): ProviderEventHandler {
   const { store, platform, conversationId, messageContext, logDir, runId, nodeId, stepName } = deps;
-  const runningTools = new Map<string, { toolName: string; startedAt: number }>();
   const liveSubtasks = new Set<string>();
 
-  const persist = (
-    eventType: 'tool_called' | 'tool_completed' | 'task_activity' | 'hook_activity',
-    data: Record<string, unknown>
-  ): void => {
-    store
-      .createWorkflowEvent({
-        workflow_run_id: runId,
-        event_type: eventType,
-        step_name: stepName,
-        data,
-      })
-      .catch((err: Error) => {
-        getLog().error({ err, workflowRunId: runId, eventType }, 'workflow_event_persist_failed');
-      });
+  const record = async (event: ProviderEvent): Promise<void> => {
+    const envelope: ProviderEventEnvelope = {
+      attemptId: deps.attempt.attemptId,
+      seq: deps.attempt.next(),
+      observedAt: new Date().toISOString(),
+      event,
+    };
+    await logProviderEvent(logDir, runId, stepName, envelope);
+    // Not awaited, as other observability rows are; the store logs its own failure
+    // (IWorkflowStore.createWorkflowEvent never throws). The JSONL line above still
+    // holds the event, and a reader sees the missing `seq` as a hole.
+    void store.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'provider_event',
+      step_name: stepName,
+      data: envelope,
+    });
+    getWorkflowEventEmitter().emit({ type: 'provider_event', runId, stepName, ...envelope });
   };
 
   const sendWarning = async (
@@ -131,172 +124,103 @@ export function createProviderEventHandler(deps: ProviderEventHandlerDeps): Prov
     }
   };
 
-  const recordSubtask = (event: SubtaskEvent): void => {
-    if (event.status === 'started') liveSubtasks.add(event.taskId);
-    else if (event.status !== 'running') liveSubtasks.delete(event.taskId);
-    const activity = SUBTASK_ACTIVITY[event.status];
-    getWorkflowEventEmitter().emit({
-      type: 'task_activity',
-      runId,
-      nodeId,
-      taskId: event.taskId,
-      activity,
-      ...(event.description !== undefined ? { description: event.description } : {}),
-      ...(event.summary !== undefined ? { summary: event.summary } : {}),
-      ...(event.usage !== undefined ? { usage: event.usage } : {}),
-      ...(event.lastToolName !== undefined ? { lastToolName: event.lastToolName } : {}),
-      ...(event.taskType !== undefined ? { taskType: event.taskType } : {}),
-      ...(event.outputFile !== undefined ? { outputFile: event.outputFile } : {}),
-    });
-    persist('task_activity', {
-      task_id: event.taskId,
-      activity,
-      ...(event.description !== undefined ? { description: event.description } : {}),
-      ...(event.summary !== undefined ? { summary: event.summary } : {}),
-      ...(event.usage !== undefined ? { usage: event.usage } : {}),
-      ...(event.lastToolName !== undefined ? { last_tool_name: event.lastToolName } : {}),
-      ...(event.taskType !== undefined ? { task_type: event.taskType } : {}),
-      ...(event.outputFile !== undefined ? { output_file: event.outputFile } : {}),
-    });
+  const handleToolCall = async (
+    event: Extract<ProviderEvent, { type: 'tool_call' }>,
+    streaming: boolean
+  ): Promise<void> => {
+    if (!streaming) return;
+    await safeSendMessage(
+      platform,
+      conversationId,
+      formatToolCall(toolCallDisplayName(event), event.rawInput),
+      messageContext,
+      { category: 'tool_call_formatted' } as WorkflowMessageMetadata
+    );
+    if (platform.sendStructuredEvent) {
+      await platform.sendStructuredEvent(conversationId, event);
+    }
   };
 
-  const recordHook = (event: HookEvent): void => {
-    const outcome = event.status === 'started' ? undefined : HOOK_OUTCOME[event.status];
-    const activity = outcome === undefined ? 'started' : 'response';
-    getWorkflowEventEmitter().emit({
-      type: 'hook_activity',
-      runId,
-      nodeId,
-      hookId: event.hookId,
-      hookName: event.hookName,
-      hookEvent: event.hookEvent,
-      activity,
-      ...(outcome !== undefined ? { outcome } : {}),
-      ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-    });
-    persist('hook_activity', {
-      hook_id: event.hookId,
-      hook_name: event.hookName,
-      hook_event: event.hookEvent,
-      activity,
-      ...(outcome !== undefined ? { outcome } : {}),
-      ...(event.exitCode !== undefined ? { exit_code: event.exitCode } : {}),
-    });
+  const handleToolCallUpdate = async (
+    event: Extract<ProviderEvent, { type: 'tool_call_update' }>,
+    streaming: boolean
+  ): Promise<void> => {
+    if (streaming && platform.sendStructuredEvent) {
+      await platform.sendStructuredEvent(conversationId, event);
+    }
+  };
+
+  const handleMcpServerStatus = async (
+    event: Extract<ProviderEvent, { type: 'mcp_server_status' }>
+  ): Promise<void> => {
+    // Only the node's declared servers surface. The provider decides whether the
+    // node can run without one: Claude and Codex fail it before the first turn.
+    if (
+      (event.status === 'failed' || event.status === 'needs_auth') &&
+      deps.configuredMcpServers.has(event.server)
+    ) {
+      await sendWarning(
+        `MCP server connection failed: ${event.server} (${event.status})${event.error ? `: ${event.error}` : ''}`,
+        { mcpServer: event.server, mcpStatus: event.status }
+      );
+    } else {
+      getLog().debug(
+        { nodeId, mcpServer: event.server, mcpStatus: event.status },
+        'dag.mcp_server_status'
+      );
+    }
+  };
+
+  const handleSubtask = (event: Extract<ProviderEvent, { type: 'subtask' }>): void => {
+    if (terminalSubtaskStatuses.has(event.status)) liveSubtasks.delete(event.taskId);
+    else liveSubtasks.add(event.taskId);
   };
 
   return {
     async handle(event): Promise<void> {
+      await deps.toolAttention.observe(event);
+      await record(event);
       const streaming = platform.getStreamingMode() === 'stream';
       switch (event.type) {
         case 'agent_message_chunk':
           await deps.onMessageText(event.text);
-          await logAssistant(logDir, runId, event.text);
           return;
-        case 'tool_call': {
-          const toolName = toolCallDisplayName(event);
-          const toolInput = recordedToolInput(event.rawInput);
-          runningTools.set(event.toolCallId, { toolName, startedAt: Date.now() });
-          getWorkflowEventEmitter().emit({
-            type: 'tool_started',
-            runId,
-            toolName,
-            stepName: nodeId,
-            toolCallId: event.toolCallId,
-          });
-          if (streaming) {
-            await safeSendMessage(
-              platform,
-              conversationId,
-              formatToolCall(toolName, event.rawInput),
-              messageContext,
-              { category: 'tool_call_formatted' } as WorkflowMessageMetadata
-            );
-            if (platform.sendStructuredEvent) {
-              await platform.sendStructuredEvent(conversationId, event);
-            }
-          }
-          await logTool(logDir, runId, toolName, toolInput);
-          persist('tool_called', {
-            tool_name: toolName,
-            tool_input: toolInput,
-            tool_call_id: event.toolCallId,
-          });
+        case 'tool_call':
+          await handleToolCall(event, streaming);
           return;
-        }
-        case 'tool_call_update': {
-          const tool = runningTools.get(event.toolCallId);
-          if (tool) {
-            runningTools.delete(event.toolCallId);
-            const durationMs = Date.now() - tool.startedAt;
-            const toolOutcome = TOOL_OUTCOME[event.status];
-            getWorkflowEventEmitter().emit({
-              type: 'tool_completed',
-              runId,
-              toolName: tool.toolName,
-              stepName: nodeId,
-              durationMs,
-              toolCallId: event.toolCallId,
-              toolOutcome,
-              ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-            });
-            persist('tool_completed', {
-              tool_name: tool.toolName,
-              duration_ms: durationMs,
-              tool_call_id: event.toolCallId,
-              tool_outcome: toolOutcome,
-              ...(event.exitCode !== undefined ? { exit_code: event.exitCode } : {}),
-            });
-          } else {
-            // The contract forbids this (conformance rule 3); record the provider's mistake.
-            getLog().warn(
-              { nodeId, toolCallId: event.toolCallId },
-              'provider_events.tool_update_without_call'
-            );
-          }
-          if (streaming && platform.sendStructuredEvent) {
-            await platform.sendStructuredEvent(conversationId, event);
-          }
+        case 'tool_call_update':
+          await handleToolCallUpdate(event, streaming);
           return;
-        }
         case 'warning':
           // The ⚠️ is display formatting at the platform edge; nothing reads it back.
           await sendWarning(`⚠️ ${event.message}`, { code: event.code });
           return;
         case 'mcp_server_status':
-          // Servers the user's own config adds (e.g. a plugin MCP inherited from
-          // ~/.claude/) routinely fail inside the headless subprocess and are not
-          // actionable for the workflow author, so only the node's own servers surface.
-          if (
-            (event.status === 'failed' || event.status === 'needs_auth') &&
-            deps.configuredMcpServers.has(event.server)
-          ) {
-            await sendWarning(
-              `MCP server connection failed: ${event.server} (${event.status})${event.error ? `: ${event.error}` : ''}`,
-              { mcpServer: event.server, mcpStatus: event.status }
-            );
-          } else {
-            getLog().debug(
-              { nodeId, mcpServer: event.server, mcpStatus: event.status },
-              'dag.mcp_server_status'
-            );
-          }
+          await handleMcpServerStatus(event);
           return;
         case 'subtask':
-          recordSubtask(event);
+          handleSubtask(event);
           return;
+        case 'heartbeat':
         case 'hook':
-          recordHook(event);
-          return;
         case 'agent_thought_chunk':
         case 'compaction':
         case 'state_update':
-          // No reader yet: they reset the idle watchdog by arriving.
+          // Recorded above; no other side effect.
           return;
         default: {
           const unhandled: never = event;
           throw new Error(`Unhandled provider event: ${JSON.stringify(unhandled)}`);
         }
       }
+    },
+    hasOpenTools: () => deps.toolAttention.hasOpenTools(),
+    stall: () => deps.toolAttention.stall(),
+    refreshAttention: async (): Promise<void> => {
+      await deps.toolAttention.refresh();
+    },
+    clearAttention: async (): Promise<void> => {
+      await deps.toolAttention.clear();
     },
     liveSubtaskIds(): string[] {
       return [...liveSubtasks];

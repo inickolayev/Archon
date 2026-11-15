@@ -8,7 +8,8 @@
  * `loopControlSchema` carries the fields both need (completion gate, iteration cap,
  * session reset, interactive gate). Each variant extends it with its body shape.
  */
-import { z } from '@hono/zod-openapi';
+import { z } from 'zod';
+import { deprecatedField } from './field-deprecation';
 import { isValidCommandName } from '../command-validation';
 
 /**
@@ -44,21 +45,9 @@ const isNonBlank = (value: string): boolean => value.trim().length > 0;
  * `detectCompletionSignal`, whose final-standalone-line pattern then matches a
  * whitespace-only final line.
  *
- * Adding a channel means adding it to BOTH rules here, and to TWO hand-maintained
- * files in the console builder — @archon/web cannot import this package, so they
- * agree by convention rather than by type. They fail differently, and the second
- * is the dangerous one:
- *  - `builder/validation/structural.ts` mirrors these rules. Miss it and the
- *    builder reports the wrong verdict for a workflow the engine accepts.
- *  - `builder/variants/loop.ts` (`loopFromDag`/`loopToDag`) is a hand-written FIELD
- *    LIST, and the importer's unsupported-key warning only walks TOP-LEVEL wire
- *    keys — anything nested inside `loop: {…}` is invisible to it. Miss it and the
- *    field is SILENTLY DELETED the first time anyone opens the workflow in the
- *    console and saves: no import issue, no warning, the loop just quietly loses a
- *    completion channel. `signal_completes` behaves this way today.
- *
- * Verify agreement by parsing both, never by reading them —
- * `scripts/node-ref-parity.test.ts` does exactly that, in CI.
+ * The console validates channels independently because @archon/web cannot import
+ * this package. `scripts/node-ref-parity.test.ts` derives its channel cases from
+ * the owning tuples to enforce agreement across that boundary.
  */
 export const loopControlSchema = z
   .object({
@@ -73,12 +62,34 @@ export const loopControlSchema = z
      * filename resolved downstream, where the trimmed form is what resolution
      * sees.) Different jobs, different treatment.
      */
-    until: z
-      .string()
-      .refine(isNonBlank, "'loop.until' must be a non-blank completion signal string")
-      .optional(),
-    /** Maximum iterations allowed; exceeding this fails the node. */
+    until: deprecatedField(
+      z
+        .string()
+        .refine(isNonBlank, "'loop.until' must be a non-blank completion signal string")
+        .optional(),
+      {
+        since: '0.10.0',
+        kind: 'prose_until',
+        replacement: {
+          loop:
+            "Declare 'loop.until_bash' (deterministic check) or 'loop.until_field' (a declared boolean " +
+            'in output_format) instead (#2707 step 3). While supported, emit legacy signals as ' +
+            "'<promise>SIGNAL</promise>' or a final standalone signal line.",
+          loop_group:
+            "Declare 'loop_group.until_bash' instead — it can read a body node's structured " +
+            'output (e.g. \'value=$body-node.output.field; test "$value" = "true"\') (#2707 step 3). While ' +
+            "supported, emit legacy signals as '<promise>SIGNAL</promise>' or a final standalone signal line.",
+        },
+      }
+    ),
+    /** Maximum iterations allowed; reaching it unmet fails the node unless `on_exhausted`. */
     max_iterations: z.number().int().positive("'loop.max_iterations' must be a positive integer"),
+    /**
+     * What reaching `max_iterations` without meeting a completion channel does: `fail`
+     * (the default) fails the node; `complete` completes it with the last iteration's
+     * output, unchanged in shape. Only exhaustion completes: a failing iteration still fails.
+     */
+    on_exhausted: z.enum(['fail', 'complete']).optional(),
     /** Whether to start fresh session each iteration (default: false). */
     fresh_context: z.boolean().default(false),
     /**
@@ -92,7 +103,18 @@ export const loopControlSchema = z
       .refine(isNonBlank, "'loop.until_bash' must be a non-blank shell script")
       .optional(),
     /** When true, pause between iterations for user input via /workflow approve. */
-    interactive: z.boolean().optional(),
+    interactive: deprecatedField(z.boolean().optional(), {
+      since: '0.10.0',
+      kind: 'legacy_pause',
+      shape: 'interactive_loop',
+      subject: path =>
+        `'${path.join('.')}' with 'gate_message' and '$LOOP_USER_INPUT' is deprecated.`,
+      replacement:
+        'Write a ' +
+        "'loop_group' whose body ends in a 'wait: attention' node instead; the next iteration " +
+        "reads '$LOOP_PREV.<id>.output.text', and 'until_bash' checks the answer at " +
+        "'$<id>.output'.",
+    }),
     /** Message shown to user when paused (required when interactive is true). */
     gate_message: z.string().optional(),
     /**
@@ -148,6 +170,14 @@ export const BASE_COMPLETION_CHANNELS = [
   { field: 'until_bash', describe: 'deterministic check, exit 0 = complete' },
 ] as const;
 
+export const LOOP_COMPLETION_CHANNELS = [
+  ...BASE_COMPLETION_CHANNELS,
+  { field: 'until_field', describe: 'a declared boolean in output_format' },
+] as const;
+
+export type BaseCompletionChannel = (typeof BASE_COMPLETION_CHANNELS)[number]['field'];
+export type LoopCompletionChannel = (typeof LOOP_COMPLETION_CHANNELS)[number]['field'];
+
 /**
  * `loop:` node config — iteration control plus exactly one iteration-prompt source:
  * an inline `prompt` or a named command file (`command`). `loop_group:` shares only
@@ -196,11 +226,8 @@ export const loopNodeConfigSchema = loopControlSchema
     // The across-channels rule for `loop:` — three channels, unlike loop_group's two.
     addMissingChannelIssue(
       ctx,
-      [data.until, data.until_bash, data.until_field].filter(v => v !== undefined),
-      [
-        ...BASE_COMPLETION_CHANNELS,
-        { field: 'until_field', describe: 'a declared boolean in output_format' },
-      ]
+      LOOP_COMPLETION_CHANNELS.filter(({ field }) => data[field] !== undefined).map(c => c.field),
+      LOOP_COMPLETION_CHANNELS
     );
 
     const hasPrompt = typeof data.prompt === 'string' && data.prompt.length > 0;

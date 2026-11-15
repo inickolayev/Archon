@@ -1,0 +1,999 @@
+import { createHash } from 'node:crypto';
+import { drainResourceStartHost, ResourceStartDrainError } from './resource-start-host';
+import type { PreparedWorkflowLaunch } from '@archon/workflows/schemas/resource-start';
+import { afterEach, expect, expectTypeOf, mock, spyOn, test } from 'bun:test';
+import type { z } from 'zod';
+import {
+  type IsolationEnvironmentRow,
+  ISOLATION_PROVIDER_TYPES,
+  ISOLATION_WORKFLOW_TYPES,
+  ENVIRONMENT_STATUSES,
+} from '@archon/isolation';
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
+import { registerWorktree } from '@archon/isolation';
+import { toRepoPath, toWorktreePath } from '@archon/git';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { trackTempRoots } from '@archon/paths/test-utils';
+import { toBranchName } from '@archon/git';
+import { createFileWorkflowHost, isolationSchema } from './file-host';
+import { FileStoreUnsupportedError, commit } from '@archon/workflows/file-store';
+const roots = trackTempRoots();
+// Restore the keys in place: assigning a new object to process.env drops
+// Bun's case-insensitive Windows env, so later files read PATH as undefined.
+const prior = Object.fromEntries(
+  ['ARCHON_HOME', 'DATABASE_URL', 'GITHUB_APP_ID'].map(key => [key, process.env[key]])
+);
+afterEach(() => {
+  for (const [key, value] of Object.entries(prior)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+test('file isolation records conform to the isolation store row', () => {
+  expectTypeOf<z.output<typeof isolationSchema>[number]>().toEqualTypeOf<IsolationEnvironmentRow>();
+});
+test('file isolation records validate persisted rows with every isolation vocabulary member', () => {
+  const row: IsolationEnvironmentRow = {
+    id: 'environment',
+    codebase_id: 'project',
+    workflow_type: 'task',
+    workflow_id: 'run',
+    provider: 'worktree',
+    working_path: '/checkout',
+    branch_name: 'feature',
+    status: 'active',
+    created_at: new Date('2026-01-01T00:00:00.000Z'),
+    created_by_platform: null,
+    created_by_user_id: null,
+    metadata: { adopted: true, nested: { value: 1 } },
+  };
+  for (const workflow_type of ISOLATION_WORKFLOW_TYPES) {
+    for (const provider of ISOLATION_PROVIDER_TYPES) {
+      for (const status of ENVIRONMENT_STATUSES) {
+        const expected = { ...row, workflow_type, provider, status };
+        expect(isolationSchema.parse(JSON.parse(JSON.stringify([expected])))).toEqual([expected]);
+      }
+    }
+  }
+  for (const field of ['workflow_type', 'provider', 'status'] as const) {
+    expect(isolationSchema.safeParse([{ ...row, [field]: 'unsupported' }]).success).toBe(false);
+  }
+  expect(isolationSchema.safeParse([{ ...row, created_at: 'invalid-date' }]).success).toBe(false);
+});
+test('file host records persist across hosts and released worktrees fence pending claims', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-host-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const root = join(home, 'store');
+  const host = await createFileWorkflowHost(root);
+  const codebase = await host.records.codebases.createCodebase({
+    name: 'project',
+    default_cwd: home,
+  });
+  const widerInput = {
+    default_cwd: join(home, 'checkout'),
+    repository_url: 'https://example.test/repo',
+    default_branch: 'main',
+    kind: 'folder' as const,
+  };
+  await host.records.codebases.updateCodebase(codebase, widerInput);
+  expect(await host.records.codebases.getCodebase(codebase.id)).toMatchObject({
+    ...widerInput,
+    kind: 'repo',
+  });
+  await host.records.codebases.updateCodebase(codebase, {
+    default_cwd: undefined,
+    repository_url: null,
+    default_branch: null,
+  });
+  expect(await host.records.codebases.getCodebase(codebase.id)).toMatchObject({
+    default_cwd: widerInput.default_cwd,
+    repository_url: null,
+    default_branch: null,
+    kind: 'repo',
+  });
+  const user = await host.records.users.findOrCreateUserByPlatformIdentity(
+    'cli',
+    'operator',
+    'Operator'
+  );
+  expect(user).toMatchObject({ display_name: 'Operator' });
+  expect(await host.records.users.findOrCreateUserByPlatformIdentity('cli', 'operator')).toEqual(
+    user
+  );
+  await expect(
+    host.records.conversations.getConversationById('conversation')
+  ).rejects.toBeInstanceOf(FileStoreUnsupportedError);
+  await host.records.codebases.updateCodebaseCommands(codebase.id, {
+    test: { path: 'test.md', description: 'Test' },
+  });
+  await commit(root, [], async () => ({
+    result: undefined,
+    changes: {
+      documents: {
+        'host/codebases.json': [
+          {
+            ...codebase,
+            commands: { test: { path: 'test.md', description: 'Test' } },
+            envVars: { FILE_SETTING: 'value' },
+          },
+        ],
+      },
+    },
+  }));
+  const env = await host.records.isolation.create({
+    codebase_id: codebase.id,
+    workflow_type: 'task',
+    workflow_id: 'run',
+    working_path: join(home, 'checkout'),
+    branch_name: toBranchName('feature'),
+    created_by_user_id: 'first',
+    metadata: { worktree_creation_id: 'proof', worktree_branch_created: true, adopted: false },
+  });
+  const upsert = await host.records.isolation.create({
+    ...env,
+    created_by_platform: env.created_by_platform ?? undefined,
+    branch_name: toBranchName('other'),
+    created_by_user_id: 'second',
+  });
+  expect(upsert.id).toBe(env.id);
+  expect(upsert.created_by_user_id).toBe('first');
+  await host.records.isolation.updateMetadata(upsert.id, { adopted: true });
+  const reopened = await createFileWorkflowHost(root);
+  expect(await reopened.records.users.getUserById(user!.id)).toEqual(user);
+  expect(await reopened.deps.store.getCodebaseEnvVars(codebase.id)).toEqual({
+    FILE_SETTING: 'value',
+  });
+  expect(
+    await reopened.records.codebases.findCodebaseByPathPrefix(join(home, 'nested'))
+  ).toMatchObject({ id: codebase.id, commands: { test: { path: 'test.md' } } });
+  expect(await reopened.records.isolation.getById(env.id)).toMatchObject({
+    id: env.id,
+    branch_name: 'other',
+    created_at: upsert.created_at,
+    metadata: { worktree_creation_id: 'proof', worktree_branch_created: true, adopted: true },
+  });
+  expect(await reopened.records.isolation.countActiveByCodebase(codebase.id)).toBe(1);
+  await reopened.records.isolation.updateStatus(env.id, 'destroyed');
+  const run = await reopened.deps.store.createWorkflowRun({
+    workflow_name: 'test',
+    user_message: '',
+    codebase_id: codebase.id,
+    working_path: env.working_path,
+  });
+  expect(await reopened.deps.store.claimPendingWorkflowRun(run.id)).toBeNull();
+  const recreated = await reopened.records.isolation.create({
+    ...env,
+    created_by_platform: env.created_by_platform ?? undefined,
+    created_by_user_id: env.created_by_user_id ?? undefined,
+    branch_name: toBranchName(env.branch_name),
+  });
+  expect(recreated.id).not.toBe(env.id);
+  expect(await reopened.deps.store.claimPendingWorkflowRun(run.id)).toMatchObject({
+    status: 'running',
+  });
+});
+
+test('two file hosts cannot register owners of the same project storage', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-host-storage-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const root = join(home, 'store');
+  const first = await createFileWorkflowHost(root);
+  const second = await createFileWorkflowHost(root);
+  const results = await Promise.allSettled([
+    first.records.codebases.createCodebase({
+      name: 'My App',
+      kind: 'folder',
+      default_cwd: '/first',
+    }),
+    second.records.codebases.createCodebase({
+      name: 'my-app',
+      kind: 'folder',
+      default_cwd: '/second',
+    }),
+  ]);
+  expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+  expect(await first.records.codebases.listCodebases()).toHaveLength(1);
+});
+
+test('file host remote lookup reuses SSH and legacy checkout identities', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-remote-')));
+  process.env.ARCHON_HOME = home;
+  execFileSync('git', ['-C', home, 'init', '-q']);
+  execFileSync('git', [
+    '-C',
+    home,
+    'remote',
+    'add',
+    'origin',
+    'git@gitlab.example:org/team/app.git',
+  ]);
+  const host = await createFileWorkflowHost(join(home, 'store'));
+  const project = await host.records.codebases.createCodebase({
+    name: 'My App',
+    default_cwd: home,
+    repository_url: 'git@gitlab.example:org/team/app.git',
+  });
+  expect(
+    (await host.records.codebases.findCodebaseByRepoUrl('https://gitlab.example/org/team/app'))?.id
+  ).toBe(project.id);
+  await host.records.codebases.updateCodebase(project, { repository_url: null });
+  expect(
+    (await host.records.codebases.findCodebaseByRepoUrl('https://gitlab.example/org/team/app.git'))
+      ?.id
+  ).toBe(project.id);
+});
+
+test.each(['persisted', 'legacy'])(
+  'file lookup routes a %s owner past an unavailable legacy checkout',
+  async owner => {
+    const home = roots(await mkdtemp(join(tmpdir(), 'file-known-remote-')));
+    process.env.ARCHON_HOME = home;
+    const host = await createFileWorkflowHost(join(home, 'store'));
+    await host.records.codebases.createCodebase({
+      name: 'Legacy',
+      default_cwd: join(home, 'missing'),
+    });
+    execFileSync('git', ['-C', home, 'init', '-q']);
+    execFileSync('git', ['-C', home, 'remote', 'add', 'origin', 'https://github.com/acme/api']);
+    const known = await host.records.codebases.createCodebase({
+      name: 'acme/api',
+      default_cwd: home,
+      repository_url: owner === 'persisted' ? 'https://github.com/acme/api' : undefined,
+    });
+    expect(
+      (await host.records.codebases.findCodebaseByRepoUrl('git@github.com:acme/api.git'))?.id
+    ).toBe(known.id);
+  }
+);
+
+test('file adoption metadata refuses a replaced registration, including the same path', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-adoption-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const host = await createFileWorkflowHost(join(home, 'store'));
+  const store = host.records.isolation;
+  const input = {
+    codebase_id: 'cb',
+    workflow_type: 'task' as const,
+    workflow_id: 'run',
+    working_path: home,
+    branch_name: toBranchName('task'),
+  };
+  for (const path of [home, join(home, 'other')]) {
+    const observed = await store.create(input);
+    const replacement = await store.create({ ...input, working_path: path });
+    await expect(store.updateMetadata(observed.id, { adopted: true }, observed)).rejects.toThrow(
+      'changed during adoption'
+    );
+    expect(await store.getById(observed.id)).toEqual(replacement);
+    await store.updateMetadata(replacement.id, { adopted: true }, replacement);
+    expect((await store.getById(replacement.id))?.metadata.adopted).toBe(true);
+  }
+});
+
+test('file host retires only the observed worktree registration', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-retire-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const store = (await createFileWorkflowHost(join(home, 'store'))).records.isolation;
+  const input = {
+    codebase_id: 'cb',
+    workflow_type: 'task' as const,
+    workflow_id: 'run',
+    working_path: home,
+    branch_name: toBranchName('task'),
+  };
+  const observed = await store.create(input);
+  const replacement = await store.create(input);
+  expect(replacement.id).toBe(observed.id);
+  await expect(store.markWorktreeDestroyed(observed)).rejects.toThrow('changed during cleanup');
+  expect(await store.getById(observed.id)).toEqual(replacement);
+  await store.markWorktreeDestroyed(replacement);
+  expect((await store.getById(replacement.id))?.status).toBe('destroyed');
+  await store.markWorktreeDestroyed(replacement);
+  const destroyed = (await store.getById(replacement.id))!;
+  await store.markWorktreeDestroyed(destroyed);
+  expect(await store.getById(replacement.id)).toEqual(destroyed);
+  await expect(store.markWorktreeDestroyed(observed)).rejects.toThrow('changed during cleanup');
+  await expect(store.updateMetadata(destroyed.id, { adopted: true }, destroyed)).rejects.toThrow(
+    'changed during adoption'
+  );
+});
+
+test('file cleanup validates the selected registration before invoking removal', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-cleanup-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const store = (await createFileWorkflowHost(join(home, 'store'))).records.isolation;
+  const input = {
+    codebase_id: 'cb',
+    workflow_type: 'task' as const,
+    workflow_id: 'run',
+    working_path: home,
+    branch_name: toBranchName('task'),
+  };
+  const original = await store.create(input);
+  const replacement = await store.create(input);
+  let removed = false;
+  await expect(
+    store.withWorktreeRegistration(original, async mark => {
+      removed = true;
+      await mark();
+    })
+  ).rejects.toThrow('changed during cleanup');
+  expect(removed).toBe(false);
+  expect(await store.getById(replacement.id)).toEqual(replacement);
+  await store.withWorktreeRegistration(replacement, async mark => {
+    await mark();
+  });
+  expect((await store.getById(replacement.id))?.status).toBe('destroyed');
+});
+
+test('file worktree cleanup excludes replacement until removal finishes', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-worktree-cleanup-lock-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const root = join(home, 'store');
+  const first = (await createFileWorkflowHost(root)).records.isolation;
+  const second = (await createFileWorkflowHost(root)).records.isolation;
+  const checkout = join(home, 'checkout');
+  await mkdir(checkout);
+  const input = {
+    codebase_id: 'cb',
+    workflow_type: 'task' as const,
+    workflow_id: 'run',
+    working_path: checkout,
+    branch_name: toBranchName('task'),
+  };
+  const observed = await first.create(input);
+  const entered = Promise.withResolvers<boolean>();
+  const release = Promise.withResolvers<void>();
+  const cleanup = first.withWorktreeRegistration(observed, async markDestroyed => {
+    entered.resolve(
+      await access(join(root, 'lock')).then(
+        () => true,
+        () => false
+      )
+    );
+    await release.promise;
+    await rm(checkout, { recursive: true });
+    await markDestroyed();
+  });
+  const lockHeldDuringRemoval = await entered.promise;
+  let published = false;
+  const registration = second.create(input).then(row => {
+    published = true;
+    return row;
+  });
+  try {
+    expect(lockHeldDuringRemoval).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(published).toBe(false);
+    expect(await first.getById(observed.id)).toEqual(observed);
+    await access(checkout);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([cleanup, registration]);
+  }
+  await cleanup;
+  const replacement = await registration;
+  expect(published).toBe(true);
+  expect((await first.getById(observed.id))?.status).toBe('destroyed');
+  expect(await first.getById(replacement.id)).toEqual(replacement);
+  expect(await first.listActive()).toEqual([replacement]);
+  await expect(access(checkout)).rejects.toThrow();
+});
+
+test('file host refuses legacy tokenless replacements within its atomic adoption write', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'legacy-adoption-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const root = join(home, 'store');
+  const {
+    records: { isolation: store },
+  } = await createFileWorkflowHost(root);
+  const created = await store.create({
+    codebase_id: 'cb',
+    workflow_type: 'task',
+    workflow_id: 'run',
+    working_path: home,
+    branch_name: toBranchName('task'),
+  });
+  const observed = { ...created, metadata: {} };
+  for (const replacement of [
+    { ...observed, working_path: join(home, 'other') },
+    { ...observed, branch_name: 'other' },
+    { ...observed, created_at: new Date(0) },
+    { ...observed, metadata: { legacy: true } },
+  ]) {
+    await commit(root, [], async () => ({
+      result: undefined,
+      changes: { documents: { 'host/isolation.json': [replacement] } },
+    }));
+    await expect(store.updateMetadata(observed.id, { adopted: true }, observed)).rejects.toThrow(
+      'changed during adoption'
+    );
+    expect(await store.getById(created.id)).toEqual(replacement);
+    await store.updateMetadata(replacement.id, { adopted: true }, replacement);
+  }
+});
+
+test('file checkout cleanup preserves registered paths and aliases, and removes an unowned sibling', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-cleanup-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const root = join(home, 'store');
+  const first = await createFileWorkflowHost(root);
+  const second = await createFileWorkflowHost(root);
+  const checkout = join(home, 'checkout');
+  const unowned = join(home, 'checkout-other');
+  await mkdir(join(checkout, 'subdirectory'), { recursive: true });
+  await mkdir(unowned);
+  await writeFile(join(checkout, 'operator-work.txt'), 'keep my work');
+  const alias = join(home, 'alias');
+  await symlink(checkout, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  await first.records.codebases.createCodebase({
+    name: 'owner',
+    kind: 'folder',
+    default_cwd: alias,
+  });
+
+  for (const path of [checkout, alias, home, join(checkout, 'subdirectory')]) {
+    await second.records.codebases.removeUnregisteredCheckout(path, detached =>
+      rm(detached, { recursive: true })
+    );
+    expect(await readFile(join(checkout, 'operator-work.txt'), 'utf8')).toBe('keep my work');
+  }
+  await second.records.codebases.removeUnregisteredCheckout(unowned, detached =>
+    rm(detached, { recursive: true })
+  );
+  await expect(access(unowned)).rejects.toThrow();
+});
+
+test('file checkout removal releases the registration lock before removing', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'file-cleanup-lock-')));
+  process.env.ARCHON_HOME = home;
+  const root = join(home, 'store');
+  const first = await createFileWorkflowHost(root);
+  const second = await createFileWorkflowHost(root);
+  const checkout = join(home, 'checkout');
+  await mkdir(checkout);
+  const remove = mock(async (detached: string) => {
+    await expect(access(join(root, 'lock'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(access(checkout)).rejects.toMatchObject({ code: 'ENOENT' });
+    await second.records.codebases.createCodebase({
+      name: 'owner',
+      kind: 'folder',
+      default_cwd: checkout,
+    });
+    await rm(detached, { recursive: true });
+  });
+
+  await first.records.codebases.removeUnregisteredCheckout(checkout, remove);
+
+  expect(remove).toHaveBeenCalledTimes(1);
+  expect(await first.records.codebases.listCodebases()).toHaveLength(1);
+});
+
+test('file host retirement is idempotent for a legacy registration and fences replacements', async () => {
+  const home = roots(await mkdtemp(join(tmpdir(), 'legacy-retire-')));
+  process.env.ARCHON_HOME = home;
+  process.env.DATABASE_URL = '';
+  process.env.GITHUB_APP_ID = '';
+  const root = join(home, 'store');
+  const store = (await createFileWorkflowHost(root)).records.isolation;
+  const created = await store.create({
+    codebase_id: 'cb',
+    workflow_type: 'task',
+    workflow_id: 'run',
+    working_path: home,
+    branch_name: toBranchName('task'),
+  });
+  const observed = { ...created, metadata: {} };
+  await commit(root, [], async () => ({
+    result: undefined,
+    changes: { documents: { 'host/isolation.json': [observed] } },
+  }));
+  await store.markWorktreeDestroyed(observed);
+  const destroyed = (await store.getById(observed.id))!;
+  await store.markWorktreeDestroyed(observed);
+  await store.markWorktreeDestroyed(destroyed);
+  expect(await store.getById(observed.id)).toEqual(destroyed);
+  await expect(store.updateMetadata(destroyed.id, { adopted: true }, destroyed)).rejects.toThrow(
+    'changed during adoption'
+  );
+  const replacement = { ...destroyed, metadata: { replaced: true } };
+  await commit(root, [], async () => ({
+    result: undefined,
+    changes: { documents: { 'host/isolation.json': [replacement] } },
+  }));
+  await expect(store.markWorktreeDestroyed(observed)).rejects.toThrow('changed during cleanup');
+  expect(await store.getById(observed.id)).toEqual(replacement);
+});
+
+for (const persistent of [false, true]) {
+  test(`registration preserves a created checkout after a ${persistent ? 'persistent' : 'transient'} file finalization failure`, async () => {
+    const home = roots(await mkdtemp(join(tmpdir(), 'file-create-failure-')));
+    process.env.ARCHON_HOME = home;
+    process.env.DATABASE_URL = '';
+    process.env.GITHUB_APP_ID = '';
+    const root = join(home, 'store');
+    const host = await createFileWorkflowHost(root);
+    const checkout = join(home, 'checkout');
+    await fs.mkdir(checkout);
+    const failure = Object.assign(new Error('head write failed'), { code: 'EIO' });
+    const open = fs.open;
+    let failed = false;
+    const fault = spyOn(fs, 'open').mockImplementation((...args) => {
+      if (String(args[0]).startsWith(join(root, 'head.json.')) && (persistent || !failed)) {
+        failed = true;
+        return Promise.reject(failure);
+      }
+      return open(...args);
+    });
+    let removed = false;
+    try {
+      await expect(
+        registerWorktree(
+          {
+            store: host.records.isolation,
+            registrationsBeforeCreation: [],
+            provider: {
+              destroy: async () => {
+                removed = true;
+                await fs.rm(checkout, { recursive: true });
+                return {
+                  worktreeRemoved: true,
+                  directoryClean: true,
+                  branchDeleted: false,
+                  remoteBranchDeleted: false,
+                  warnings: [],
+                };
+              },
+            },
+          },
+          {
+            id: 'checkout',
+            provider: 'worktree',
+            workingPath: toWorktreePath(checkout),
+            branchName: toBranchName('task'),
+            status: 'active',
+            createdAt: new Date(),
+            metadata: {
+              provenance: 'created',
+              creationId: 'proof',
+              branchCreated: true,
+              adopted: false,
+            },
+          },
+          toRepoPath(home),
+          {
+            codebase_id: 'cb',
+            workflow_type: 'task',
+            workflow_id: 'run',
+          }
+        )
+      ).rejects.toBe(failure);
+      expect(
+        JSON.parse(await fs.readFile(join(root, 'host/isolation.json'), 'utf8'))
+      ).toMatchObject([{ status: 'active', working_path: checkout }]);
+    } finally {
+      fault.mockRestore();
+    }
+    expect(removed).toBe(false);
+    const recovered = await createFileWorkflowHost(root);
+    expect(
+      await recovered.records.isolation.findActiveByWorkflow('cb', 'task', 'run')
+    ).toMatchObject({ working_path: checkout });
+    expect((await fs.stat(checkout)).isDirectory()).toBe(true);
+  });
+}
+
+for (const { late, local } of [
+  { late: false, local: false },
+  { late: true, local: false },
+  { late: false, local: true },
+]) {
+  test(`registered reusable-checkout holders block explicit branches, registration late=${String(late)}, local=${String(local)}`, async () => {
+    const home = roots(await mkdtemp(join(tmpdir(), 'file-host-admission-')));
+    process.env.ARCHON_HOME = home;
+    process.env.DATABASE_URL = '';
+    const host = await createFileWorkflowHost(join(home, 'store'));
+    const store = host.deps.store;
+    const codebaseId = (
+      await host.records.codebases.createCodebase({
+        name: 'project',
+        default_cwd: home,
+        kind: 'folder',
+      })
+    ).id;
+    const workingPath = join(home, 'checkout');
+    const makeLaunch = (): PreparedWorkflowLaunch => ({
+      version: 2,
+      run: {
+        id: crypto.randomUUID(),
+        codebase_id: codebaseId,
+        workflow_name: 'test',
+        user_message: '',
+        metadata: {},
+      },
+      execution: { cwd: home, conversationId: 'conversation', isolation: { kind: 'in-place' } },
+    });
+    const register = () =>
+      host.records.isolation.create({
+        codebase_id: codebaseId,
+        workflow_type: 'task',
+        workflow_id: 'reusable',
+        working_path: workingPath,
+        branch_name: toBranchName('different-git-branch'),
+      });
+    const input = (launch: PreparedWorkflowLaunch, capacity = late ? 1 : local ? 2 : 4) => ({
+      resource: 'registered',
+      capacity,
+      hostId: 'host',
+      overlap: 'queue' as const,
+      launch,
+    });
+    const capacity = makeLaunch();
+    if (late) await store.admitResourceStart(input(capacity));
+    else await register();
+    const incoming = makeLaunch();
+    incoming.execution.isolation = { kind: 'worktree', branch: 'reusable' };
+    if (late)
+      expect(await store.admitResourceStart(input(incoming))).toMatchObject({ status: 'queued' });
+    const holder = makeLaunch();
+    holder.execution.cwd = workingPath;
+    if (local) {
+      await store.admitResourceStart(input(holder));
+      expect(await store.admitResourceStart(input(incoming))).toMatchObject({
+        status: 'queued',
+        blocker: { kind: 'run', id: holder.run.id },
+      });
+    } else await store.createWorkflowRun(holder.run);
+    await store.claimPendingWorkflowRun(holder.run.id, workingPath);
+    if (late) {
+      await register();
+      await store.cancelWorkflowRun(capacity.run.id);
+    } else {
+      expect(await store.admitResourceStart(input(incoming))).toMatchObject({
+        status: 'queued',
+        blocker: { kind: 'run', id: holder.run.id },
+      });
+      const skip = makeLaunch();
+      skip.execution.isolation = incoming.execution.isolation;
+      expect(await store.admitResourceStart({ ...input(skip), overlap: 'skip' })).toMatchObject({
+        status: 'skipped',
+        blocker: { kind: 'run', id: holder.run.id },
+      });
+      for (const isolation of local
+        ? []
+        : [
+            { kind: 'worktree' as const },
+            { kind: 'worktree' as const, branch: 'different-git-branch' },
+          ]) {
+        const independent = makeLaunch();
+        independent.execution.isolation = isolation;
+        expect(await store.admitResourceStart(input(independent))).toMatchObject({
+          status: 'admitted',
+        });
+      }
+    }
+    const drain = () => store.drainResourceStarts({ resource: 'registered', hostId: 'host' });
+    expect(await drain()).toEqual([]);
+    expect(await store.getWorkflowRun(incoming.run.id)).toBeNull();
+    expect((await store.getWorkflowRun(holder.run.id))?.status).toBe('running');
+    await store.completeWorkflowRun(holder.run.id, { duration_ms: 1 });
+    expect(await drain()).toMatchObject([{ runId: incoming.run.id }]);
+  });
+}
+
+for (const branchFirst of [false, true]) {
+  test(`drains registered checkout aliases one at a time, branch first=${String(branchFirst)}`, async () => {
+    const home = roots(await mkdtemp(join(tmpdir(), 'file-host-alias-drain-')));
+    process.env.ARCHON_HOME = home;
+    process.env.DATABASE_URL = '';
+    const host = await createFileWorkflowHost(join(home, 'store'));
+    const store = host.deps.store;
+    const codebase = await host.records.codebases.createCodebase({
+      name: 'project',
+      default_cwd: home,
+      kind: 'folder',
+    });
+    const workingPath = join(home, 'checkout');
+    const makeLaunch = (): PreparedWorkflowLaunch => ({
+      version: 2,
+      run: {
+        id: crypto.randomUUID(),
+        codebase_id: codebase.id,
+        workflow_name: 'test',
+        user_message: '',
+        metadata: {},
+      },
+      execution: { cwd: home, conversationId: 'conversation', isolation: { kind: 'in-place' } },
+    });
+    await host.records.isolation.create({
+      codebase_id: codebase.id,
+      workflow_type: 'task',
+      workflow_id: 'reusable',
+      working_path: workingPath,
+      branch_name: toBranchName('different-git-branch'),
+    });
+
+    const inPlace = makeLaunch();
+    inPlace.execution.cwd = workingPath;
+    const branch = makeLaunch();
+    branch.execution.isolation = { kind: 'worktree', branch: 'reusable' };
+    const queued = branchFirst ? [branch, inPlace] : [inPlace, branch];
+    const input = (launch: PreparedWorkflowLaunch) => ({
+      resource: 'alias-drain',
+      capacity: 2,
+      hostId: 'host',
+      overlap: 'queue' as const,
+      launch,
+    });
+    const holder = await store.createWorkflowRun(makeLaunch().run);
+    await store.claimPendingWorkflowRun(holder.id, workingPath);
+    for (const launch of queued)
+      expect(await store.admitResourceStart(input(launch))).toMatchObject({
+        status: 'queued',
+        blocker: { kind: 'run', id: holder.id },
+      });
+    const drain = () => store.drainResourceStarts({ resource: 'alias-drain', hostId: 'host' });
+    expect(await drain()).toEqual([]);
+    await store.completeWorkflowRun(holder.id, { duration_ms: 1 });
+    expect(await drain()).toEqual([
+      { status: 'admitted', requestId: queued[0]!.run.id, runId: queued[0]!.run.id },
+    ]);
+    expect(await store.getResourceStartRequest(queued[1]!.run.id)).toMatchObject({
+      status: 'queued',
+    });
+    expect(await store.getWorkflowRun(queued[1]!.run.id)).toBeNull();
+    expect(await drain()).toEqual([]);
+    await store.claimPendingWorkflowRun(queued[0]!.run.id, workingPath);
+    await store.completeWorkflowRun(queued[0]!.run.id, { duration_ms: 1 });
+    expect(await drain()).toEqual([
+      { status: 'admitted', requestId: queued[1]!.run.id, runId: queued[1]!.run.id },
+    ]);
+  });
+}
+
+for (const corruption of [
+  'launch',
+  'json',
+  'missing',
+  'only-launch',
+  'only-null',
+  'only-missing-hostId',
+  'only-slot-json',
+  'only-slot-queue',
+  'only-resource',
+  'only-missing-resource',
+  'only-missing-id',
+  'only-missing-overlap',
+  'only-missing-status',
+  'only-missing-blocker',
+  'only-missing-launch',
+  'only-missing-position',
+] as const) {
+  test.each(corruption.startsWith('only-slot-') ? [0] : [0, 1])(
+    `host drain contains queued ${corruption} corruption at offset %i`,
+    async offset => {
+      const root = roots(await mkdtemp(join(tmpdir(), 'host-drain-')));
+      const host = await createFileWorkflowHost(root);
+      const store = host.deps.store;
+      const launch = (resource: string): PreparedWorkflowLaunch => ({
+        version: 2,
+        run: {
+          id: crypto.randomUUID(),
+          workflow_name: 'test',
+          codebase_id: 'project',
+          user_message: '',
+          metadata: {},
+        },
+        execution: { cwd: `/${resource}`, conversationId: 'test', isolation: { kind: 'in-place' } },
+      });
+      const queued: string[] = [];
+      const holders: string[] = [];
+      const queueResource = async (resource: string, count: number): Promise<void> => {
+        for (let index = 0; index < count; index++) {
+          const prepared = launch(resource);
+          const decision = await store.admitResourceStart({
+            resource,
+            capacity: 1,
+            hostId: 'host',
+            overlap: 'queue',
+            launch: prepared,
+          });
+          if (index === 0) {
+            holders.push(prepared.run.id);
+          } else {
+            expect(decision.status).toBe('queued');
+            queued.push(prepared.run.id);
+          }
+        }
+      };
+      await queueResource('a', 4);
+      await queueResource('z', 2);
+      for (const id of holders) {
+        if (corruption === 'only-slot-json' && id === holders[0]) continue;
+        await store.claimPendingWorkflowRun(id);
+        await store.completeWorkflowRun(id, { duration_ms: 1 });
+      }
+      const damagedId = queued[offset]!;
+      const slotDamage = corruption.startsWith('only-slot-');
+      const path = join(
+        root,
+        slotDamage ? 'resource/slots' : 'resource/requests',
+        `${createHash('sha256')
+          .update(slotDamage ? 'a' : damagedId)
+          .digest('hex')}.json`
+      );
+      const damageRequest = async (): Promise<void> => {
+        if (corruption === 'missing') await fs.unlink(path);
+        else if (corruption === 'json' || corruption === 'only-slot-json')
+          await writeFile(path, '{');
+        else if (corruption === 'only-null') await writeFile(path, 'null');
+        else {
+          const row = JSON.parse(await readFile(path, 'utf8'));
+          if (corruption.startsWith('only-missing-'))
+            delete row[corruption.slice('only-missing-'.length)];
+          else if (corruption === 'only-resource') row.resource = null;
+          else if (corruption === 'only-slot-queue') row.queue = 42;
+          else row.launch = {};
+          await writeFile(path, JSON.stringify(row));
+        }
+      };
+      await damageRequest();
+      const before = corruption === 'missing' ? undefined : await readFile(path, 'utf8');
+      const started: string[] = [];
+      const error = await drainResourceStartHost({
+        ...host,
+        hostId: 'host',
+        startAdmitted: async id => {
+          started.push(id);
+        },
+      }).catch((caught: unknown) => caught);
+      expect(started).toEqual([...queued.slice(0, offset), queued.at(-1)!]);
+      expect(error).toBeInstanceOf(ResourceStartDrainError);
+      if (!(error instanceof ResourceStartDrainError)) throw new Error('expected drain failure');
+      expect(error.failures).toHaveLength(1);
+      const failure = error.failures[0]?.error;
+      if (!(failure instanceof Error)) throw new Error('expected original drain error');
+      expect(failure.message).toContain('Queued request');
+      if (slotDamage) expect(failure.message).toContain('resource/slots/');
+      else expect(failure.message).toContain(damagedId);
+      expect(failure.cause).toBeInstanceOf(Error);
+      expect(await store.getWorkflowRun(damagedId)).toBeNull();
+      if (offset > 0) {
+        await store.claimPendingWorkflowRun(queued[0]!);
+        await store.completeWorkflowRun(queued[0]!, { duration_ms: 1 });
+        expect(await store.drainResourceStarts({ resource: 'a', hostId: 'host' })).toEqual([]);
+        expect(await store.getWorkflowRun(queued[2]!)).toBeNull();
+      }
+      if (before !== undefined) expect(await readFile(path, 'utf8')).toBe(before);
+      else await expect(access(path)).rejects.toThrow();
+    }
+  );
+}
+
+for (const [damage, owner] of [
+  ['json', 'host'],
+  ['json', 'other'],
+  ['schema', 'host'],
+  ['schema', 'other'],
+  ['unreadable', 'host'],
+  ['unreadable', 'other'],
+  ['healthy', 'other'],
+] as const) {
+  test(`host drain starts independent queued work beside a ${damage} receipt bound to ${owner}`, async () => {
+    const root = roots(await mkdtemp(join(tmpdir(), 'host-receipt-')));
+    const host = await createFileWorkflowHost(root);
+    const store = host.deps.store;
+    const receiptId = crypto.randomUUID();
+    await store.acceptStartReceipt({
+      receipt: {
+        id: receiptId,
+        sourceInstanceId: 'source',
+        deliveryId: null,
+        contentDigest: 'digest',
+        receivedAt: '2026-01-01T00:00:00.000Z',
+        occurredAt: null,
+        sourceActor: null,
+      },
+      outcome: 'matched',
+      bindings: [
+        {
+          bindingId: 'binding',
+          bindingRevision: null,
+          hostId: owner,
+          runAsUserId: 'operator',
+          resource: 'receipt-resource',
+          capacity: 1,
+          overlap: 'queue',
+          launch: {
+            cwd: '/receipt',
+            workflowName: 'test',
+            inputs: {},
+            isolation: { kind: 'in-place' },
+          },
+        },
+      ],
+    });
+    const launch = (): PreparedWorkflowLaunch => ({
+      version: 2,
+      run: {
+        id: crypto.randomUUID(),
+        workflow_name: 'test',
+        codebase_id: 'project',
+        user_message: '',
+        metadata: {},
+      },
+      execution: { cwd: '/independent', conversationId: 'test', isolation: { kind: 'in-place' } },
+    });
+    const holder = launch(),
+      queued = launch();
+    for (const prepared of [holder, queued])
+      await store.admitResourceStart({
+        resource: 'independent',
+        capacity: 1,
+        hostId: 'host',
+        overlap: 'queue',
+        launch: prepared,
+      });
+    await store.claimPendingWorkflowRun(holder.run.id);
+    await store.completeWorkflowRun(holder.run.id, { duration_ms: 1 });
+    const document = `resource/receipts/${createHash('sha256').update(receiptId).digest('hex')}.json`;
+    const path = join(root, document);
+    const bytes = await readFile(path, 'utf8');
+    if (damage === 'json') await writeFile(path, '{');
+    if (damage === 'schema')
+      await writeFile(path, JSON.stringify({ ...JSON.parse(bytes), bindings: 42 }));
+    if (damage === 'unreadable') {
+      await fs.unlink(path);
+      await mkdir(path);
+    }
+
+    const started: string[] = [];
+    for (let pass = 0; pass < 2; pass++) {
+      const error = await drainResourceStartHost({
+        ...host,
+        hostId: 'host',
+        startAdmitted: async id => {
+          started.push(id);
+        },
+      }).catch((caught: unknown) => caught);
+      expect(started).toEqual([queued.run.id]);
+      if (damage === 'healthy') {
+        expect(error).toBeUndefined();
+        continue;
+      }
+      if (!(error instanceof ResourceStartDrainError)) throw new Error('expected drain failure');
+      expect(error.failures).toHaveLength(1);
+      expect(error.failures[0]?.receiptId).toBeUndefined();
+      const failure = error.failures[0]?.error;
+      if (!(failure instanceof Error)) throw new Error('expected damaged receipt error');
+      expect(failure.message).toContain(document);
+      expect(failure.cause).toBeInstanceOf(Error);
+    }
+
+    if (damage === 'healthy' || owner !== 'host') return;
+    if (damage === 'unreadable') await rm(path, { recursive: true });
+    await writeFile(path, bytes);
+    expect(await store.listPendingStartBindings({ hostId: 'host' })).toMatchObject([
+      { receiptId, bindingId: 'binding', status: 'pending', ownerId: null },
+    ]);
+  });
+}

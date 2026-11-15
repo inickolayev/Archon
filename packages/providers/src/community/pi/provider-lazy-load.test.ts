@@ -16,7 +16,7 @@
  * no assertion context — counters keep failures actionable.
  *
  * Runs in its own `bun test` invocation because Bun's `mock.module` is
- * process-wide and would poison `provider.test.ts`, which installs benign
+ * process-wide and would poison the provider unit tests, which install benign
  * stubs for the same modules (see CLAUDE.md on test isolation).
  */
 import { expect, mock, test } from 'bun:test';
@@ -35,11 +35,9 @@ mock.module('@earendil-works/pi-ai', () => {
 });
 
 test('registering and instantiating the Pi provider does not eagerly load the Pi SDK', async () => {
-  // Go through the same public entrypoint the CLI and server call.
-  // `registerCommunityProviders()` pulls in the full registration path
-  // (registry.ts → registration.ts → provider.ts → provider's helpers).
-  const { clearRegistry, getAgentProvider, registerCommunityProviders } =
-    await import('../../registry');
+  // Use the CLI/server registration path so the test covers its transitive imports.
+  const { clearRegistry, getAgentProvider } = await import('../../registry');
+  const { registerCommunityProviders } = await import('../../in-process');
 
   clearRegistry();
   registerCommunityProviders();

@@ -1,40 +1,63 @@
-import { terminalRecordSchema } from '@archon/workflows/schemas/terminal-record';
+import { attentionDegradedSchema } from '@archon/workflows/schemas/attention-degraded';
+import {
+  toolCallAttentionArraySchema,
+  TOOL_CALL_ATTENTION_METADATA_KEY,
+} from '@archon/workflows/schemas/workflow-run';
+import {
+  runNodeStateSchema,
+  terminalRecordSchema,
+} from '@archon/workflows/schemas/terminal-record';
+import { providerEventRecordSchema as engineProviderEventRecordSchema } from '@archon/workflows/schemas/provider-event';
 /**
  * Zod schemas for workflow API endpoints.
  */
 import { z } from '@hono/zod-openapi';
+import { openAttentionQueueCountsSchema } from '@archon/workflows/attention-counts';
+import { attentionQueueItemSchema } from '@archon/workflows/attention-queue';
+import {
+  attentionWatchLevelSchema,
+  classifiedAttentionStreamLineSchema,
+} from '@archon/workflows/attention-needs';
+import { attentionLabelKeySchema, attentionLabelsSchema } from '@archon/workflows/schemas/dag-node';
 import {
   workflowDefinitionSchema as engineWorkflowDefinitionSchema,
+  workflowLoadErrorSchema as engineWorkflowLoadErrorSchema,
   workflowSourceSchema as engineWorkflowSourceSchema,
 } from '@archon/workflows/schemas/workflow';
 import {
+  createRunAttentionSchema,
+  declaredAnswererNameSchema,
+  approvalContextSchema,
+  expectedApprovalGateSchema,
   workflowRunSchema as engineWorkflowRunSchema,
   workflowRunOutcomeSchema as engineWorkflowRunOutcomeSchema,
+  workflowRunStatusSchema as engineWorkflowRunStatusSchema,
   workflowWaitContextSchema as engineWorkflowWaitContextSchema,
   RUN_STOP_REASON_METADATA_KEY,
 } from '@archon/workflows/schemas/workflow-run';
 import { runStopReasonSchema as engineRunStopReasonSchema } from '@archon/workflows/schemas/run-terminal-reason';
+import { nodeCostScopeSchema } from '@archon/workflows/schemas/node-execution';
 import { workflowEventRowSchema } from '@archon/core/schemas/workflow-event';
-import { dashboardWorkflowRunSchema as coreDashboardWorkflowRunSchema } from '@archon/core/schemas/workflow-run';
+import {
+  dashboardWorkflowRunSchema as coreDashboardWorkflowRunSchema,
+  runOwnerObservationSchema,
+} from '@archon/core/schemas/workflow-run';
 
 /** Workflow definition schema — derived from engine schema via direct subpath import. */
-export const workflowDefinitionSchema =
-  engineWorkflowDefinitionSchema.openapi('WorkflowDefinition');
+export const workflowDefinitionSchema = engineWorkflowDefinitionSchema.meta({
+  id: 'WorkflowDefinition',
+});
 
 /** A workflow load error entry returned in GET /api/workflows `errors` field. */
-export const workflowLoadErrorSchema = z
-  .object({
-    filename: z.string(),
-    error: z.string(),
-    errorType: z.enum(['read_error', 'parse_error', 'validation_error']),
-  })
-  .openapi('WorkflowLoadError');
+export const workflowLoadErrorSchema = engineWorkflowLoadErrorSchema.meta({
+  id: 'WorkflowLoadError',
+});
 
 /**
  * Workflow source — project-defined, bundled default, or home-scoped (global).
  * Precedence for same-named entries: `bundled` < `global` < `project`.
  */
-export const workflowSourceSchema = engineWorkflowSourceSchema.openapi('WorkflowSource');
+export const workflowSourceSchema = engineWorkflowSourceSchema.meta({ id: 'WorkflowSource' });
 
 /** A workflow entry in the list response, including its source. */
 export const workflowListEntrySchema = z
@@ -68,6 +91,11 @@ export const workflowListResponseSchema = z
 export const getWorkflowResponseSchema = z
   .object({
     workflow: workflowDefinitionSchema,
+    /**
+     * The file's YAML mapping before normalization — the shape an editor must
+     * send back to PUT/validate. Absent when the top level is not a mapping.
+     */
+    authored: z.record(z.string(), z.unknown()).optional(),
     filename: z.string(),
     source: workflowSourceSchema,
   })
@@ -136,10 +164,10 @@ export const resourceSourceResponseSchema = z
 // Workflow run schemas
 // =========================================================================
 
-/** Workflow run status values. */
-export const workflowRunStatusSchema = z
-  .enum(['pending', 'running', 'completed', 'failed', 'cancelled', 'paused'])
-  .openapi('WorkflowRunStatus');
+/** Workflow run status values, owned by the engine. */
+export const workflowRunStatusSchema = engineWorkflowRunStatusSchema.meta({
+  id: 'WorkflowRunStatus',
+});
 
 /** Workflow-authored verdict, independent from lifecycle status. */
 export const workflowRunOutcomeSchema = engineWorkflowRunOutcomeSchema
@@ -147,30 +175,52 @@ export const workflowRunOutcomeSchema = engineWorkflowRunOutcomeSchema
   .openapi('WorkflowRunOutcome');
 
 /** Persisted durable-wait cursor exposed to API clients without erasing its discriminants. */
-export const workflowWaitContextSchema =
-  engineWorkflowWaitContextSchema.openapi('WorkflowWaitContext');
+export const workflowWaitContextSchema = engineWorkflowWaitContextSchema.meta({
+  id: 'WorkflowWaitContext',
+});
 
 /** Why a run stopped, as the engine recorded it on the run row. */
-export const runStopReasonSchema = engineRunStopReasonSchema.openapi('RunStopReason');
+export const runStopReasonSchema = engineRunStopReasonSchema.meta({ id: 'RunStopReason' });
 
 /**
- * Run metadata stays open-ended, but its durable-wait and stop-reason contracts are
+ * Run metadata stays open-ended, but approval, waits, tool advisories and stop reasons are
  * engine-owned and typed.
  */
 export const workflowRunMetadataSchema = z
   .object({
+    [TOOL_CALL_ATTENTION_METADATA_KEY]: toolCallAttentionArraySchema.optional(),
+    approval: approvalContextSchema.optional(),
     wait: workflowWaitContextSchema.optional(),
     [RUN_STOP_REASON_METADATA_KEY]: runStopReasonSchema.optional(),
   })
   .catchall(z.unknown())
   .openapi('WorkflowRunMetadata');
 
+export const RUN_ATTENTION_SCHEMA_NAME = 'RunAttention';
+export const runAttentionSchema = createRunAttentionSchema(z.string().datetime()).openapi(
+  RUN_ATTENTION_SCHEMA_NAME
+);
+// OpenAPI 3.0's union null arm needs an explicit type or generated clients erase the entire union.
+const nullableRunAttentionSchema = z.union([runAttentionSchema, z.literal(null)]).openapi({
+  anyOf: [
+    { $ref: `#/components/schemas/${RUN_ATTENTION_SCHEMA_NAME}` },
+    { type: 'object', nullable: true, enum: [null] },
+  ],
+});
+
+const ownerObservationSchema = runOwnerObservationSchema.nullable().openapi({
+  description:
+    "What this server observes about the running run's execution owner, by the rule `archon workflow wait` uses for `owner_lost`: `reachable` (an owner answers), `unreachable` (the recorded owner is on this server's host and user and nothing answers; the stored status is unchanged and abandoning the run is the operator's call), `unknown` (this server cannot observe the owner: another host or user, no recorded owner, or no answer in time). Null when the run is not running. Observed per request; never stored.",
+});
+
 /** A workflow run record (wire shape with ISO string dates). */
 export const workflowRunSchema = engineWorkflowRunSchema
   .extend({
     outcome: workflowRunOutcomeSchema,
     metadata: workflowRunMetadataSchema,
+    attention: nullableRunAttentionSchema,
     started_at: z.string(),
+    active_phase_started_at: z.string().nullable(),
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),
   })
@@ -185,6 +235,10 @@ export const workflowRunListResponseSchema = z
 export const workflowEventSchema = workflowEventRowSchema
   .extend({
     created_at: z.string().datetime(),
+    cost_scope: nodeCostScopeSchema.optional().openapi({
+      description:
+        "What `data.cost_usd` measures, by the engine's rule: `own` is the node's own spend; `total` restates spend other rows of the run carry. Present only on rows with a `cost_usd`.",
+    }),
   })
   .openapi('WorkflowEvent');
 
@@ -192,14 +246,58 @@ export const workflowEventSchema = workflowEventRowSchema
 export const workflowRunDetailSchema = z
   .object({
     run: workflowRunSchema.extend({
+      platform_type: z.string().nullable().openapi({
+        description:
+          "The platform of the run's own conversation (`web`, `cli`, ...), the same value the dashboard listing serves. Null when the run has no conversation.",
+      }),
       worker_platform_id: z.string().optional(),
       parent_platform_id: z.string().optional(),
       conversation_platform_id: z.string().nullable(),
+      owner_observation: ownerObservationSchema,
       terminal_record: terminalRecordSchema.nullable(),
+      nodes: z.array(runNodeStateSchema).openapi({
+        description:
+          "The engine's node states: the terminal record's when present, otherwise the engine fold over the events recorded so far.",
+      }),
     }),
     events: z.array(workflowEventSchema),
   })
   .openapi('WorkflowRunDetail');
+
+/**
+ * One provider event as the engine recorded it: the provider's object in the engine
+ * envelope, with its run and node. Derived from the engine schema the store validates
+ * against, so the served shape cannot drift from the persisted one.
+ */
+export const providerEventRecordSchema = engineProviderEventRecordSchema.meta({
+  id: 'ProviderEventRecord',
+});
+
+/** GET /api/workflows/runs/:runId/provider-events query. */
+export const providerEventsQuerySchema = z
+  .object({
+    step: z.string().min(1).optional().openapi({
+      description: 'Only this node (its persisted step name).',
+    }),
+    attemptId: z.string().min(1).optional().openapi({
+      description: 'Cursor attempt. Requires `step` and `afterSeq`.',
+    }),
+    afterSeq: z.coerce.number().int().nonnegative().optional().openapi({
+      description:
+        "Cursor seq: return the attempt's events after it and every later attempt's. Requires `step` and `attemptId`.",
+    }),
+  })
+  .refine(q => (q.attemptId === undefined) === (q.afterSeq === undefined), {
+    message: 'attemptId and afterSeq must be given together',
+  })
+  .refine(q => q.attemptId === undefined || q.step !== undefined, {
+    message: 'a cursor needs step',
+  });
+
+/** GET /api/workflows/runs/:runId/provider-events response. */
+export const providerEventsResponseSchema = z
+  .object({ events: z.array(providerEventRecordSchema) })
+  .openapi('ProviderEventsResponse');
 
 /** GET /api/workflows/runs/by-worker/:platformId response. */
 export const workflowRunByWorkerResponseSchema = z
@@ -218,12 +316,12 @@ export const workflowRunActionResponseSchema = z
 
 /** POST /api/workflows/runs/:runId/approve request body. */
 export const approveWorkflowRunBodySchema = z
-  .object({ comment: z.string().optional() })
+  .object({ comment: z.string().optional(), expectedGate: expectedApprovalGateSchema.optional() })
   .openapi('ApproveWorkflowRunBody');
 
 /** POST /api/workflows/runs/:runId/reject request body. */
 export const rejectWorkflowRunBodySchema = z
-  .object({ reason: z.string().optional() })
+  .object({ reason: z.string().optional(), expectedGate: expectedApprovalGateSchema.optional() })
   .openapi('RejectWorkflowRunBody');
 
 /**
@@ -232,8 +330,32 @@ export const rejectWorkflowRunBodySchema = z
  * outcome the dedicated routes above produce.
  */
 export const respondWorkflowRunBodySchema = z
-  .object({ decision: z.string().min(1), text: z.string().optional() })
+  .object({
+    decision: z.string().min(1),
+    text: z.string().optional(),
+    expectedGate: expectedApprovalGateSchema.optional(),
+  })
   .openapi('RespondWorkflowRunBody');
+
+/**
+ * POST /api/workflows/runs/:runId/answer request body: an answer to a paused attention
+ * wait. `occurrence` is the one run-attention reports; an answer for any other occurrence
+ * is refused. `choose` holds declared option ids (none for a message form);
+ * `recommended: true` chooses the option the wait recommends instead. `as` is the name
+ * the answerer declares for itself: recorded with the answer as a claim, never checked.
+ */
+export const answerWorkflowRunBodySchema = z
+  .object({
+    occurrence: z.string(),
+    choose: z.array(z.string().min(1)).optional(),
+    recommended: z.literal(true).optional(),
+    text: z.string().optional(),
+    as: declaredAnswererNameSchema.optional(),
+  })
+  .refine(body => body.recommended !== true || (body.choose ?? []).length === 0, {
+    message: 'Use choose or recommended, not both',
+  })
+  .openapi('AnswerWorkflowRunBody');
 
 /** DELETE /api/workflows/:name/node-sessions path params. */
 export const resetWorkflowNodeSessionsParamsSchema = z
@@ -267,11 +389,88 @@ export const resetWorkflowNodeSessionsResponseSchema = z
 export const dashboardWorkflowRunSchema = coreDashboardWorkflowRunSchema
   .extend({
     metadata: workflowRunMetadataSchema,
+    attention: nullableRunAttentionSchema,
+    owner_observation: ownerObservationSchema,
     started_at: z.string(),
+    active_phase_started_at: z.string().nullable(),
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),
   })
   .openapi('DashboardWorkflowRun');
+
+/**
+ * GET /api/runs/attention query. A server has no working directory, so without
+ * `project` the queue is install-wide; `all=true` says so explicitly. `label` repeats.
+ */
+export const attentionQueueQuerySchema = z.object({
+  project: z.string().optional(),
+  all: z.enum(['true', 'false']).optional(),
+  label: z.union([z.string(), z.array(z.string())]).optional(),
+  sort: z.string().optional(),
+  countBy: z.string().optional(),
+});
+
+/** GET /api/runs/attention/stream query: the list query without its ordering and counting. */
+export const attentionStreamQuerySchema = attentionQueueQuerySchema
+  .pick({ project: true, all: true, label: true })
+  .extend({
+    /**
+     * How much of the stream to send; `protocol`, every line, when absent. `quiet` is what
+     * `--watch` writes and `notices` what `--watch --notices` writes.
+     */
+    level: attentionWatchLevelSchema.optional(),
+  });
+
+/**
+ * One GET /api/runs/attention/stream event's data: the `--watch --json` line, with what
+ * it asks of its reader in `needs`.
+ */
+export const attentionStreamLineResponseSchema =
+  classifiedAttentionStreamLineSchema.openapi('AttentionStreamLine');
+
+/**
+ * GET /api/runs/attention list response. `items` is the queue; `runs` holds the runs that hold them
+ * as dashboard rows for the console.
+ */
+export const runsNeedingAttentionResponseSchema = z
+  .object({
+    runs: z.array(dashboardWorkflowRunSchema),
+    items: z.array(attentionQueueItemSchema.meta({ id: 'AttentionQueueItem' })),
+    degraded: z.array(attentionDegradedSchema).optional(),
+  })
+  .openapi('RunsNeedingAttentionResponse');
+
+/** GET /api/runs/attention response when `countBy` is given. */
+export const attentionQueueCountsResponseSchema = z
+  .object({
+    counts: openAttentionQueueCountsSchema.meta({ id: 'AttentionQueueCounts' }),
+    degraded: z.array(attentionDegradedSchema).optional(),
+  })
+  .openapi('AttentionQueueCountsResponse');
+
+/** GET /api/runs/{runId}/attention response: null when the run needs no one now. */
+export const attentionQueueItemResponseSchema = z
+  .object({ item: attentionQueueItemSchema.nullable() })
+  .openapi('AttentionQueueItemResponse');
+
+/** POST /api/runs/{runId}/attention/labels body. */
+export const labelAttentionBodySchema = z
+  .object({
+    occurrence: z.string(),
+    set: attentionLabelsSchema.optional(),
+    unset: z.array(attentionLabelKeySchema).optional(),
+  })
+  .openapi('LabelAttentionBody');
+
+/** POST /api/runs/{runId}/attention/labels response. */
+export const labelAttentionResponseSchema = z
+  .object({
+    runId: z.string(),
+    occurrence: z.string(),
+    revision: z.number().int(),
+    labels: attentionLabelsSchema,
+  })
+  .openapi('LabelAttentionResponse');
 
 /** GET /api/dashboard/runs response. */
 export const dashboardRunsResponseSchema = z

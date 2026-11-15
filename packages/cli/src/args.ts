@@ -1,16 +1,19 @@
 import type { ParseArgsConfig } from 'util';
+import { CHAT_PROJECT_ID_ARG } from '@archon/paths/workflow-scope';
 
 type CliArgOptions = NonNullable<ParseArgsConfig['options']>;
 
 // The single options map for the top-level CLI parse. Kept in its own module
 // so tests can import it without executing cli.ts (whose import runs main).
 export const cliArgOptions: CliArgOptions = {
+  [CHAT_PROJECT_ID_ARG]: { type: 'string' },
   cwd: { type: 'string', default: process.cwd() },
   help: { type: 'boolean', short: 'h' },
   branch: { type: 'string', short: 'b' },
   from: { type: 'string' },
   'from-branch': { type: 'string' },
   base: { type: 'string' },
+  'base-branch': { type: 'string' },
   'workflow-source': { type: 'string' },
   'no-worktree': { type: 'boolean' },
   folder: { type: 'boolean' },
@@ -21,10 +24,16 @@ export const cliArgOptions: CliArgOptions = {
   supersedes: { type: 'string' },
   open: { type: 'boolean' },
   spawn: { type: 'boolean' },
+  providers: { type: 'string' },
   quiet: { type: 'boolean', short: 'q' },
   verbose: { type: 'boolean', short: 'v' },
   json: { type: 'boolean' },
+  throughput: { type: 'boolean' },
   events: { type: 'boolean' },
+  watch: { type: 'boolean' },
+  event: { type: 'string' },
+  'resume-at': { type: 'string' },
+  interval: { type: 'string' },
   'run-id': { type: 'string' },
   type: { type: 'string' },
   data: { type: 'string' },
@@ -32,6 +41,25 @@ export const cliArgOptions: CliArgOptions = {
   comment: { type: 'string' },
   reason: { type: 'string' },
   text: { type: 'string' },
+  occurrence: { type: 'string' },
+  // Repeatable: `--choose a --choose b` answers a multi_select attention wait with both.
+  choose: { type: 'string', multiple: true },
+  // `workflow respond|answer --recommended`: answer with the option the wait recommends.
+  recommended: { type: 'boolean' },
+  // `workflow approve|reject|respond|answer --as <name>`: the name the answerer declares.
+  as: { type: 'string' },
+  // Repeatable attention-queue filters and label writes: `--label k=v`, `--set k=v`, `--unset k`.
+  label: { type: 'string', multiple: true },
+  set: { type: 'string', multiple: true },
+  unset: { type: 'string', multiple: true },
+  sort: { type: 'string' },
+  'count-by': { type: 'string' },
+  // `workflow attention --watch --protocol`: the full sync protocol, for programs.
+  protocol: { type: 'boolean' },
+  // `workflow attention --watch --notices`: also what happened to work nobody has to act on.
+  notices: { type: 'boolean' },
+  // `workflow attention --watch --after <cursor>`: replay the stream after an earlier line.
+  after: { type: 'string' },
   port: { type: 'string' },
   'download-only': { type: 'boolean' },
   scope: { type: 'string' },
@@ -39,17 +67,39 @@ export const cliArgOptions: CliArgOptions = {
   yes: { type: 'boolean' },
   force: { type: 'boolean' },
   merged: { type: 'boolean' },
+  move: { type: 'boolean' },
   'include-closed': { type: 'boolean' },
   'conversation-id': { type: 'string' },
   detach: { type: 'boolean' },
+  'no-wait': { type: 'boolean' },
   all: { type: 'boolean' },
   status: { type: 'string' },
   limit: { type: 'string' },
+  'if-revision': { type: 'string' },
+  prefix: { type: 'string' },
+  project: { type: 'string' },
+  // `archon metrics` window, subject filter, cohort cut and model split.
+  since: { type: 'string' },
+  until: { type: 'string' },
+  subject: { type: 'string' },
+  compare: { type: 'string' },
+  'by-model': { type: 'string' },
+  install: { type: 'boolean' },
+  raw: { type: 'boolean' },
+  values: { type: 'boolean' },
+  lease: { type: 'boolean' },
+  'release-lease': { type: 'boolean' },
+  held: { type: 'boolean' },
   timeout: { type: 'string' },
   follow: { type: 'boolean' },
+  format: { type: 'string' },
   effort: { type: 'string' },
   full: { type: 'boolean' },
   'dry-run': { type: 'boolean' },
+  // `archon workflow types`: compare instead of writing. `--out` is the file it writes,
+  // and the directory `archon pack bindings` writes into.
+  check: { type: 'boolean' },
+  out: { type: 'string' },
   stubs: { type: 'string' },
   'stubs-init': { type: 'string' },
   'default-stubs': { type: 'boolean' },
@@ -60,10 +110,19 @@ export const cliArgOptions: CliArgOptions = {
   // Repeatable sparse tier/@alias rebinding for one workflow invocation (#2481).
   model: { type: 'string', multiple: true },
   config: { type: 'string' },
+  'config-from-run': { type: 'string' },
   host: { type: 'string' },
+  'delivery-id': { type: 'string' },
+  item: { type: 'string' },
+  inputs: { type: 'string' },
   owner: { type: 'string' },
+  // `archon pack bindings`: the operator's choices a pack's binding declaration lacks.
+  repo: { type: 'string' },
+  'run-as': { type: 'string' },
+  only: { type: 'string' },
   // Private sealed handoff appended by the parent of a detached workflow run.
   'internal-detached-run-config': { type: 'string' },
   // Private handoff: the run row the detached parent created before forking (#2872).
   'internal-detached-run-id': { type: 'string' },
+  'internal-detached-worktree-identifier': { type: 'string' },
 };

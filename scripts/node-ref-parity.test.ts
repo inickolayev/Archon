@@ -37,24 +37,47 @@
  *     and — unlike any regex over source text — it cannot be fooled by a
  *     commented-out copy either, because a comment does not execute.
  */
+import { providerRegistry } from '@archon/providers';
 import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   WHEN_ATOM_PATTERN,
-  parseWhenAtom,
-  splitOutsideQuotes,
-  whenAtoms,
+  LOOP_PREV_WHEN_ATOM_PATTERN,
+  parseWhenExpression,
   type WhenAtom,
 } from '../packages/workflows/src/when-atom';
 import { parseWorkflow } from '../packages/workflows/src/loader';
 import {
   ATOM_PATTERN,
+  LOOP_PREV_ATOM_PATTERN,
   parse,
 } from '../packages/web/src/experiments/console/builder/validation/when-grammar';
+import { INPUTS_SCOPE } from '../packages/workflows/src/reference-scopes';
+import { INPUT_NAME_SOURCE, parseWholeInputsRef } from '../packages/workflows/src/output-ref';
+import {
+  INPUTS_SCOPE as WEB_INPUTS_SCOPE,
+  INPUTS_REF_PREFIX,
+  INPUT_NAME_SOURCE as WEB_INPUT_NAME_SOURCE,
+  WHOLE_INPUTS_REF_PATTERN,
+} from '../packages/web/src/lib/input-ref';
 import { findOutputRefs } from '../packages/web/src/lib/node-ref';
+import {
+  LOOP_COMPLETION_CHANNELS,
+  type LoopCompletionChannel,
+} from '../packages/workflows/src/schemas/loop';
 import { dagNodeSchema } from '../packages/workflows/src/schemas';
-import { validateStructural } from '../packages/web/src/experiments/console/builder/validation/structural';
+import {
+  MAX_DURABLE_WAIT_MS as BUILDER_MAX_DURABLE_WAIT_MS,
+  validateStructural,
+} from '../packages/web/src/experiments/console/builder/validation/structural';
+import { MAX_DURABLE_WAIT_MS } from '../packages/workflows/src/schemas/durable-wait';
+import {
+  createEditorState,
+  editorReducer,
+} from '../packages/web/src/experiments/console/builder/editor/state';
+import { toWorkflowDefinition } from '../packages/web/src/experiments/console/builder/model/to-workflow';
+import { serializeToYaml } from '../packages/web/src/experiments/console/builder/yaml';
 
 const REPO_ROOT = join(import.meta.dir, '..');
 // OUTPUT_REF_SOURCE moved from loader.ts to output-ref.ts (#2637) so the loader
@@ -150,6 +173,19 @@ describe('node-ref parity: @archon/web mirrors the engine', () => {
     expect(nodeId.test('classify-testability')).toBe(true);
   });
 
+  test('INPUTS remains reserved with the established diagnostic', () => {
+    const result = dagNodeSchema.safeParse({ id: 'INPUTS', bash: 'echo ok' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toEqual([
+        expect.objectContaining({
+          path: ['id'],
+          message: "node id 'INPUTS' is reserved for the $INPUTS.<name> parameter surface",
+        }),
+      ]);
+    }
+  });
+
   test('both effective scans reserve $INPUTS.output for workflow inputs', () => {
     const text = 'compare $INPUTS.output';
     expect(findOutputRefs(text)).toEqual(new Set());
@@ -166,7 +202,8 @@ nodes:
   - id: use
     prompt: "${text}"
 `,
-      'output-input-parity.yaml'
+      'output-input-parity.yaml',
+      providerRegistry
     );
     expect(engine.error).toBeNull();
     expect(engine.workflow).not.toBeNull();
@@ -203,16 +240,19 @@ nodes:
  * identical, so no `.toString()` trick applies — is pinned only for the strings
  * enumerated below, plus their grouping.
  *
- * The ordering itself — `||` outer, `&&` inner — is written here rather than read
- * from the engine, so this pins the BUILDER against that contract, not the engine
- * against it. An engine-side precedence change is caught instead by
- * `condition-evaluator.test.ts` ("&& has higher precedence than ||"), behaviourally,
- * on a truth table.
+ * The engine side is `parseWhenExpression`, the entry point the loader and the
+ * evaluator both use, so the comparison covers every rule they apply, including the
+ * ones that run after the regex matches (the numeric-RHS rule is one).
  */
 describe('when-atom parity: the builder parses what the engine parses', () => {
   test("the builder's atom pattern is byte-identical to the engine's", () => {
     expect(ATOM_PATTERN.source).toBe(WHEN_ATOM_PATTERN.source);
     expect(ATOM_PATTERN.flags).toBe(WHEN_ATOM_PATTERN.flags);
+  });
+
+  test("the builder's loop-previous pattern is byte-identical to the engine's", () => {
+    expect(LOOP_PREV_ATOM_PATTERN.source).toBe(LOOP_PREV_WHEN_ATOM_PATTERN.source);
+    expect(LOOP_PREV_ATOM_PATTERN.flags).toBe(LOOP_PREV_WHEN_ATOM_PATTERN.flags);
   });
 
   /**
@@ -225,6 +265,12 @@ describe('when-atom parity: the builder parses what the engine parses', () => {
     "$classify.output.type != 'FEATURE'",
     '$build.exit_code == 0',
     "$a.field.sub == 'x'",
+    "$review.output.proposal.action == 'add'",
+    '$review.output.proposal.details.count >= 0',
+    "$review.output.proposal.action == '$review.output.proposal.typo'",
+    "$review.output.proposal.action[0] == 'add'",
+    "$review.output.proposal.* == 'add'",
+
     // #2567: hyphenated ids, which the builder's legacy `\w` copy rejected.
     "$check-reproduction.output == 'done'",
     "$classify-testability.output.testable == 'e2e_testable'",
@@ -254,6 +300,26 @@ describe('when-atom parity: the builder parses what the engine parses', () => {
     "$INPUTSX.output.x == 'y'",
     // The scope name is matched case-sensitively, so this is a node called `inputs`.
     "$inputs.mode == 'x'",
+    // Previous-iteration references, including malformed ordinary-node spellings.
+    "$LOOP_PREV.work.output == 'done'",
+    "$LOOP_PREV.INPUTS.output == 'done'",
+    "$LOOP_PREV.LOOP_PREV.output == 'done'",
+    '$LOOP_PREV.check-work.output.result.count >= -0.5',
+    '$LOOP_PREV.work.output == true',
+    "$LOOP_PREV.work.output > '80abc'",
+    "$LOOP_PREV.work.output > 'high'",
+    '$LOOP_PREV.work.output <= true',
+    "$LOOP_PREV.work.output > ''",
+    "$LOOP_PREV.output == 'x'",
+    "$LOOP_PREV.output.field == 'x'",
+    "$LOOP_PREV.work == 'x'",
+    "$LOOP_PREV.work.field == 'x'",
+    "$LOOP_PREV.work.output.a[0] == 'x'",
+    "$LOOP_PREV.work.output.* == 'x'",
+    "$LOOP_PREV.1bad.output == 'x'",
+    "$LOOP_PREVX.output == 'x'",
+    "$loop_prev.output == 'x'",
+    "$LOOP_PREV.work.output == 'x && y || z' && $INPUTS.mode == 'fast' || $n.output == 'ok'",
     // Every operator, in both RHS spellings.
     "$n.output == '5'",
     "$n.output != '5'",
@@ -295,6 +361,21 @@ describe('when-atom parity: the builder parses what the engine parses', () => {
     '$a.output ==',
     '$1bad.output == 1',
     "$a.output == 'X' &&",
+    // Grouping parentheses, which neither side supports.
+    "($a.output == 'X')",
+    "$a.output == 'X' && ($b.output == 'Y' || $c.output == 'Z')",
+    "$a.output == '(X)'",
+    // A numeric operator needs a numeric RHS; both sides use the `parseFloat` rule, so
+    // a quoted number and a numeric prefix both pass, while text, '' and booleans fail.
+    '$n.output > 80',
+    "$n.output >= '-0.5'",
+    "$n.output < '80abc'",
+    "$n.output > 'high'",
+    "$n.output > ''",
+    '$n.output <= true',
+    "$INPUTS.limit >= 'many'",
+    "$a.output == 'X' || $n.output < 'low'",
+    "$n.output == 'high'",
   ];
 
   /**
@@ -305,33 +386,36 @@ describe('when-atom parity: the builder parses what the engine parses', () => {
    */
   function engineRef(atom: WhenAtom): string {
     if (atom.ref.kind === 'input') return `$INPUTS.${atom.ref.name}`;
+    const prefix = atom.ref.kind === 'loop_prev' ? '$LOOP_PREV.' : '$';
     return atom.ref.field === undefined
-      ? `$${atom.ref.nodeId}.output`
-      : `$${atom.ref.nodeId}.output.${atom.ref.field}`;
+      ? `${prefix}${atom.ref.nodeId}.output`
+      : `${prefix}${atom.ref.nodeId}.output.${atom.ref.field}`;
   }
 
-  /** `null` means "rejected"; an array means "accepted, and here is what it means". */
-  function engineParse(expr: string): string[] | null {
-    const atoms = whenAtoms(expr).map(parseWhenAtom);
-    if (atoms.some(atom => atom === null)) return null;
-    return atoms.map(atom => {
-      // Narrowed by the `some` guard above; `flatMap` would lose that.
-      if (atom === null) throw new Error('unreachable');
-      return `${engineRef(atom)} ${atom.operator} ${JSON.stringify(atom.expected)}`;
-    });
+  /**
+   * `null` means "rejected"; an array means "accepted, and here is what it means".
+   * Uses `parseWhenExpression`, the same entry point the loader and the evaluator use.
+   */
+  function engineParse(expr: string, allowLoopPrev: boolean): string[] | null {
+    return (
+      parseWhenExpression(expr, allowLoopPrev)
+        ?.flat()
+        .map(atom => `${engineRef(atom)} ${atom.operator} ${JSON.stringify(atom.expected)}`) ?? null
+    );
   }
 
-  function webParse(expr: string): string[] | null {
-    const result = parse(expr);
+  function webParse(expr: string, allowLoopPrev: boolean): string[] | null {
+    const result = parse(expr, allowLoopPrev);
     if (!result.ok) return null;
     return result.ast.or.flatMap(group =>
       group.map(atom => {
+        const prefix = atom.kind === 'loop_prev' ? '$LOOP_PREV.' : '$';
         const ref =
           atom.kind === 'input'
             ? `$INPUTS.${atom.name}`
             : atom.field === undefined
-              ? `$${atom.nodeId}.output`
-              : `$${atom.nodeId}.output.${atom.field}`;
+              ? `${prefix}${atom.nodeId}.output`
+              : `${prefix}${atom.nodeId}.output.${atom.field}`;
         return `${ref} ${atom.op} ${JSON.stringify(atom.value)}`;
       })
     );
@@ -340,34 +424,58 @@ describe('when-atom parity: the builder parses what the engine parses', () => {
   /**
    * The AND/OR shape as a list of group sizes — `[2, 1]` for `a && b || c`.
    *
-   * The engine has no grouped parse to compare against (`whenAtoms` flattens on
-   * purpose, because its callers want every atom, not the boolean structure), so
-   * the expected shape is derived from the engine's OWN exported splitter. That
-   * keeps this a cross-package comparison rather than the web checking itself.
+   * Both shapes come from each side's grouped parse, so a one-sided precedence swap
+   * shows up here even though the flattened atom lists agree.
    *
    * `null` for a rejected expression, so the two sides stay comparable on the
    * malformed entries as well.
    */
-  function engineGroupShape(expr: string): number[] | null {
-    if (engineParse(expr) === null) return null;
-    return splitOutsideQuotes(expr.trim(), '||').map(
-      clause => splitOutsideQuotes(clause, '&&').length
-    );
+  function engineGroupShape(expr: string, allowLoopPrev: boolean): number[] | null {
+    return parseWhenExpression(expr, allowLoopPrev)?.map(group => group.length) ?? null;
   }
 
-  function webGroupShape(expr: string): number[] | null {
-    const result = parse(expr);
+  function webGroupShape(expr: string, allowLoopPrev: boolean): number[] | null {
+    const result = parse(expr, allowLoopPrev);
     return result.ok ? result.ast.or.map(group => group.length) : null;
   }
 
-  for (const expr of CORPUS) {
-    test(`agrees on ${JSON.stringify(expr)}`, () => {
-      expect(webParse(expr)).toEqual(engineParse(expr));
-      // Not implied by the line above: both sides flatten, and `a && b || c` and
-      // `a || b && c` flatten to the SAME ordered atom list. Only the grouping
-      // separates them, and getting it wrong changes the boolean formula the
-      // builder writes back through `format()`.
-      expect(webGroupShape(expr)).toEqual(engineGroupShape(expr));
+  for (const allowLoopPrev of [false, true]) {
+    for (const expr of CORPUS) {
+      test(`agrees on ${JSON.stringify(expr)} (loop context: ${allowLoopPrev})`, () => {
+        expect(webParse(expr, allowLoopPrev)).toEqual(engineParse(expr, allowLoopPrev));
+        // Not implied by the line above: both sides flatten, and `a && b || c` and
+        // `a || b && c` flatten to the SAME ordered atom list. Only the grouping
+        // separates them, and getting it wrong changes the boolean formula the
+        // builder writes back through `format()`.
+        expect(webGroupShape(expr, allowLoopPrev)).toEqual(engineGroupShape(expr, allowLoopPrev));
+      });
+    }
+  }
+});
+
+describe('input reference parity: all web consumers share the engine spelling', () => {
+  test('the shared web scope, display prefix and input-name grammar match the engine', () => {
+    expect(WEB_INPUTS_SCOPE).toBe(INPUTS_SCOPE);
+    expect(INPUTS_REF_PREFIX).toBe(`$${INPUTS_SCOPE}.`);
+    expect(WEB_INPUT_NAME_SOURCE).toBe(INPUT_NAME_SOURCE);
+  });
+
+  for (const ref of [
+    '$INPUTS.resume_at',
+    ' $INPUTS.my-input ',
+    '$INPUTS.baseBranch',
+    '$INPUTS._name1',
+    '$INPUTS.output',
+    '$INPUTS.1bad',
+    '$INPUTS.',
+    '$INPUTS.name.field',
+    '$INPUTSX.name',
+    '$inputs.name',
+    'prefix $INPUTS.name',
+    '$INPUTS.name suffix',
+  ]) {
+    test(`whole-value input reference agrees on ${JSON.stringify(ref)}`, () => {
+      expect(WHOLE_INPUTS_REF_PATTERN.exec(ref.trim())?.[1]).toBe(parseWholeInputsRef(ref));
     });
   }
 });
@@ -393,42 +501,20 @@ describe('when-atom parity: the builder parses what the engine parses', () => {
  * meaningfully shared. That is exactly the axis that broke in #2591.
  */
 describe('loop completion-channel parity', () => {
-  /**
-   * `until_field` names a property in the node's `output_format`, and the engine
-   * additionally checks that it is declared, required and boolean — rules the
-   * builder deliberately does not mirror (it has no schema editor). Supplying a
-   * valid schema for those cases keeps this a comparison of the CHANNEL rule, so a
-   * disagreement here means the channel rules drifted, not that the two sides
-   * validate different things.
-   */
   const OUTPUT_FORMAT = {
     type: 'object',
     properties: { done: { type: 'boolean' } },
     required: ['done'],
   };
 
-  type Channels = { until?: string; until_bash?: string; until_field?: string };
+  type Channels = Partial<Record<LoopCompletionChannel, string>>;
 
   const CORPUS: Channels[] = [
     {},
-    { until: 'COMPLETE' },
-    { until_bash: 'bun run test' },
-    { until_field: 'done' },
     { until: 'COMPLETE', until_bash: 'bun run test' },
     { until: 'COMPLETE', until_field: 'done' },
     { until_bash: 'bun run test', until_field: 'done' },
     { until: 'COMPLETE', until_bash: 'bun run test', until_field: 'done' },
-    // Blank in each position, beside a valid sibling and alone — the shape that
-    // broke once already: an aggregate-only gate accepted a blank field whenever
-    // another channel was valid, while the builder rejected it.
-    { until: '' },
-    { until: '   ' },
-    { until: '\t' },
-    { until_bash: '' },
-    { until_bash: '   ' },
-    { until_bash: '\n' },
-    { until_field: '' },
-    { until_field: '  ' },
     { until: '   ', until_bash: 'bun run test' },
     { until: 'COMPLETE', until_bash: '   ' },
     { until: 'COMPLETE', until_field: '  ' },
@@ -441,10 +527,9 @@ describe('loop completion-channel parity', () => {
   ];
 
   function engineAccepts(channels: Channels): boolean {
-    const needsSchema = channels.until_field !== undefined;
     return dagNodeSchema.safeParse({
       id: 'l',
-      ...(needsSchema ? { output_format: OUTPUT_FORMAT } : {}),
+      output_format: OUTPUT_FORMAT,
       loop: { prompt: 'iterate', max_iterations: 5, ...channels },
     }).success;
   }
@@ -458,14 +543,39 @@ describe('loop completion-channel parity', () => {
         {
           id: 'l',
           variant: 'loop',
-          base: {},
+          base: { output_format: OUTPUT_FORMAT },
           data: { prompt: 'iterate', max_iterations: 5, fresh_context: false, ...channels },
         },
       ],
     });
     // Only the channel fields — the builder also reports unrelated required-field
     // issues, and this check owns the channel rule alone.
-    return !issues.some(issue => issue.path.field?.startsWith('loop.until'));
+    return !issues.some(issue =>
+      LOOP_COMPLETION_CHANNELS.some(({ field }) => issue.path.field === `loop.${field}`)
+    );
+  }
+
+  for (const { field } of LOOP_COMPLETION_CHANNELS) {
+    test(`accepts ${field} alone`, () => {
+      const channels = { [field]: 'done' };
+      expect(engineAccepts(channels)).toBe(true);
+      expect(builderAccepts(channels)).toBe(true);
+    });
+    for (const blank of ['', '  ', '\t\n']) {
+      test(`rejects blank ${field} (${JSON.stringify(blank)}) alone`, () => {
+        const channels = { [field]: blank };
+        expect(engineAccepts(channels)).toBe(false);
+        expect(builderAccepts(channels)).toBe(false);
+      });
+      for (const sibling of LOOP_COMPLETION_CHANNELS) {
+        if (sibling.field === field) continue;
+        test(`rejects blank ${field} (${JSON.stringify(blank)}) beside ${sibling.field}`, () => {
+          const channels = { [field]: blank, [sibling.field]: 'done' };
+          expect(engineAccepts(channels)).toBe(false);
+          expect(builderAccepts(channels)).toBe(false);
+        });
+      }
+    }
   }
 
   for (const channels of CORPUS) {
@@ -473,4 +583,139 @@ describe('loop completion-channel parity', () => {
       expect(builderAccepts(channels)).toBe(engineAccepts(channels));
     });
   }
+});
+
+describe('new builder loops', () => {
+  test('an untouched new loop exports a valid shell completion check without warnings', () => {
+    const initial = createEditorState({
+      name: 'new-loop',
+      description: 'New loop defaults',
+      meta: {},
+      nodes: [],
+    });
+    const { workflow } = editorReducer(initial, {
+      type: 'add-node',
+      variant: 'loop',
+      position: { x: 0, y: 0 },
+      at: 0,
+    });
+    const exported = toWorkflowDefinition(workflow);
+    const node = exported.nodes[0];
+    const loop = node.loop;
+    if (!loop) throw new Error('New loop is missing its configuration');
+    expect(Object.hasOwn(loop, 'until')).toBe(false);
+    expect(loop.until_field).toBeUndefined();
+    expect(node.output_format).toBeUndefined();
+    expect(validateStructural(workflow).filter(issue => issue.severity === 'error')).toEqual([]);
+    const check = loop.until_bash;
+    if (!check?.trim()) throw new Error('New loop is missing its shell completion check');
+
+    const yaml = serializeToYaml(exported);
+    const parsed = parseWorkflow(yaml, 'new-loop.yaml', providerRegistry);
+    expect(parsed.error).toBeNull();
+    expect(parsed.workflow).not.toBeNull();
+    expect(parsed.warnings).toEqual([]);
+    const parsedNode = parsed.workflow?.nodes[0];
+    if (!parsedNode || !('loop' in parsedNode)) throw new Error('Parsed loop is missing');
+    expect(parsedNode.loop?.until_bash).toBe(check);
+
+    const result = Bun.spawnSync(['bash', '-c', check]);
+    expect(result.exitCode).toBe(1);
+  });
+});
+
+describe('loop until_field schema parity', () => {
+  const cases: Array<[string, Record<string, unknown> | undefined, boolean, string?]> = [
+    ['requires output_format', undefined, false],
+    [
+      'requires a declared property',
+      { properties: { other: { type: 'boolean' } }, required: ['done'] },
+      false,
+    ],
+    ['requires membership in required', { properties: { done: { type: 'boolean' } } }, false],
+    [
+      'requires a boolean string type',
+      { properties: { done: { type: 'string' } }, required: ['done'] },
+      false,
+    ],
+    [
+      'accepts a required boolean',
+      { properties: { done: { type: 'boolean' } }, required: ['done'] },
+      true,
+    ],
+    ['accepts an untyped property', { properties: { done: {} }, required: ['done'] }, true],
+    [
+      'accepts a type union',
+      { properties: { done: { type: ['boolean', 'null'] } }, required: ['done'] },
+      true,
+    ],
+    ['accepts a boolean schema property', { properties: { done: true }, required: ['done'] }, true],
+    [
+      'matches the trimmed field name',
+      { properties: { done: {} }, required: ['done'] },
+      true,
+      ' done ',
+    ],
+    [
+      'rejects an inherited property name',
+      { properties: {}, required: ['toString'] },
+      false,
+      'toString',
+    ],
+    ['rejects absent properties', {}, false],
+    ['rejects null properties', { properties: null }, false],
+    ['rejects array properties', { properties: ['done'] }, false],
+    ['rejects an empty required list', { properties: { done: {} }, required: [] }, false],
+    [
+      'rejects a required list naming another field',
+      { properties: { done: {} }, required: ['other'] },
+      false,
+    ],
+    ['rejects non-array required', { properties: { done: {} }, required: 'done' }, false],
+  ];
+
+  for (const [name, output_format, accepted, until_field = 'done'] of cases) {
+    test(name, () => {
+      const engine = dagNodeSchema.safeParse({
+        id: 'l',
+        output_format,
+        loop: { prompt: 'iterate', max_iterations: 5, until_field },
+      });
+      expect(engine.success).toBe(accepted);
+      const issues = validateStructural({
+        name: 'w',
+        description: 'd',
+        meta: {},
+        nodes: [
+          {
+            id: 'l',
+            variant: 'loop',
+            base: { output_format },
+            data: {
+              prompt: 'iterate',
+              max_iterations: 5,
+              fresh_context: false,
+              until_field,
+            },
+          },
+        ],
+      });
+      expect(issues.length === 0).toBe(engine.success);
+      if (!accepted) {
+        expect(issues).toContainEqual(
+          expect.objectContaining({
+            severity: 'error',
+            source: 'client-instant',
+            path: { nodeId: 'l', field: 'loop.until_field' },
+          })
+        );
+      }
+    });
+  }
+});
+
+describe('durable wait bound parity', () => {
+  test("the builder's wait bound is the engine's", () => {
+    expect(BUILDER_MAX_DURABLE_WAIT_MS).toBe(MAX_DURABLE_WAIT_MS);
+  });
 });

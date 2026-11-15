@@ -10,7 +10,8 @@ import { providerSettledSchema } from './settled';
  * already use, so one stream has one discriminator.
  *
  * Text events carry a whole block, not a token delta: a provider coalesces deltas and sends
- * the block at a block, tool or turn boundary.
+ * the block at a block, tool or turn boundary. A warning may split a reply block;
+ * later chunks mark continuations.
  */
 
 /** ACP `agent_message_chunk`. */
@@ -18,6 +19,8 @@ export const agentMessageChunkSchema = z.object({
   type: z.literal('agent_message_chunk'),
   /** One whole block of the agent's reply. ACP wraps it in a `content` block; Archon carries the text. */
   text: z.string().min(1),
+  /** Archon addition: append to the previous reply block across an immediate warning. */
+  continuesPreviousBlock: z.literal(true).optional(),
 });
 
 /** ACP `agent_thought_chunk`. */
@@ -39,8 +42,15 @@ export const toolCallSchema = z.object({
   name: z.string(),
   /** ACP `title` (required there), a human-readable label such as the command a shell tool runs. */
   title: z.string().optional(),
-  /** ACP `rawInput`. Archon narrows it to an object, which is what every SDK sends. */
-  rawInput: z.record(z.string(), z.unknown()).optional(),
+  /** ACP `rawInput`: providers may send any JSON value, including scalar tool arguments. */
+  rawInput: z
+    .json()
+    // The OpenAPI exporter cannot traverse Zod's recursive JSON schema.
+    .meta({
+      type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
+      additionalProperties: true,
+    })
+    .optional(),
 });
 
 /**
@@ -188,6 +198,9 @@ export const stateUpdateSchema = z.object({
   state: z.enum(['running', 'requires_action']),
 });
 
+/** Provider activity that resets the idle watchdog without starting a new result phase. */
+export const heartbeatSchema = z.object({ type: z.literal('heartbeat') });
+
 /** Every non-terminal event a provider may stream. */
 export const providerEventSchema = z.discriminatedUnion('type', [
   agentMessageChunkSchema,
@@ -200,6 +213,7 @@ export const providerEventSchema = z.discriminatedUnion('type', [
   subtaskSchema,
   hookSchema,
   stateUpdateSchema,
+  heartbeatSchema,
 ]);
 export type ProviderEvent = z.infer<typeof providerEventSchema>;
 

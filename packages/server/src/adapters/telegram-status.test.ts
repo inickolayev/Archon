@@ -8,6 +8,10 @@ import { createTurnStatus, telegramStatusConfig, withTurnStatus } from './telegr
 const tick = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 class FakeAdapter implements IPlatformAdapter {
+  readonly capabilities = {
+    messagePersistence: 'core',
+    defaultWorkflowDispatch: 'foreground',
+  } as const;
   readonly sent: { conversationId: string; message: string; metadata?: MessageMetadata }[] = [];
   #secret = 'private field — a proxy must not break access to it';
 
@@ -61,7 +65,7 @@ class FakeTransport implements StatusTransport {
   }
 }
 
-const toolEvent = (name: string, rawInput?: Record<string, unknown>): PlatformStructuredEvent => ({
+const toolEvent = (name: string, rawInput?: Record<string, string>): PlatformStructuredEvent => ({
   type: 'tool_call',
   toolCallId: `call-${name}`,
   name,

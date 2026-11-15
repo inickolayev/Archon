@@ -1,0 +1,75 @@
+import type { RunDoorbell } from '../services/run-attention-watch';
+import type { IIsolationStore, IsolationEnvironmentRow } from '@archon/isolation';
+import type { Codebase, CreateCodebaseInput, UpdateCodebaseInput } from '../schemas/codebase';
+import type { User, IdentityPlatform } from '../schemas/user';
+import type { Conversation, UpdateConversationInput } from '../schemas/conversation';
+import type { MessageRow } from '../schemas/message';
+import type { IWorkflowEngine } from '@archon/workflows/engine-port';
+import type { WorkflowOperations } from '../operations/workflow-operations';
+import type { MergedConfig } from '../config/config-types';
+import type { WorkflowDeps } from '@archon/workflows/deps';
+
+export interface IWorkflowHostStore {
+  codebases: {
+    getCodebase(id: string): Promise<Codebase | null>;
+    findCodebaseByDefaultCwd(cwd: string): Promise<Codebase | null>;
+    findCodebaseByPathPrefix(cwd: string): Promise<Codebase | null>;
+    findCodebaseByName(name: string): Promise<Codebase | null>;
+    findCodebaseByRepoUrl(url: string): Promise<Codebase | null>;
+    listCodebases(): Promise<readonly Codebase[]>;
+    /** Rows for name, storage and remote-ownership scans; an unreadable row must not fail the scan. */
+    listCodebaseClaims(): Promise<readonly Codebase[]>;
+    createCodebase(data: CreateCodebaseInput): Promise<Codebase>;
+    /**
+     * Under the registration lock, check ownership and move an unregistered checkout aside.
+     * `remove` receives the moved path and runs after the lock is released, also when the
+     * locked step fails after the move; a registered checkout is left in place and `remove`
+     * is not called.
+     */
+    removeUnregisteredCheckout(
+      path: string,
+      remove: (detached: string) => Promise<void>
+    ): Promise<void>;
+    updateCodebase(target: Pick<Codebase, 'id' | 'name'>, data: UpdateCodebaseInput): Promise<void>;
+    getCodebaseCommands(id: string): Promise<Codebase['commands']>;
+    updateCodebaseCommands(id: string, commands: Codebase['commands']): Promise<void>;
+  };
+  users: {
+    getUserById(id: string): Promise<User | null>;
+    findOrCreateUserByPlatformIdentity(
+      platform: IdentityPlatform,
+      id: string,
+      displayName?: string
+    ): Promise<User | null>;
+  };
+  conversations: {
+    getConversationById(id: string): Promise<Conversation | null>;
+    updateConversation(id: string, updates: UpdateConversationInput): Promise<void>;
+  };
+  messages: {
+    addMessage(
+      conversationId: string,
+      role: MessageRow['role'],
+      content: string,
+      metadata?: Record<string, unknown>,
+      userId?: string
+    ): Promise<MessageRow>;
+  };
+  isolation: IIsolationStore & {
+    listByCodebase(codebaseId: string): Promise<readonly IsolationEnvironmentRow[]>;
+    findLatestByCodebaseAndWorkingPath(
+      codebaseId: string,
+      workingPath: string,
+      createdBefore: Date
+    ): Promise<IsolationEnvironmentRow | null>;
+  };
+}
+
+/** One workflow host: the engine, operations, queries and termination share `deps.store`. */
+export interface WorkflowHost {
+  deps: Omit<WorkflowDeps, 'loadConfig'> & { loadConfig: (cwd: string) => Promise<MergedConfig> };
+  records: IWorkflowHostStore;
+  engine: IWorkflowEngine;
+  operations: WorkflowOperations;
+  doorbell?: RunDoorbell;
+}

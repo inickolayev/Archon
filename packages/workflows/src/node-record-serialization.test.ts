@@ -1,13 +1,34 @@
-import { finishNodeExecution, startNodeExecution, newNodeInvocation } from './node-execution';
-import { readNodeRecordEvent } from './node-record-reader';
-import { describe, expect, it } from 'bun:test';
+// @archon-test-isolated
 import {
+  oldSerializedNodeDataSchema,
+  oldSkippedLifecycleSchema,
+  oldRunSkippedNodeSchema,
+} from './skip-cause.compatibility-fixture';
+import { skipCauseSchema, type SkipCause } from './schemas/node-state';
+import { buildRunNodeStates } from './terminal-record';
+import { finishNodeExecution, startNodeExecution, newNodeInvocation } from './node-execution';
+import {
+  isExecNodeRecord,
+  readNodeRecordEvent,
+  readDeferredNodeUsageEvent,
+} from './node-record-reader';
+import { declaredOutputPathsFromSchema, resolveNodeOutputField } from './output-ref';
+import { describe, expect, it } from 'bun:test';
+import { execNodeSchema } from './schemas/exec-node';
+import {
+  nodeCostScope,
   serializeNodeEmitter,
   serializeNodeOutput,
   serializeNodeStateRecord,
+  serializeDeferredNodeUsage,
   serializeNodeTranscript,
 } from './node-record-serialization';
-import type { NodeExecutionRecord } from './schemas/node-execution';
+import {
+  executionLifecycleSchema,
+  nodeExecutionMetadataSchema,
+  type NodeExecutionRecord,
+} from './schemas/node-execution';
+import { NODE_LIFECYCLE_EVENT_TYPES } from './store';
 
 const record = (): NodeExecutionRecord => ({
   runId: 'run-1',
@@ -37,7 +58,7 @@ const record = (): NodeExecutionRecord => ({
   output: {
     text: 'full runtime output',
     structured: { verdict: 'pass' },
-    declaredFields: ['verdict'],
+    declaredOutputPaths: [['verdict']],
     persisted: { text: 'preview', truncated: true, originalBytes: 100, spillPath: '/spill' },
   },
   diagnostics: {
@@ -62,6 +83,197 @@ const record = (): NodeExecutionRecord => ({
 });
 
 describe('node record serializers', () => {
+  const lifecycles = {
+    started: { status: 'started' },
+    suspended: { status: 'suspended', point: 'wait' },
+    completed: { status: 'completed' },
+    failed: { status: 'failed', error: 'body failed' },
+    skipped: {
+      status: 'skipped',
+      reason: 'trigger_rule',
+      cause: { kind: 'upstream_failed', origin: 'peer' },
+    },
+  } satisfies {
+    [Status in NodeExecutionRecord['lifecycle']['status']]: Extract<
+      NodeExecutionRecord['lifecycle'],
+      { status: Status }
+    >;
+  };
+
+  it.each(Object.values(lifecycles))(
+    'admits and reconstructs $status execution events',
+    lifecycle => {
+      const source = { ...record(), lifecycle };
+      const durable = serializeNodeStateRecord(source);
+      expect(NODE_LIFECYCLE_EVENT_TYPES.some(type => type === durable.event_type)).toBe(true);
+      expect(readNodeRecordEvent(durable)?.metadata?.lifecycle).toEqual(lifecycle);
+    }
+  );
+
+  it('reads back every field the writer emits for a failed lifecycle', () => {
+    const lifecycle: Extract<NodeExecutionRecord['lifecycle'], { status: 'failed' }> = {
+      status: 'failed',
+      error: 'body failed',
+      exitCode: 2,
+      retryable: false,
+      failureKind: 'exec_failed',
+      providerFailure: { class: 'rate_limited', evidence: 'slow down' },
+    };
+    // A field added to the failed variant but not populated above fails here, not in review.
+    const failedShape = executionLifecycleSchema.options.find(
+      option => option.shape.status.value === 'failed'
+    );
+    expect(Object.keys(lifecycle).sort()).toEqual(Object.keys(failedShape?.shape ?? {}).sort());
+    const durable = serializeNodeStateRecord({ ...record(), lifecycle });
+    const restored = readNodeRecordEvent({ ...durable, data: JSON.stringify(durable.data) });
+    expect(restored?.metadata?.lifecycle).toEqual(lifecycle);
+  });
+
+  it('preserves persisted lifecycle selection order', () => {
+    expect(NODE_LIFECYCLE_EVENT_TYPES).toEqual([
+      'node_started',
+      'node_suspended',
+      'node_completed',
+      'node_failed',
+      'node_skipped',
+      'node_skipped_prior_success',
+    ]);
+  });
+
+  it('persists and reads every schema-owned metadata field', () => {
+    const source = record();
+    const durable = serializeNodeStateRecord(source);
+    const restored = readNodeRecordEvent({ ...durable, data: JSON.stringify(durable.data) });
+    for (const key of nodeExecutionMetadataSchema.keyof().options) {
+      expect(Object.hasOwn(source, key)).toBe(true);
+      expect(restored?.metadata?.[key]).toEqual(source[key]);
+      if (key === 'runId' || key === 'path' || key === 'lifecycle') {
+        expect(durable.data).not.toHaveProperty(key);
+      } else {
+        expect(Object.hasOwn(durable.data, key)).toBe(true);
+        expect(durable.data[key]).toEqual(source[key]);
+        expect(restored?.data[key]).toEqual(source[key]);
+      }
+    }
+  });
+
+  it('classifies current and metadata-free exec records using the persisted writer vocabulary', () => {
+    for (const runtime of execNodeSchema.shape.runtime.options) {
+      const source: NodeExecutionRecord = {
+        ...record(),
+        node: { id: 'exec', kind: 'exec', runtime },
+      };
+      const event = serializeNodeStateRecord(source);
+      expect(event.data.type).toBe(runtime === 'sh' ? 'bash' : 'script');
+      for (const data of [event.data, { type: event.data.type }]) {
+        const restored = readNodeRecordEvent({ ...event, data });
+        expect(restored).toBeDefined();
+        expect(restored && isExecNodeRecord(restored)).toBe(true);
+      }
+    }
+    const event = serializeNodeStateRecord(record());
+    for (const data of [event.data, { type: event.data.type }, {}]) {
+      const restored = readNodeRecordEvent({ ...event, data });
+      expect(restored && isExecNodeRecord(restored)).toBe(false);
+    }
+  });
+
+  it.each([
+    ['started', 'node_start'],
+    ['completed', 'node_complete'],
+  ] as const)('labels %s shell transcript rows as <bash>', (status, type) => {
+    const source: NodeExecutionRecord = {
+      ...record(),
+      node: { id: 'build', kind: 'exec', runtime: 'sh' },
+      lifecycle: { status },
+    };
+
+    expect(serializeNodeTranscript(source)).toMatchObject({
+      type,
+      step: 'build',
+      content: '<bash>',
+    });
+  });
+
+  it('projects deferred usage without lifecycle, output or provider binding', () => {
+    const source = {
+      ...record(),
+      accounting: 'node' as const,
+      lifecycle: { status: 'suspended' as const, point: 'interactive_loop' as const },
+    };
+    const event = serializeDeferredNodeUsage(source);
+    expect(event).toMatchObject({
+      workflow_run_id: 'run-1',
+      step_name: 'group.review',
+      event_type: 'node_deferred_usage',
+      data: {
+        accounting: 'node',
+        tokens: { input: 0, output: 0 },
+        cost_usd: 0,
+      },
+    });
+    expect(Object.keys(event.data).sort()).toEqual(
+      ['accounting', 'invocation', 'spend', 'tokens', 'cost_usd'].sort()
+    );
+    expect(readNodeRecordEvent(event)).toBeUndefined();
+    const withBaseline = serializeDeferredNodeUsage(source, source.spend);
+    expect(
+      readDeferredNodeUsageEvent({
+        ...withBaseline,
+        data: JSON.stringify(withBaseline.data),
+      })?.data.loopBaseline
+    ).toEqual(source.spend);
+  });
+
+  it('distinguishes incomplete token accounting from an ordinary unavailable measurement', () => {
+    for (const reason of ['unknown', 'not_reported', 'incomplete'] as const) {
+      const source = record();
+      source.spend.tokens = { source: 'unavailable', reason };
+      expect(serializeNodeOutput(source).tokens).toBeUndefined();
+      expect(serializeNodeOutput(source).tokensUnknown).toBe(
+        reason === 'incomplete' ? true : undefined
+      );
+      const event = serializeNodeStateRecord(source);
+      expect(readNodeRecordEvent(event)?.rawUsage.tokensUnknown).toBe(
+        reason === 'incomplete' ? true : undefined
+      );
+      const deferred = serializeDeferredNodeUsage(source);
+      expect(readDeferredNodeUsageEvent(deferred)?.rawUsage.tokensUnknown).toBe(
+        reason === 'incomplete'
+      );
+    }
+    const unavailable = finishNodeExecution(
+      record(),
+      { status: 'completed' },
+      { tokensUnknown: true }
+    );
+    expect(unavailable.spend.tokens).toEqual({ source: 'unavailable', reason: 'incomplete' });
+    expect(unavailable.spend.costUsd).toEqual(record().spend.costUsd);
+  });
+
+  it('capacity failure survives a persisted JSON round trip', () => {
+    const failure = { class: 'overloaded', evidence: 'opaque vendor failure' } as const;
+    const failed = finishNodeExecution(record(), {
+      status: 'failed',
+      error: failure.evidence,
+      failureKind: 'overloaded',
+      providerFailure: failure,
+    });
+    const event = serializeNodeStateRecord(failed);
+    const restored = readNodeRecordEvent({ ...event, data: JSON.stringify(event.data) });
+    expect(restored?.data.failure_kind).toBe('overloaded');
+    expect(restored?.data.provider_failure).toEqual(failure);
+  });
+
+  it('reads the cost scope the durable row marks, with or without its accounting', () => {
+    for (const accounting of nodeExecutionMetadataSchema.shape.accounting.options) {
+      const { data } = serializeNodeStateRecord({ ...record(), accounting });
+      const scope = nodeCostScope(data);
+      expect(scope === 'total').toBe(data.aggregate === true);
+      expect(nodeCostScope({ ...data, accounting: undefined })).toBe(scope);
+    }
+  });
+
   it('invalid provider numbers cannot erase a completed output on JSON round trip', () => {
     const completed = finishNodeExecution(
       record(),
@@ -78,6 +290,20 @@ describe('node record serializers', () => {
     expect(restored?.metadata?.spend.costUsd).toEqual({ source: 'unavailable', reason: 'invalid' });
     expect(restored?.metadata?.spend.tokens).toEqual({ source: 'unavailable', reason: 'invalid' });
     expect(restored?.data).not.toHaveProperty('cost_usd');
+  });
+
+  it('projects the requested binding onto the started event', () => {
+    const source = record();
+    source.lifecycle = { status: 'started' };
+    source.binding.effort = 'high';
+
+    expect(serializeNodeEmitter(source)).toMatchObject({
+      type: 'node_started',
+      provider: 'claude',
+      model: 'large',
+      tier: 'large',
+      effort: 'high',
+    });
   });
 
   it('projects one canonical record truthfully through persistence, transcript, emitter and runtime', () => {
@@ -123,19 +349,22 @@ describe('node record serializers', () => {
     });
     expect(JSON.stringify(durable)).not.toContain('full runtime output');
     expect(JSON.stringify(durable)).not.toContain('sessionId');
+    // The fixture amends an already-recorded attempt, so the transcript and the emitter
+    // present no spend of its own (#3508). The durable row keeps every number beside the
+    // `aggregate` marker, and the runtime result keeps the scope total the run total reads.
     expect(serializeNodeTranscript(source)).toMatchObject({
       type: 'node_complete',
       duration_ms: 42,
-      cost_usd: 0,
-      tokens: { input: 0, output: 0 },
     });
+    expect(serializeNodeTranscript(source)).not.toHaveProperty('cost_usd');
+    expect(serializeNodeTranscript(source)).not.toHaveProperty('tokens');
     expect(serializeNodeEmitter(source)).toMatchObject({
       type: 'node_completed',
       duration: 42,
-      costUsd: 0,
       stopReason: 'end_turn',
       numTurns: 1,
     });
+    expect(serializeNodeEmitter(source)).not.toHaveProperty('costUsd');
     expect(serializeNodeOutput(source)).toMatchObject({
       state: 'completed',
       output: 'full runtime output',
@@ -144,6 +373,97 @@ describe('node record serializers', () => {
       costUsd: 0,
       loopIterations: 3,
     });
+  });
+
+  it('reports spend as a node its own only for accounting: node (#3508)', () => {
+    // The rule every sink shares, stated where a future `accounting` value is decided:
+    // a restatement reaches the durable row (marked `aggregate`) and the runtime result
+    // (which the run total reads), and nothing else.
+    for (const accounting of ['aggregate', 'instance', 'amendment'] as const) {
+      const source = { ...record(), accounting };
+      const label = `accounting: ${accounting}`;
+      const transcript = serializeNodeTranscript(source);
+      const emitter = serializeNodeEmitter(source);
+      expect({ [`${label} transcript`]: transcript && 'cost_usd' in transcript }).toEqual({
+        [`${label} transcript`]: false,
+      });
+      expect({ [`${label} emitter`]: emitter && 'costUsd' in emitter }).toEqual({
+        [`${label} emitter`]: false,
+      });
+      expect(serializeNodeStateRecord(source).data).toMatchObject({
+        aggregate: true,
+        cost_usd: 0,
+        tokens: { input: 0, output: 0 },
+      });
+      expect(serializeNodeOutput(source)).toMatchObject({
+        costUsd: 0,
+        tokens: { input: 0, output: 0 },
+      });
+    }
+
+    const source = { ...record(), accounting: 'node' as const };
+    expect(serializeNodeTranscript(source)).toMatchObject({
+      cost_usd: 0,
+      tokens: { input: 0, output: 0 },
+    });
+    expect(serializeNodeEmitter(source)).toMatchObject({ costUsd: 0 });
+    expect(serializeNodeStateRecord(source).data).not.toHaveProperty('aggregate');
+  });
+
+  it('names a node by its bare command name on progress surfaces and keeps the qualified reference durable', () => {
+    const packaged = '__archon_pack__installed:Wirasm.archon-video:make::hooks';
+    const nameOf = (node: NodeExecutionRecord['node']) => {
+      const event = serializeNodeEmitter({ ...record(), node });
+      return event && 'nodeName' in event ? event.nodeName : undefined;
+    };
+
+    expect(
+      nameOf({ id: 'hooks-node', kind: 'agent', source: { kind: 'command', name: packaged } })
+    ).toBe('hooks');
+    expect(
+      nameOf({ id: 'review', kind: 'agent', source: { kind: 'command', name: 'review-pr' } })
+    ).toBe('review-pr');
+    expect(nameOf({ id: 'build', kind: 'exec', runtime: 'sh' })).toBe('build');
+
+    const source: NodeExecutionRecord = {
+      ...record(),
+      node: { id: 'hooks-node', kind: 'agent', source: { kind: 'command', name: packaged } },
+      diagnostics: { command: packaged },
+    };
+    expect(serializeNodeStateRecord(source)).toMatchObject({
+      step_name: 'group.review',
+      data: { command: packaged },
+    });
+    expect(serializeNodeTranscript(source)).toMatchObject({
+      step: 'hooks-node',
+      content: packaged,
+    });
+  });
+
+  it('writes the full session id to the durable row only, for completed and failed attempts', () => {
+    const sessionId = '0123456789abcdef-full-session-id';
+    const finished = [
+      finishNodeExecution(record(), { status: 'completed' }, { sessionId }),
+      finishNodeExecution(
+        record(),
+        { status: 'failed', error: 'boom', failureKind: 'transient' },
+        { sessionId }
+      ),
+    ];
+    for (const source of finished) {
+      const durable = serializeNodeStateRecord(source);
+      expect(durable.data.session_id).toBe(sessionId);
+      // The reader exposes it from the stored JSON, as `workflow get` reads it.
+      const restored = readNodeRecordEvent({ ...durable, data: JSON.stringify(durable.data) });
+      expect(restored?.data.session_id).toBe(sessionId);
+      expect(source.binding.sessionPreview).toBe('01234567');
+      // Whole-output assertions, so a field added later cannot carry the id either.
+      expect(JSON.stringify(serializeNodeTranscript(source))).not.toContain(sessionId);
+      expect(JSON.stringify(serializeNodeEmitter(source))).not.toContain(sessionId);
+      expect(JSON.stringify(restored?.metadata)).not.toContain(sessionId);
+    }
+    // The engine still threads the id to the next node through the node's output.
+    expect(serializeNodeOutput(finished[0])).toMatchObject({ state: 'completed', sessionId });
   });
 
   it('only exposes a short provider session preview', () => {
@@ -171,5 +491,192 @@ describe('node record serializers', () => {
     expect(serializeNodeEmitter(source)).not.toHaveProperty('duration');
     expect(serializeNodeOutput(source)).not.toHaveProperty('tokens');
     expect(serializeNodeOutput(source)).not.toHaveProperty('costUsd');
+  });
+
+  it.each([
+    { status: 'completed' },
+    { status: 'failed', error: 'body failed' },
+    {
+      status: 'skipped',
+      reason: 'trigger_rule',
+      cause: { kind: 'upstream_failed', origin: 'peer' },
+    },
+    { status: 'suspended', point: 'interactive_loop' },
+  ] as const)('preserves unpriced group usage through $status finalization', lifecycle => {
+    const started = startNodeExecution({
+      runId: 'run',
+      path: 'group',
+      invocation: newNodeInvocation(),
+      node: {
+        id: 'group',
+        kind: 'loop_group',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'child', kind: 'agent', source: { kind: 'inline', prompt: 'Work' } }],
+        },
+      },
+    });
+    expect(started.spend.costUsd).toEqual({ source: 'unavailable', reason: 'not_applicable' });
+    const finished = finishNodeExecution(started, lifecycle, { costPartial: true });
+    const saved = readNodeRecordEvent(serializeNodeStateRecord(finished));
+    expect(saved?.metadata?.spend.costUsd).toEqual({ source: 'unavailable', reason: 'incomplete' });
+    expect(serializeNodeOutput(finished)).toMatchObject({ costPartial: true });
+    expect(serializeNodeOutput(finished)).not.toHaveProperty('costUsd');
+  });
+
+  it('marks a partially reported cost as a floor without changing its value', () => {
+    const started = startNodeExecution({
+      runId: 'run',
+      path: 'work',
+      node: { id: 'work', kind: 'agent', source: { kind: 'inline', prompt: 'p' } },
+      invocation: newNodeInvocation(),
+      provider: 'claude',
+    });
+    const partial = finishNodeExecution(
+      started,
+      { status: 'completed' },
+      { costUsd: 0.2, costPartial: true }
+    );
+    expect(partial.spend.costUsd).toEqual({ source: 'provider', value: 0.2, partial: true });
+    expect(serializeNodeOutput(partial)).toMatchObject({ costUsd: 0.2 });
+    // With no reported cost at all there is nothing to mark: the cost stays unavailable.
+    const unreported = finishNodeExecution(started, { status: 'completed' }, { costPartial: true });
+    expect(unreported.spend.costUsd).toEqual(started.spend.costUsd);
+  });
+});
+
+it('persists the path contract beside its legacy root fields and reads either shape', () => {
+  const source = record();
+  const paths = [['proposal'], ['proposal', 'action']];
+  source.output = { text: '{"proposal":{"action":"add"}}', declaredOutputPaths: paths };
+  expect(serializeNodeOutput(source)).toMatchObject({ declaredOutputPaths: paths });
+  for (const event of [
+    serializeNodeStateRecord(source),
+    serializeNodeStateRecord({
+      runId: source.runId,
+      path: source.path,
+      node: source.node,
+      cache: { action: 'replayed', output: source.output },
+    }),
+  ]) {
+    // Older binaries read only `declared_fields`, so every write still carries it.
+    expect(event.data).toMatchObject({
+      declared_fields: ['proposal'],
+      declared_output_paths: paths,
+    });
+    expect(
+      readNodeRecordEvent({ ...event, data: JSON.stringify(event.data) })?.data
+        .declared_output_paths
+    ).toEqual(paths);
+    // A row an older binary wrote has only the root fields: they read as depth-1 paths.
+    expect(
+      readNodeRecordEvent({ ...event, data: { node_output: '{}', declared_fields: ['a', 'b'] } })
+        ?.data.declared_output_paths
+    ).toEqual([['a'], ['b']]);
+  }
+});
+
+it('round trips a composed path contract without changing its persisted shape', () => {
+  const paths = declaredOutputPathsFromSchema({
+    anyOf: [
+      { properties: { proposal: { properties: { action: { type: 'string' } } } } },
+      { properties: { proposal: { properties: { reason: { type: 'string' } } } } },
+    ],
+  });
+  const source = record();
+  source.output = { text: '{"proposal":{"reason":"needed"}}', declaredOutputPaths: paths };
+  const event = serializeNodeStateRecord(source);
+  expect(event.data).toMatchObject({
+    declared_fields: ['proposal'],
+    declared_output_paths: [['proposal'], ['proposal', 'action'], ['proposal', 'reason']],
+  });
+  const restored = readNodeRecordEvent({ ...event, data: JSON.stringify(event.data) });
+  expect(restored?.data.declared_output_paths).toEqual(paths);
+  expect(
+    resolveNodeOutputField(
+      {
+        state: 'completed',
+        output: source.output.text,
+        declaredOutputPaths: restored?.data.declared_output_paths,
+      },
+      'review',
+      'proposal.reason',
+      '$review.output.proposal.reason'
+    )
+  ).toEqual({ kind: 'value', value: 'needed' });
+});
+
+it('preserves an empty strict composed contract through persistence and authorization', () => {
+  const paths = declaredOutputPathsFromSchema({ allOf: [{}] });
+  expect(paths).toEqual([]);
+  const source = record();
+  const text = '{"undeclared":"present"}';
+  source.output = { text, declaredOutputPaths: paths };
+  const event = serializeNodeStateRecord(source);
+  expect(event.data).toMatchObject({ declared_fields: [], declared_output_paths: [] });
+  const restored = readNodeRecordEvent({ ...event, data: JSON.stringify(event.data) });
+  expect(restored?.data.declared_output_paths).toEqual([]);
+  expect(() =>
+    resolveNodeOutputField(
+      {
+        state: 'completed',
+        output: text,
+        declaredOutputPaths: restored?.data.declared_output_paths,
+      },
+      'review',
+      'undeclared',
+      '$review.output.undeclared'
+    )
+  ).toThrow('not declared');
+});
+
+describe('include skip provenance compatibility', () => {
+  const legacyCauses = [
+    { kind: 'condition', expr: "$gate.output == 'go'" },
+    { kind: 'condition_parse_error', expr: '$missing.output.route' },
+    { kind: 'timeout' },
+    { kind: 'upstream_failed', origin: 'source' },
+    { kind: 'upstream_skipped', origin: 'source' },
+  ] satisfies SkipCause[];
+
+  it.each(legacyCauses)('preserves $kind provenance while older readers accept it', legacyCause => {
+    const boundary = { includeId: 'outer__cycle.review', workflow: 'review-block' };
+    const cause = { ...legacyCause, boundary };
+    expect(skipCauseSchema.parse(legacyCause)).toEqual(legacyCause);
+    const reason =
+      cause.kind === 'condition'
+        ? 'when_condition'
+        : cause.kind === 'condition_parse_error'
+          ? 'when_condition_parse_error'
+          : cause.kind === 'timeout'
+            ? 'timeout'
+            : 'trigger_rule';
+    const lifecycle = { status: 'skipped', reason, cause } as const;
+    const source = { ...record(), lifecycle };
+    const durable = serializeNodeStateRecord(source);
+    expect(readNodeRecordEvent(durable)?.metadata?.lifecycle).toEqual(lifecycle);
+    expect(readNodeRecordEvent(durable)?.data.cause).toEqual(cause);
+    expect(serializeNodeOutput(source)).toMatchObject({ state: 'skipped', cause });
+    expect(serializeNodeEmitter(source)).toMatchObject({ type: 'node_skipped', reason, cause });
+    const oldData = oldSerializedNodeDataSchema.parse(durable.data);
+    expect(oldData.cause).toEqual(legacyCause);
+    expect(oldSkippedLifecycleSchema.parse(lifecycle)).toEqual({
+      ...lifecycle,
+      cause: legacyCause,
+    });
+    const oldSource = { ...source, lifecycle: { ...lifecycle, cause: legacyCause } };
+    expect(oldData).toEqual(
+      oldSerializedNodeDataSchema.parse(serializeNodeStateRecord(oldSource).data)
+    );
+    const nodes = buildRunNodeStates({ id: source.runId, metadata: {} }, [durable]);
+    expect(nodes).toEqual([{ node_id: source.path, state: 'skipped', reason, cause }]);
+    expect(oldRunSkippedNodeSchema.parse(nodes[0])).toEqual({
+      node_id: source.path,
+      state: 'skipped',
+      reason,
+      cause: legacyCause,
+    });
   });
 });

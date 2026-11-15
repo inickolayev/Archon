@@ -1,223 +1,56 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { listPiModels } from './model-catalog';
+import type {
+  CredentialStatus,
+  ProviderDiagnostics,
+  ProviderModelList,
+} from '@archon/provider-contract';
+import {
+  collectCredentialValues,
+  redactCredentialValues,
+} from '@archon/paths/credential-redaction';
 
 import { createLogger } from '@archon/paths';
-// Type-only import — erased by TS, so it does NOT trigger Pi's config.js
-// package.json read at module load (see the header note below). Used only to
-// annotate the per-call ResourceLoader local.
-import type { DefaultResourceLoader } from '@earendil-works/pi-coding-agent';
 
 import type {
   IAgentProvider,
   MessageChunk,
   ProviderCapabilities,
   SendQueryOptions,
-  SystemPromptInput,
 } from '../../types';
 
 import { PI_CAPABILITIES } from './capabilities';
-import { parsePiConfig, resolvePiExtensionSettings } from './config';
-import { parsePiModelRef } from './model-ref';
-import { buildCustomProviderModelsPath } from './request-auth';
-import { withResumedOutcome, resumedOutcome } from '../../shared/resumed';
+import { parsePiConfig } from './config';
 import { closeOpenToolCalls } from '../../shared/tool-calls';
-import { ClassifiedProviderError, failureClassOfThrown, failureResult } from '../../shared/failure';
+import { failureClassOfThrown, failureResult } from '../../shared/failure';
+import { piExtensionFailureEvidence } from './extension-error-broker';
+import {
+  applyPiEnvOverride,
+  createPiModelRuntime,
+  piAuthEnv,
+  resolvePiModel,
+  resolvePiTurnAuth,
+} from './auth';
+import { ensurePiOAuthFlowsRegistered, ensurePiPackageDirShim } from './sdk-setup';
+import { streamPiTurn } from './turn';
 
 // IMPORTANT: Do NOT add static `import { ... } from '@earendil-works/*'` here,
 // and do NOT statically import sibling modules that themselves import runtime
 // values from Pi (options-translator, resource-loader, session-resolver,
-// ui-context-stub, event-bridge). Pi's `@earendil-works/pi-coding-agent/dist/config.js`
+// ui-context-stub, event-bridge, session-setup). Pi's `@earendil-works/pi-coding-agent/dist/config.js`
 // runs `readFileSync(getPackageJsonPath(), "utf-8")` at module load; inside a
 // compiled Archon binary `getPackageJsonPath()` resolves to
 // `dirname(process.execPath) + "/package.json"` — a path that doesn't exist —
 // and archon crashes at startup before any command runs (v0.3.7 symptom).
 //
 // All Pi SDK value bindings and Pi-dependent helper modules are dynamically
-// imported inside `sendQuery()` below, which runs only when a Pi workflow is
-// actually invoked. Type-only imports above are fine — TS erases them.
+// imported when a Pi workflow is actually invoked (`streamPiTurn` in ./turn.ts,
+// and the methods below). Type-only imports are fine — TS erases them.
 //
 // Lazy-loading defers the crash from boot-time to sendQuery-time — but the
 // crash still happens when Pi is actually used. `ensurePiPackageDirShim()`
-// (see below) fixes the *runtime* half: before any dynamic Pi import in
-// sendQuery, write a stub package.json to tmpdir and point Pi at it via
-// its own documented `PI_PACKAGE_DIR` escape hatch.
-
-// ─── Concurrency throttle ────────────────────────────────────────────────────
-
-/**
- * Simple counting semaphore for capping concurrent Pi `session.prompt()` calls.
- * Pi/Minimax has no built-in SDK-level throttling; without this, large parallel
- * workflow batches (e.g. 10+ concurrent review PRs × 5 aspects each) hit rate
- * limits and cascade-fail. Module-level so it's shared across all PiProvider
- * instances within a process — Pi concurrency is global (one upstream backend).
- */
-class Semaphore {
-  private available: number;
-  private readonly waiters: (() => void)[] = [];
-
-  constructor(count: number) {
-    this.available = count;
-  }
-
-  acquire(): Promise<void> {
-    if (this.available > 0) {
-      this.available--;
-      return Promise.resolve();
-    }
-    return new Promise<void>(resolve => {
-      this.waiters.push(resolve);
-    });
-  }
-
-  release(): void {
-    const next = this.waiters.shift();
-    if (next) {
-      next();
-      return;
-    }
-    this.available++;
-  }
-}
-
-let piSemaphore: Semaphore | undefined;
-
-/**
- * Write a minimal package.json to a stable tmpdir and set `PI_PACKAGE_DIR`
- * so Pi's `config.js` short-circuits its `dirname(process.execPath)` walk
- * (which fails inside a compiled archon binary). Pi only reads three
- * optional fields from that package.json — `piConfig.name`, `piConfig.configDir`,
- * and `version` — so the stub is genuinely minimal. Idempotent: the file is
- * only written once per host (existsSync check), and the env var is set on
- * every call so multiple PiProvider instances stay consistent.
- *
- * Done on each sendQuery rather than at module load so (a) the file write
- * is paid only when Pi is actually used, and (b) the env var can't get
- * clobbered between registration and invocation.
- */
-export function ensurePiPackageDirShim(): void {
-  const shimDir = join(tmpdir(), 'archon-pi-shim');
-  const shimPkgJson = join(shimDir, 'package.json');
-  if (!existsSync(shimPkgJson)) {
-    // `piConfig: {}` is explicit so Pi's defaults (`name: 'pi'`,
-    // `configDir: '.pi'`) kick in — matches Pi's standalone behavior.
-    try {
-      mkdirSync(shimDir, { recursive: true });
-      writeFileSync(
-        shimPkgJson,
-        JSON.stringify({
-          name: 'archon-pi-shim',
-          version: '0.0.0',
-          piConfig: {},
-        })
-      );
-    } catch (error) {
-      // Surface as a classified error so the executor's catch sees a known
-      // shape instead of a raw EACCES/ENOSPC from node:fs.
-      const err = error as NodeJS.ErrnoException;
-      throw new Error(`Pi shim setup failed at ${shimDir}: ${err.message}`);
-    }
-  }
-  process.env.PI_PACKAGE_DIR = shimDir;
-}
-
-// ─── Bedrock backend registration (compiled-binary parity) ───────────────────
-
-/**
- * Registrar for Pi's Bedrock backend module. Split out from
- * `ensureBedrockProviderRegistered` so tests can inject a spy without touching
- * the real SDK (Bun's `mock.module` is process-global and irreversible).
- */
-export type BedrockRegistrar = () => Promise<void>;
-
-/**
- * The default registrar: dynamically import the Pi SDK's Bedrock override hook
- * and the statically-bundled Bedrock module, then wire them together.
- *
- * Both specifiers are STRING LITERALS on purpose — that is the entire point of
- * this fix. Pi lazy-loads every backend via `import()`, and for all backends
- * except Bedrock the specifier is a string literal that Bun's `--compile`
- * static analysis can follow and embed. Bedrock's loader instead routes through
- * a computed-specifier indirection (`importNodeOnlyApi('./bedrock-converse-stream.ts')`
- * in pi-ai's `bedrock-converse-stream.lazy.js`) that Bun cannot resolve, so
- * `bedrock-converse-stream.js` + `@aws-sdk/client-bedrock-runtime` never get
- * bundled and a compiled Archon binary fails with `Cannot find module … /$bunfs/…`
- * on any `amazon-bedrock/*` model (issue #2154).
- *
- * Pi fixed the identical bug in their own binary (earendil-works/pi#2349,
- * PR #2350): `setBedrockProviderModule()` is checked FIRST inside the loader,
- * and is fed the module via the static `@earendil-works/pi-ai/bedrock-provider`
- * subpath, which Bun DOES bundle. Archon compiles its own CLI and never runs
- * Pi's bun entrypoint (`bun/register-bedrock.js`), so we mirror that shim here.
- *
- * The two subpaths match Pi's own 0.80.6 `bun/register-bedrock.js` shim exactly:
- * `setBedrockProviderModule` from `@earendil-works/pi-ai/compat` (the SDK moved
- * it off the package root into the compat entrypoint) and `bedrockProviderModule`
- * from `@earendil-works/pi-ai/bedrock-provider`. Both are safe to import inside a
- * compiled binary — Pi loads them in its own working binary — unlike
- * `@earendil-works/pi-coding-agent/config.js`, which reads a package.json next to
- * `process.execPath` (see the header note and `ensurePiPackageDirShim`).
- */
-async function defaultBedrockRegistrar(): Promise<void> {
-  const [compatModule, bedrockModule] = await Promise.all([
-    import('@earendil-works/pi-ai/compat'),
-    import('@earendil-works/pi-ai/bedrock-provider'),
-  ]);
-  compatModule.setBedrockProviderModule(bedrockModule.bedrockProviderModule);
-}
-
-let bedrockRegistrationPromise: Promise<void> | undefined;
-
-/**
- * Register Pi's Bedrock backend override once per process. Idempotent: the
- * registrar runs on the first call and every later call reuses the cached
- * promise. Called from `sendQuery()` (not at module load), so it never
- * eagerly pulls the Pi SDK into module scope — preserving the lazy-load
- * invariant guarded by `provider-lazy-load.test.ts`.
- *
- * Registration failure is swallowed with a WARN rather than thrown: the hook
- * only matters for `amazon-bedrock/*` models, so a failure must not break
- * `anthropic/*`, `cursor/*`, or any other Pi backend. If a Bedrock node then
- * runs, Pi's own `importNodeOnlyApi` fallback still surfaces the original
- * `Cannot find module` error — i.e. degradation is strictly no worse than the
- * pre-fix behavior, and the WARN keeps it searchable.
- */
-export function ensureBedrockProviderRegistered(
-  registrar: BedrockRegistrar = defaultBedrockRegistrar
-): Promise<void> {
-  bedrockRegistrationPromise ??= registrar()
-    .then(() => {
-      getLog().debug('pi.bedrock_provider_register_completed');
-    })
-    .catch((err: unknown) => {
-      getLog().warn({ err }, 'pi.bedrock_provider_register_failed');
-    });
-  return bedrockRegistrationPromise;
-}
-
-/** Test-only: reset the once-per-process registration cache. */
-export function resetBedrockRegistrationForTest(): void {
-  bedrockRegistrationPromise = undefined;
-}
-
-// Pi provider id → env var name used by pi-ai's getEnvApiKey(). Generated
-// from the installed pi-ai SDK (full backend coverage) — see
-// scripts/generate-pi-vendor-map.ts; `bun run check:pi-vendor-map` guards drift.
-import { PI_PROVIDER_ENV_VARS } from './pi-vendor-map.generated';
-
-// Pi provider id → OAuth-subscription env var. pi-ai's getApiKeyEnvVars lists
-// the OAuth var ahead of the API-key var (e.g. anthropic →
-// ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]). Archon delivers subscriptions
-// to env-only chat under this var (delivery.ts), but the per-user injection never
-// writes to process.env — Pi only ingests requestOptions.env via the explicit
-// bridge below, so the bridge must read the OAuth var too (#1984). github-copilot
-// delivers its single COPILOT_GITHUB_TOKEN (already the API-key var); openai is
-// shipped by delivery.ts as a CODEX_HOME/auth.json file (dropped in env-only chat),
-// never an env var — so on this env channel anthropic is the only backend that
-// needs a distinct OAuth var.
-const PI_OAUTH_ENV_VARS: Readonly<Record<string, string>> = {
-  anthropic: 'ANTHROPIC_OAUTH_TOKEN',
-};
+// (./sdk-setup.ts) fixes the *runtime* half: before any dynamic Pi import,
+// write a stub package.json to tmpdir and point Pi at it via its own
+// documented `PI_PACKAGE_DIR` escape hatch.
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -225,70 +58,144 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-// Structured-output prompt augmentation is shared across providers. Import
-// once for local use and re-export so existing callers and tests keep their
-// import path stable; new providers should import from `../../shared/structured-output`.
-import { augmentPromptForJsonSchema } from '../../shared/structured-output';
-export { augmentPromptForJsonSchema };
-
-/**
- * Anthropic subscription OAuth access tokens are `sk-ant-oat…` (API keys are
- * `sk-ant-api…`). This is the same content-shape discriminator pi-ai's
- * createClient uses to pick OAuth vs API-key auth downstream, so Archon's
- * detection can never disagree with the SDK's.
- */
-function isAnthropicOAuthToken(token: string | null | undefined): boolean {
-  return typeof token === 'string' && token.startsWith('sk-ant-oat');
-}
-
-/**
- * Archon's default system prompt for Pi sessions that authenticate to
- * Anthropic with a SUBSCRIPTION OAuth token (Claude Pro/Max, `sk-ant-oat*`).
- *
- * WHY THIS EXISTS (load-bearing — do not drop without re-reading):
- * Pi's built-in coding-agent system prompt (pi-coding-agent's
- * `buildSystemPrompt`) embeds a self-referential "Pi documentation" block
- * ("...read only when the user asks about pi itself, its SDK, extensions,
- * themes, skills, or TUI...") plus an "operating inside pi, a coding agent
- * harness" identity line. That block is dense with third-party-coding-tool
- * vocabulary, and Anthropic's post-2026-04-04 subscription-OAuth enforcement
- * classifies any request carrying it as a third-party app — returning
- * `400 invalid_request_error "You're out of extra usage"` for Pro/Max OAuth
- * tokens, even though the same token works for first-party Claude Code.
- *
- * Supplying ANY custom system prompt makes pi-coding-agent take its
- * `customPrompt` branch, which omits the incriminating block entirely. pi-ai
- * still prepends the OAuth-required "You are Claude Code, Anthropic's official
- * CLI for Claude." block as system[0], so subscription tokens are accepted.
- * Verified at the wire level (PR #1831): [CC, this-prompt] → HTTP 200;
- * [CC, pi-default-with-docs-block] → HTTP 400.
- *
- * Scope is deliberately narrow: the fallback applies ONLY when the session
- * will use Anthropic subscription-OAuth auth. API-key sessions and
- * non-Anthropic backends keep Pi's built-in prompt (with its dynamic tool
- * list) — there is no benefit to replacing it there. Workflow- or
- * request-level `systemPrompt` still wins (see sendQuery step 4c).
- */
-export const ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT = `You are an expert coding assistant. You help users by reading files, executing commands, editing code, and writing new files.
-
-Use the available tools to accomplish the task:
-- read: examine file contents instead of cat/sed
-- bash: run shell commands (ls, grep, find, build, test)
-- edit: make precise, minimal text replacements; each match must be unique
-- write: create new files or fully rewrite existing ones
-
-Guidelines:
-- Prefer reading files before editing them.
-- Keep edits small and targeted; do not pad with unchanged context.
-- Be concise in your responses.
-- Show file paths clearly when working with files.`;
-
 /**
  * Pi community provider — wraps `@earendil-works/pi-coding-agent`'s full
  * coding-agent harness. Each `sendQuery()` call creates a fresh session
  * (no reuse) so concurrent calls don't collide.
  */
 export class PiProvider implements IAgentProvider {
+  async listModels(
+    request: Parameters<NonNullable<IAgentProvider['listModels']>>[0]
+  ): Promise<ProviderModelList> {
+    return {
+      models: (await listPiModels(request.signal)).map(model => ({
+        id: model.ref,
+        label: model.name,
+        details: {
+          provider: model.provider,
+          modelId: model.id,
+          reasoning: model.reasoning,
+          cost: model.cost,
+          contextWindow: model.contextWindow,
+        },
+      })),
+    };
+  }
+
+  async diagnose(
+    request: Parameters<NonNullable<IAgentProvider['diagnose']>>[0]
+  ): Promise<ProviderDiagnostics> {
+    request.signal.throwIfAborted();
+    const checks: ProviderDiagnostics['checks'] = [];
+    try {
+      ensurePiPackageDirShim();
+      await import('@earendil-works/pi-coding-agent');
+      checks.push({ id: 'pi-sdk', label: 'Pi SDK', status: 'ok', message: 'Pi SDK loaded' });
+    } catch (error) {
+      request.signal.throwIfAborted();
+      return {
+        checks: [
+          {
+            id: 'pi-sdk',
+            label: 'Pi SDK',
+            status: 'fail',
+            message: `Pi SDK could not load: ${redactCredentialValues(error instanceof Error ? error.message : String(error), collectCredentialValues(process.env))}`,
+            remedy: 'Reinstall the Pi provider',
+          },
+        ],
+      };
+    }
+    const credential = await this.checkCredential({
+      ...request,
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(
+          (entry): entry is [string, string] => entry[1] !== undefined
+        )
+      ),
+      signal: request.signal,
+    });
+    request.signal.throwIfAborted();
+    checks.push({
+      id: 'pi-credentials',
+      label: 'Pi backend credentials',
+      status:
+        credential.state === 'usable'
+          ? 'ok'
+          : credential.state === 'not_checked'
+            ? 'skip'
+            : credential.state === 'check_failed'
+              ? 'fail'
+              : 'warn',
+      message: `Backend credential status: ${credential.state}${'evidence' in credential ? `: ${credential.evidence}` : ''}`,
+      ...(credential.state === 'usable'
+        ? {}
+        : { remedy: 'Configure a Pi model and its backend credentials' }),
+    });
+    return { checks };
+  }
+
+  async resolveCredentialModel(
+    request: Parameters<NonNullable<IAgentProvider['resolveCredentialModel']>>[0]
+  ): Promise<string> {
+    ensurePiPackageDirShim();
+    const sdk = await import('@earendil-works/pi-coding-agent');
+    const config = parsePiConfig(request.assistantConfig ?? {});
+    const parsed = resolvePiModel(request.model ?? config.model, request.cwd, sdk);
+    return `${parsed.provider}/${parsed.modelId}`;
+  }
+
+  async checkCredential(
+    request: Parameters<IAgentProvider['checkCredential']>[0]
+  ): Promise<CredentialStatus> {
+    const { signal } = request;
+    let { credentialValues } = piAuthEnv(undefined, request.env);
+    try {
+      const piConfig = parsePiConfig(request.assistantConfig ?? {});
+      const authEnv = piAuthEnv(piConfig.env, request.env);
+      credentialValues = authEnv.credentialValues;
+      signal.throwIfAborted();
+      ensurePiPackageDirShim();
+      // A compiled binary cannot follow pi-ai's computed OAuth import, so the
+      // loaders have to be registered before a stored grant is resolved. Turns
+      // already do this in loadPiTurnModules; doctor and preflight come through
+      // here and never reach that path.
+      const oauthFlowsReady = ensurePiOAuthFlowsRegistered();
+      const piCodingAgent = await import('@earendil-works/pi-coding-agent');
+      await oauthFlowsReady;
+      const parsed = resolvePiModel(request.model ?? piConfig.model, process.cwd(), piCodingAgent);
+      const requestModelRuntime = await createPiModelRuntime(
+        piCodingAgent,
+        parsed.provider,
+        authEnv,
+        signal
+      );
+      const { runtime } = requestModelRuntime;
+      try {
+        await applyPiEnvOverride(runtime, parsed.provider, authEnv, requestModelRuntime.authPath);
+        const { status } = await resolvePiTurnAuth(
+          runtime,
+          parsed.provider,
+          new piCodingAgent.ModelRegistry(runtime).find(parsed.provider, parsed.modelId) !==
+            undefined,
+          credentialValues,
+          signal
+        );
+        return status;
+      } finally {
+        requestModelRuntime.release();
+      }
+    } catch (error) {
+      return {
+        state: 'check_failed',
+        source: 'native',
+        evidence: redactCredentialValues(
+          error instanceof Error ? error.message : String(error),
+          credentialValues
+        ),
+      };
+    }
+  }
+
   /**
    * One call is one Pi prompt. A failure, including one thrown while setting the
    * session up, ends in a `result` carrying a typed `failure`, and the engine decides
@@ -303,7 +210,7 @@ export class PiProvider implements IAgentProvider {
     let resultReported = false;
     try {
       for await (const chunk of closeOpenToolCalls(
-        this.streamTurn(prompt, cwd, resumeSessionId, requestOptions),
+        streamPiTurn(prompt, cwd, resumeSessionId, requestOptions),
         { resultEndsTurn: true }
       )) {
         if (chunk.type === 'result') resultReported = true;
@@ -314,724 +221,16 @@ export class PiProvider implements IAgentProvider {
       const err = error as Error;
       // The turn already reported its one result; a later error does not change it.
       if (resultReported) getLog().error({ err }, 'pi.error_after_result');
-      else yield failureResult(failureClassOfThrown(err), 'pi_query_failed', err.message);
+      else
+        yield failureResult(
+          failureClassOfThrown(err),
+          'pi_query_failed',
+          piExtensionFailureEvidence(err) ?? err.message
+        );
     }
     // The bridge ends when `prompt()` resolves, after every run of Pi's agent loop
     // (auto-retry, compaction, queued follow-ups) has finished: nothing more runs.
     yield { type: 'settled' };
-  }
-
-  private async *streamTurn(
-    prompt: string,
-    cwd: string,
-    resumeSessionId?: string,
-    requestOptions?: SendQueryOptions
-  ): AsyncGenerator<MessageChunk> {
-    // Install the PI_PACKAGE_DIR shim BEFORE the dynamic imports below: Pi's
-    // config.js runs `readFileSync(getPackageJsonPath())` at its own module
-    // init, and getPackageJsonPath() checks process.env.PI_PACKAGE_DIR first.
-    // Without this, the dynamic import below would crash with ENOENT on
-    // `dirname(process.execPath)/package.json` inside a compiled binary.
-    ensurePiPackageDirShim();
-
-    // Register Pi's Bedrock backend override once per process so `amazon-bedrock/*`
-    // models load inside a compiled Archon binary (issue #2154). Kicked off here
-    // to run concurrently with the SDK imports below; awaited before the session
-    // streams (the override is consulted lazily when the Bedrock backend loads).
-    const bedrockReady = ensureBedrockProviderRegistered();
-
-    // Lazy-load Pi SDK and all Pi-dependent helper modules here. Must not move
-    // these imports to module scope — see the header comment for the failure
-    // mode (archon compiled binary crashes at startup when Pi's config.js
-    // reads a package.json that doesn't exist next to the executable).
-    //
-    // Class constructors (AuthStorage, ModelRegistry, SettingsManager) are
-    // accessed via `piCodingAgent.X` rather than destructured, because
-    // destructured PascalCase bindings trip eslint's naming-convention rule.
-    const [
-      piCodingAgent,
-      { bridgeSession },
-      { resolvePiSkills, resolvePiThinkingLevel, resolvePiTools, buildDefaultPiTools },
-      { createPiResourceLoader, getOrCreateReloadedExtensionLoader },
-      { resolvePiSession },
-      { createArchonUIBridge, createArchonUIContext },
-      { buildPiNativeToolDefinitions },
-    ] = await Promise.all([
-      import('@earendil-works/pi-coding-agent'),
-      import('./event-bridge'),
-      import('./options-translator'),
-      import('./resource-loader'),
-      import('./session-resolver'),
-      import('./ui-context-stub'),
-      import('./native-tools'),
-    ]);
-    const { createAgentSession } = piCodingAgent;
-
-    // Ensure the Bedrock override is set before any session work — the SDK reads
-    // it only when the Bedrock backend is first streamed, but awaiting here keeps
-    // the ordering obvious and the cost is one resolved-promise await after the
-    // first call.
-    await bedrockReady;
-
-    const assistantConfig = requestOptions?.assistantConfig ?? {};
-    const piConfig = parsePiConfig(assistantConfig);
-
-    // 0. Apply config-level env vars to process.env for in-process extensions
-    //    (plannotator reads PLANNOTATOR_REMOTE at session_start, etc.).
-    //    Shell env wins: we only set keys not already present. Request-level
-    //    `requestOptions.env` remains a separate channel — it flows through
-    //    bash spawn hooks for subprocess isolation, not into process.env.
-    if (piConfig.env) {
-      const applied: string[] = [];
-      for (const [key, value] of Object.entries(piConfig.env)) {
-        if (process.env[key] === undefined) {
-          process.env[key] = value;
-          applied.push(key);
-        }
-      }
-      if (applied.length > 0) {
-        getLog().debug({ keys: applied }, 'pi.config_env_applied');
-      }
-    }
-
-    // 1. Resolve model ref: request (workflow node / chat) → config default →
-    //    the operator's own Pi default (defaultProvider/defaultModel in
-    //    ~/.pi/agent/settings.json, as written by the `pi` CLI when a model is
-    //    selected). The settings fallback keeps Archon model-agnostic for Pi:
-    //    no vendor model is hardcoded anywhere, and litellm-only setups — whose
-    //    catalog drifts over time — work without pinning a specific model.
-    //    Mirrors how the standalone `pi` CLI boots with the user's default.
-    let modelRef = requestOptions?.model ?? piConfig.model;
-    if (!modelRef) {
-      try {
-        const settingsManager = piCodingAgent.SettingsManager.create(cwd);
-        const settings = settingsManager.getGlobalSettings();
-        // SettingsManager records malformed/unreadable settings via
-        // drainErrors() rather than throwing, so a broken settings.json yields
-        // default (empty) settings here. Drain + log them so that case is
-        // visible instead of being swallowed behind the "requires a model"
-        // error below (this branch may throw before the main settings load
-        // that would otherwise surface them).
-        for (const { scope, error: settingsErr } of settingsManager.drainErrors()) {
-          getLog().warn({ scope, err: settingsErr }, 'pi.settings_default_model_read_error');
-        }
-        const provider = settings.defaultProvider?.trim();
-        const modelId = settings.defaultModel?.trim();
-        if (provider && modelId) {
-          modelRef = `${provider}/${modelId}`;
-          getLog().info({ modelRef }, 'pi.model_defaulted_from_settings');
-        }
-      } catch (err) {
-        // Non-fatal: settings.json may be absent (user never ran `pi`) or
-        // unreadable. Fall through to the explicit "requires a model" error
-        // below rather than swallowing the missing-model condition.
-        getLog().debug({ err }, 'pi.settings_default_model_read_failed');
-      }
-    }
-    if (!modelRef) {
-      throw new ClassifiedProviderError(
-        'misconfigured',
-        'Pi provider requires a model. Set `model` on the workflow node or `assistants.pi.model` in .archon/config.yaml, ' +
-          'or select a default model in the `pi` CLI (writes defaultProvider/defaultModel to ~/.pi/agent/settings.json). ' +
-          "Format: '<pi-provider-id>/<model-id>' (e.g. 'google/gemini-2.5-pro')."
-      );
-    }
-    const parsed = parsePiModelRef(modelRef);
-    if (!parsed) {
-      throw new ClassifiedProviderError(
-        'misconfigured',
-        `Invalid Pi model ref: '${modelRef}'. Expected format '<pi-provider-id>/<model-id>' (e.g. 'google/gemini-2.5-pro').`
-      );
-    }
-
-    // 2. Build ModelRuntime + ModelRegistry. Both read on every sendQuery —
-    //    user edits to auth.json or models.json take effect without restart.
-    //    The registry is a thin facade over the runtime — extension providers
-    //    call registerProvider() on it during bindExtensions() to add their
-    //    models (phase 2 resolution).
-    const envVarName = PI_PROVIDER_ENV_VARS[parsed.provider];
-    const oauthVarName = PI_OAUTH_ENV_VARS[parsed.provider];
-    let modelRuntime: Awaited<ReturnType<typeof piCodingAgent.ModelRuntime.create>>;
-    let modelRegistry: InstanceType<typeof piCodingAgent.ModelRegistry>;
-    // For custom (non-built-in) Pi providers, build a per-call `models.json`
-    // with `${VAR}` references substituted against the per-call env. The
-    // SDK's session-auth path resolves `${VAR}` from `process.env`, which
-    // Archon deliberately keeps empty (per-call secrets ride on
-    // `requestOptions.env`); pre-substituting into a per-call file closes
-    // the seam (see `./request-auth.ts` for the full rationale). Declared
-    // as `let` so the assignment sits INSIDE the try below — that way a
-    // `mkdirSync`/`writeFileSync`/`chmodSync` throw is framed as
-    // `'Pi auth storage init failed: …'` (matching the contract the
-    // `request-auth.ts` doc comment promises), and the cleanup `finally`
-    // can still see the value to unlink the file if `ModelRuntime.create`
-    // throws after the substitution succeeded.
-    let customProviderModelsPath: string | undefined;
-    try {
-      customProviderModelsPath = !envVarName
-        ? buildCustomProviderModelsPath({
-            provider: parsed.provider,
-            requestEnv: requestOptions?.env,
-            protectedEnvKeys: requestOptions?.protectedEnvKeys,
-          })
-        : undefined;
-      // Archon delivers per-user credentials (API keys + subscriptions) as a
-      // per-run auth.json and points us at it via ARCHON_PI_AUTH_PATH — using an
-      // explicit authPath (not PI_CODING_AGENT_DIR) so the user's models.json /
-      // settings.json at ~/.pi/agent/ are untouched. The path arrives on the
-      // per-call `requestOptions.env` channel (the executor's per-user injection
-      // never writes to process.env — see the piConfig.env note above), so read it
-      // there first and fall back to process.env for a shell-level override.
-      const archonAuthPath =
-        (requestOptions?.env?.ARCHON_PI_AUTH_PATH ?? process.env.ARCHON_PI_AUTH_PATH)?.trim() ||
-        undefined;
-      // pi-coding-agent 0.84.0 folded AuthStorage + ModelRegistry into a single
-      // ModelRuntime; ModelRegistry is now a thin facade constructed from a
-      // runtime. authPath still feeds the file-backed CredentialStore inside
-      // ModelRuntime — the per-user auth.json path is honoured the same way.
-      // modelsPath follows the same per-call pattern for custom providers'
-      // `${VAR}` substitution.
-      modelRuntime = await piCodingAgent.ModelRuntime.create({
-        authPath: archonAuthPath,
-        ...(customProviderModelsPath ? { modelsPath: customProviderModelsPath } : {}),
-      });
-      modelRegistry = new piCodingAgent.ModelRegistry(modelRuntime);
-    } catch (err) {
-      const e = err as Error;
-      getLog().error({ err: e, piProvider: parsed.provider }, 'pi.auth_storage_init_failed');
-      // Unclassified: this step both reads the operator's files and writes a per-call
-      // temp file, and this catch does not tell those failures apart.
-      throw new Error(
-        `Pi auth storage init failed: ${e.message}. Check that ~/.pi/agent/auth.json ` +
-          '(or $PI_CODING_AGENT_DIR/auth.json) is valid JSON and readable.'
-      );
-    } finally {
-      // The per-call models.json holds the literal substituted secret in
-      // cleartext. ModelRuntime.create reads it once at construction (via
-      // ModelConfig.load); the runtime carries the loaded values for the
-      // rest of the session, so the file can be removed as soon as the
-      // create() promise resolves. Without this cleanup, long-running
-      // processes accumulate one file per sendQuery and eventually hit
-      // ENOSPC, after which buildCustomProviderModelsPath's mkdirSync fails
-      // and the SDK silently falls through to the unsubstituted user
-      // models.json — re-opening the round-1 R1 leak surface. Errors here
-      // are non-fatal (the file may already be gone, or the FS may be in
-      // an odd state); the original error has already been surfaced.
-      if (customProviderModelsPath) {
-        try {
-          rmSync(customProviderModelsPath, { force: true });
-        } catch {
-          // Deliberately swallowed — see comment above.
-        }
-      }
-    }
-
-    // 3. [LOOKUP-1] Check the static catalog first (phase 1 of 2).
-    //    Extension providers (e.g. kiro) aren't in the catalog — defer to LOOKUP-2 after bindExtensions().
-    let model = modelRegistry.find(parsed.provider, parsed.modelId);
-    if (!model) {
-      // Surface any models.json load error as a warning — helps debug
-      // custom-provider configs (e.g. missing baseUrl in models.json).
-      const loadError = modelRegistry.getError?.();
-      if (loadError) {
-        getLog().warn(
-          { piProvider: parsed.provider, modelId: parsed.modelId, loadError },
-          'pi.model_registry_load_error'
-        );
-      }
-      // Not an error yet — extension providers will register during
-      // bindExtensions(). Log at info so the deferral is visible in logs.
-      getLog().info(
-        { piProvider: parsed.provider, modelId: parsed.modelId },
-        'pi.model_not_in_static_catalog_deferring'
-      );
-    }
-
-    // 4. Resolve credentials. Per-request env vars override auth.json entries via
-    //    setRuntimeApiKey — codebase-scoped env vars win over the user's global Pi
-    //    login. Subscriptions delivered to env-only chat arrive under the OAuth var
-    //    (e.g. ANTHROPIC_OAUTH_TOKEN); read it first, then the API-key var. pi-ai's
-    //    createClient discriminates OAuth vs api-key by token content (sk-ant-oat*),
-    //    so one runtime channel serves both — and setRuntimeApiKey stays runtime-only
-    //    (no auth.json disk write, unlike AuthStorage.set) (#1984).
-    const readEnvOverride = (name: string | undefined): string | undefined =>
-      name ? (requestOptions?.env?.[name] ?? process.env[name]) : undefined;
-    const envOverride = readEnvOverride(oauthVarName) ?? readEnvOverride(envVarName);
-    if (envOverride) {
-      // pi 0.84.0+: setRuntimeApiKey is async (the runtime serializes the
-      // credential mutation per provider). await it before any subsequent
-      // getAuth() call so the override is visible to the model resolution
-      // path (otherwise the SDK would read the file-backed credential
-      // before the runtime override lands).
-      await modelRuntime.setRuntimeApiKey(parsed.provider, envOverride);
-    }
-
-    // Auth validation deferred for extension providers — they manage credentials
-    // outside Pi's AuthStorage (e.g. kiro uses AWS SSO/OIDC via ~/.aws/sso/cache/).
-    // Only validate early for static-catalog models where we can give actionable hints.
-    // The resolved credential is also kept for the Anthropic subscription-OAuth
-    // detection in step 4c; for 'anthropic' we resolve even when the model is
-    // deferred to extensions (AuthStorage reads are cheap and side-effect-free)
-    // so a catalog miss can never skip the OAuth-safe default prompt.
-    let resolvedKey: string | undefined;
-    let hasResolvedAuth = false;
-    if (model && !envVarName) {
-      // This is deliberately status-only: Pi resolves models.json request auth
-      // when it sends, and command-backed values must execute only once there.
-      hasResolvedAuth = modelRegistry.hasConfiguredAuth(model);
-    } else if (model || parsed.provider === 'anthropic') {
-      // pi 0.84.0+: ModelRuntime exposes `getAuth(providerId)` returning
-      // `{ auth: { apiKey, headers, baseUrl }, env?, source? } | undefined`.
-      // We only need the apiKey for the Anthropic subscription-OAuth shape
-      // discriminator in step 4c — the SDK reads the credential on its own
-      // when sending.
-      const resolution = await modelRuntime.getAuth(parsed.provider);
-      resolvedKey = resolution?.auth.apiKey;
-      hasResolvedAuth = Boolean(resolvedKey);
-    }
-    if (model) {
-      if (!hasResolvedAuth) {
-        if (envVarName) {
-          // Name the OAuth var first when the backend has one — a subscription
-          // user who hits this miss must be told the var the resolver actually
-          // prefers (ANTHROPIC_OAUTH_TOKEN), not just the API-key var (#1984).
-          const varHint = oauthVarName
-            ? `${oauthVarName} (subscription) or ${envVarName}`
-            : envVarName;
-          const envHint = `Set ${varHint} in the environment or codebase env vars (.archon/config.yaml env: section).`;
-          const loginHint = `Or run \`pi\` and type \`/login\` locally to authenticate '${parsed.provider}' via OAuth; credentials land in ~/.pi/agent/auth.json and are picked up automatically.`;
-          throw new ClassifiedProviderError(
-            'auth',
-            `Pi auth: no credentials for provider '${parsed.provider}'. ${envHint} ${loginHint}`
-          );
-        }
-
-        // Unmapped providers (LM Studio, ollama, llamacpp, custom
-        // OpenAI-compatible endpoints) often don't need credentials at all —
-        // log + continue rather than failing fast so local models work without
-        // ceremony. If the SDK call later fails for a provider that *does*
-        // need creds, the auth_missing breadcrumb is searchable in the log.
-        getLog().info(
-          {
-            piProvider: parsed.provider,
-            envHint: `Provider '${parsed.provider}' is not in the Archon adapter's env-var table — file an issue if you want a shortcut env var for it.`,
-            loginHint: `Or run \`pi\` and type \`/login\` locally to authenticate '${parsed.provider}' via OAuth; credentials land in ~/.pi/agent/auth.json and are picked up automatically.`,
-          },
-          'pi.auth_missing'
-        );
-      }
-    }
-
-    // 4. Translate Archon nodeConfig to Pi SDK options. All three translations
-    //    below correspond to capability flags declared `true` in
-    //    PI_CAPABILITIES; nodeConfig fields that don't map cleanly still
-    //    trigger a dag-executor warning upstream.
-    const nodeConfig = requestOptions?.nodeConfig;
-
-    //    4a. thinkingLevel: Pi's native representation of Archon's `effort` field.
-    const { level: thinkingLevel, warning: thinkingWarning } = resolvePiThinkingLevel(nodeConfig);
-    if (thinkingWarning) {
-      yield { type: 'warning', code: 'pi.thinking_level_ignored', message: thinkingWarning };
-    }
-
-    //    4b. tools: covers allowed_tools / denied_tools. `undefined` leaves Pi
-    //        defaults; an explicit empty array means "no tools" (valid idiom
-    //        matching e2e-claude-smoke's `allowed_tools: []`).
-    //        requestOptions.env (codebase-scoped env vars from .archon/config.yaml)
-    //        is injected into bash subprocesses via a BashSpawnHook, mirroring
-    //        Claude's options.env and Codex's constructor env.
-    const { tools: filteredTools, unknownTools } = resolvePiTools(
-      cwd,
-      nodeConfig,
-      requestOptions?.env
-    );
-    if (unknownTools.length > 0) {
-      yield {
-        type: 'warning',
-        code: 'pi.unknown_tools',
-        message: `Pi ignored unknown tool names: ${unknownTools.join(', ')}. Pi's built-in tools: read, bash, edit, write, grep, find, ls.`,
-      };
-    }
-
-    //    4c. systemPrompt: request-level (AgentRequestOptions) wins over
-    //        node-level; either overrides Pi's default.
-    //        Pi only supports string system prompts; structured preset objects
-    //        and string[] are dropped. Validate each level INDEPENDENTLY before
-    //        applying precedence — a non-string request-level value (e.g. a
-    //        preset object) must not win via `??` and mask a valid node-level
-    //        string.
-    const coerceStringPrompt = (
-      value: SystemPromptInput | undefined,
-      source: 'request' | 'node'
-    ): string | undefined => {
-      if (value === undefined) return undefined;
-      if (typeof value === 'string') return value;
-      getLog().warn(
-        { systemPromptType: typeof value, systemPromptSource: source },
-        'pi.system_prompt_dropped_non_string'
-      );
-      return undefined;
-    };
-    const explicitSystemPrompt =
-      coerceStringPrompt(requestOptions?.systemPrompt, 'request') ??
-      coerceStringPrompt(nodeConfig?.systemPrompt, 'node');
-
-    //        When no explicit prompt is set AND this session authenticates to
-    //        Anthropic with a subscription OAuth token, fall back to
-    //        ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT — Anthropic's OAuth
-    //        endpoint hard-400s Pi's self-identifying built-in prompt (see the
-    //        constant's doc comment). Every other session (API-key auth,
-    //        non-Anthropic backends) keeps `undefined` so Pi's built-in prompt,
-    //        with its dynamic tool list, stays intact.
-    const usesAnthropicOAuth =
-      parsed.provider === 'anthropic' && isAnthropicOAuthToken(resolvedKey);
-    const systemPrompt =
-      explicitSystemPrompt ??
-      (usesAnthropicOAuth ? ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT : undefined);
-
-    //    4d. skills: Archon uses name references (e.g. `skills: [agent-browser]`).
-    //        Resolve each name against .agents/skills and .claude/skills (project
-    //        + user-global). Resolved paths go through Pi's additionalSkillPaths;
-    //        Pi's buildSystemPrompt appends their agentskills.io XML block to
-    //        the system prompt automatically, so the model sees them.
-    const { paths: skillPaths, missing: missingSkills } = resolvePiSkills(cwd, nodeConfig?.skills);
-    if (missingSkills.length > 0) {
-      yield {
-        type: 'warning',
-        code: 'pi.skills_unresolved',
-        message: `Pi could not resolve skill names: ${missingSkills.join(', ')}. Searched .agents/skills and .claude/skills (project + user-global). Each must be a directory containing SKILL.md.`,
-      };
-    }
-
-    // 5. Session management. Pi stores each session as a JSONL file under
-    //    ~/.pi/agent/sessions/<encoded-cwd>/<uuid>.jsonl. `resolvePiSession`
-    //    returns a SessionManager bound to either a new session (no resume
-    //    id) or an existing session (resume id matches a file); if the id
-    //    was provided but not found, it falls through to a new session and
-    //    the caller surfaces a resume_failed warning (matches the Codex
-    //    provider's fallback pattern for the same condition).
-    const { sessionManager, resumeFailed } = await resolvePiSession(
-      cwd,
-      resumeSessionId,
-      requestOptions?.forkSession
-    );
-    if (resumeFailed) {
-      yield {
-        type: 'warning',
-        code: 'pi.resume_failed',
-        message: 'Could not resume Pi session. Starting fresh conversation.',
-      };
-    }
-
-    // Load user's Pi settings from disk (~/.pi/agent/settings.json for global,
-    // <cwd>/.pi/settings.json for project) as the starting point, then seed an
-    // in-memory instance. The in-memory instance guarantees no write-back to
-    // the user's settings files — AgentSession setter calls (setModel, etc.)
-    // write only to the in-process InMemorySettingsStorage object.
-    //
-    // NOTE: fileSettings is used only for the initial load; it is NOT passed to
-    // DefaultResourceLoader or AgentSession. DefaultResourceLoader creates its own
-    // file-backed SettingsManager internally for extension discovery. Sharing this
-    // instance is unsafe: DefaultResourceLoader.reload() calls
-    // settingsManager.reload(), which resets InMemorySettingsStorage to {} (the
-    // storage's global/project fields are undefined after inMemory() construction,
-    // so reload() produces empty settings, wiping all loaded user preferences).
-    const fileSettings = piCodingAgent.SettingsManager.create(cwd);
-
-    // Drain and log any settings file parse errors (malformed JSON, etc.) — non-fatal.
-    const settingsErrors = fileSettings.drainErrors();
-    for (const { scope, error: err } of settingsErrors) {
-      getLog().warn({ scope, err }, 'pi.settings_load_error');
-    }
-
-    // Pre-merge global + project settings before seeding inMemory().
-    // NOTE: Using applyOverrides() after construction is unsafe due to Pi SDK internals:
-    // SettingsManager.save() (dist/core/settings-manager.js) recalculates
-    //   this.settings = deepMergeSettings(this.globalSettings, this.projectSettings)
-    // wiping any applyOverrides() work, because inMemory() always constructs with
-    // this.projectSettings = {}. save() is called by setDefaultModelAndProvider()
-    // (dist/core/settings-manager.js), which AgentSession.setModel() calls
-    // (dist/core/agent-session.js) whenever an extension switches models in an
-    // interactive session — silently wiping project overrides mid-session.
-    // deepMergeSettings is not exported from the Pi SDK; replicate its one-level-deep
-    // semantics (nested objects merged one level deep, primitives/arrays override).
-    const globalSettings = fileSettings.getGlobalSettings();
-    const projectSettings = fileSettings.getProjectSettings();
-    const seedSettings: Record<string, unknown> = { ...globalSettings };
-    for (const key of Object.keys(projectSettings)) {
-      const pv = (projectSettings as Record<string, unknown>)[key];
-      if (pv === undefined) continue;
-      const gv = seedSettings[key];
-      seedSettings[key] =
-        typeof pv === 'object' &&
-        pv !== null &&
-        !Array.isArray(pv) &&
-        typeof gv === 'object' &&
-        gv !== null &&
-        !Array.isArray(gv)
-          ? { ...(gv as Record<string, unknown>), ...(pv as Record<string, unknown>) }
-          : pv;
-    }
-    const settingsManager = piCodingAgent.SettingsManager.inMemory(
-      seedSettings as ReturnType<typeof fileSettings.getGlobalSettings>
-    );
-    // Default ON: extensions (community packages like @plannotator/pi-extension
-    // or your own local ones) are a core reason users run Pi. Opt out with
-    // `assistants.pi.enableExtensions: false` (or `interactive: false`) in
-    // `.archon/config.yaml`. Previously default-off, which silently broke
-    // users who installed or built an extension and expected it to fire.
-    //
-    // Extension posture is resolved PER NODE (issue #2073): assistant-level
-    // defaults can be overridden via `assistants.pi.nodes.<nodeId>` so that
-    // e.g. only the planner node gets plannotator's `plan` flag and a
-    // UI-capable context (hasUI), while an implement node runs without the
-    // planning-mode edit guard. Direct chat (no nodeId) uses the defaults.
-    //
-    // The portable node-YAML `pi:` block (#2133) rides on `nodeConfig.pi` and is
-    // the highest-precedence layer — it travels with the workflow, so a node
-    // rename can't orphan it the way the node-id-keyed config map can.
-    const { enableExtensions, interactive, extensionFlags } = resolvePiExtensionSettings(
-      piConfig,
-      nodeConfig?.nodeId,
-      nodeConfig?.pi
-    );
-
-    // Build the ResourceLoader. When extensions are ON we MUST reuse a
-    // process-cached, already-reloaded loader: Pi's `reload()` re-invokes every
-    // installed extension factory from scratch and the 2nd reload in a process
-    // deadlocks on the first call's never-torn-down state (issue #1877 — see the
-    // doc on getOrCreateReloadedExtensionLoader). When extensions are OFF there
-    // is no re-entrancy hazard, so a fresh per-call loader can reload safely.
-    // That reload is still required for Pi to discover its native context files.
-    // Build the shared options once so the two paths can't drift.
-    const loaderOptions = {
-      ...(systemPrompt !== undefined ? { systemPrompt } : {}),
-      ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
-    };
-    let resourceLoader: DefaultResourceLoader;
-    const extensionProviderNames = new Set<string>();
-    if (enableExtensions) {
-      const { loader, providerRegistrations } = await getOrCreateReloadedExtensionLoader(
-        cwd,
-        loaderOptions
-      );
-      resourceLoader = loader;
-      // Re-apply the load-time extension provider registrations to THIS call's
-      // fresh ModelRegistry (issue #2064). Extension factories run only during
-      // the single cached reload(), and the SDK drains their queued
-      // registerProvider() calls into the FIRST session's registry only — so
-      // without this, the 2nd+ sendQuery in a process (e.g. DAG node 2) never
-      // sees extension models (pi-cursor's `cursor/*`) and LOOKUP-2 fails.
-      // registerProvider() is a documented upsert, so the first call receiving
-      // the same configs again via its own bindCore() flush is harmless.
-      for (const { name, config, extensionPath } of providerRegistrations) {
-        extensionProviderNames.add(name);
-        try {
-          modelRegistry.registerProvider(name, config);
-        } catch (err) {
-          // Intentional non-fatal fallback mirroring the SDK's own bindCore()
-          // flush (per-entry try/catch + emitted extension error): one broken
-          // extension config must not fail nodes that use other providers.
-          // If the model this node actually needs is missing, LOOKUP-2 below
-          // still throws the loud, actionable "Pi model not found" error.
-          getLog().warn(
-            { err, piExtensionProvider: name, extensionPath },
-            'pi.extension_provider_reapply_failed'
-          );
-        }
-      }
-      if (providerRegistrations.length > 0) {
-        getLog().debug({ count: providerRegistrations.length }, 'pi.extension_providers_reapplied');
-      }
-    } else {
-      resourceLoader = createPiResourceLoader(cwd, loaderOptions);
-      await resourceLoader.reload();
-    }
-
-    getLog().info(
-      {
-        piProvider: parsed.provider,
-        modelId: parsed.modelId,
-        cwd,
-        thinkingLevel,
-        toolCount: filteredTools?.length,
-        systemPromptSource:
-          explicitSystemPrompt !== undefined
-            ? 'explicit'
-            : systemPrompt !== undefined
-              ? 'anthropic-oauth-default'
-              : 'pi-builtin',
-        skillCount: skillPaths.length,
-        missingSkillCount: missingSkills.length,
-        extensionsEnabled: enableExtensions,
-        interactive,
-        nodeId: nodeConfig?.nodeId,
-        resumed: resumeSessionId !== undefined && !resumeFailed,
-      },
-      'pi.session_started'
-    );
-
-    // In-process native tools (e.g. manage_run) via Pi customTools. Because
-    // setting customTools forces noTools:'builtin' (dropping Pi's defaults), the
-    // base tool set must be re-supplied alongside the native defs.
-    const nativeToolDefs =
-      requestOptions?.nativeTools && requestOptions.nativeTools.length > 0
-        ? buildPiNativeToolDefinitions(requestOptions.nativeTools)
-        : [];
-    const baseTools =
-      filteredTools ??
-      (nativeToolDefs.length > 0 ? buildDefaultPiTools(cwd, requestOptions?.env) : undefined);
-    const piCustomTools =
-      nativeToolDefs.length > 0 ? [...(baseTools ?? []), ...nativeToolDefs] : filteredTools;
-
-    const { session, modelFallbackMessage } = await createAgentSession({
-      cwd,
-      // model is omitted when not yet resolved (extension provider path).
-      // createAgentSession accepts this — the model will be set via
-      // session.setModel() after bindExtensions() resolves it (step 4g).
-      ...(model ? { model } : {}),
-      // pi 0.84.0+: createAgentSession no longer accepts authStorage +
-      // modelRegistry separately; pass the modelRuntime and the SDK builds its
-      // own internal registry facade. The runtime we pass is the one already
-      // scoped with `setRuntimeApiKey` calls above, and for custom providers
-      // it was built against a per-call `modelsPath` with `${VAR}` references
-      // pre-substituted (see step 2 above) — no further per-call wiring.
-      modelRuntime,
-      sessionManager,
-      settingsManager,
-      resourceLoader,
-      ...(thinkingLevel ? { thinkingLevel } : {}),
-      // Pi 0.68+: `tools` was repurposed as a string[] allowlist of built-in
-      // tool names; the actual Tool[] payload now goes through `customTools`.
-      // `noTools: "builtin"` suppresses the default built-in set so our
-      // filtered (and env-injected bash) list isn't doubled up (the
-      // suppression-behavior bug was fixed in pi 0.70.0). When filteredTools
-      // is undefined we keep Pi's defaults — no overrides.
-      //
-      // `customTools` is also the only path through which we can attach a
-      // BashSpawnHook for managed-env injection: Pi's built-in bash tool is
-      // pre-constructed without a spawnHook (see resolvePiTools in
-      // options-translator.ts), so the env-aware bash MUST go through
-      // customTools, not just for tool restriction.
-      ...(piCustomTools !== undefined
-        ? { customTools: piCustomTools, noTools: 'builtin' as const }
-        : {}),
-    });
-
-    // Extension models aren't in the static catalog — skip the fallback warning.
-    if (modelFallbackMessage && model) {
-      yield { type: 'warning', code: 'pi.model_fallback', message: modelFallbackMessage };
-    }
-
-    // 4e. Extension flag pass-through. Must happen before bindExtensions
-    //     below — extensions read flags inside their session_start handler.
-    //     `extensionFlags` is the per-node resolved map (assistant-level flags
-    //     shallow-merged with `nodes.<nodeId>.extensionFlags`, node wins).
-    if (enableExtensions && extensionFlags) {
-      const runner = session.extensionRunner;
-      if (runner) {
-        for (const [name, value] of Object.entries(extensionFlags)) {
-          runner.setFlagValue(name, value);
-        }
-      }
-    }
-
-    // 4f. Bind UI context or fire session_start with no UI. Must run after flag pass-through above.
-    //     Extension providers register their models during bindExtensions() — this is the trigger
-    //     for LOOKUP-2: they call registerProvider() on our modelRegistry during session_start.
-    const uiBridge = interactive ? createArchonUIBridge() : undefined;
-    if (uiBridge) {
-      const uiContext = createArchonUIContext(uiBridge);
-      await session.bindExtensions({ uiContext });
-    } else if (enableExtensions) {
-      await session.bindExtensions({});
-    }
-
-    // 4g. [LOOKUP-2] Re-check the registry after bindExtensions() for extension-registered models.
-    //     Safe to call session.setModel() here — no prompt has been sent yet.
-    if (!model) {
-      model = modelRegistry.find(parsed.provider, parsed.modelId);
-      if (!model) {
-        session.dispose();
-        const extensionProvider = extensionProviderNames.has(parsed.provider);
-        const catalogProvider =
-          !extensionProvider && modelRegistry.getProvider(parsed.provider) !== undefined;
-        const remedy = catalogProvider
-          ? 'The provider is configured, but this model id is not in the Pi model catalog. ' +
-            'If the model is newer than your catalog, refresh it with `pi update --models`; ' +
-            `Archon reads the refreshed store at ${join(piCodingAgent.getAgentDir(), 'models-store.json')}.`
-          : extensionProvider
-            ? `Provider '${parsed.provider}' comes from an installed Pi extension, but that ` +
-              'extension did not register this model id. Check the extension configuration and model name.'
-            : `Provider '${parsed.provider}' is not in the Pi model catalog. If it comes from a Pi ` +
-              'provider extension, install that extension (e.g. `pi install npm:pi-provider-kiro`) ' +
-              'and set `enableExtensions: true` in .archon/config.yaml. If it is a catalog provider, ' +
-              'refresh the catalog with `pi update --models`.';
-        throw new ClassifiedProviderError(
-          'misconfigured',
-          `Pi model not found: provider='${parsed.provider}' model='${parsed.modelId}'. ${remedy}`
-        );
-      }
-      try {
-        await session.setModel(model);
-      } catch (err) {
-        session.dispose();
-        throw err;
-      }
-    }
-
-    // 5. Structured output (best-effort). Pi has no SDK-level JSON schema
-    //    mode the way Claude and Codex do, so we implement it via prompt
-    //    engineering: append the schema + "JSON only, no fences" instruction,
-    //    and have the bridge parse the accumulated assistant text on
-    //    agent_end. Parse failures degrade gracefully — the executor's
-    //    existing dag.structured_output_missing warning path handles them.
-    const outputFormat = requestOptions?.outputFormat;
-    const effectivePrompt = outputFormat
-      ? augmentPromptForJsonSchema(prompt, outputFormat.schema)
-      : prompt;
-
-    // 6. Bridge callback-based events to the async generator contract.
-    //    bridgeSession owns dispose() and abort wiring. When `interactive`
-    //    is on, it also binds/unbinds the UI stub's emitter so extension
-    //    notifications land on the same queue as Pi events.
-    //
-    //    The module-level semaphore is initialized lazily from the first
-    //    config that sets maxConcurrent and reused for the lifetime of the
-    //    process — this is a known v1 tradeoff. Pi concurrency is global
-    //    (one upstream backend) so a process-wide cap is the right scope.
-    const maxConcurrent = piConfig.maxConcurrent;
-    if (maxConcurrent !== undefined && piSemaphore === undefined) {
-      piSemaphore = new Semaphore(maxConcurrent);
-      getLog().info({ maxConcurrent }, 'pi.semaphore_initialized');
-    }
-
-    // Snapshot before the first await — if a concurrent call initializes the
-    // module-level piSemaphore after this point, sem stays undefined and the
-    // finally block correctly skips release (we never acquired).
-    const sem = piSemaphore;
-    if (sem !== undefined) {
-      getLog().debug('pi.semaphore_acquiring');
-      await sem.acquire();
-      getLog().debug('pi.semaphore_acquired');
-    }
-    try {
-      yield* withResumedOutcome(
-        bridgeSession(
-          session,
-          effectivePrompt,
-          requestOptions?.abortSignal,
-          outputFormat?.schema,
-          uiBridge
-        ),
-        resumedOutcome(resumeSessionId, !resumeFailed)
-      );
-      getLog().info({ piProvider: parsed.provider }, 'pi.prompt_completed');
-    } catch (err) {
-      getLog().error({ err, piProvider: parsed.provider }, 'pi.prompt_failed');
-      throw err;
-    } finally {
-      sem?.release();
-    }
   }
 
   getType(): string {

@@ -1,3 +1,5 @@
+export { GitFailure } from './errors';
+export type { GitFailureKind } from './errors';
 // Types
 export type {
   RepoPath,
@@ -32,6 +34,10 @@ export {
   isBareRepository,
   CanonicalRepoPathUnavailableError,
   verifyWorktreeOwnership,
+  isWorktreeRegistered,
+  readWorktreeRegistration,
+  isSameWorktreePath,
+  toNativeWorktreePath,
 } from './worktree';
 export type {
   WorktreeLayout,
@@ -48,8 +54,10 @@ export {
   getCurrentBranchStrict,
   localBranchExists,
   countCommitsAhead,
+  countCommitsMissingFromRemotes,
   checkout,
   hasUncommittedChanges,
+  hasUncommittedChangesStrict,
   commitAllChanges,
   isBranchMerged,
   isPatchEquivalent,
@@ -61,6 +69,8 @@ export {
 // Forge detection
 export { detectForge } from './forge';
 export type { ForgeType, ForgeInfo } from './forge';
+export { GITHUB_COM_HOST, parseGitHubHost, readGitHubHost, resolveGitHubHost } from './github-host';
+export type { GitHubHost } from './github-host';
 
 // Repository operations
 export {
@@ -69,10 +79,21 @@ export {
   getRemoteUrl,
   listChildRepos,
   syncWorkspace,
-  fetchWithRefLockRetry,
+  fetchWithRetry,
   cloneRepository,
   validateCloneUrl,
   syncRepository,
   addSafeDirectory,
 } from './repo';
 export type { CloneCredentials, CloneRepositoryOptions } from './repo';
+export { trustRegisteredPath } from './registration-trust';
+
+export {
+  inspectRemoteBranches,
+  validateBranchName,
+  ConfiguredBaseBranchNotFoundError,
+  InvalidBaseBranchError,
+} from './remote-branches';
+export type { RemoteBranchTarget, RemoteBranches } from './remote-branches';
+
+export { githubTokenCredentials } from './credentials';

@@ -1,30 +1,13 @@
-import { requestJson } from '../lib/http';
+import type { paths } from '@/lib/api.generated';
+import type { ListRunsOptions, RunsAttention } from '../primitives/run';
+export type { ListRunsOptions, RunsAttention } from '../primitives/run';
+import { requestJson, buildApiUrl } from '../lib/http';
 import { toRun, type Run } from '../primitives/run';
-import { toRunEvent, type RunEvent } from '../primitives/event';
-import type { RunStatus } from '../lib/run-status';
+import { toRunEvent, type RunEvent, type RunNodeState } from '../primitives/event';
 import type { components } from '@/lib/api.generated';
 
-export interface ListRunsOptions {
-  codebaseId?: string;
-  status?: RunStatus;
-  limit?: number;
-}
-
-export interface RunCounts {
-  all: number;
-  running: number;
-  paused: number;
-  failed: number;
-  completed: number;
-  cancelled: number;
-  pending: number;
-}
-
-interface DashboardRunsResponse {
-  runs: Parameters<typeof toRun>[0][];
-  total: number;
-  counts: Partial<RunCounts>;
-}
+type DashboardRunsResponse = components['schemas']['DashboardRunsResponse'];
+export type RunCounts = DashboardRunsResponse['counts'];
 
 function normalizeCounts(c: Partial<RunCounts>): RunCounts {
   return {
@@ -41,12 +24,14 @@ function normalizeCounts(c: Partial<RunCounts>): RunCounts {
 export async function listRuns(
   opts: ListRunsOptions = {}
 ): Promise<{ runs: Run[]; counts: RunCounts; total: number }> {
-  const qs = new URLSearchParams();
-  if (opts.codebaseId !== undefined) qs.set('codebaseId', opts.codebaseId);
-  if (opts.status !== undefined) qs.set('status', opts.status);
-  if (opts.limit !== undefined) qs.set('limit', opts.limit.toString());
-  const url = `/api/dashboard/runs${qs.size > 0 ? `?${qs.toString()}` : ''}`;
-  const res = await requestJson<DashboardRunsResponse>(url);
+  const res = await requestJson('/api/dashboard/runs', 'get', {
+    query: {
+      codebaseId: opts.codebaseId,
+      status: opts.status,
+      limit: opts.limit?.toString(),
+      offset: opts.offset?.toString(),
+    },
+  });
   return {
     runs: res.runs.map(toRun),
     counts: normalizeCounts(res.counts),
@@ -54,71 +39,71 @@ export async function listRuns(
   };
 }
 
+export async function listRunsNeedingAttention(): Promise<RunsAttention> {
+  const res = await requestJson('/api/runs/attention', 'get');
+  if (!('runs' in res)) throw new Error('Attention endpoint returned counts instead of runs');
+  return { runs: res.runs.map(toRun), degraded: res.degraded ?? [] };
+}
+
 export async function listGlobalCounts(): Promise<RunCounts> {
   // Counts without any codebase filter — used by top chrome pill.
-  const res = await requestJson<DashboardRunsResponse>('/api/dashboard/runs?limit=1');
+  const res = await requestJson('/api/dashboard/runs', 'get', { query: { limit: '1' } });
   return normalizeCounts(res.counts);
 }
 
-interface RunDetailResponse {
-  run: Parameters<typeof toRun>[0];
-  events: Parameters<typeof toRunEvent>[0][];
-}
-
-export async function getRun(id: string): Promise<{ run: Run; events: RunEvent[] }> {
-  const res = await requestJson<RunDetailResponse>(`/api/workflows/runs/${encodeURIComponent(id)}`);
+export async function getRun(
+  id: string
+): Promise<{ run: Run; events: RunEvent[]; nodes: RunNodeState[] }> {
+  const res = await requestJson('/api/workflows/runs/{runId}', 'get', { params: { runId: id } });
   return {
     run: toRun(res.run),
     events: res.events.map(toRunEvent),
+    nodes: res.run.nodes,
   };
 }
 
 export async function cancelRun(id: string): Promise<void> {
-  await requestJson(`/api/workflows/runs/${encodeURIComponent(id)}/cancel`, {
-    method: 'POST',
-    body: JSON.stringify({}),
-  });
+  await requestJson('/api/workflows/runs/{runId}/cancel', 'post', { params: { runId: id } });
 }
 
-export async function approveRun(id: string, comment?: string): Promise<void> {
-  await requestJson(`/api/workflows/runs/${encodeURIComponent(id)}/approve`, {
-    method: 'POST',
-    body: JSON.stringify(comment !== undefined ? { comment } : {}),
-  });
+type RespondWorkflowRunBody = components['schemas']['RespondWorkflowRunBody'];
+
+export async function respondRun(
+  id: string,
+  decision: string,
+  text?: string,
+  expectedGate?: RespondWorkflowRunBody['expectedGate']
+): Promise<void> {
+  const body: RespondWorkflowRunBody = { decision, text, expectedGate };
+  await requestJson('/api/workflows/runs/{runId}/respond', 'post', { params: { runId: id }, body });
 }
 
-export async function rejectRun(id: string, reason: string): Promise<void> {
-  await requestJson(`/api/workflows/runs/${encodeURIComponent(id)}/reject`, {
-    method: 'POST',
-    body: JSON.stringify({ reason }),
-  });
-}
+type AnswerWorkflowRunBody = components['schemas']['AnswerWorkflowRunBody'];
 
 /**
- * Resolve a paused run with any of its gate's declared decisions (#2707 step 2).
- * `approve`/`reject` produce the exact same resolution as `approveRun`/`rejectRun` —
- * the server delegates those two ids to the same functions — so callers can use this
- * uniformly instead of branching on decision id.
+ * Answer a paused attention wait in its declared form. `occurrence` is the one the run's
+ * attention reports; the server refuses an answer meant for any other pause.
  */
-export async function respondRun(id: string, decision: string, text?: string): Promise<void> {
-  await requestJson(`/api/workflows/runs/${encodeURIComponent(id)}/respond`, {
-    method: 'POST',
-    body: JSON.stringify(text !== undefined ? { decision, text } : { decision }),
-  });
+export async function answerRun(
+  id: string,
+  occurrence: string,
+  choose: string[],
+  text?: string
+): Promise<void> {
+  const body: AnswerWorkflowRunBody = { occurrence, choose, text };
+  await requestJson('/api/workflows/runs/{runId}/answer', 'post', { params: { runId: id }, body });
 }
 
-export async function resumeRun(id: string): Promise<void> {
-  await requestJson(`/api/workflows/runs/${encodeURIComponent(id)}/resume`, {
-    method: 'POST',
-    body: JSON.stringify({}),
+/** Asks the server to resume a run; resolves to the server's account of what it started. */
+export async function resumeRun(id: string): Promise<string> {
+  const res = await requestJson('/api/workflows/runs/{runId}/resume', 'post', {
+    params: { runId: id },
   });
+  return res.message;
 }
 
 export async function abandonRun(id: string): Promise<void> {
-  await requestJson(`/api/workflows/runs/${encodeURIComponent(id)}/abandon`, {
-    method: 'POST',
-    body: JSON.stringify({}),
-  });
+  await requestJson('/api/workflows/runs/{runId}/abandon', 'post', { params: { runId: id } });
 }
 
 /**
@@ -127,22 +112,27 @@ export async function abandonRun(id: string): Promise<void> {
  * packages/server/src/routes/schemas/workflow.schemas.ts.
  */
 export type ArtifactFile = components['schemas']['ArtifactFile'];
-type ListArtifactsResponse = components['schemas']['ListArtifactsResponse'];
 
 export async function listRunArtifacts(runId: string): Promise<ArtifactFile[]> {
-  const res = await requestJson<ListArtifactsResponse>(
-    `/api/runs/${encodeURIComponent(runId)}/artifacts`
-  );
+  const res = await requestJson('/api/runs/{runId}/artifacts', 'get', { params: { runId } });
   return res.files;
 }
 
 /** Fetch a single artifact file as text (markdown or plain). */
 export async function fetchArtifact(runId: string, path: string): Promise<string> {
-  const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-  const res = await fetch(`/api/artifacts/${encodeURIComponent(runId)}/${encodedPath}`);
+  const res = await fetch(
+    buildApiUrl('/api/artifacts/{runId}/{filename}', 'get', { params: { runId, filename: path } })
+  );
   if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? `Failed to fetch artifact: ${res.status.toString()}`);
+    const body: unknown = await res.json().catch(() => ({}));
+    const error: ArtifactError['error'] | undefined =
+      typeof body === 'object' && body !== null && 'error' in body && typeof body.error === 'string'
+        ? body.error
+        : undefined;
+    throw new Error(error ?? `Failed to fetch artifact: ${res.status.toString()}`);
   }
   return res.text();
 }
+
+type ArtifactError =
+  paths['/api/artifacts/{runId}/{filename}']['get']['responses'][400]['content']['application/json'];

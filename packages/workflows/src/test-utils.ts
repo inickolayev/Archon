@@ -12,7 +12,9 @@ import type {
 } from './schemas/workflow';
 import { expandWorkflowIncludes } from './include-expander';
 import { resolveWorkflow } from './graph-plan';
-import type { CapturedSourceOwner } from './executor';
+import type { CapturedSourceOwner } from './run-source';
+import type { WorkflowEventInput } from './store';
+import type { WorkflowEventRow } from './schemas/workflow-event';
 
 const DEFAULT_NODE = { id: 'default', command: 'test-command' };
 
@@ -124,4 +126,22 @@ export async function executeTestDagWorkflow(
 ): ReturnType<typeof import('./dag-executor').executeDagWorkflow> {
   const { executeDagWorkflow } = await import('./dag-executor');
   return executeDagWorkflow(options);
+}
+
+/** A persisted workflow event as an in-memory test store records it. */
+export interface InMemoryStoreEvent
+  extends Pick<WorkflowEventInput, 'workflow_run_id' | 'step_index' | 'step_name' | 'data'> {
+  event_type: string;
+}
+
+export function inMemoryEventRows(events: readonly InMemoryStoreEvent[]): WorkflowEventRow[] {
+  return events.map((event, index) => ({
+    ...event,
+    id: `event-${String(index)}`,
+    step_index: event.step_index ?? null,
+    step_name: event.step_name ?? null,
+    data: event.data ?? {},
+    created_at: new Date(0).toISOString(),
+    event_order: index,
+  }));
 }

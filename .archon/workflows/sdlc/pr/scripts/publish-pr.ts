@@ -1,97 +1,270 @@
 /**
- * Publish the prepared pull request and record its verified identity.
+ * Push the branch, then publish the pull request and record its verified identity.
  *
- * The preceding node judges: it establishes the target, writes the body, pushes
- * the branch, and names the pull request the run was launched onto when there is
- * one. This node owns the public write and proves it landed, through whichever
- * source the run selected.
+ * The preceding nodes judged the target and the text and proved the merged tree; this
+ * node owns publication, including the push and PR writes, and proves each landed,
+ * through the forge plugin. When its caller allows it, it also writes the description
+ * section the run prepared: between its own markers, keeping every other byte of the
+ * description, and read back like every other write. The push comes first and refuses
+ * on any failure (./.shared/push.ts), so a pull request is never created for a head
+ * the remote does not have.
  *
- * Whether this work already has a pull request is decided here, not in a prompt:
- * an open pull request for the recorded head IS the pull request, and a second
- * one is never opened for it.
+ * Whether this work already has a pull request is decided here, not in a prompt: an
+ * open pull request for the recorded head IS the pull request, and a second one is
+ * never opened for it. A run continuing a pull request pushes to that pull request's
+ * own head as the forge reports it, not to the branch prepare declared, and only
+ * while it is open. The push is by merge only — it never forces, so a head that is
+ * not an ancestor of this commit refuses.
  *
  * Bound inputs (`with:` bindings, canonical text in env):
- * - INPUTS_INTENT: path to the JSON intent the preparing node wrote.
+ * - INPUTS_REPO / INPUTS_HEAD_REPO: `{host, path}` of the base and head repositories.
+ * - INPUTS_HEAD / INPUTS_BASE: the head and base branch names.
+ * - INPUTS_BRANCH: the branch a new pull request opens from, as the caller resolved
+ *   it; empty uses INPUTS_HEAD.
+ * - INPUTS_EXISTING: the pull request prepare found for this work, or `null`. It is
+ *   continued only when the caller named it or selected no branch.
+ * - INPUTS_PULL_REQUEST: the number the caller resolved for it, or empty or `null`.
+ * - INPUTS_TITLE: the title.
+ * - INPUTS_BODY: the certified body pointer, or null; prepare writes none for a pull request it continues.
+ * - INPUTS_DRAFT: `true` opens a draft.
+ * - INPUTS_DESCRIPTION: the certified description-section pointer, or null.
+ * - INPUTS_PUBLISH_DESCRIPTION: `true` lets the run write that section; anything else
+ *   refuses a declared one before pushing.
  */
 
-import { readFileSync } from 'node:fs';
-import { createPr, findOpenPrByHead, viewPr } from '../../.shared/pr.ts';
-import {
-  forgeSource,
-  record,
-  sameRepo,
-  type PrRecord,
-  type QualifiedPr,
-} from '../../.shared/forge.ts';
-import { emit, note, refuse, text } from '../../.shared/io.ts';
+import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { encodePrPublicationRecord, PR_CREATE_RECORD, DESCRIPTION_SECTION, createPr, editPrBody, findOpenPrByHead, viewPr } from '../../.shared/pr.ts';
+import { artifactsDir, emit, ForgeError, input, refuse } from 'archon:script';
+import { type PrRecord, type QualifiedPr } from '../../.shared/identity.ts';
+import { nullableJson, record } from '../../.shared/inputs.ts';
+import { pushHead } from '../../.shared/push.ts';
 
-function repo(value: unknown, field: string): QualifiedPr['repo'] {
-  const parsed = record(value);
-  if (
-    typeof parsed?.host !== 'string' ||
-    parsed.host.trim() === '' ||
-    typeof parsed.path !== 'string' ||
-    parsed.path.trim() === ''
-  ) {
-    throw new Error(`the PR intent's ${field} must name a host and an owner/repo path`);
-  }
-  return { host: parsed.host, path: parsed.path };
-}
+type Repo = QualifiedPr['repo'];
 
-function required(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw new Error(`the PR intent's ${field} must be a non-empty string`);
-  }
-  return value;
-}
+const { start: SECTION_START, end: SECTION_END } = DESCRIPTION_SECTION;
 
-function publish(): PrRecord {
-  const source = forgeSource(process.env.ARCHON_SDLC_FORGE);
-  const intent = record(JSON.parse(readFileSync(text(process.env.INPUTS_INTENT), 'utf8')));
-  if (!intent) throw new Error('the PR intent must be a JSON object');
-  const base = repo(intent.repo, 'repo');
-  const headRepo = intent.headRepo === undefined ? base : repo(intent.headRepo, 'headRepo');
-  const head = required(intent.head, 'head');
-
-  // The run was launched onto an existing pull request: it names the number, and
-  // its draft state belongs to its author, not to this run's draft input.
-  if (intent.existing !== undefined) {
-    if (typeof intent.existing !== 'number' || !Number.isInteger(intent.existing)) {
-      throw new Error("the PR intent's existing must be the pull request number");
+async function descriptionMarkers(markdown: string): Promise<{ marker: string; at: number }[]> {
+  const candidates: { marker: string; at: number; token: string }[] = [];
+  const tagged = markdown.replace(
+    new RegExp(Object.values(DESCRIPTION_SECTION).join('|'), 'g'),
+    (marker: string, at: number) => {
+      const token = ` archon-description-position-${at} `;
+      candidates.push({ marker, at, token });
+      // Legacy sections put the closing delimiter directly after a Markdown table.
+      // Separate it for recognition only; raw HTML containers still own their comments.
+      const separator = marker === SECTION_END && (at === 0 || markdown[at - 1] === '\n') ? '\n\n' : '';
+      return `${separator}<!--${token}-->`;
     }
-    const view = viewPr({ repo: base, number: intent.existing }, source);
-    const observedHead = view.pr.head_repo;
-    if (view.pr.head !== head || observedHead === null || !sameRepo(observedHead, headRepo)) {
+  );
+  const comments = new Set<string>();
+  const nested = new Set<string>();
+  await new HTMLRewriter()
+    .on('*', { comments: comment => { nested.add(comment.text); } })
+    .onDocument({ comments: comment => { comments.add(comment.text); } })
+    .transform(new Response(Bun.markdown.html(tagged)))
+    .text();
+  return candidates.filter(candidate => comments.has(candidate.token) && !nested.has(candidate.token));
+}
+
+function blockSeparator(value: string): string {
+  return value === '' || value.endsWith('\n\n') ? '' : value.endsWith('\n') ? '\n' : '\n\n';
+}
+
+/**
+ * The description with `section` between the delivery markers: replacing what lies
+ * between an existing pair, or appended as a new pair. Text outside the markers is
+ * never changed, and a marker that does not pair is refused rather than guessed at.
+ */
+async function withDescriptionSection(live: string, section: string): Promise<string> {
+  const block = `${SECTION_START}\n${section}${blockSeparator(section)}${SECTION_END}`;
+  const markers = await descriptionMarkers(live);
+  let composed: string;
+  let blockAt: number;
+  const starts = markers.filter(entry => entry.marker === SECTION_START).map(entry => entry.at);
+  const ends = markers.filter(entry => entry.marker === SECTION_END).map(entry => entry.at);
+  if (starts.length === 0 && ends.length === 0) {
+    const separator = blockSeparator(live);
+    blockAt = live.length + separator.length;
+    composed = `${live}${separator}${block}\n`;
+  } else {
+    const [start] = starts;
+    const [end] = ends;
+    if (starts.length !== 1 || ends.length !== 1 || start === undefined || end === undefined || end < start) {
       throw new Error(
-        `pull request ${String(intent.existing)} has head ${String(view.pr.head_repo?.path)}:${view.pr.head}, not the recorded ${headRepo.path}:${head}`
+        'the description has an unpaired or repeated archon-delivery-description marker; fix it by hand'
       );
     }
+    blockAt = start;
+    composed = live.slice(0, start) + block + live.slice(end + SECTION_END.length);
+  }
+  const pair = await descriptionMarkers(composed);
+  if (
+    pair.length !== 2 ||
+    pair[0]?.marker !== SECTION_START || pair[0].at !== blockAt ||
+    pair[1]?.marker !== SECTION_END || pair[1].at !== blockAt + block.length - SECTION_END.length
+  ) {
+    throw new Error('the composed description hides or adds delivery markers; close Markdown fences and HTML containers before publishing');
+  }
+  return composed;
+}
+
+/** The prepared section's content, or undefined when prepare declared none. */
+async function preparedSection(artifacts: string): Promise<string | undefined> {
+  const pointer = record(nullableJson(input('description')));
+  if (pointer === undefined) return undefined;
+  if (input('publish_description').trim() !== 'true') {
+    throw new Error('prepare declared a description section, but the caller did not allow publishing one');
+  }
+  if (
+    pointer.type !== 'archon_artifact' ||
+    pointer.run_id !== process.env.WORKFLOW_ID ||
+    pointer.path !== 'pr-description.md'
+  ) {
+    throw new Error('prepare must declare the pr-description.md artifact from this run');
+  }
+  const section = readFileSync(join(artifacts, pointer.path), 'utf8');
+  if (section.trim() === '') throw new Error('prepare declared an empty pr-description.md');
+  if ((await descriptionMarkers(section)).length > 0) {
+    throw new Error('pr-description.md contains reserved description markers; put literal examples in Markdown code');
+  }
+  return section;
+}
+
+async function applyDescription(pr: PrRecord, section: string): Promise<void> {
+  const ref = { repo: pr.repo, number: pr.number };
+  const live = viewPr(ref).body;
+  const body = await withDescriptionSection(live, section);
+  if (body === live) {
+    console.error(`publish-pr: ${pr.url}'s description section is already current.`);
+    return;
+  }
+  editPrBody(ref, body);
+}
+
+function recordPublishedPr(claimPath: string, pr: PrRecord, required: boolean): void {
+  if (!required) return;
+  try {
+    writeFileSync(claimPath, encodePrPublicationRecord({ pr }), { mode: 0o600 });
+  } catch (error) {
+    throw new Error(
+      `published and verified ${pr.url}, but could not record its identity at ${claimPath}; continue this PR explicitly: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    );
+  }
+}
+
+function publish(hasDescription: boolean): PrRecord {
+  const repo = JSON.parse(input('repo')) as Repo;
+  const headRepo = JSON.parse(input('head_repo')) as Repo;
+  const existing = nullableJson(input('existing')) as number | null;
+  const artifacts = artifactsDir();
+
+  const named = nullableJson(input('pull_request')) as number | null;
+  if (named !== null && existing !== named) {
+    throw new Error(
+      `the caller named pull request ${String(named)} to continue, but prepare declared ${String(existing ?? 'none')}`
+    );
+  }
+
+  // A branch the caller selected decides the pull request over one prepare found
+  // unnamed, which may sit on the checkout's other branch: only an open pull request
+  // with that head is reused below.
+  const branch = input('branch').trim();
+  if (existing !== null && named === null && branch) {
+    console.error(`publish-pr: the caller selected ${branch}; pull request ${String(existing)} is reused only if it has that head.`);
+  } else if (existing !== null) {
+    const view = viewPr({ repo, number: existing });
+    const prHeadRepo = view.pr.head_repo;
+    if (view.pr.state !== 'open') {
+      throw new Error(`pull request ${String(existing)} is ${view.pr.state}; nothing is pushed`);
+    }
+    if (prHeadRepo === null) {
+      throw new Error(`pull request ${String(existing)}'s head repository is gone; nothing is pushed`);
+    }
+    pushHead({ repo, head_repo: prHeadRepo, head: view.pr.head });
+    // The run continues a named pull request: its draft state belongs to its author,
+    // and its description changes only by the section publish() applies when allowed.
+    // The record names the pull request; its `head_revision` is the read before the
+    // push, and no reader takes the pushed commit from it.
+    recordPublishedPr(join(artifacts, PR_CREATE_RECORD), view.pr, hasDescription);
     return view.pr;
   }
 
-  const existing = findOpenPrByHead(base, headRepo, head, source);
-  if (existing) {
-    note(`publish-pr: ${existing.pr.url} already has this head, so no pull request was opened.`);
-    return existing.pr;
+  const head = branch || input('head');
+  const headRevision = pushHead({ repo, head_repo: headRepo, head });
+
+  const open = findOpenPrByHead(repo, headRepo, head);
+  if (open) {
+    console.error(`publish-pr: ${open.pr.url} already has this head, so no pull request was opened.`);
+    recordPublishedPr(join(artifacts, PR_CREATE_RECORD), open.pr, hasDescription);
+    return open.pr;
   }
-  if (typeof intent.draft !== 'boolean') throw new Error("the PR intent's draft must be a boolean");
-  return createPr(
-    {
-      repo: base,
-      headRepo,
-      head,
-      headRevision: required(intent.headRevision, 'headRevision'),
-      base: required(intent.base, 'base'),
-      title: required(intent.title, 'title'),
-      bodyPath: required(intent.bodyPath, 'bodyPath'),
-      draft: intent.draft,
-    },
-    source
-  );
+
+  const body = record(nullableJson(input('body')));
+  if (body === undefined) {
+    throw new Error(`no open pull request has ${headRepo.path}:${head}, and prepare wrote no body to open one with`);
+  }
+  if (
+    body.type !== 'archon_artifact' ||
+    body.run_id !== process.env.WORKFLOW_ID ||
+    body.path !== 'pr-body.md'
+  ) {
+    throw new Error('prepare must declare the pr-body.md artifact from this run');
+  }
+  const bodyPath = join(artifacts, body.path);
+  // A local read failure sent no create; it must not leave a claim blocking retry.
+  readFileSync(bodyPath, 'utf8');
+
+  // Killing the script cannot cancel a submitted forge write. Keep this claim even
+  // after success: a retry may only reconcile it.
+  const claimPath = join(artifacts, PR_CREATE_RECORD);
+  try {
+    writeFileSync(claimPath, encodePrPublicationRecord({ repo, headRepo, head }), { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+      throw new Error(
+        `a previous PR create is unresolved; no open PR was found for ${headRepo.path}:${head}. Reconcile the write recorded at ${claimPath} before creating another PR`
+      );
+    }
+    throw error;
+  }
+  try {
+    const pr = createPr(
+      {
+        repo,
+        headRepo,
+        head,
+        headRevision,
+        base: input('base'),
+        title: input('title'),
+        bodyPath,
+        draft: input('draft').trim() === 'true',
+      }
+    );
+    recordPublishedPr(claimPath, pr, true);
+    return pr;
+  } catch (error) {
+    // A forge refusal is definite: no write was sent, so the claim would only block
+    // a retry. Every other failure may have left a pull request behind.
+    if (error instanceof ForgeError && error.mutation?.outcome === 'refused') {
+      unlinkSync(claimPath);
+    }
+    throw error;
+  }
+}
+
+// Validate the artifact before pushing; check composition against the live body before editing.
+async function publishWithDescription(): Promise<PrRecord> {
+  const section = await preparedSection(artifactsDir());
+  const pr = publish(section !== undefined);
+  // The edit does not move the head, so the head-verified record stays the output.
+  if (section !== undefined) await applyDescription(pr, section);
+  return pr;
 }
 
 try {
-  emit(publish());
+  emit(await publishWithDescription());
 } catch (error) {
   refuse(`publish-pr: ${error instanceof Error ? error.message : String(error)}`);
 }

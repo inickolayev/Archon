@@ -2,9 +2,13 @@
 
 import { z } from 'zod';
 import type { ForgeError } from '@archon/forge/operations';
-import type { RepoRef } from '@archon/forge';
+import { parseRemoteUrl, type RepoRef } from '@archon/forge';
+import { parseGitHubHost, resolveGitHubHost, type GitHubHost } from '@archon/git';
 
 export type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/** The wait between repeated reads; tests replace it so they do not sleep. */
+export type Sleep = (ms: number) => Promise<unknown>;
 
 export class GitHubError extends Error {
   constructor(
@@ -23,44 +27,15 @@ export class GitHubError extends Error {
 
 export function repositoryPath(path: string): { owner: string; repo: string } | null {
   const parts = path.replace(/^\/+|\/+$/g, '').split('/');
-  if (parts.length !== 2 || parts.some(part => part === '' || part === '.' || part === '..')) {
-    return null;
-  }
+  if (parts.length !== 2) return null;
   const owner = parts[0];
   const repo = parts[1].endsWith('.git') ? parts[1].slice(0, -4) : parts[1];
-  return owner && repo ? { owner, repo } : null;
+  if ([owner, repo].some(part => part === '' || part === '.' || part === '..')) return null;
+  return { owner, repo };
 }
 
-export function apiRoot(host: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(`https://${host}`);
-  } catch (cause) {
-    throw new GitHubError(
-      { kind: 'invalid_request', message: `Invalid GitHub host: ${host}` },
-      true,
-      { cause }
-    );
-  }
-  if (
-    parsed.username ||
-    parsed.password ||
-    parsed.pathname !== '/' ||
-    parsed.search ||
-    parsed.hash
-  ) {
-    throw new GitHubError(
-      { kind: 'invalid_request', message: `Invalid GitHub host: ${host}` },
-      true
-    );
-  }
-  return parsed.hostname.toLowerCase() === 'github.com'
-    ? 'https://api.github.com'
-    : `https://${parsed.host}/api/v3`;
-}
-
-/** The API root and encoded `owner/repo` segment for one qualified repository. */
-export function location(repo: RepoRef): { root: string; path: string } {
+/** The owner and name GraphQL addresses a repository by; an unparseable path is refused. */
+export function githubRepository(repo: RepoRef): { owner: string; repo: string } {
   const parsed = repositoryPath(repo.path);
   if (!parsed) {
     throw new GitHubError(
@@ -68,17 +43,57 @@ export function location(repo: RepoRef): { root: string; path: string } {
       true
     );
   }
+  return parsed;
+}
+
+function githubHost(host: string): GitHubHost {
+  const github = parseGitHubHost(`https://${host}`);
+  if (!github) {
+    throw new GitHubError(
+      { kind: 'invalid_request', message: `Invalid GitHub host: ${host}` },
+      true
+    );
+  }
+  const configured = resolveGitHubHost();
+  const protocol = new URL(configured.webUrl).protocol;
+  const requested = parseGitHubHost(`${protocol}//${host}`);
+  return configured.host === requested?.host ? configured : github;
+}
+
+/** The REST and GraphQL roots and encoded `owner/repo` segment for one qualified repository. */
+export function location(repo: RepoRef): { root: string; graphql: string; path: string } {
+  const parsed = githubRepository(repo);
+  const github = githubHost(repo.host);
   return {
-    root: apiRoot(repo.host),
+    root: github.apiBaseUrl,
+    graphql: github.graphqlUrl,
     path: `${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}`,
   };
 }
 
-/** GraphQL shares the host but not the REST path; only `markPullRequestReadyForReview` needs it. */
-export function graphqlEndpoint(root: string): string {
-  return root === 'https://api.github.com'
-    ? `${root}/graphql`
-    : `${root.replace(/\/api\/v3$/, '')}/api/graphql`;
+/** One authenticated GitHub call, answered with any status or lost in transit. */
+export async function githubSend(
+  fetchImpl: Fetch,
+  token: string,
+  url: string,
+  init: RequestInit = {}
+): Promise<Response> {
+  try {
+    return await fetchImpl(url, {
+      ...init,
+      headers: {
+        accept: 'application/vnd.github+json',
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'x-github-api-version': '2022-11-28',
+        'user-agent': 'archon-forge-github',
+      },
+    });
+  } catch (cause) {
+    throw new GitHubError({ kind: 'unavailable', message: 'GitHub API request failed' }, false, {
+      cause,
+    });
+  }
 }
 
 /**
@@ -93,43 +108,15 @@ export async function githubRequest(
   token: string,
   url: string,
   init: RequestInit = {},
-  acknowledge?: () => void
+  acknowledge?: () => void,
+  responseMode: 'json' | 'empty' = 'json'
 ): Promise<unknown> {
-  let response: Response;
-  try {
-    response = await fetchImpl(url, {
-      ...init,
-      headers: {
-        accept: 'application/vnd.github+json',
-        authorization: `Bearer ${token}`,
-        'content-type': 'application/json',
-        'x-github-api-version': '2022-11-28',
-        'user-agent': 'archon-forge-github',
-      },
-    });
-  } catch (cause) {
-    throw new GitHubError({ kind: 'forge_error', message: 'GitHub API request failed' }, false, {
-      cause,
-    });
-  }
+  const response = await githubSend(fetchImpl, token, url, init);
   if (!response.ok) {
-    throw new GitHubError(
-      {
-        kind:
-          response.status === 404
-            ? 'not_found'
-            : response.status === 401 || response.status === 403
-              ? 'authorization'
-              : response.status === 409 || response.status === 422
-                ? 'conflict'
-                : 'forge_error',
-        message: `GitHub API request failed with HTTP ${String(response.status)}`,
-        status: response.status,
-      },
-      response.status >= 400 && response.status < 500
-    );
+    throw githubResponseError(response);
   }
   acknowledge?.();
+  if (responseMode === 'empty') return undefined;
   try {
     return await response.json();
   } catch (cause) {
@@ -162,41 +149,91 @@ export async function githubPages<T>(
   }
 }
 
-export function parseRemote(remote: string | null): RepoRef | null {
-  if (remote === null || remote.trim() === '') return null;
-  const value = remote.trim();
-
-  if (value.includes('://')) {
-    let url: URL;
-    try {
-      url = new URL(value);
-    } catch (cause) {
-      throw new GitHubError(
-        { kind: 'invalid_request', message: 'GitHub remote is not a valid URL' },
-        true,
-        { cause }
-      );
-    }
-    if (!['https:', 'ssh:'].includes(url.protocol)) return null;
-    if (url.password !== '' || (url.protocol === 'https:' && url.username !== '')) {
-      throw new GitHubError(
-        { kind: 'invalid_request', message: 'GitHub remote must not contain credentials' },
-        true
-      );
-    }
-    if (url.search !== '' || url.hash !== '') {
-      throw new GitHubError(
-        {
-          kind: 'invalid_request',
-          message: 'GitHub remote must not contain a query or fragment',
-        },
-        true
-      );
-    }
-    const repository = repositoryPath(decodeURIComponent(url.pathname));
-    if (!repository) return null;
-    return { host: url.host.toLowerCase(), path: `${repository.owner}/${repository.repo}` };
+/**
+ * One GraphQL call. GitHub answers 200 with an `errors` document for a query or
+ * mutation it rejects, so the errors are read here rather than trusted away by
+ * the status, and a write is acknowledged only once the document carries none.
+ */
+export async function githubGraphql(
+  fetchImpl: Fetch,
+  token: string,
+  repo: RepoRef,
+  query: string,
+  variables: Record<string, unknown>,
+  acknowledge?: () => void
+): Promise<unknown> {
+  const { graphql } = location(repo);
+  const raw = await githubRequest(fetchImpl, token, graphql, {
+    method: 'POST',
+    body: JSON.stringify({ query, variables }),
+  });
+  const parsed = z
+    .object({
+      data: z.unknown().optional(),
+      errors: z.array(z.object({ message: z.string(), type: z.string().optional() })).optional(),
+    })
+    .parse(raw);
+  if (parsed.errors && parsed.errors.length > 0) {
+    const types = new Set(parsed.errors.map(error => error.type));
+    throw new GitHubError(
+      {
+        kind: types.has('RATE_LIMITED')
+          ? 'rate_limited'
+          : types.has('NOT_FOUND')
+            ? 'not_found'
+            : types.has('FORBIDDEN') || types.has('INSUFFICIENT_SCOPES')
+              ? 'authorization'
+              : 'forge_error',
+        message: `GitHub GraphQL refused the request: ${parsed.errors[0]?.message ?? 'unknown error'}`,
+      },
+      true
+    );
   }
+  acknowledge?.();
+  return parsed.data;
+}
+
+function parseUrlRemote(value: string): RepoRef | null {
+  let parsed: ReturnType<typeof parseRemoteUrl>;
+  try {
+    parsed = parseRemoteUrl(value);
+  } catch (cause) {
+    throw new GitHubError(
+      { kind: 'invalid_request', message: 'GitHub remote is not a valid URL' },
+      true,
+      { cause }
+    );
+  }
+  const { url, host, pathname } = parsed;
+  if (!['http:', 'https:', 'ssh:'].includes(url.protocol)) return null;
+  if (url.password !== '' || (url.protocol !== 'ssh:' && url.username !== '')) {
+    throw new GitHubError(
+      { kind: 'invalid_request', message: 'GitHub remote must not contain credentials' },
+      true
+    );
+  }
+  if (value.includes('?') || value.includes('#')) {
+    throw new GitHubError(
+      {
+        kind: 'invalid_request',
+        message: 'GitHub remote must not contain a query or fragment',
+      },
+      true
+    );
+  }
+  const decodedPath = decodeURIComponent(pathname);
+  const repository =
+    (url.protocol === 'ssh:' || !decodedPath.includes('\\')) &&
+    repositoryPath(decodedPath) &&
+    repositoryPath(decodeURIComponent(url.pathname));
+  if (!repository) return null;
+  return { host, path: `${repository.owner}/${repository.repo}` };
+}
+
+export function parseRemote(remote: string | null): RepoRef | null {
+  if (!remote?.trim()) return null;
+  const value = remote.trim();
+  if (value.includes('://')) return parseUrlRemote(value);
 
   // Git's SCP-like SSH form has no URL scheme. Its optional user is transport identity,
   // not an HTTP credential, and is deliberately discarded at this normalization boundary.
@@ -205,6 +242,25 @@ export function parseRemote(remote: string | null): RepoRef | null {
   const repository = repositoryPath(match[2]);
   if (!repository) return null;
   return { host: match[1].toLowerCase(), path: `${repository.owner}/${repository.repo}` };
+}
+
+/**
+ * GitHub's web URL of an issue or a pull request: `<repository>/issues/<n>` or
+ * `<repository>/pull/<n>`. A query or fragment, such as a link to one comment, is
+ * ignored; any other URL is not a subject.
+ */
+export function parseSubjectUrl(
+  value: string | null
+): { repo: RepoRef; subject: { kind: 'issue' | 'pr'; number: number } } | null {
+  const trimmed = value?.trim().replace(/[?#].*$/, '') ?? '';
+  const match = /^(https?:\/\/.+)\/(issues|pull)\/([1-9]\d*)\/?$/.exec(trimmed);
+  if (!match) return null;
+  const repo = parseUrlRemote(match[1]);
+  if (!repo) return null;
+  return {
+    repo,
+    subject: { kind: match[2] === 'pull' ? 'pr' : 'issue', number: Number(match[3]) },
+  };
 }
 
 /** Translate a thrown cause into the wire error a caller can act on. */
@@ -220,4 +276,37 @@ export function githubErrorDetail(cause: unknown): ForgeError {
     kind: 'forge_error',
     message: cause instanceof Error ? cause.message : String(cause),
   };
+}
+
+/**
+ * GitHub answers a rate limit with 429, or with 403 carrying `retry-after` or an
+ * exhausted `x-ratelimit-remaining`. A 403 with neither header is an authorization
+ * failure as far as its status and headers say.
+ */
+function rateLimited({ status, headers }: Response): boolean {
+  return (
+    status === 429 ||
+    (status === 403 && (headers.has('retry-after') || headers.get('x-ratelimit-remaining') === '0'))
+  );
+}
+
+function responseKind(response: Response): ForgeError['kind'] {
+  const { status } = response;
+  if (rateLimited(response)) return 'rate_limited';
+  if (status >= 500) return 'unavailable';
+  if (status === 404) return 'not_found';
+  if (status === 401 || status === 403) return 'authorization';
+  if (status === 409 || status === 422) return 'conflict';
+  return 'forge_error';
+}
+
+export function githubResponseError(response: Response): GitHubError {
+  return new GitHubError(
+    {
+      kind: responseKind(response),
+      message: `GitHub API request failed with HTTP ${String(response.status)}`,
+      status: response.status,
+    },
+    response.status >= 400 && response.status < 500
+  );
 }

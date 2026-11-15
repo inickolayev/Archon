@@ -34,10 +34,15 @@ mock.module('@archon/paths', () => ({
 }));
 
 import { TelegramAdapter, isStructuralCategory } from './adapter';
+import { deprecatedNotice } from '@archon/providers/community/deprecation';
 
 type SendMessage = Api['sendMessage'];
 
 describe('TelegramAdapter', () => {
+  test('supports durable conversation project detachment', () => {
+    expect(new TelegramAdapter('fake-token-for-testing').capabilities.canDetachProject).toBe(true);
+  });
+
   describe('streaming mode configuration', () => {
     test('should return batch mode when configured', () => {
       const adapter = new TelegramAdapter('fake-token-for-testing', 'batch');
@@ -60,6 +65,9 @@ describe('TelegramAdapter', () => {
     let mockSendMessage: Mock<SendMessage>;
 
     beforeEach(() => {
+      mockLogger.info.mockClear();
+      mockLogger.debug.mockClear();
+      mockLogger.warn.mockClear();
       adapter = new TelegramAdapter('fake-token-for-testing');
       mockSendMessage = mock<SendMessage>(async (chatId, text) => ({
         message_id: 1,
@@ -76,6 +84,7 @@ describe('TelegramAdapter', () => {
 
     test('should send with MarkdownV2 parse_mode', async () => {
       await adapter.sendMessage('12345', '**test**');
+      expect(mockLogger.debug).toHaveBeenCalledWith({ messageLength: 8 }, 'telegram.send_message');
 
       // Should send with MarkdownV2 parse_mode
       expect(mockSendMessage).toHaveBeenCalledWith(
@@ -86,10 +95,15 @@ describe('TelegramAdapter', () => {
     });
 
     test('should fallback to plain text when MarkdownV2 fails', async () => {
-      mockSendMessage.mockRejectedValueOnce(new Error("Bad Request: can't parse entities"));
+      mockLogger.warn.mockClear();
+      mockSendMessage.mockRejectedValueOnce(new Error('Bad Request for @alice 987654321'));
 
-      await adapter.sendMessage('12345', '**test**');
+      await adapter.sendMessage('12345', '**@alice 987654321**');
 
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { chunkLength: 20 },
+        'telegram.markdownv2_failed'
+      );
       expect(mockSendMessage).toHaveBeenCalledTimes(2);
       // First call with MarkdownV2
       expect(mockSendMessage).toHaveBeenNthCalledWith(
@@ -250,7 +264,64 @@ describe('TelegramAdapter', () => {
     beforeEach(() => {
       mockLogger.warn.mockClear();
       mockLogger.info.mockClear();
+      mockLogger.debug.mockClear();
     });
+
+    test.each([true, false])(
+      'inbound message logs no identity (unauthorized=%s)',
+      async unauthorized => {
+        // Access is decided by the account link (ADR 0004), not an env whitelist:
+        // the authorizer stands in for the database lookup.
+        const adapter = new TelegramAdapter('fake-token-for-testing');
+        adapter.setAuthorizer(async () => ({ allow: !unauthorized }));
+        const bot = adapter.getBot();
+        bot.api.setMyCommands = mock(async (): Promise<true> => true);
+        bot.botInfo = {
+          id: 111,
+          is_bot: true,
+          first_name: 'Archon',
+          username: 'archon',
+          can_join_groups: true,
+          can_read_all_group_messages: false,
+          supports_inline_queries: false,
+          can_connect_to_business: false,
+          has_main_web_app: false,
+          can_manage_bots: false,
+          has_topics_enabled: false,
+          allows_users_to_create_topics: false,
+        };
+        bot.start = mock(async options => {
+          await options?.onStart?.(bot.botInfo);
+        });
+        await adapter.start();
+        await bot.handleUpdate({
+          update_id: 1,
+          message: {
+            message_id: 1,
+            date: 0,
+            chat: { id: 987654321, type: 'private', first_name: 'Alice' },
+            from: {
+              id: 987654321,
+              is_bot: false,
+              first_name: 'Alice',
+              username: 'alice',
+            },
+            text: '@alice private message',
+          },
+        });
+        if (unauthorized)
+          expect(mockLogger.info).toHaveBeenCalledWith(
+            { offeredLink: false },
+            'telegram.sender_not_linked'
+          );
+        else expect(mockLogger.debug).toHaveBeenCalledWith('telegram.message_dropped_no_handler');
+        const logged = JSON.stringify(
+          [mockLogger.info, mockLogger.debug, mockLogger.warn].flatMap(fn => fn.mock.calls)
+        );
+        expect(logged).not.toContain('9876');
+        expect(logged).not.toContain('alice');
+      }
+    );
 
     test('should retry on 409 and succeed on second attempt', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
@@ -274,6 +345,23 @@ describe('TelegramAdapter', () => {
         'telegram.start_conflict_retrying'
       );
       expect(mockLogger.info).toHaveBeenCalledWith('telegram.bot_started');
+    });
+
+    test('logs the shared deprecation notice on start', async () => {
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      adapter.setAuthorizer(async () => ({ allow: true }));
+      const mockStart = mock<(opts?: { onStart?: () => void }) => Promise<void>>(opts => {
+        opts?.onStart?.();
+        return new Promise(() => {});
+      });
+      (adapter.getBot() as unknown as { start: typeof mockStart }).start = mockStart;
+
+      await adapter.start();
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { notice: deprecatedNotice('Telegram') },
+        'telegram.deprecated'
+      );
     });
 
     test('should throw immediately on non-409 error', async () => {
@@ -306,8 +394,8 @@ describe('TelegramAdapter', () => {
       await adapter.start({ retryDelayMs: 0 });
 
       expect(mockStart).toHaveBeenCalledTimes(3);
-      // Count the retry warnings specifically: publishing the command list runs
-      // in the background after a successful start and may warn on its own.
+      // Count the retry warnings specifically: the deprecation notice and
+      // publishing the command list warn on their own.
       const retryWarnings = (mockLogger.warn.mock.calls as unknown[][]).filter(
         call => call[1] === 'telegram.start_conflict_retrying'
       );
@@ -400,7 +488,11 @@ describe('TelegramAdapter', () => {
       adapter.setAuthorizer(async ({ userId }) =>
         userId === 4242 ? { allow: true } : { allow: false }
       );
-      const received: { conversationId: string; message: string; displayName?: string }[] = [];
+      const received: {
+        conversationId: string;
+        message: string;
+        displayName?: string;
+      }[] = [];
       adapter.onMessage(async ctx => {
         received.push({
           conversationId: ctx.conversationId,
@@ -416,7 +508,11 @@ describe('TelegramAdapter', () => {
       // The adapter hands over the CHAT id; the server resolves which of that
       // chat's conversations the message belongs to.
       expect(received).toEqual([
-        { conversationId: '-1001234567890', message: '/chats', displayName: 'Ada Lovelace' },
+        {
+          conversationId: '-1001234567890',
+          message: '/chats',
+          displayName: 'Ada Lovelace',
+        },
       ]);
     });
 
@@ -531,7 +627,13 @@ describe('TelegramAdapter', () => {
     test('an album of three photos becomes ONE message with three files', async () => {
       const { handlers, received } = await startCapturing(20);
       const photo = handlers.get('message:photo');
-      photo?.(ctxWith({ media_group_id: 'g1', caption: 'three shots', photo: [{ file_id: 'a' }] }));
+      photo?.(
+        ctxWith({
+          media_group_id: 'g1',
+          caption: 'three shots',
+          photo: [{ file_id: 'a' }],
+        })
+      );
       photo?.(ctxWith({ media_group_id: 'g1', photo: [{ file_id: 'b' }] }));
       photo?.(ctxWith({ media_group_id: 'g1', photo: [{ file_id: 'c' }] }));
       await new Promise(resolve => setTimeout(resolve, 80));
@@ -556,7 +658,10 @@ describe('TelegramAdapter', () => {
     test('a voice note arrives as a file with NO words of its own', async () => {
       const { handlers, received } = await startCapturing();
       handlers.get('message:voice')?.(
-        ctxWith({ message_id: 77, voice: { file_id: 'v-1', duration: 42, file_size: 9_000 } })
+        ctxWith({
+          message_id: 77,
+          voice: { file_id: 'v-1', duration: 42, file_size: 9_000 },
+        })
       );
       await new Promise(resolve => setTimeout(resolve, 5));
 
@@ -574,7 +679,10 @@ describe('TelegramAdapter', () => {
     test('a voice note WITH a caption keeps the caption', async () => {
       const { handlers, received } = await startCapturing();
       handlers.get('message:audio')?.(
-        ctxWith({ caption: 'the standup', audio: { file_id: 'a-1', file_name: 'x.mp3' } })
+        ctxWith({
+          caption: 'the standup',
+          audio: { file_id: 'a-1', file_name: 'x.mp3' },
+        })
       );
       await new Promise(resolve => setTimeout(resolve, 5));
 
@@ -809,7 +917,10 @@ describe('images in a reply', () => {
   const trackTempRoot = trackTempRoots();
   const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
 
-  function instrument(adapter: TelegramAdapter): { texts: string[]; photos: unknown[] } {
+  function instrument(adapter: TelegramAdapter): {
+    texts: string[];
+    photos: unknown[];
+  } {
     const texts: string[] = [];
     const photos: unknown[] = [];
     adapter.getBot().api.sendMessage = mock(async (chatId: unknown, text: unknown) => {

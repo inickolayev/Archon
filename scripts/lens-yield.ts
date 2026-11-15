@@ -43,13 +43,19 @@ export interface LensTally {
   readonly findings: number;
   /** Findings no other lens also sourced — the measure that retired the comments lens. */
   readonly sole: number;
-  /** Critical or Important among them. */
+  /** Labelled blocking among them, under the current or the earlier label set. */
   readonly blocking: number;
-  /** Findings synthesis or a later round disproved. */
+  /** Findings synthesis or a later round disproved, or accepted as declined. */
   readonly disproved: number;
 }
 
-const BLOCKING = new Set(['critical', 'important']);
+type LensCounts = {
+  -readonly [Key in Exclude<keyof LensTally, 'lens'>]: LensTally[Key];
+};
+
+// Synthesis labels findings `blocking` or `note`. Older findings files carry
+// `Critical`/`Important`/`Suggestion`, and the tally still reads them.
+const BLOCKING = new Set(['blocking', 'critical', 'important']);
 const FINDINGS_GLOB = '**/review/findings.json';
 
 function asFindings(parsed: unknown): FindingRecord[] {
@@ -135,28 +141,31 @@ export async function collectFindings(
 }
 
 export function tallyLenses(files: readonly FindingsFile[]): LensTally[] {
-  const tallies = new Map<
-    string,
-    { findings: number; sole: number; blocking: number; disproved: number }
-  >();
+  const tallies = new Map<string, LensCounts>();
   for (const file of files) {
     for (const finding of file.findings) {
-      const lenses = [...new Set(finding.sources)];
-      const disproved = finding.status === 'disproved';
-      const blocking = BLOCKING.has(finding.severity.toLowerCase()) && !disproved;
-      for (const lens of lenses) {
-        const tally = tallies.get(lens) ?? { findings: 0, sole: 0, blocking: 0, disproved: 0 };
-        tally.findings += 1;
-        if (lenses.length === 1) tally.sole += 1;
-        if (blocking) tally.blocking += 1;
-        if (disproved) tally.disproved += 1;
-        tallies.set(lens, tally);
-      }
+      tallyFinding(finding, tallies);
     }
   }
   return [...tallies]
     .map(([lens, tally]) => ({ lens, ...tally }))
     .sort((a, b) => b.findings - a.findings || a.lens.localeCompare(b.lens));
+}
+
+function tallyFinding(finding: FindingRecord, tallies: Map<string, LensCounts>): void {
+  const lenses = [...new Set(finding.sources)];
+  // A declined finding is one the owner refused with a reason synthesis accepted:
+  // like a disproved one, it was never a valid finding to act on.
+  const disproved = finding.status === 'disproved' || finding.status === 'declined';
+  const blocking = BLOCKING.has(finding.severity.toLowerCase()) && !disproved;
+  for (const lens of lenses) {
+    const tally = tallies.get(lens) ?? { findings: 0, sole: 0, blocking: 0, disproved: 0 };
+    tally.findings += 1;
+    if (lenses.length === 1) tally.sole += 1;
+    if (blocking) tally.blocking += 1;
+    if (disproved) tally.disproved += 1;
+    tallies.set(lens, tally);
+  }
 }
 
 export function formatReport(

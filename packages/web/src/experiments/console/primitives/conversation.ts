@@ -1,4 +1,10 @@
+import type { components } from '@/lib/api.generated';
 import { relativeTime } from '../lib/format';
+
+type RawConversation = Pick<
+  components['schemas']['Conversation'],
+  'id' | 'platform_conversation_id' | 'platform_type' | 'title' | 'last_activity_at' | 'user_id'
+>;
 
 /** Conversation summary primitive. Normalized from the server conversation row. */
 export interface ConversationSummary {
@@ -6,21 +12,12 @@ export interface ConversationSummary {
    * Platform conversation id (`web-<ts>-<rand>`) — NOT the DB uuid. This is the
    * id the `/api/conversations/:id/messages` and `/api/stream/:id` routes accept.
    */
-  id: string;
-  title: string | null;
-  platformType: string;
-  lastActivityAt: string | null;
+  id: RawConversation['platform_conversation_id'];
+  title: RawConversation['title'];
+  platformType: RawConversation['platform_type'];
+  lastActivityAt: RawConversation['last_activity_at'];
   /** Archon user that owns it — who the chat belongs to. */
-  userId: string | null;
-}
-
-interface RawConversation {
-  id: string;
-  platform_conversation_id: string;
-  platform_type: string;
-  title: string | null;
-  last_activity_at: string | null;
-  user_id?: string | null;
+  userId: RawConversation['user_id'];
 }
 
 export function toConversationSummary(raw: RawConversation): ConversationSummary {
@@ -29,7 +26,7 @@ export function toConversationSummary(raw: RawConversation): ConversationSummary
     title: raw.title,
     platformType: raw.platform_type,
     lastActivityAt: raw.last_activity_at,
-    userId: raw.user_id ?? null,
+    userId: raw.user_id,
   };
 }
 

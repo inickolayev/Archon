@@ -5,25 +5,37 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { join, relative } from 'node:path';
-import { planRequestedRuns } from './repo-tests';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { trackTempRoots } from '@archon/paths/test-utils';
+import { archonCliInvocation } from '@archon/paths/cli-command';
+import { bunTestCommand, bunTestEnv } from './bun-test-command';
+import {
+  planRequestedRuns,
+  planShard,
+  rootTestEnv,
+  planStepCommand,
+  ROOT_TEST_PLAN,
+  type RootTestStep,
+} from './repo-tests';
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const fromRoot = (path: string): string => join(REPO_ROOT, path);
 
 describe('planRequestedRuns', () => {
   test('places a path inside a package with that package', () => {
-    const runs = planRequestedRuns([fromRoot('packages/paths/src/effort.test.ts')]);
+    const runs = planRequestedRuns([fromRoot('packages/paths/src/skills.test.ts')]);
 
     expect(runs).toHaveLength(1);
     expect(runs[0].owner.label).toBe('packages/paths');
     expect(runs[0].owner.cwd).toBe(fromRoot('packages/paths'));
-    expect(runs[0].args).toEqual(['src/effort.test.ts']);
+    expect(runs[0].args).toEqual(['src/skills.test.ts']);
   });
 
   test('reads a relative path against the repository root', () => {
-    const relativePath = relative(REPO_ROOT, fromRoot('packages/paths/src/effort.test.ts'));
+    const relativePath = relative(REPO_ROOT, fromRoot('packages/paths/src/skills.test.ts'));
 
-    expect(planRequestedRuns([relativePath])[0].args).toEqual(['src/effort.test.ts']);
+    expect(planRequestedRuns([relativePath])[0].args).toEqual(['src/skills.test.ts']);
   });
 
   test('keeps a root-owned path at the repository root', () => {
@@ -34,10 +46,33 @@ describe('planRequestedRuns', () => {
     expect(runs[0].args).toEqual(['./scripts/test-inventory.test.ts']);
   });
 
+  test.each(['.archon/scripts', '.archon/scripts/', 'scripts', 'scripts/'])(
+    'routes the root-owned directory %s',
+    selector => {
+      expect(planRequestedRuns([selector])).toEqual([
+        {
+          owner: { label: 'the repository root', cwd: REPO_ROOT },
+          args: [`./${selector.replace(/\/$/, '')}`],
+        },
+      ]);
+    }
+  );
+
+  test.each([
+    'scriptsx',
+    'scripts-other/',
+    'scripts-other/example.test.ts',
+    '.archon/scriptsx',
+    '.archon/scripts-other/',
+    '.archon/scripts-other/example.test.ts',
+  ])('rejects the sibling-prefix selector %s', selector => {
+    expect(planRequestedRuns([selector])).toEqual([]);
+  });
+
   test('plans one run per owner, in the order the owners were named', () => {
     const runs = planRequestedRuns([
       fromRoot('packages/isolation/src/resolver.test.ts'),
-      fromRoot('packages/paths/src/effort.test.ts'),
+      fromRoot('packages/paths/src/skills.test.ts'),
       fromRoot('packages/isolation/src/pr-state.test.ts'),
     ]);
 
@@ -46,26 +81,26 @@ describe('planRequestedRuns', () => {
       'packages/paths',
     ]);
     expect(runs[0].args).toEqual(['src/resolver.test.ts', 'src/pr-state.test.ts']);
-    expect(runs[1].args).toEqual(['src/effort.test.ts']);
+    expect(runs[1].args).toEqual(['src/skills.test.ts']);
   });
 
   test('forwards flags and substring filters to the owner the paths named', () => {
     const runs = planRequestedRuns([
       '--bail',
       '-t',
-      'effort',
-      fromRoot('packages/paths/src/effort.test.ts'),
+      'resolveSkillDirectories',
+      fromRoot('packages/paths/src/skills.test.ts'),
     ]);
 
     expect(runs).toHaveLength(1);
-    expect(runs[0].args).toEqual(['--bail', '-t', 'effort', 'src/effort.test.ts']);
+    expect(runs[0].args).toEqual(['--bail', '-t', 'resolveSkillDirectories', 'src/skills.test.ts']);
   });
 
   test('forwards an unplaced argument to every owner the paths named', () => {
     const runs = planRequestedRuns([
       '--bail',
       fromRoot('packages/isolation/src/resolver.test.ts'),
-      fromRoot('packages/paths/src/effort.test.ts'),
+      fromRoot('packages/paths/src/skills.test.ts'),
     ]);
 
     expect(runs.map((run): string => run.owner.label)).toEqual([
@@ -73,8 +108,42 @@ describe('planRequestedRuns', () => {
       'packages/paths',
     ]);
     expect(runs[0].args).toEqual(['--bail', 'src/resolver.test.ts']);
-    expect(runs[1].args).toEqual(['--bail', 'src/effort.test.ts']);
+    expect(runs[1].args).toEqual(['--bail', 'src/skills.test.ts']);
   });
+
+  for (const option of ['-t', '--test-name-pattern']) {
+    test.each(['scripts', '.archon/scripts'])(
+      `forwards ${option} value %s unchanged to root and package owners`,
+      pattern => {
+        const runs = planRequestedRuns([
+          'scripts/pack-scripts-validation.test.ts',
+          option,
+          pattern,
+          'packages/paths/src/archon-paths.test.ts',
+        ]);
+
+        expect(runs.map(run => run.args)).toEqual([
+          ['./scripts/pack-scripts-validation.test.ts', option, pattern],
+          [option, pattern, 'src/archon-paths.test.ts'],
+        ]);
+        expect(planRequestedRuns([option, pattern])).toEqual([]);
+      }
+    );
+  }
+
+  test.each(['--changed', '--changed=HEAD', '--parallel=2', '--bail=1'])(
+    '%s preserves the following selector for package and root routing',
+    option => {
+      expect(planRequestedRuns([option, 'packages/paths/src/skills.test.ts'])[0].args).toEqual([
+        option,
+        'src/skills.test.ts',
+      ]);
+      expect(planRequestedRuns([option, 'scripts/package-tests.test.ts'])[0].args).toEqual([
+        option,
+        './scripts/package-tests.test.ts',
+      ]);
+    }
+  );
 
   test('plans no run when no argument names an owner', () => {
     expect(planRequestedRuns(['some/where/nope.test.ts'])).toEqual([]);
@@ -84,6 +153,58 @@ describe('planRequestedRuns', () => {
     // A bare package directory reaches the same outcome down a different branch: the
     // package exists, but there is no selector after it for `bun test` to run.
     expect(planRequestedRuns([fromRoot('packages/paths')])).toEqual([]);
+  });
+});
+
+describe('planShard', () => {
+  test.each(['cli', 'core', 'packages', 'scripts', 'pack'] as const)(
+    '--plan %s selects that shard',
+    shard => {
+      expect(planShard(['--plan', shard])).toBe(shard);
+    }
+  );
+
+  test.each([[['--plan', 'nope']], [['--plan']], [['--plan', 'scripts', 'scripts/']]])(
+    'rejects the malformed request %j',
+    requested => {
+      expect(() => planShard(requested)).toThrow(
+        'Usage: bun run test --plan <cli|core|packages|scripts|pack>'
+      );
+    }
+  );
+
+  test.each([[[]], [['scripts/']], [['-t', '--plan']]])('leaves %j to the router', requested => {
+    expect(planShard(requested)).toBeUndefined();
+  });
+});
+
+describe('rootTestEnv', () => {
+  test("names this checkout's CLI for pack tests, even when a host CLI is inherited", () => {
+    expect(JSON.parse(rootTestEnv({}).ARCHON_CLI_COMMAND ?? '')).toEqual(archonCliInvocation());
+    expect(
+      JSON.parse(rootTestEnv({ ARCHON_CLI_COMMAND: '["archon"]' }).ARCHON_CLI_COMMAND ?? '')
+    ).toEqual(archonCliInvocation());
+  });
+});
+
+describe('planStepCommand', () => {
+  test('the workspaces step leaves out exactly the packages that run alone', () => {
+    const steps: readonly RootTestStep[] = ROOT_TEST_PLAN;
+    const solo = steps.flatMap(step => (step.kind === 'workspace' ? [step.package] : []));
+    expect(solo.length).toBeGreaterThan(0);
+    for (const step of steps) {
+      if (step.kind === 'workspace') {
+        expect(planStepCommand(step)).toEqual(['bun', '--filter', step.package, 'test']);
+      }
+      if (step.kind === 'workspaces') {
+        expect(planStepCommand(step)).toEqual([
+          'bun',
+          ...solo.flatMap(name => ['--filter', `!${name}`]),
+          '--parallel',
+          'test',
+        ]);
+      }
+    }
   });
 });
 
@@ -100,13 +221,17 @@ describe('planRequestedRuns', () => {
  */
 describe('repo-tests exit codes', () => {
   const SCRIPT = fromRoot('scripts/repo-tests.ts');
-  const invoke = (args: string[]): { exitCode: number | null; stderr: string } => {
+  const invoke = (args: string[]): { exitCode: number | null; stderr: string; stdout: string } => {
     const result = Bun.spawnSync(['bun', SCRIPT, ...args], {
       cwd: REPO_ROOT,
       stdout: 'pipe',
       stderr: 'pipe',
     });
-    return { exitCode: result.exitCode, stderr: result.stderr.toString() };
+    return {
+      exitCode: result.exitCode,
+      stderr: result.stderr.toString(),
+      stdout: result.stdout.toString(),
+    };
   };
 
   test('exits non-zero and names what it accepts when no argument routes', () => {
@@ -116,11 +241,47 @@ describe('repo-tests exit codes', () => {
     expect(stderr).toContain('No argument named a test path this runner can place');
   });
 
+  test('unroutable diagnostics exclude option values', () => {
+    for (const options of [
+      ['--define', 'API_KEY="probe-secret"'],
+      ['--define=API_KEY="probe-secret"'],
+    ]) {
+      const { exitCode, stdout, stderr } = invoke([...options, 'unmatched']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('unmatched');
+      expect(stdout + stderr).not.toContain('probe-secret');
+      expect(stdout + stderr).not.toContain('--define');
+    }
+  });
+
+  for (const options of [['--shard=2/2'], ['--shard', '2/2']]) {
+    test(`rejects sharding across owners before starting children: ${options.join(' ')}`, () => {
+      const { exitCode, stdout, stderr } = invoke([
+        ...options,
+        'packages/paths/src/skills.test.ts',
+        'scripts/bun-test-command.test.ts',
+      ]);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('Sharding requires one test owner');
+      expect(stderr).toContain('packages/paths');
+      expect(stderr).toContain('the repository root');
+      expect(stdout).toBe('');
+      expect(stderr).not.toContain('bun test v');
+    });
+  }
+
+  test('exits non-zero with the usage for an unknown plan shard', () => {
+    const { exitCode, stderr } = invoke(['--plan', 'nope']);
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('Usage: bun run test --plan <cli|core|packages|scripts|pack>');
+  });
+
   test('propagates a failing run instead of reporting success', () => {
     // A real file so the argument routes, plus a filter `bun test` cannot match, so the
     // child exits non-zero and the runner has a real failure to carry back.
     const { exitCode } = invoke([
-      fromRoot('packages/paths/src/effort.test.ts'),
+      fromRoot('packages/paths/src/skills.test.ts'),
       '-t',
       'no-such-test-name-exists',
     ]);
@@ -128,9 +289,195 @@ describe('repo-tests exit codes', () => {
     expect(exitCode).not.toBe(0);
   });
 
+  test('single-owner sharding preserves native execution', () => {
+    const { exitCode, stdout } = invoke(['--shard=1/1', 'packages/paths/src/skills.test.ts']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('◀ @archon/paths ./src/skills.test.ts');
+  });
+
   test('exits 0 when the routed run passes', () => {
-    const { exitCode } = invoke([fromRoot('packages/paths/src/effort.test.ts')]);
+    const { exitCode, stdout } = invoke([fromRoot('packages/paths/src/skills.test.ts')]);
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('◀ @archon/paths ./src/skills.test.ts');
+  });
+
+  test('bun run test .archon/scripts/ executes the directory tests', () => {
+    // `bun test` exits non-zero when `-t` matches nothing it collected, so a zero exit
+    // proves the directory selector reached a test inside it. The filter keeps the run to
+    // one cheap test instead of the whole directory, and the exit code reads the same
+    // whether or not Bun quiets its console output for an agent caller.
+    const { exitCode } = Bun.spawnSync(
+      ['bun', 'run', 'test', '.archon/scripts/', '-t', 'a blocked item closes nothing'],
+      { cwd: REPO_ROOT, stdout: 'ignore', stderr: 'ignore' }
+    );
 
     expect(exitCode).toBe(0);
   });
 });
+
+for (const option of ['coverage-dir', 'reporter-outfile', 'path-ignore-patterns', 'timings']) {
+  test(`root routing preserves --${option} path values`, () => {
+    for (const value of [
+      'packages/paths/src/skills.test.ts',
+      'scripts/test-inventory.test.ts',
+      '.archon/scripts/',
+    ]) {
+      expect(
+        planRequestedRuns([`--${option}`, value, 'scripts/test-inventory.test.ts']).map(
+          run => run.args
+        )
+      ).toEqual([[`--${option}`, value, './scripts/test-inventory.test.ts']]);
+      expect(planRequestedRuns([`--${option}`, value])).toEqual([]);
+      expect(
+        planRequestedRuns([`--${option}`, value, 'packages/paths/src/skills.test.ts']).map(
+          run => run.args
+        )
+      ).toEqual([[`--${option}`, value, 'src/skills.test.ts']]);
+    }
+  });
+}
+
+const track = trackTempRoots();
+for (const owner of ['package', 'root'] as const) {
+  for (const scenario of ['explicit-pass', 'empty-shard', 'unchanged-name-filter'] as const) {
+    if (owner === 'root' && scenario === 'explicit-pass') continue;
+    test(`JUnit preserves native zero-file success: ${owner}, ${scenario}`, () => {
+      const root = track(mkdtempSync(join(tmpdir(), 'zero-file-junit-')));
+      const cwd = owner === 'package' ? fromRoot('packages/paths') : REPO_ROOT;
+      const selector =
+        owner === 'package' ? 'src/skills.test.ts' : './scripts/bun-test-command.test.ts';
+      const args =
+        scenario === 'explicit-pass'
+          ? [selector.replace('.test.ts', '-unmatched.test.ts'), '--pass-with-no-tests']
+          : scenario === 'empty-shard'
+            ? [selector, '--shard=2/2']
+            : [selector, '--changed', '-t', 'resolveSkillDirectories'];
+      const nativeReport = join(root, 'native.xml');
+      const native = Bun.spawnSync(
+        bunTestCommand([...args, '--reporter=junit', `--reporter-outfile=${nativeReport}`]),
+        { cwd, env: bunTestEnv(), stdout: 'pipe', stderr: 'pipe' }
+      );
+      expect(native.exitCode).toBe(0);
+      expect(existsSync(nativeReport)).toBe(false);
+
+      const entryPoints =
+        owner === 'package'
+          ? [
+              { cwd, args },
+              {
+                cwd: REPO_ROOT,
+                args: [`packages/paths/${args[0]}`, ...args.slice(1)],
+              },
+            ]
+          : [{ cwd, args }];
+      for (const [index, entry] of entryPoints.entries()) {
+        const report = join(root, `wrapped-${index}.xml`);
+        const wrapped = Bun.spawnSync(
+          ['bun', 'run', 'test', ...entry.args, '--reporter=junit', `--reporter-outfile=${report}`],
+          { cwd: entry.cwd, env: bunTestEnv(), stdout: 'pipe', stderr: 'pipe' }
+        );
+        expect(wrapped.exitCode).toBe(native.exitCode);
+        const xml = readFileSync(report, 'utf8');
+        expect(xml).toMatch(/<testsuites[^>]*tests="0"/);
+        expect(xml).toMatch(/<testsuites[^>]*errors="0"/);
+        expect(wrapped.stderr.toString()).toContain('Bun exited 0 without a JUnit report');
+      }
+    });
+  }
+}
+
+for (const second of ['package', 'root']) {
+  test(`root JUnit retains earlier owners before a ${second} owner`, () => {
+    const root = track(mkdtempSync(join(tmpdir(), 'root-junit-')));
+    const report = join(root, 'combined.xml');
+    const secondFile =
+      second === 'package'
+        ? 'packages/plugin-manifest/src/index.test.ts'
+        : 'scripts/bun-test-command.test.ts';
+    const result = Bun.spawnSync(
+      [
+        'bun',
+        fromRoot('scripts/repo-tests.ts'),
+        'packages/paths/src/skills.test.ts',
+        secondFile,
+        '--reporter=junit',
+        '--reporter-outfile',
+        second === 'root' ? relative(REPO_ROOT, report) : report,
+      ],
+      { cwd: REPO_ROOT, stdout: 'pipe', stderr: 'pipe' }
+    );
+    expect(result.exitCode).toBe(0);
+    const xml = readFileSync(report, 'utf8');
+    expect(xml).toContain('<testcase name="returns empty paths and missing for undefined input"');
+    expect(xml).toContain(
+      second === 'package'
+        ? 'accepts comparator ranges on full versions'
+        : 'sets the default per-test budget'
+    );
+    expect(xml.match(/<\?xml/g)).toHaveLength(1);
+    expect(xml).toMatch(/<testsuites[^>]*failures="0"[^>]*errors="0"/);
+  });
+}
+
+test('root JUnit includes a failing owner and stops before unstarted owners', () => {
+  const root = track(mkdtempSync(join(tmpdir(), 'root-junit-')));
+  const report = join(root, 'failure.xml');
+  const result = Bun.spawnSync(
+    [
+      'bun',
+      fromRoot('scripts/repo-tests.ts'),
+      'packages/paths/src/skills.test.ts',
+      'packages/plugin-manifest/src/no-matching-file.test.ts',
+      'scripts/bun-test-command.test.ts',
+      '--reporter=junit',
+      `--reporter-outfile=${report}`,
+    ],
+    { cwd: REPO_ROOT, stdout: 'pipe', stderr: 'pipe' }
+  );
+  expect(result.exitCode).not.toBe(0);
+  const xml = readFileSync(report, 'utf8');
+  expect(xml).toContain('<testcase name="returns empty paths and missing for undefined input"');
+  expect(xml).toContain('no-matching-file.test.ts');
+  expect(xml).toContain('<error');
+  expect(xml).not.toContain('bun-test-command.test.ts');
+});
+
+for (const secondFile of [
+  'packages/plugin-manifest/src/index.test.ts',
+  'scripts/bun-test-command.test.ts',
+]) {
+  for (const options of [
+    ['-t', '.*'],
+    ['--test-name-pattern', '.*'],
+    ['--test-name-pattern=.*'],
+    ['-t.*'],
+  ]) {
+    test(`root rejects split name filters before children: ${secondFile}, ${options[0]}`, () => {
+      const root = track(mkdtempSync(join(tmpdir(), 'root-name-filter-')));
+      const report = join(root, 'rejected.xml');
+      const result = Bun.spawnSync(
+        [
+          'bun',
+          fromRoot('scripts/repo-tests.ts'),
+          'packages/paths/src/skills.test.ts',
+          secondFile,
+          ...options,
+          '--reporter=junit',
+          `--reporter-outfile=${report}`,
+        ],
+        { cwd: REPO_ROOT, stdout: 'pipe', stderr: 'pipe' }
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout.toString()).toBe('');
+      const stderr = result.stderr.toString();
+      expect(stderr).toContain('Name filters require one test owner');
+      expect(stderr).toContain('packages/paths');
+      expect(stderr).toContain(
+        secondFile.startsWith('packages/') ? 'packages/plugin-manifest' : 'the repository root'
+      );
+      expect(stderr).not.toContain('bun test v');
+      expect(existsSync(report)).toBe(false);
+    });
+  }
+}

@@ -26,7 +26,9 @@ export interface IDatabase {
    * Execute a callback within a database transaction.
    * All queries using the provided function are atomic -
    * they either all commit or all roll back on error.
-   *
+   * `fn` may run more than once: after a lock conflict (SQLite busy, PostgreSQL deadlock
+   * or serialization failure) the adapter rolls back and reruns the whole callback, so
+   * it must have no effects outside the transaction.
    * @param fn - Callback receiving a transaction-scoped query function
    * @returns The callback's return value
    */
@@ -98,20 +100,18 @@ export interface SqlDialect {
   now(): string;
 
   /**
+   * Tie-breaker for message timestamps: SQLite insertion order (`rowid`),
+   * PostgreSQL's existing stable ID order. Used descending for newest-first reads.
+   */
+  readonly messageOrderTieBreaker: string;
+
+  /**
    * SQL expression for a top-level JSON merge (existing || new). A null value in the
    * patch removes that key on every dialect, so `{ key: null }` is how a caller clears it.
    * @param column - Column name
    * @param paramIndex - Parameter placeholder index
    */
   jsonMerge(column: string, paramIndex: number): string;
-
-  /**
-   * SQL expression to check if JSON array contains value
-   * @param column - Column name containing JSON
-   * @param path - JSON path to array (e.g., 'related_issues')
-   * @param paramIndex - Parameter placeholder index for value
-   */
-  jsonArrayContains(column: string, path: string, paramIndex: number): string;
 
   /**
    * SQL expression for interval subtraction from now
@@ -124,4 +124,39 @@ export interface SqlDialect {
    * @param column - Timestamp column name
    */
   daysSince(column: string): string;
+
+  /**
+   * SQL expression reading the JSON value at a dotted key path (`approval.nodeId`).
+   * A JSON string reads as its unquoted text on both dialects, and a JSON null or an
+   * absent key reads as SQL NULL. Postgres returns every scalar as text; SQLite
+   * returns numbers and booleans as SQL numbers.
+   * @param column - JSON column, optionally table-qualified (`r.metadata`)
+   * @param path - Dot-separated object keys
+   */
+  jsonText(column: string, path: string): string;
+
+  /**
+   * SQL expression for a JSON object with the given top-level keys removed.
+   * @param column - JSON object expression
+   * @param keys - Top-level keys to remove
+   */
+  jsonRemove(column: string, ...keys: string[]): string;
+
+  /**
+   * Suffix for a SELECT whose rows a later write in the same transaction depends on:
+   * ` FOR UPDATE` on Postgres (` FOR UPDATE OF <table>` when named), empty on SQLite.
+   * SQLite needs no row lock: the adapter serializes transactions on one connection,
+   * and a cross-process writer that commits between the read and the write fails the
+   * deferred transaction's read-to-write upgrade with SQLITE_BUSY, which the adapter
+   * answers by rerunning the whole transaction.
+   * @param table - Table or alias to lock when the SELECT joins others
+   */
+  rowLock(table?: string): string;
+
+  /**
+   * Clause after a FROM table that forces `index`: ` INDEXED BY <index>` on SQLite,
+   * empty on Postgres. SQLite has no statistics unless ANALYZE ran, so it prefers any
+   * index with an equality term over a partial index whose predicate the query repeats.
+   */
+  indexedBy(index: string): string;
 }

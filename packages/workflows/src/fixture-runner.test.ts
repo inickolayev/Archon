@@ -1,4 +1,7 @@
+// @archon-test-isolated
+import { applyRunEnvironment } from './run-preflight';
 /** Tests for the declared-data dry-run fixture runner (#2772). */
+import { providerRegistry } from '@archon/providers';
 import { describe, it, expect, beforeAll, afterAll, mock, spyOn } from 'bun:test';
 import {
   cpSync,
@@ -30,8 +33,7 @@ afterAll(() => removeTempTree(bundledDefaultsRoot));
 const realArchonPaths = await import('@archon/paths');
 mock.module('@archon/paths', () => ({
   ...realArchonPaths,
-  getDefaultWorkflowsPath: () => join(bundledDefaultsRoot, 'defaults'),
-  getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
+  getBundledWorkflowsPath: () => bundledDefaultsRoot,
 }));
 
 import { execFileAsync, resolveBashPath } from '@archon/git';
@@ -51,7 +53,7 @@ import {
 function workflowsOnDisk(cwd: string, names: string[], pack = 'pack'): WorkflowWithSource[] {
   return names.map(name => {
     const path = join(cwd, '.archon', 'workflows', pack, `${name}.yaml`);
-    const parsed = parseWorkflow(readFileSync(path, 'utf8'), `${name}.yaml`);
+    const parsed = parseWorkflow(readFileSync(path, 'utf8'), `${name}.yaml`, providerRegistry);
     if (!parsed.workflow) throw new Error(parsed.error.error);
     const raw = new Map([[parsed.workflow.name, parsed.workflow]]);
     const expanded = expandWorkflowIncludes(raw);
@@ -69,6 +71,7 @@ import {
   formatFixtureReport,
   parseFixtureFile,
   runFixtures as runFixturesFromSource,
+  type FixtureDeclaration,
   type FixtureReport,
   type RunFixturesOptions,
 } from './fixture-runner';
@@ -164,6 +167,41 @@ describe('parseFixtureFile', () => {
     expect(parsed.stubs).toEqual({ 'node-a': 'stub' });
   });
 
+  it('accepts authored verdict expectations and rejects invalid values', () => {
+    for (const authored of ['succeeded', 'failed']) {
+      expect(parseFixtureFile(`fixture:\n  authored: ${authored}`, 'x').declaration).toMatchObject({
+        expect: 'completed',
+        authored,
+      });
+    }
+    expect(() => parseFixtureFile('fixture:\n  authored: completed', 'x')).toThrow(
+      "'fixture' block"
+    );
+  });
+
+  it.each(['authoredOutcome', 'expected', 'failNode', 'reachd', 'input', 'resolvedTextContains'])(
+    'rejects unknown fixture declaration key %s',
+    key => {
+      expect(() => parseFixtureFile(`fixture:\n  ${key}: failed`, 'x')).toThrow(
+        `Unrecognized key: "${key}"`
+      );
+    }
+  );
+
+  it('preserves every supported fixture declaration key', () => {
+    const declaration: FixtureDeclaration = {
+      expect: 'failed',
+      authored: 'failed',
+      'fail-node': 'node-a',
+      reached: ['node-a'],
+      inputs: { branch: 'task-123' },
+      'resolved-text-contains': { 'node-a': 'task-123' },
+    };
+    expect(parseFixtureFile(Bun.YAML.stringify({ fixture: declaration }), 'x').declaration).toEqual(
+      declaration
+    );
+  });
+
   it('requires fail-node when expect is failed', () => {
     expect(() =>
       parseFixtureFile(['fixture:', '  expect: failed', 'node-a: "stub"'].join('\n'), 'x')
@@ -189,6 +227,40 @@ describe('parseFixtureFile', () => {
 
 describe('runFixtures', () => {
   const passingBody = ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n');
+
+  it('contains environment lookup failures in executable fixtures and continues stub fixtures', async () => {
+    const { cwd } = writeTempProject({
+      fixtureName: 'a-executable',
+      body: 'fixture:\n  expect: failed\n  fail-node: node-a\nexec-code: true\n',
+    });
+    writeTempProject({ cwd, fixtureName: 'b-stub', body: passingBody });
+    const resolveExecConfig = mock(async () => {
+      throw new Error('environment store unavailable');
+    });
+    const report = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['test-wf']),
+      cwd,
+      resolveExecConfig,
+    });
+    expect(resolveExecConfig).toHaveBeenCalledTimes(1);
+    expect(report.passed).toBe(1);
+    expect(report.failed).toBe(1);
+    expect(report.results[0]).toMatchObject({
+      pass: false,
+      failureReason: 'environment store unavailable',
+    });
+    expect(report.results[1]).toMatchObject({ pass: true, outcome: 'completed' });
+  });
+
+  it('does not resolve executable environment when no fixtures exist', async () => {
+    const cwd = makeTempProject();
+    const resolveExecConfig = mock(async () => {
+      throw new Error('environment store unavailable');
+    });
+    const report = await runFixtures({ workflows: [], cwd, resolveExecConfig });
+    expect(report.results).toEqual([]);
+    expect(resolveExecConfig).not.toHaveBeenCalled();
+  });
 
   it('passes a fixture whose declared outcome matches the dry-run outcome', async () => {
     const { cwd } = writeTempProject({ body: passingBody });
@@ -225,6 +297,71 @@ describe('runFixtures', () => {
     expect(formatFixtureReport(report)).toContain('Simulation outcome: completed');
     expect(formatFixtureReport(report)).toContain('Authored outcome: failed');
   });
+
+  it.each([
+    ['agent', '    prompt: verdict'],
+    ['exec', '    bash: echo verdict'],
+    ['loop-assumed', '    loop: { prompt: verdict, until_bash: "true", max_iterations: 1 }'],
+    ['loop-field', '    loop: { prompt: verdict, until_field: done, max_iterations: 1 }'],
+  ])('checks object and JSON-string authored stubs equivalently for %s', async (_kind, node) => {
+    for (const green of [true, false]) {
+      const authored = green ? 'succeeded' : 'failed';
+      const value = { green, done: true };
+      const workflowYaml = [
+        'name: test-wf',
+        'description: stubbed verdict',
+        'returns: node-a',
+        'outcome_field: green',
+        'nodes:',
+        '  - id: node-a',
+        node,
+        '    output_format:',
+        '      type: object',
+        '      properties:',
+        '        green: { type: boolean }',
+        '        done: { type: boolean }',
+        '      required: [green, done]',
+      ].join('\n');
+      const { cwd } = writeTempProject({
+        workflowYaml,
+        fixtureName: 'object',
+        body: Bun.YAML.stringify({ fixture: { authored }, 'node-a': value }),
+      });
+      writeTempProject({
+        cwd,
+        workflowYaml,
+        fixtureName: 'string',
+        body: Bun.YAML.stringify({ fixture: { authored }, 'node-a': JSON.stringify(value) }),
+      });
+      const report = await runFixtures({ workflows: workflowsOnDisk(cwd, ['test-wf']), cwd });
+      expect(report).toMatchObject({
+        passed: 2,
+        failed: 0,
+        results: [
+          { outcome: 'completed', authoredOutcome: authored, pass: true },
+          { outcome: 'completed', authoredOutcome: authored, pass: true },
+        ],
+      });
+    }
+  });
+
+  it.each(['completed', 'failed'] as const)(
+    'fails an authored expectation without a verdict under expect: %s',
+    async outcome => {
+      const { cwd } = writeTempProject({
+        body: `fixture:\n  expect: ${outcome}\n  authored: succeeded\n${
+          outcome === 'failed' ? '  fail-node: node-a' : 'node-a: stub'
+        }`,
+      });
+      const report = await runFixtures({ workflows: workflowsOnDisk(cwd, ['test-wf']), cwd });
+      expect(report.results[0]).toMatchObject({
+        outcome,
+        pass: false,
+        authoredOutcome: null,
+        failureReason: 'expected authored outcome succeeded, dry-run reported undeclared',
+      });
+    }
+  );
 
   it('requires declared nodes to complete or be stubbed', async () => {
     const { cwd } = writeTempProject({
@@ -288,6 +425,69 @@ describe('runFixtures', () => {
     });
 
     expect(report.passed).toBe(1);
+  });
+
+  // #5442: the printed failure named a downstream field reference; only the per-node
+  // trace showed that every loop body node had been skipped.
+  it('prints each node status for a failed fixture, without node payloads', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: rounds\n' +
+        '    loop_group:\n' +
+        '      until_bash: "true"\n' +
+        '      max_iterations: 1\n' +
+        '      nodes:\n' +
+        '        - id: gate\n          prompt: decide payload-marker\n' +
+        '          output_format: { type: object, properties: { status: { type: string } } }\n' +
+        '        - id: deliver\n          prompt: ship\n          depends_on: [gate]\n' +
+        `          when: "$gate.output.status == 'go-payload-marker'"\n` +
+        '  - id: report\n    prompt: $rounds.output.pr_url\n    depends_on: [rounds]\n',
+      body: [
+        'fixture:',
+        '  expect: completed',
+        "gate: { status: stop, note: 'payload-marker' }",
+        'deliver: "shipped"',
+      ].join('\n'),
+    });
+    const report = await runFixtures({ workflows: workflowsOnDisk(cwd, ['test-wf']), cwd });
+
+    const result = report.results[0];
+    expect(result.pass).toBe(false);
+    expect(result.trace).toEqual([
+      { nodeId: 'gate', nodeType: 'prompt', state: 'stubbed', iteration: 1 },
+      {
+        nodeId: 'deliver',
+        nodeType: 'prompt',
+        state: 'skipped',
+        iteration: 1,
+        reason: 'when_condition',
+      },
+      expect.objectContaining({ nodeId: 'rounds', state: 'completed' }),
+      { nodeId: 'report', nodeType: 'prompt', state: 'failed' },
+    ]);
+    const rendered = formatFixtureReport(report);
+    expect(rendered).toContain(
+      '    trace:\n' +
+        '      STUBBED   gate (prompt) [iteration 1]\n' +
+        '      SKIPPED   deliver (prompt) [iteration 1] — when_condition\n'
+    );
+    expect(rendered).toContain('      FAILED    report (prompt)\n');
+    expect(rendered).toContain(`    report: ${result.nodeFailures?.[0]?.reason}`);
+    const json = JSON.stringify(report);
+    expect(JSON.parse(json).results[0].trace).toEqual(result.trace);
+    // Resolved prompts, stub outputs and `when:` expressions stay out of the report.
+    expect(rendered).not.toContain('payload-marker');
+    expect(json).not.toContain('payload-marker');
+  });
+
+  it('keeps a passing fixture free of the trace', async () => {
+    const { cwd } = writeTempProject({ body: STUB_FIXTURE });
+    const report = await runFixtures({ workflows: workflowsOnDisk(cwd, ['test-wf']), cwd });
+
+    expect(report.results[0].pass).toBe(true);
+    expect(report.results[0].trace).toBeUndefined();
+    expect(formatFixtureReport(report)).not.toContain('trace:');
   });
 
   it('reports the full failed set when a single fail-node cannot cover it', async () => {
@@ -1081,6 +1281,7 @@ describe('discovery and fixture execution agree (#3183)', () => {
       writeWorkflowDirs(cwd, [path]);
 
       const discovered = await discoverWorkflows(cwd, {
+        providers: providerRegistry,
         loadDefaults: false,
         sourceRoots: isolatedSourceRoots(cwd),
       });
@@ -1145,7 +1346,20 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     await git(cwd, 'init', '-q');
     writeFileSync(join(cwd, 'tracked.txt'), COMMITTED_YAML);
     await git(cwd, 'add', '-A');
-    await git(cwd, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
+    // No background `git maintenance`: callerFrom copies this tree, and a detached
+    // maintenance process can delete its lock file mid-copy.
+    await git(
+      cwd,
+      '-c',
+      'maintenance.auto=false',
+      '-c',
+      'user.email=t@t',
+      '-c',
+      'user.name=t',
+      'commit',
+      '-qm',
+      'init'
+    );
   }
 
   /**
@@ -1154,8 +1368,8 @@ describe('runFixtures exec-code isolation (#2851)', () => {
    * `git worktree add` has nothing to check out without a HEAD commit, so every exec-code
    * test needs its caller to be a real repository. Built in place that is three git
    * processes per test, and process creation is what this block costs on a contended
-   * Windows runner — the parity test below spent 5015ms of a 5000ms budget there. A plain
-   * repository's metadata holds no absolute paths, so copying a prepared one is an
+   * Windows runner — the parity test below spent 5015ms of the 5000ms budget it then
+   * had. A plain repository's metadata holds no absolute paths, so copying a prepared one is an
    * independent repository at file-copy price: ~0.8ms measured locally against ~50ms for
    * the three processes.
    *
@@ -1185,6 +1399,50 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     cpSync(template, cwd, { recursive: true });
     return cwd;
   }
+
+  it('checks authored expectations against an executed return script', async () => {
+    const { cwd } = writeTempProject({
+      cwd: callerFrom(trackedOnlyRepo),
+      workflowYaml: [
+        'name: test-wf',
+        'description: executed verdict',
+        'returns: verdict',
+        'outcome_field: succeeded',
+        'nodes:',
+        '  - id: verdict',
+        '    runtime: bun',
+        '    script: |',
+        '      console.log(JSON.stringify({ succeeded: false }));',
+        '    output_format:',
+        '      type: object',
+        '      properties:',
+        '        succeeded: { type: boolean }',
+        '      required: [succeeded]',
+      ].join('\n'),
+      body: 'fixture:\n  authored: succeeded\nexec-code: true',
+    });
+    writeTempProject({
+      cwd,
+      fixtureName: 'matching',
+      workflowYaml: readFileSync(join(cwd, '.archon/workflows/pack/test-wf.yaml'), 'utf8'),
+      body: 'fixture:\n  authored: failed\nexec-code: true',
+    });
+    const report = await runFixtures({ workflows: workflowsOnDisk(cwd, ['test-wf']), cwd });
+    expect(report).toMatchObject({
+      passed: 1,
+      failed: 1,
+      results: [
+        {
+          outcome: 'completed',
+          authoredOutcome: 'failed',
+          pass: false,
+          failureReason: 'expected authored outcome succeeded, dry-run reported failed',
+        },
+        { outcome: 'completed', authoredOutcome: 'failed', pass: true },
+      ],
+    });
+    expect(formatFixtureReport(report)).toContain('Authored outcome: failed');
+  });
 
   it('gives clean and pre-dirtied callers the same verdict (#2851)', async () => {
     // One caller, invoked twice: the dirt is then the ONLY difference between the two
@@ -1241,6 +1499,224 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     // be a spawn failure — bash never ran — which must not read as the guard working.
     expect(exit).toBe(1);
   });
+
+  it.each(['completed', 'failed'] as const)(
+    'reports executable node diagnostics when the fixture expects %s',
+    async expected => {
+      const { cwd } = writeTempProject({
+        workflowYaml: [
+          'name: test-wf',
+          'description: failing code diagnostic',
+          'nodes:',
+          '  - id: code',
+          '    bash: |',
+          '      # inline-body-marker',
+          '      printf stdout-tail',
+          '      printf stderr-tail >&2',
+          '      exit 7',
+        ].join('\n'),
+        body: [
+          'fixture:',
+          `  expect: ${expected}`,
+          ...(expected === 'failed' ? ['  fail-node: code'] : []),
+          'exec-code: true',
+        ].join('\n'),
+      });
+      callerFrom(trackedOnlyRepo, cwd);
+      const report = await runFixtures({ workflows: workflowsOnDisk(cwd, ['test-wf']), cwd });
+      expect(report.results[0].outcome).toBe('failed');
+      expect(report.results[0].pass).toBe(expected === 'failed');
+      const rendered = formatFixtureReport(report);
+      expect(rendered).toContain("Bash node 'code' failed [exit 7]");
+      expect(rendered).toContain('stdout-tail');
+      expect(rendered).toContain('stderr-tail');
+      expect(rendered).not.toContain('inline-body-marker');
+      expect(rendered).not.toContain('Command failed:');
+    }
+  );
+
+  it('keeps silent inline source out of fixture reports after redaction', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: silent failure\nnodes:\n  - id: code\n    runtime: bun\n    script: |\n      // private-inline-body-marker\n      process.exit(7);',
+      body: 'fixture:\n  expect: failed\n  fail-node: code\nexec-code: true',
+    });
+    callerFrom(trackedOnlyRepo, cwd);
+    const report = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['test-wf']),
+      cwd,
+      config: {
+        assistant: undefined,
+        assistants: { claude: {}, codex: {} },
+        commands: {},
+        protectedCredentialValues: ['failed'],
+      },
+    });
+    expect(report.results[0].pass).toBe(true);
+    for (const output of [formatFixtureReport(report), JSON.stringify(report)]) {
+      expect(output).toContain("Script node 'code' failed [exit 7]: no diagnostic output");
+      expect(output).not.toContain('private-inline-body-marker');
+      expect(output).not.toContain('Command [REDACTED]');
+    }
+  });
+
+  it.each(['bash', 'script'] as const)(
+    'reports host-absent configured env in executable %s fixture diagnostics',
+    async kind => {
+      expect(process.env.ARCHON_FIXTURE_DIAGNOSTIC).toBeUndefined();
+      const { cwd } = writeTempProject({
+        workflowYaml: [
+          'name: test-wf',
+          'description: configured environment diagnostic',
+          'nodes:',
+          '  - id: code',
+          ...(kind === 'bash'
+            ? [
+                '    bash: |',
+                '      printf "stdout: %s" "$ARCHON_FIXTURE_DIAGNOSTIC"',
+                '      printf "stderr: %s" "$ARCHON_FIXTURE_DIAGNOSTIC" >&2',
+                '      exit 7',
+              ]
+            : [
+                '    runtime: bun',
+                '    script: |',
+                '      console.log("stdout:", process.env.ARCHON_FIXTURE_DIAGNOSTIC);',
+                '      console.error("stderr:", process.env.ARCHON_FIXTURE_DIAGNOSTIC);',
+                '      process.exit(7);',
+              ]),
+        ].join('\n'),
+        body: 'fixture:\n  expect: failed\n  fail-node: code\nexec-code: true',
+      });
+      callerFrom(trackedOnlyRepo, cwd);
+      const report = await runFixtures({
+        workflows: workflowsOnDisk(cwd, ['test-wf']),
+        cwd,
+        config: {
+          assistant: undefined,
+          assistants: { claude: {}, codex: {} },
+          commands: {},
+          envVars: { ARCHON_FIXTURE_DIAGNOSTIC: 'configured-value' },
+        },
+      });
+      expect(report.results[0].outcome).toBe('failed');
+      expect(report.results[0].pass).toBe(true);
+      for (const output of [formatFixtureReport(report), JSON.stringify(report)]) {
+        expect(output).toContain('[exit 7]');
+        expect(output).toContain('stdout: configured-value');
+        expect(output).toContain('stderr: configured-value');
+      }
+    }
+  );
+
+  it.each(['bash', 'script'] as const)(
+    'redacts inherited credentials from executable %s fixture diagnostics',
+    async kind => {
+      const secret = 'synthetic-fixture-credential-4353';
+      const previous = process.env.ARCHON_FIXTURE_TEST_SECRET;
+      process.env.ARCHON_FIXTURE_TEST_SECRET = secret;
+      try {
+        const { cwd } = writeTempProject({
+          workflowYaml: [
+            'name: test-wf',
+            'description: credential diagnostic',
+            'nodes:',
+            '  - id: code',
+            ...(kind === 'bash'
+              ? [
+                  '    bash: |',
+                  '      printf "stdout: %s" "$ARCHON_FIXTURE_TEST_SECRET"',
+                  '      printf "stderr: %s" "$ARCHON_FIXTURE_TEST_SECRET" >&2',
+                  '      exit 7',
+                ]
+              : [
+                  '    runtime: bun',
+                  '    script: |',
+                  '      console.log("stdout:", process.env.ARCHON_FIXTURE_TEST_SECRET);',
+                  '      console.error("stderr:", process.env.ARCHON_FIXTURE_TEST_SECRET);',
+                  '      process.exit(7);',
+                ]),
+          ].join('\n'),
+          body: 'fixture:\n  expect: failed\n  fail-node: code\nexec-code: true',
+        });
+        callerFrom(trackedOnlyRepo, cwd);
+        const report = await runFixtures({ workflows: workflowsOnDisk(cwd, ['test-wf']), cwd });
+        expect(report.results[0].pass).toBe(true);
+        expect(report.results[0].nodeFailures?.[0].reason).toContain('[exit 7]');
+        for (const output of [formatFixtureReport(report), JSON.stringify(report)]) {
+          expect(output).not.toContain(secret);
+          expect(output).toContain('stdout: [REDACTED]');
+          expect(output).toContain('stderr: [REDACTED]');
+        }
+      } finally {
+        if (previous === undefined) delete process.env.ARCHON_FIXTURE_TEST_SECRET;
+        else process.env.ARCHON_FIXTURE_TEST_SECRET = previous;
+      }
+    }
+  );
+
+  it.each(['bash', 'script'] as const)(
+    'redacts configured protected credentials from executable %s fixture diagnostics',
+    async kind => {
+      const secret = 'synthetic-protected-fixture-4353';
+      const explicitValue = 'synthetic-explicit-fixture-4353';
+      const previous = process.env.ARCHON_FIXTURE_ACCOUNT;
+      delete process.env.ARCHON_FIXTURE_ACCOUNT;
+      try {
+        const { cwd } = writeTempProject({
+          workflowYaml: [
+            'name: test-wf',
+            'description: credential diagnostic',
+            'inputs:',
+            '  value:',
+            '    required: true',
+            'nodes:',
+            '  - id: code',
+            ...(kind === 'bash'
+              ? [
+                  '    bash: |',
+                  '      printf "stdout: %s %s" "$ARCHON_FIXTURE_ACCOUNT" "$INPUTS_VALUE"',
+                  '      printf "stderr: %s %s" "$ARCHON_FIXTURE_ACCOUNT" "$INPUTS_VALUE" >&2',
+                  '      exit 7',
+                ]
+              : [
+                  '    runtime: bun',
+                  '    script: |',
+                  '      console.log("stdout:", process.env.ARCHON_FIXTURE_ACCOUNT, process.env.INPUTS_VALUE);',
+                  '      console.error("stderr:", process.env.ARCHON_FIXTURE_ACCOUNT, process.env.INPUTS_VALUE);',
+                  '      process.exit(7);',
+                ]),
+          ].join('\n'),
+          body: `fixture:\n  expect: failed\n  fail-node: code\n  inputs:\n    value: ${explicitValue}\nexec-code: true`,
+        });
+        callerFrom(trackedOnlyRepo, cwd);
+        const report = await runFixtures({
+          workflows: workflowsOnDisk(cwd, ['test-wf']),
+          cwd,
+          resolveExecConfig: async () =>
+            applyRunEnvironment(
+              {
+                assistant: undefined,
+                assistants: { claude: {}, codex: {} },
+                commands: {},
+                protectedCredentialValues: [explicitValue],
+              },
+              { ARCHON_FIXTURE_ACCOUNT: secret }
+            ),
+        });
+        expect(report.results[0].pass).toBe(true);
+        expect(report.results[0].nodeFailures?.[0].reason).toContain('[exit 7]');
+        for (const output of [formatFixtureReport(report), JSON.stringify(report)]) {
+          expect(output).not.toContain(secret);
+          expect(output).not.toContain(explicitValue);
+          expect(output).toContain('stdout: [REDACTED] [REDACTED]');
+          expect(output).toContain('stderr: [REDACTED] [REDACTED]');
+        }
+      } finally {
+        if (previous === undefined) delete process.env.ARCHON_FIXTURE_ACCOUNT;
+        else process.env.ARCHON_FIXTURE_ACCOUNT = previous;
+      }
+    }
+  );
 
   it('keeps executed writes out of the caller checkout (#2851)', async () => {
     const { cwd } = writeTempProject({

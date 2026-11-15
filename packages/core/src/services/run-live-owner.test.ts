@@ -1,4 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+// @archon-test-isolated
+import { describe, expect, expectTypeOf, test } from 'bun:test';
+import type { z } from 'zod';
+import type { ProcessGroupStop } from '@archon/paths/plugin-process';
+import { processGroupStopSchema } from './run-owner-preparation';
+import { testTimeout } from '@archon/paths/test-utils';
 import {
   chmodSync,
   existsSync,
@@ -35,6 +40,12 @@ import {
  * to state one and say why rather than inherit this.
  */
 const LIVE_OWNER_EVENT_DEADLINE_MS = 3_000;
+
+/**
+ * Several times the idle lease timeout that used to cut a slow stop off (#3516), and on the
+ * scale of the slowest stop a lease has had to outlive.
+ */
+const SLOW_STOP_IDLE_MS = 9_000;
 
 async function waitFor(check: () => boolean, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -139,8 +150,8 @@ describe('run live owner', () => {
     const second: RunLiveOwnerWatchEvent[] = [];
     const firstWatch = await watchRunLiveOwner(runId, event => first.push(event));
     const secondWatch = await watchRunLiveOwner(runId, event => second.push(event));
-    expect(firstWatch).not.toBeNull();
-    expect(secondWatch).not.toBeNull();
+    expect(firstWatch.kind).toBe('attached');
+    expect(secondWatch.kind).toBe('attached');
 
     await owner.close();
     await waitForOwnerEvent(() => first.length === 1 && second.length === 1);
@@ -159,7 +170,7 @@ describe('run live owner', () => {
     try {
       await withRunLiveOwner(runId, {}, async () => {
         const watch = await watchRunLiveOwner(runId, event => events.push(event));
-        expect(watch).not.toBeNull();
+        expect(watch.kind).toBe('attached');
         throw executionError;
       });
     } catch (error) {
@@ -190,10 +201,12 @@ describe('run live owner', () => {
     const owner = await startRunLiveOwner(runId, { detachedProcessPid: process.pid });
     const events: RunLiveOwnerWatchEvent[] = [];
     const watch = await watchRunLiveOwner(runId, event => events.push(event));
-    expect(watch).not.toBeNull();
+    expect(watch.kind).toBe('attached');
     const lease = await requestRunLiveOwnerStop(runId);
     try {
       expect(lease.pid).toBe(process.pid);
+      // This process never claimed a Windows job object, so its owner reports none.
+      expect(lease.windowsJob).toBeUndefined();
       expect(owner.isStopRequested()).toBe(true);
       await lease.commit();
       await waitForOwnerEvent(() => events.includes('control_handoff'));
@@ -204,6 +217,55 @@ describe('run live owner', () => {
     }
     await waitForOwnerEvent(() => events.includes('attention'));
     expect(events).toEqual(['control_handoff', 'attention']);
+  });
+
+  test(
+    'holds a committed stop lease for as long as both ends are alive, however slow the stop',
+    async () => {
+      // A stop can wait seconds terminating and confirming the tree with nothing sent on
+      // the lease (#3516). An idle timer on either end used to close the lease during that
+      // wait, and the stop then refused a live owner. Idle past that window, then prove
+      // both ends still hold the lease.
+      const runId = `slow-stop-${crypto.randomUUID()}`;
+      const owner = await startRunLiveOwner(runId, { detachedProcessPid: process.pid });
+      const lease = await requestRunLiveOwnerStop(runId);
+      try {
+        await lease.commit();
+        await Bun.sleep(SLOW_STOP_IDLE_MS);
+        expect(lease.isLive()).toBe(true);
+        expect(owner.isStopRequested()).toBe(true);
+      } finally {
+        lease.release();
+        await owner.close();
+      }
+    },
+    testTimeout(SLOW_STOP_IDLE_MS + 5_000)
+  );
+
+  test('reads the Windows job an owner reports, and refuses one that is not a name', async () => {
+    const runId = `windows-job-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    let windowsJob: unknown = 'Global\\archon-run-fixture';
+    const server = createServer(socket => {
+      socket.once('data', () => {
+        socket.write(`${JSON.stringify({ kind: 'detached', pid: 12345, windowsJob })}\n`);
+      });
+    });
+    await listen(server, path);
+    try {
+      const lease = await requestRunLiveOwnerStop(runId);
+      lease.release();
+      expect(lease.windowsJob).toBe('Global\\archon-run-fixture');
+
+      for (windowsJob of [42, '']) {
+        const refusal = await stopRefusal(runId);
+        expect(refusal.message).toContain('owner returned an invalid response');
+        expect(refusal.reason).toBe('unproven');
+      }
+    } finally {
+      await close(server);
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
   });
 
   test('bounds close while a controller retains an uncommitted stop lease', async () => {
@@ -266,13 +328,14 @@ describe('run live owner', () => {
     try {
       const lease = await requestRunLiveOwnerStop(runId);
       try {
-        // Bun reports a destroyed Windows named pipe through the bounded idle timeout;
-        // POSIX sockets report their peer's EOF immediately.
-        const expectedFailure =
-          process.platform === 'win32'
-            ? /owner did not commit the termination lease/
-            : /owner (?:ended|closed) before committing termination/;
-        await expect(lease.commit()).rejects.toThrow(expectedFailure);
+        const outcome = await lease.commit().then(
+          () => undefined,
+          (error: unknown) => error
+        );
+        expect(outcome).toBeInstanceOf(Error);
+        expect(outcome).toMatchObject({
+          message: expect.stringMatching(/owner (?:ended|closed) before committing termination/),
+        });
       } finally {
         lease.release();
       }
@@ -295,7 +358,7 @@ describe('run live owner', () => {
     const events: RunLiveOwnerWatchEvent[] = [];
     try {
       const watch = await watchRunLiveOwner(runId, event => events.push(event));
-      expect(watch).not.toBeNull();
+      expect(watch.kind).toBe('attached');
       await waitForOwnerEvent(() => events.length > 0);
       expect(events).toEqual(['disconnected']);
     } finally {
@@ -305,7 +368,9 @@ describe('run live owner', () => {
 
   test('reports an unreachable owner only when nothing accepts the connection', async () => {
     // No endpoint at all: the path does not exist.
-    expect((await stopRefusal(`absent-${crypto.randomUUID()}`)).reason).toBe('unreachable');
+    const absentRunId = `absent-${crypto.randomUUID()}`;
+    expect((await stopRefusal(absentRunId)).reason).toBe('unreachable');
+    expect(await watchRunLiveOwner(absentRunId, () => undefined)).toEqual({ kind: 'unreachable' });
 
     // A socket left behind by an owner that died without closing refuses the
     // connection. A second link keeps the socket inode when close() unlinks the path,
@@ -321,6 +386,7 @@ describe('run live owner', () => {
     renameSync(residue, path);
     try {
       expect((await stopRefusal(runId)).reason).toBe('unreachable');
+      expect(await watchRunLiveOwner(runId, () => undefined)).toEqual({ kind: 'unreachable' });
     } finally {
       rmSync(path, { force: true });
     }
@@ -340,6 +406,7 @@ describe('run live owner', () => {
       const refusal = await stopRefusal(runId);
       expect(refusal.detail).toBe('EACCES');
       expect(refusal.reason).toBe('unproven');
+      expect(await watchRunLiveOwner(runId, () => undefined)).toEqual({ kind: 'unproven' });
     } finally {
       await close(server);
       rmSync(path, { force: true });
@@ -360,4 +427,139 @@ describe('run live owner', () => {
       await owner.close();
     }
   });
+});
+
+describe('detached owner preparation', () => {
+  test('prepares only on commit, streams inventory, and shares holds until the last controller releases', async () => {
+    const runId = `prepared-${crypto.randomUUID()}`;
+    const owner = await startRunLiveOwner(runId, { detachedProcessPid: process.pid });
+    let prepared = 0;
+    let released = 0;
+    let finish!: (warnings: string[]) => void;
+    const ready = new Promise<string[]>(resolve => {
+      finish = resolve;
+    });
+    const groups = Array.from({ length: 12 }, (_, i) => ({
+      pgid: 1000 + i,
+      leaderReaped: true as const,
+    }));
+    const unregister = owner.registerTerminationPreparation(() => {
+      prepared++;
+      return {
+        groups,
+        ready,
+        release: () => {
+          released++;
+        },
+      };
+    });
+    const first = await requestRunLiveOwnerStop(runId);
+    const second = await requestRunLiveOwnerStop(runId);
+    try {
+      expect(prepared).toBe(0);
+      const firstCommit = first.commit();
+      const secondCommit = second.commit();
+      await waitForOwnerEvent(() => prepared === 1);
+      let acknowledged = false;
+      void firstCommit.then(() => {
+        acknowledged = true;
+      });
+      await Bun.sleep(10);
+      expect(acknowledged).toBe(false);
+      finish(['Cleanup fixture warning']);
+      expect(await firstCommit).toEqual({ groups, warnings: ['Cleanup fixture warning'] });
+      expect(await secondCommit).toEqual({ groups, warnings: ['Cleanup fixture warning'] });
+      first.release();
+      await Bun.sleep(10);
+      expect(released).toBe(0);
+      second.release();
+      await waitForOwnerEvent(() => released === 1);
+      const third = await requestRunLiveOwnerStop(runId);
+      try {
+        expect((await third.commit())?.groups).toEqual(groups);
+        expect(prepared).toBe(2);
+      } finally {
+        third.release();
+      }
+      await waitForOwnerEvent(() => released === 2);
+      unregister();
+      const legacy = await requestRunLiveOwnerStop(runId);
+      try {
+        expect(await legacy.commit()).toBeUndefined();
+      } finally {
+        legacy.release();
+      }
+    } finally {
+      first.release();
+      second.release();
+      unregister();
+      await owner.close();
+    }
+  });
+
+  test.each([
+    ['malformed', '{"group":{"pgid":"invalid","leaderReaped":true}}', 'Invalid input'],
+    ['oversized', 'x'.repeat(257), 'Run owner acknowledgement exceeded its size limit'],
+    [
+      'contradictory group',
+      '{"group":{"pgid":1,"leaderReaped":true,"signalError":"EPERM"}}',
+      'Invalid input',
+    ],
+    ['mixed', '{"warning":"held output","group":{"pgid":1,"leaderReaped":false}}', 'Invalid input'],
+  ])(
+    'rejects %s preparation frames instead of acknowledging a stop',
+    async (_kind, frame, expectedError) => {
+      const runId = `invalid-preparation-${crypto.randomUUID()}`;
+      const path = runLiveOwnerPath(runId);
+      const sockets = new Set<Socket>();
+      const socketErrors: Error[] = [];
+      const requests: string[] = [];
+      const server = createServer(socket => {
+        sockets.add(socket);
+        socket.once('close', () => sockets.delete(socket));
+        // Rejection can close a Windows pipe while this fixture is still writing.
+        socket.on('error', error => {
+          socketErrors.push(error);
+          socket.destroy();
+        });
+        socket.setEncoding('utf8');
+        let pending = '';
+        socket.on('data', chunk => {
+          pending += chunk;
+          let newline = pending.indexOf('\n');
+          while (newline !== -1) {
+            const request = pending.slice(0, newline);
+            pending = pending.slice(newline + 1);
+            requests.push(request);
+            if (request === 'stop') socket.write('{"kind":"detached","pid":12345}\n');
+            if (request === 'terminate') socket.write(`preparing\n${frame}\nready\n`);
+            newline = pending.indexOf('\n');
+          }
+        });
+      });
+      await listen(server, path);
+      const lease = await requestRunLiveOwnerStop(runId);
+      try {
+        // Await pipe I/O before Bun's matchers, which synchronously pump the event loop.
+        const outcome = await lease.commit().then(
+          () => undefined,
+          (error: unknown) => error
+        );
+        expect(outcome).toBeInstanceOf(Error);
+        expect(outcome).toMatchObject({ message: expect.stringContaining(expectedError) });
+        expect(requests).toEqual(['stop', 'terminate']);
+      } finally {
+        lease.release();
+        for (const socket of sockets) socket.destroy();
+        await close(server);
+      }
+      for (const error of socketErrors) {
+        expect(error).toMatchObject({ code: expect.stringMatching(/^(EPIPE|ECONNRESET)$/) });
+      }
+    }
+  );
+});
+
+test('lease group frames conform to the process owner facts', () => {
+  expectTypeOf<z.output<typeof processGroupStopSchema>>().toEqualTypeOf<ProcessGroupStop>();
 });

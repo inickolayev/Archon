@@ -14,8 +14,8 @@
  * ignored-capability warnings — makes a capability change a `bun run validate`
  * failure until the docs are regenerated.
  *
- * Source of truth: the provider registry (registerBuiltinProviders +
- * registerCommunityProviders → getProviderInfoList). The factories stay lazy,
+ * Source of truth: the provider registry (registerInProcessProviders →
+ * getRegisteredProviders). The factories stay lazy,
  * so no provider is instantiated; we only read the static capability metadata.
  *
  * Usage:
@@ -29,12 +29,10 @@
  */
 import { readFile, writeFile } from 'fs/promises';
 import { join, resolve } from 'path';
-import {
-  registerBuiltinProviders,
-  registerCommunityProviders,
-  getProviderInfoList,
-} from '@archon/providers';
-import type { ProviderCapabilities, ProviderInfo } from '@archon/providers';
+import { getRegisteredProviders, DEPRECATED_PROVIDERS_DOCS_PATH } from '@archon/providers';
+import { registerInProcessProviders } from '@archon/providers/in-process';
+import type { ProviderCapabilities, ProviderRegistration } from '@archon/providers';
+import { providerCapabilitiesSchema } from '../packages/provider-contract/src/capabilities';
 
 const REPO_ROOT = resolve(import.meta.dir, '..');
 const OUTPUT_PATH = join(
@@ -46,12 +44,16 @@ const CHECK_ONLY = process.argv.includes('--check');
 /**
  * Ordered rows of the matrix. `key` is the `ProviderCapabilities` field, so a
  * renamed/removed field is a compile error here. The totality guard below fails
- * loudly if a NEW capability field is added to the type without an axis, so the
- * matrix can never silently omit a capability.
+ * loudly if a schema field has neither an axis nor an explicit skip, even when
+ * no provider declares that optional field.
  */
 const AXES: readonly { key: keyof ProviderCapabilities; label: string }[] = [
+  { key: 'backgroundWork', label: 'Background work observation' },
   { key: 'sessionResume', label: 'Session resume' },
-  { key: 'sessionFork', label: 'Immutable session fork (`context.resume`)' },
+  {
+    key: 'sessionFork',
+    label: 'Immutable session fork (`context.resume`, cross-run `persist_session`)',
+  },
   { key: 'mcp', label: 'MCP servers (`mcp:`)' },
   { key: 'hooks', label: 'Hooks (`hooks:`)' },
   { key: 'skills', label: 'Skills (`skills:`)' },
@@ -124,6 +126,7 @@ interface ResolvedCaveat {
 
 /** Render a single provider's value for an axis. */
 export function renderCell(caps: ProviderCapabilities, key: keyof ProviderCapabilities): string {
+  if (key === 'backgroundWork') return caps.backgroundWork;
   if (key === 'structuredOutput') {
     const tier = caps.structuredOutput;
     if (tier === 'enforced') return '**enforced**';
@@ -136,21 +139,14 @@ export function renderCell(caps: ProviderCapabilities, key: keyof ProviderCapabi
 }
 
 /**
- * Fail loudly if a provider declares a capability key the matrix neither
- * renders nor explicitly skips — i.e. someone added a field to
- * `ProviderCapabilities` without giving it a matrix axis.
+ * Optional fields belong in the matrix even before any provider declares them.
  */
-function assertTotalCoverage(providers: ProviderInfo[]): void {
+function assertTotalCoverage(): void {
   const covered = new Set<string>([...AXES.map(a => a.key), ...SKIP_KEYS]);
-  const uncovered = new Set<string>();
-  for (const p of providers) {
-    for (const key of Object.keys(p.capabilities)) {
-      if (!covered.has(key)) uncovered.add(key);
-    }
-  }
-  if (uncovered.size > 0) {
+  const uncovered = Object.keys(providerCapabilitiesSchema.shape).filter(key => !covered.has(key));
+  if (uncovered.length > 0) {
     throw new Error(
-      `ProviderCapabilities field(s) not represented in the capability matrix: ${[...uncovered].join(', ')}. ` +
+      `ProviderCapabilities field(s) not represented in the capability matrix: ${uncovered.join(', ')}. ` +
         'Add an axis in scripts/generate-capability-matrix.ts (or add to SKIP_KEYS if advisory-only).'
     );
   }
@@ -163,7 +159,7 @@ function assertTotalCoverage(providers: ProviderInfo[]): void {
  * renders as supported — a caveat on a ❌ cell means the capability was turned
  * off and the caveat text is stale.
  */
-function resolveCaveats(providers: ProviderInfo[]): ResolvedCaveat[] {
+function resolveCaveats(providers: ProviderRegistration[]): ResolvedCaveat[] {
   const axisByKey = new Map(AXES.map(a => [a.key, a] as const));
   return CAVEATS.map(caveat => {
     const provider = providers.find(p => p.id === caveat.provider);
@@ -187,11 +183,19 @@ function resolveCaveats(providers: ProviderInfo[]): ResolvedCaveat[] {
   });
 }
 
-function buildMarkdown(providers: ProviderInfo[], caveats: ResolvedCaveat[]): string {
+function providerTags(p: ProviderRegistration): string {
+  const tags = [
+    ...(p.builtIn ? [] : ['community provider']),
+    ...(p.deprecationNotice ? [`[deprecated](${DEPRECATED_PROVIDERS_DOCS_PATH})`] : []),
+  ];
+  return tags.length > 0 ? ` *(${tags.join(', ')})*` : '';
+}
+
+function buildMarkdown(providers: ProviderRegistration[], caveats: ResolvedCaveat[]): string {
   const ids = providers.map(p => p.id);
 
   const providerList = providers
-    .map(p => `- \`${p.id}\` — ${p.displayName}${p.builtIn ? '' : ' *(community provider)*'}`)
+    .map(p => `- \`${p.id}\` — ${p.displayName}${providerTags(p)}`)
     .join('\n');
 
   const header = `| Capability | ${ids.map(id => `\`${id}\``).join(' | ')} |`;
@@ -234,8 +238,16 @@ function buildMarkdown(providers: ProviderInfo[], caveats: ResolvedCaveat[]): st
     'workflow or `.archon/config.yaml`). A ✅ means Archon translates the corresponding',
     'capability for that provider; a ❌ means the capability is unsupported. Unsupported',
     'behavior is feature-specific: some optional fields are ignored with a warning, while',
-    'strict contracts fail closed. In particular, `context.resume` rejects an explicitly',
-    'unsupported provider at load time and an implicitly resolved one at runtime.',
+    'strict contracts fail closed. In particular, a node naming `mcp:`, `skills:` or',
+    '`plugins:` on a provider without that capability fails the run before any node',
+    'starts, and `context.resume` rejects an explicitly unsupported provider at load',
+    'time and an implicitly resolved one at runtime. An `mcp:` declared `optional: true`',
+    'instead runs the node without its servers and records why.',
+    '',
+    'The columns are the providers built from this repository. Release binaries install',
+    'Claude, Codex and Pi as provider plugins, with the same capabilities. A third-party',
+    'provider plugin declares its capabilities in its install-time descriptor and is not',
+    'a column in this generated table. The same pre-spend capability checks apply.',
     '',
     'Reporting flags describe SDK fields that Archon translates into execution results.',
     'Supported does not guarantee that every result reports a value or that usage includes',
@@ -243,6 +255,14 @@ function buildMarkdown(providers: ProviderInfo[], caveats: ResolvedCaveat[]): st
     'count events as turns, or substitute the requested model for an unreported model.',
     'Cost reporting is independent of spend-limit support. Older providers may omit',
     'reporting declarations; absence means unknown, not unsupported.',
+    '',
+    'Background work: `reported` waits for runtime-reported task endings; `none` means verified absent;',
+    '`unobserved` means background work may exist without an observable lifecycle. A process',
+    'backgrounded inside a foreground shell command (`cmd &`) is invisible to every provider.',
+    'Codex observes subagents through `subAgentActivity` notifications and unified-exec processes',
+    'through `commandExecution` items with source `unifiedExecStartup`. Idle thread status is',
+    'not evidence that this work has ended. See [Streaming event mapping](/contributing/adding-a-community-provider/#streaming-event-mapping)',
+    'for the background-start admission and observation cutoff rules.',
     '',
     '## Providers',
     '',
@@ -262,10 +282,14 @@ function buildMarkdown(providers: ProviderInfo[], caveats: ResolvedCaveat[]): st
     '- **✅¹ (superscript)** — supported, but with semantics that differ from the headline',
     '  meaning of the axis — see [Caveats](#caveats).',
     '- **Structured output** — `enforced` (the SDK/backend grammar-constrains decoding),',
-    '  `best-effort` (schema appended to the prompt, then validated + re-asked up to 3×),',
+    '  `best-effort` (the model is asked for the schema, then validated + re-asked up to 3×),',
     '  or ❌ (unsupported). See [AI Assistants → Structured output guarantees](/getting-started/ai-assistants/#structured-output-guarantees).',
     '- **In-process native tools** — the provider can register Archon `NativeTool`s for a',
-    "  turn (gates auto-injection of Archon's `manage_run` tool into project-scoped chat).",
+    "  turn. It gates auto-injection of Archon's `invoke_workflow`, `register_project` and",
+    '  `attention` tools into every chat, and of `manage_run` into project-scoped chat. Providers without it',
+    '  use the existing CLI for run launch and management after project selection.',
+    '  These launches are detached and headless, with CLI identity and no originating-chat',
+    '  delivery. Registration requires an explicit user command; assistant prose has no effects.',
     '',
     'For per-provider field-level notes (YAML syntax, caveats), see the',
     '[AI Assistants guide](/getting-started/ai-assistants/).',
@@ -274,13 +298,12 @@ function buildMarkdown(providers: ProviderInfo[], caveats: ResolvedCaveat[]): st
 }
 
 async function main(): Promise<void> {
-  registerBuiltinProviders();
-  registerCommunityProviders();
-  const providers = getProviderInfoList();
+  registerInProcessProviders();
+  const providers = getRegisteredProviders();
   if (providers.length === 0) {
     throw new Error('No providers registered — registry bootstrap failed.');
   }
-  assertTotalCoverage(providers);
+  assertTotalCoverage();
   const caveats = resolveCaveats(providers);
 
   const contents = buildMarkdown(providers, caveats);

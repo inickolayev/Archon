@@ -2,154 +2,21 @@ import { describe, expect, test } from 'bun:test';
 import { runForgeMutationConformance } from '@archon/forge/conformance';
 import {
   contentDigest,
+  forgeResponseSchema,
   type ForgeMutationRequest,
-  type ForgeRequest,
-  type ForgeResponse,
 } from '@archon/forge/operations';
 import { githubPluginMetadata, handleGithubOperation } from './operations';
+import { json, pull, fakeGitHub, mergeGitHub, rerunGitHub, run } from './lifecycle-fixture';
+import { prRecord } from './pull-requests';
 
 const repo = { host: 'github.com', path: 'archon/test' };
 const ref = { repo, number: 7 };
-const ROOT = 'https://api.github.com/repos/archon/test';
 
-function json(value: unknown, status = 200): Response {
-  return Response.json(value, { status });
-}
-
-interface PullState {
-  number: number;
-  node_id: string;
-  html_url: string;
-  title: string;
-  body: string | null;
-  state: 'open' | 'closed';
-  draft: boolean;
-  merged?: boolean;
-  head: { ref: string; sha: string; repo: { full_name: string } | null };
-  base: { ref: string; sha: string };
-}
-
-function pull(overrides: Partial<PullState> = {}): PullState {
-  return {
-    number: 7,
-    node_id: 'PR_node',
-    html_url: 'https://github.com/archon/test/pull/7',
-    title: 'A title',
-    body: 'A body',
-    state: 'open',
-    draft: true,
-    head: { ref: 'feature', sha: 'headsha', repo: { full_name: 'archon/test' } },
-    base: { ref: 'dev', sha: 'basesha' },
-    ...overrides,
-  };
-}
-
-/**
- * A GitHub that applies writes to one pull request and one comment list, so a
- * read-back sees what a write did — or, with `lose`, does not.
- */
-function fakeGitHub(
-  options: {
-    pull?: PullState;
-    comments?: { id: number; body: string }[];
-    lose?: boolean;
-    status?: (url: string, method: string) => number | undefined;
-    network?: (url: string, method: string) => boolean;
-  } = {}
-) {
-  const state = options.pull ?? pull();
-  const comments = options.comments ?? [];
-  const calls: { url: string; method: string }[] = [];
-  let nextId = 900;
-  const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    const url = String(input);
-    const method = init?.method ?? 'GET';
-    calls.push({ url, method });
-    if (options.network?.(url, method)) throw new TypeError('network down');
-    const status = options.status?.(url, method);
-    if (status !== undefined) return json({ message: 'refused' }, status);
-    if (url.includes('/graphql')) {
-      if (!options.lose) state.draft = false;
-      return json({
-        data: { markPullRequestReadyForReview: { pullRequest: { id: state.node_id } } },
-      });
-    }
-    if (url.endsWith('/repos/archon/test')) return json({ full_name: 'archon/test' });
-    if (url.includes('/issues/comments/')) {
-      const id = Number(url.split('/issues/comments/')[1]);
-      if (method === 'PATCH' && !options.lose) {
-        const existing = comments.find(row => row.id === id);
-        if (existing) existing.body = JSON.parse(String(init?.body)).body as string;
-      }
-      const row = comments.find(entry => entry.id === id);
-      return row === undefined
-        ? json({ message: 'gone' }, 404)
-        : json({
-            id: row.id,
-            body: row.body,
-            html_url: `https://github.com/archon/test/pull/7#c${String(row.id)}`,
-            issue_url: `${ROOT}/issues/7`,
-          });
-    }
-    if (url.includes('/issues/7/comments')) {
-      if (method === 'POST') {
-        const id = nextId++;
-        const body = JSON.parse(String(init?.body)).body as string;
-        if (!options.lose) comments.push({ id, body });
-        return json({
-          id,
-          body,
-          html_url: `https://github.com/archon/test/pull/7#c${String(id)}`,
-          issue_url: `${ROOT}/issues/7`,
-        });
-      }
-      const page = Number(new URL(url).searchParams.get('page') ?? '1');
-      return json(
-        page === 1
-          ? comments.map(row => ({
-              id: row.id,
-              body: row.body,
-              html_url: `https://github.com/archon/test/pull/7#c${String(row.id)}`,
-              issue_url: `${ROOT}/issues/7`,
-            }))
-          : []
-      );
-    }
-    if (url.includes('/issues/7')) {
-      return json({
-        html_url: 'https://github.com/archon/test/issues/7',
-        title: 'Issue title',
-        body: 'Issue body',
-        state: 'open',
-      });
-    }
-    if (url.includes('/pulls?')) return json([state]);
-    if (url.includes('/pulls/7')) {
-      if (method === 'PATCH' && !options.lose) {
-        state.body = JSON.parse(String(init?.body)).body as string;
-      }
-      return json(state);
-    }
-    if (url.endsWith('/pulls') && method === 'POST') {
-      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      if (!options.lose) {
-        state.title = payload.title as string;
-        state.body = payload.body as string;
-        state.draft = payload.draft as boolean;
-      }
-      return json(state);
-    }
-    throw new Error(`Unexpected ${method} ${url}`);
-  };
-  return { fetch, state, comments, calls };
-}
-
-async function run(
-  request: ForgeRequest,
-  github: ReturnType<typeof fakeGitHub>
-): Promise<ForgeResponse> {
-  return handleGithubOperation(request, { token: 'token', fetch: github.fetch });
-}
+test('pull request head repositories retain the authorizing HTTPS host claim', () => {
+  const hostClaim = true;
+  const record = prRecord({ host: 'ghes.example.test:443', path: repo.path, hostClaim }, pull());
+  expect(record.head_repo).toEqual({ host: 'ghes.example.test:443', path: repo.path, hostClaim });
+});
 
 const marker = '<!-- archon-review-report -->';
 const report = `${marker}\nRound 1`;
@@ -195,6 +62,84 @@ describe('GitHub lifecycle reads', () => {
     // A closed pull request on the same branch must not answer for the head, so
     // the query never widens past GitHub's default open state.
     expect(github.calls.some(call => call.url.includes('state=all'))).toBe(false);
+  });
+
+  test('a pull request view returns its author, and a response without one reports none', async () => {
+    const view = {
+      operationId: 'author',
+      op: 'pr.view',
+      selector: { kind: 'number', ref },
+    } as const;
+    expect(
+      await run(view, fakeGitHub({ pull: pull({ user: { id: 42, login: 'octo' } }) }))
+    ).toMatchObject({
+      ok: true,
+      result: { value: { author: { host: 'github.com', id: '42', login: 'octo' } } },
+    });
+    expect(await run(view, fakeGitHub({ pull: pull({ user: null }) }))).toMatchObject({
+      ok: true,
+      result: { value: { author: null } },
+    });
+    const legacy = await run(view, fakeGitHub());
+    expect(legacy.ok && legacy.result.value).not.toHaveProperty('author');
+  });
+
+  test.each([
+    ['open', pull(), { merged_at: null, closed_at: null }],
+    [
+      'merged',
+      pull({
+        state: 'closed',
+        merged: true,
+        merged_at: '2026-11-03T10:00:00Z',
+        closed_at: '2026-11-03T10:00:00Z',
+      }),
+      { merged_at: '2026-11-03T10:00:00Z', closed_at: '2026-11-03T10:00:00Z' },
+    ],
+    [
+      'closed',
+      pull({ state: 'closed', merged: false, closed_at: '2026-11-04T10:00:00Z' }),
+      { merged_at: null, closed_at: '2026-11-04T10:00:00Z' },
+    ],
+  ] as const)('a %s pull request view carries its timestamps', async (state, observed, times) => {
+    const response = forgeResponseSchema.parse(
+      await run(
+        { operationId: 'times', op: 'pr.view', selector: { kind: 'number', ref } },
+        fakeGitHub({ pull: { ...observed } })
+      )
+    );
+    expect(response).toMatchObject({
+      ok: true,
+      result: {
+        value: {
+          pr: { state },
+          timestamps: { created_at: '2026-11-01T09:00:00Z', ...times },
+        },
+      },
+    });
+  });
+
+  test('a head selector for any state reads the newest pull request, merged or not', async () => {
+    const merged = '2026-11-03T10:00:00Z';
+    const github = fakeGitHub({
+      pull: pull({ state: 'closed', merged: true, merged_at: merged, closed_at: merged }),
+    });
+    const response = await run(
+      {
+        operationId: 'any-state',
+        op: 'pr.view',
+        selector: { kind: 'head', repo, headRepo: repo, head: 'feature', state: 'any' },
+      },
+      github
+    );
+    expect(response).toMatchObject({
+      ok: true,
+      result: { value: { pr: { number: 7, state: 'merged' } } },
+    });
+    const listing = github.calls.find(call => call.url.includes('/pulls?'))?.url ?? '';
+    expect(new URL(listing).searchParams.get('state')).toBe('all');
+    expect(new URL(listing).searchParams.get('sort')).toBe('created');
+    expect(new URL(listing).searchParams.get('direction')).toBe('desc');
   });
 
   test('reports no pull request for a head that has none', async () => {
@@ -400,7 +345,7 @@ describe('GitHub mutations report which of the four outcomes happened', () => {
     const dropped = await run(create, fakeGitHub({ network: (_url, method) => method === 'POST' }));
     expect(dropped).toMatchObject({
       ok: false,
-      error: { kind: 'forge_error' },
+      error: { kind: 'unavailable' },
       mutation: { op: 'pr.create', outcome: 'outcome_unknown' },
     });
 
@@ -537,4 +482,438 @@ test('passes the public mutation conformance kit for every outcome', async () =>
     cases.map(({ name, request, expectedOutcome }) => ({ name, request, expectedOutcome }))
   );
   expect(failures).toEqual([]);
+});
+
+const mergeRequest = {
+  operationId: 'merge',
+  op: 'pr.merge',
+  ref,
+  method: 'squash',
+  conditions: { head: 'headsha' },
+} satisfies ForgeMutationRequest;
+
+test.each(['merge', 'squash'] as const)(
+  'merges with %s and the exact approved head, then reads ordered landed evidence',
+  async method => {
+    const github = mergeGitHub();
+    const failures = await runForgeMutationConformance(
+      request => handleGithubOperation(request, { token: 'token', fetch: github.fetch }),
+      githubPluginMetadata,
+      [{ name: method, request: { ...mergeRequest, method }, expectedOutcome: 'applied' }]
+    );
+    expect(failures).toEqual([]);
+    expect(github.writes).toEqual([{ sha: 'headsha', merge_method: method }]);
+    const response = await handleGithubOperation(
+      { ...mergeRequest, method },
+      { token: 'token', fetch: mergeGitHub().fetch }
+    );
+    expect(response).toMatchObject({
+      ok: true,
+      result: {
+        value: {
+          landed: { commit: 'landed', tree: 'landed-tree', parents: ['base', 'headsha'] },
+          enforcedConditions: ['head'],
+        },
+      },
+    });
+  }
+);
+
+test('merge refuses stale and unsupported conditions before writing', async () => {
+  for (const conditions of [
+    {},
+    { head: 'headsha', base: 'base' },
+    { head: 'headsha', tree: 'tree' },
+    { head: 'headsha' },
+  ]) {
+    const github = mergeGitHub({ stale: true });
+    const response = await handleGithubOperation(
+      { ...mergeRequest, conditions },
+      { token: 'token', fetch: github.fetch }
+    );
+    expect(response).toMatchObject({ ok: false, mutation: { outcome: 'refused' } });
+    expect(github.writes).toEqual([]);
+  }
+});
+
+test.each([
+  [{ status: 409 }, 'refused'],
+  [{ lost: true }, 'outcome_unknown'],
+  [{ mismatch: true }, 'verification_failed'],
+  [{ commitMismatch: true }, 'verification_failed'],
+  [{ readFailed: true }, 'verification_failed'],
+  [{ mergedFalse: true }, 'refused'],
+] as const)('merge reports truthful failure evidence for %j', async (options, outcome) => {
+  const github = mergeGitHub(options);
+  const response = await handleGithubOperation(mergeRequest, {
+    token: 'token',
+    fetch: github.fetch,
+  });
+  expect(response).toMatchObject({
+    ok: false,
+    mutation: { outcome, merge: { method: 'squash', conditions: { head: 'headsha' } } },
+  });
+  expect(JSON.stringify(response)).not.toContain('token must never escape');
+  expect(github.writes).toHaveLength(1);
+});
+
+test('unavailable supplemental merge evidence remains explicitly null', async () => {
+  expect(
+    await handleGithubOperation(mergeRequest, {
+      token: 'token',
+      fetch: mergeGitHub({ supplementalMissing: true }).fetch,
+    })
+  ).toMatchObject({
+    ok: true,
+    result: { value: { landed: { commit: 'landed', tree: null, parents: null } } },
+  });
+});
+
+const selected = (id: number, runId = 100) => ({
+  unit: { kind: 'check' as const, id: String(id), name: 'same-name' },
+  rerun: { id: String(runId), attempt: 1 },
+});
+const rerunRequest = {
+  operationId: 'rerun',
+  op: 'checks.rerun',
+  ref,
+  revision: 'headsha',
+  units: [selected(1), selected(2)],
+} satisfies ForgeMutationRequest;
+test('reruns failed jobs once per owning run and verifies a newer attempt', async () => {
+  const github = rerunGitHub();
+  const failures = await runForgeMutationConformance(
+    request => handleGithubOperation(request, { token: 'token', fetch: github.fetch }),
+    githubPluginMetadata,
+    [{ name: 'rerun', request: rerunRequest, expectedOutcome: 'applied' }]
+  );
+  expect(failures).toEqual([]);
+  expect(github.posted).toEqual(['100']);
+});
+
+test('unsupported later units prevent every rerun write', async () => {
+  const github = rerunGitHub();
+  const units = [
+    ...rerunRequest.units,
+    { unit: { kind: 'commit_status' as const, id: 'status', name: 'status' }, rerun: null },
+  ];
+  expect(
+    await handleGithubOperation({ ...rerunRequest, units }, { token: 'token', fetch: github.fetch })
+  ).toMatchObject({
+    ok: false,
+    error: { kind: 'unsupported_op' },
+    mutation: { outcome: 'refused' },
+  });
+  expect(github.posted).toEqual([]);
+});
+
+test.each([
+  { check: { app: { slug: 'another-app' } } },
+  { check: { head_sha: 'old' } },
+  { check: { status: 'in_progress' } },
+  { check: { conclusion: 'success' } },
+  { check: { conclusion: 'action_required' } },
+  { run: { check_suite_id: 99 } },
+  { run: { run_attempt: 2 } },
+  { run: { head_sha: 'old' } },
+])('invalid check/run association is refused with zero writes: %j', async options => {
+  const github = rerunGitHub(options);
+  expect(
+    await handleGithubOperation(rerunRequest, { token: 'token', fetch: github.fetch })
+  ).toMatchObject({ ok: false, mutation: { outcome: 'refused' } });
+  expect(github.posted).toEqual([]);
+});
+
+test('a rerun whose newer attempt appears after the first read-back is applied', async () => {
+  const github = rerunGitHub({ staleReads: 2 });
+  const waits: number[] = [];
+  const response = await handleGithubOperation(rerunRequest, {
+    token: 'token',
+    fetch: github.fetch,
+    sleep: async ms => void waits.push(ms),
+  });
+  expect(response).toMatchObject({
+    ok: true,
+    result: { value: { outcome: 'applied', units: [{ rerun: { id: '100', attempt: 2 } }, {}] } },
+  });
+  expect(waits).toHaveLength(2);
+  expect(github.posted).toEqual(['100']);
+});
+
+test('an accepted rerun whose newer attempt never appears is unverified, not refused', async () => {
+  const github = rerunGitHub({ oldAttempt: true });
+  let waited = 0;
+  const response = await handleGithubOperation(rerunRequest, {
+    token: 'token',
+    fetch: github.fetch,
+    sleep: async ms => void (waited += ms),
+  });
+  expect(response).toMatchObject({
+    ok: false,
+    error: { kind: 'invalid_response' },
+    mutation: {
+      outcome: 'verification_failed',
+      leaveBehind: expect.any(String),
+      rerun: { requested: rerunRequest.units, observed: [] },
+    },
+  });
+  // The wait stays well inside the 30 second limit the host gives a plugin process.
+  expect(waited).toBeGreaterThan(0);
+  expect(waited).toBeLessThanOrEqual(15_000);
+  expect(github.posted).toEqual(['100']);
+});
+
+test('an accepted rerun whose read-back request fails is unverified', async () => {
+  const github = rerunGitHub({ readFailed: true });
+  expect(
+    await handleGithubOperation(rerunRequest, { token: 'token', fetch: github.fetch })
+  ).toMatchObject({ ok: false, mutation: { outcome: 'verification_failed' } });
+  expect(github.posted).toEqual(['100']);
+});
+
+test.each([
+  [403, 'verification_failed'],
+  [undefined, 'outcome_unknown'],
+] as const)(
+  'partial reruns retain observed attempts and stop on a later failure (%s)',
+  async (failureStatus, outcome) => {
+    const github = rerunGitHub({ failureGroup: '200', failureStatus });
+    const units = [selected(1), selected(3, 200), selected(4, 300)];
+    // The third group must also validate before the first submission.
+    const fetch = async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/check-runs/4'))
+        return json({
+          id: 4,
+          name: 'same-name',
+          head_sha: 'headsha',
+          status: 'completed',
+          conclusion: 'failure',
+          app: { slug: 'github-actions' },
+          check_suite: { id: 300 },
+        });
+      return github.fetch(input, init);
+    };
+    const response = await handleGithubOperation(
+      { ...rerunRequest, units },
+      { token: 'token', fetch }
+    );
+    expect(response).toMatchObject({
+      ok: false,
+      mutation: {
+        outcome,
+        rerun: { observed: [{ unit: units[0].unit, rerun: { id: '100', attempt: 2 } }] },
+      },
+    });
+    expect(github.posted).toEqual(['100', '200']);
+  }
+);
+
+test('reviews paginate submissions and root diff comments, retaining author and commit', async () => {
+  const item = {
+    id: 1,
+    html_url: 'https://github.com/a/b/pull/7#review-1',
+    body: 'private body',
+    user: { id: 2, login: 'reviewer', type: 'User' },
+    commit_id: 'headsha',
+    state: 'COMMENTED',
+    submitted_at: '2026-10-06T10:00:00Z',
+    created_at: '2026-10-06T10:00:00Z',
+  };
+  const calls: string[] = [];
+  const response = await handleGithubOperation(
+    { operationId: 'reviews', op: 'pr.reviews', ref },
+    {
+      token: 'token',
+      fetch: async input => {
+        const url = String(input);
+        calls.push(url);
+        if (url.includes('/reviews'))
+          return json(
+            url.endsWith('page=1')
+              ? Array.from({ length: 100 }, (_, id) => ({ ...item, id }))
+              : [
+                  { ...item, id: 101, state: 'PENDING' },
+                  { ...item, id: 102, state: 'DISMISSED' },
+                ]
+          );
+        return json([
+          { ...item, state: undefined },
+          { ...item, id: 2, in_reply_to_id: 1 },
+          { ...item, id: 3, user: null, commit_id: null, created_at: null },
+          { ...item, id: 4, user: { id: 3, login: 'ci[bot]', type: 'Bot' } },
+          { ...item, id: 5, user: { id: 4, login: 'acme', type: 'Organization' } },
+          { ...item, id: 6, user: { id: 5, login: 'old' } },
+          { ...item, id: 7, user: { id: 6, login: 'ghost', type: 'Mannequin' } },
+        ]);
+      },
+    }
+  );
+  expect(response).toMatchObject({ ok: true, result: { op: 'pr.reviews' } });
+  if (!response.ok || response.result.op !== 'pr.reviews') throw new Error('expected reviews');
+  expect(response.result.value.items).toHaveLength(107);
+  const items = response.result.value.items;
+  expect(items.at(-6)).toMatchObject({
+    kind: 'review_comment',
+    author: { host: repo.host, id: '2', login: 'reviewer', type: 'user' },
+    commit: 'headsha',
+    state: null,
+  });
+  expect(items.at(-5)).toMatchObject({
+    author: null,
+    commit: null,
+    createdAt: null,
+  });
+  expect(items.slice(-4).map(entry => entry.author?.type)).toEqual([
+    'bot',
+    'organization',
+    null,
+    null,
+  ]);
+  expect(forgeResponseSchema.safeParse(response).success).toBe(true);
+  expect(calls.some(url => url.endsWith('page=2'))).toBe(true);
+});
+
+test('a moved PR head refuses reruns of otherwise valid historical checks without writing', async () => {
+  const github = rerunGitHub({ prHead: 'new-head' });
+  expect(
+    await handleGithubOperation(rerunRequest, { token: 'token', fetch: github.fetch })
+  ).toMatchObject({ ok: false, mutation: { outcome: 'refused' } });
+  expect(github.posted).toEqual([]);
+});
+
+test.each([
+  { user: { id: 2, login: '' } },
+  { user: { id: 2, login: '   ' } },
+  { commit_id: '' },
+  { commit_id: '   ' },
+  { state: '' },
+  { submitted_at: 'invalid-timestamp' },
+  { created_at: 'invalid-timestamp' },
+])('invalid review facts return a contract-valid failure: %j', async invalid => {
+  const response = await handleGithubOperation(
+    { operationId: 'reviews', op: 'pr.reviews', ref },
+    {
+      token: 'token must never escape',
+      fetch: async () =>
+        json([
+          {
+            id: 1,
+            html_url: 'https://github.com/archon/test/pull/7#review-1',
+            body: 'private body',
+            user: { id: 2, login: 'reviewer' },
+            commit_id: 'headsha',
+            state: 'COMMENTED',
+            submitted_at: '2026-10-06T10:00:00Z',
+            created_at: '2026-10-06T10:00:00Z',
+            ...invalid,
+          },
+        ]),
+    }
+  );
+  expect(response).toMatchObject({ ok: false, error: { kind: 'forge_error' } });
+  expect(forgeResponseSchema.safeParse(response).success).toBe(true);
+  expect(JSON.stringify(response)).not.toContain('token must never escape');
+  expect(JSON.stringify(response)).not.toContain('private body');
+});
+
+test.each(['pr.ready', 'pr.draft'] as const)(
+  '%s requires acknowledgement of the selected mutation before read-back',
+  async op => {
+    const github = fakeGitHub({ pull: pull({ draft: op === 'pr.ready' }) });
+    const otherMutation =
+      op === 'pr.ready' ? 'convertPullRequestToDraft' : 'markPullRequestReadyForReview';
+    let reads = 0;
+    const response = await handleGithubOperation(
+      { operationId: 'draft-state', op, ref },
+      {
+        token: 'token',
+        fetch: async (input, init) => {
+          if (init?.method === 'POST')
+            return json({ data: { [otherMutation]: { pullRequest: { id: 'PR_node' } } } });
+          reads++;
+          return github.fetch(input, init);
+        },
+      }
+    );
+    expect(response).toMatchObject({ ok: false, mutation: { op, outcome: 'outcome_unknown' } });
+    expect(reads).toBe(1);
+  }
+);
+
+describe('GitHub draft conversion', () => {
+  const request = { operationId: 'draft', op: 'pr.draft', ref } satisfies ForgeMutationRequest;
+
+  test.each([false, true])('verifies draft state from initial draft=%s', async draft => {
+    const github = fakeGitHub({ pull: pull({ draft }) });
+    expect(await run(request, github)).toMatchObject({
+      ok: true,
+      result: {
+        op: 'pr.draft',
+        value: { outcome: 'applied', changed: !draft, pr: { state: 'open', is_draft: true } },
+      },
+    });
+    expect(github.calls.filter(call => call.method === 'POST')).toHaveLength(draft ? 0 : 1);
+  });
+
+  test.each([false, true])('refuses closed PRs (merged=%s) without writing', async merged => {
+    const github = fakeGitHub({ pull: pull({ state: 'closed', merged, draft: false }) });
+    expect(await run(request, github)).toMatchObject({
+      ok: false,
+      mutation: {
+        op: 'pr.draft',
+        outcome: 'refused',
+        observed: { state: merged ? 'merged' : 'closed' },
+      },
+    });
+    expect(github.calls.every(call => call.method === 'GET')).toBe(true);
+  });
+
+  test.each([
+    ['mismatch', 'verification_failed'],
+    ['read failure', 'verification_failed'],
+    ['lost response', 'outcome_unknown'],
+    ['authorization', 'refused'],
+    ['GraphQL errors', 'outcome_unknown'],
+    ['wrong acknowledgement', 'outcome_unknown'],
+    ['closed read-back', 'verification_failed'],
+  ] as const)('reports %s truthfully', async (mode, outcome) => {
+    let posted = false;
+    const github = fakeGitHub({ pull: pull({ draft: false }), lose: mode === 'mismatch' });
+    const response = await handleGithubOperation(request, {
+      token: 'secret-token',
+      fetch: async (input, init) => {
+        if (init?.method === 'POST') {
+          posted = true;
+          if (mode === 'lost response') throw new Error('secret-token');
+          if (mode === 'authorization') return json({}, 403);
+          if (mode === 'GraphQL errors') return json({ errors: [{ message: 'secret-token' }] });
+          if (mode === 'wrong acknowledgement')
+            return json({ data: { convertPullRequestToDraft: { pullRequest: { id: 'wrong' } } } });
+        } else if (posted) {
+          if (mode === 'read failure') return json({}, 500);
+          if (mode === 'closed read-back') return json(pull({ state: 'closed' }));
+        }
+        return github.fetch(input, init);
+      },
+    });
+    expect(response).toMatchObject({ ok: false, mutation: { op: 'pr.draft', outcome } });
+    expect(forgeResponseSchema.safeParse(response).success).toBe(true);
+    expect(JSON.stringify(response)).not.toContain('secret-token');
+  });
+});
+
+test('a mutation GitHub answers 502 is sent once and keeps its unknown outcome', async () => {
+  const github = fakeGitHub({
+    status: (_url: string, method: string) => (method === 'PATCH' ? 502 : undefined),
+  });
+  const response = await handleGithubOperation(
+    { operationId: 'edit', op: 'pr.edit-body', ref, body: 'next' },
+    { token: 'token', fetch: github.fetch }
+  );
+  expect(response).toMatchObject({
+    ok: false,
+    error: { kind: 'unavailable', status: 502 },
+    mutation: { outcome: 'outcome_unknown' },
+  });
+  expect(github.calls.filter(call => call.method === 'PATCH')).toHaveLength(1);
 });

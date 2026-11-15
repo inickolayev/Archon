@@ -1,10 +1,10 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { getPluginsPath } from '@archon/paths';
 import { trackTempRoots } from '@archon/paths/test-utils';
-import { forgeCommand } from './forge';
+import { forgeCommand, sourceForgePlugins } from './forge';
 import {
   forgeAuditResponse,
   type ForgeRequest,
@@ -70,6 +70,7 @@ test('records qualified target and evaluated revision through the host audit', a
             target: ref,
             plugin,
             result: forgeAuditResponse(response),
+            retries: 0,
             durationMs: 1,
           },
         };
@@ -154,6 +155,7 @@ test('the CLI does not inject a built-in producer into explicit plugin configura
             target: null,
             plugin: null,
             result: forgeAuditResponse(response),
+            retries: 0,
             durationMs: 0,
           },
         };
@@ -190,6 +192,7 @@ test('uses trusted discovery/runtime values while retaining repo credential valu
             target: null,
             plugin: null,
             result: forgeAuditResponse(response),
+            retries: 0,
             durationMs: 0,
           },
         };
@@ -205,7 +208,7 @@ test('uses trusted discovery/runtime values while retaining repo credential valu
 
   expect(dispatchedOptions).toMatchObject({
     env: { ARCHON_HOME: '/trusted', PATH: '/trusted/bin' },
-    pluginsDir: getPluginsPath(),
+    pluginsDir: getPluginsPath('/trusted'),
     credentialEnv: {
       ARCHON_HOME: '/repo-controlled',
       PATH: '/repo-controlled/bin',
@@ -270,6 +273,7 @@ test('reads an authored request from a file so no body reaches argv', async () =
               target: null,
               plugin: null,
               result: forgeAuditResponse(response),
+              retries: 0,
               durationMs: 0,
             },
           };
@@ -359,4 +363,354 @@ test('an invalid mutation request is refused before dispatch begins', async () =
   expect(code).toBe(1);
   expect(output[0]).toMatchObject({ ok: false, error: { kind: 'invalid_request' } });
   expect(output[0]).not.toHaveProperty('mutation');
+});
+
+test('a refused request names the fields the schema refused, not their values', async () => {
+  const output: unknown[] = [];
+  const unit = { kind: 'check', id: 'job-secret-id', name: 'e2e' };
+  const code = await forgeCommand(
+    'checks.rerun',
+    {
+      data: JSON.stringify({
+        ref: { repo: { host: 'forge.example', path: 'a/b' }, number: 9 },
+        revision: 'head',
+        // A bare check unit, where the request takes `{unit, rerun}` entries.
+        units: [unit],
+      }),
+    },
+    {
+      readConfig: async () => ({}),
+      dispatch: async () => {
+        throw new Error('must not dispatch');
+      },
+      write: async value => {
+        output.push(value);
+      },
+      env: {},
+    }
+  );
+  expect(code).toBe(1);
+  const { error } = output[0] as { error: { kind: string; message: string } };
+  expect(error.kind).toBe('invalid_request');
+  expect(error.message).toContain('units.0.unit');
+  expect(error.message).toContain('units.0.rerun');
+  expect(error.message).not.toContain(unit.id);
+});
+
+test('new work-item mutations use file requests and record content-free verified audits', async () => {
+  const repo = { host: 'forge.example', path: 'a/b' };
+  const ref = { repo, number: 4 };
+  const marker = '<!-- private marker -->';
+  const requests = [
+    {
+      op: 'workitem.create',
+      repo,
+      title: 'Private title',
+      body: `${marker}\nPrivate body`,
+      marker,
+    },
+    { op: 'workitem.labels.set', ref, labels: ['a', 'b'] },
+    {
+      op: 'repo.label.ensure',
+      repo,
+      name: 'label',
+      color: 'ABCDEF',
+      description: 'Private description',
+    },
+  ];
+  const directory = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-forge-workitem-cli-')));
+  for (const request of requests) {
+    const path = join(directory, 'request.json');
+    writeFileSync(path, JSON.stringify(request));
+    const output: unknown[] = [];
+    const audits: unknown[] = [];
+    const code = await forgeCommand(
+      request.op,
+      { dataFile: path },
+      {
+        readConfig: async () => ({
+          scanPath: false,
+          plugins: [
+            {
+              plugin: 'mutator',
+              command: process.execPath,
+              args: [join(import.meta.dir, '../../../forge/src/fixtures/mutation-plugin.ts')],
+            },
+          ],
+        }),
+        // Real discovery runs here, so it scans this home and never the developer's.
+        env: { HOME: directory, ARCHON_HOME: directory, WORKFLOW_ID: 'workitems-run' },
+        write: async value => {
+          output.push(value);
+        },
+        audit: async value => {
+          audits.push(value);
+        },
+      }
+    );
+    expect(code).toBe(0);
+    expect(output[0]).toMatchObject({
+      ok: true,
+      result: { op: request.op, value: { outcome: 'applied' } },
+    });
+    expect(audits[0]).toMatchObject({ operation: request.op, target: request.ref ?? repo });
+    for (const secret of ['Private title', 'Private body', 'Private description', marker])
+      expect(JSON.stringify(audits)).not.toContain(secret);
+  }
+});
+
+test('reviews retain bodies in stdout and digest them through the CLI audit boundary', async () => {
+  const ref = { repo: { host: 'forge.example', path: 'group/repo' }, number: 42 };
+  const auditRecords: unknown[] = [];
+  const responses: unknown[] = [];
+  const code = await forgeCommand(
+    'pr.reviews',
+    { data: JSON.stringify({ ref }) },
+    {
+      env: { WORKFLOW_ID: 'run' },
+      readConfig: async () => ({}),
+      dispatch: async request => {
+        const response: ForgeResponse = {
+          operationId: request.operationId,
+          ok: true,
+          result: {
+            op: 'pr.reviews',
+            value: {
+              ref,
+              items: [
+                {
+                  kind: 'review',
+                  id: '1',
+                  author: null,
+                  commit: 'head',
+                  state: 'COMMENTED',
+                  createdAt: null,
+                  url: 'https://forge.example/review/1',
+                  body: 'confidential review',
+                },
+              ],
+            },
+          },
+        };
+        return {
+          response,
+          plugin: null,
+          audit: {
+            operationId: request.operationId,
+            operation: request.op,
+            target: ref,
+            plugin: null,
+            result: forgeAuditResponse(response),
+            retries: 0,
+            durationMs: 1,
+          },
+        };
+      },
+      audit: async audit => {
+        auditRecords.push(audit);
+      },
+      write: async response => {
+        responses.push(response);
+      },
+    }
+  );
+  expect(code).toBe(0);
+  expect(JSON.stringify(responses)).toContain('confidential review');
+  expect(JSON.stringify(auditRecords)).not.toContain('confidential review');
+  expect(JSON.stringify(auditRecords)).toContain('digest');
+});
+
+test('host metadata exposes selected plugin capabilities without credentials or operations', async () => {
+  const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'forge-metadata-')));
+  const output: unknown[] = [];
+  const code = await forgeCommand(
+    'metadata',
+    { data: JSON.stringify({ host: 'github.com' }) },
+    {
+      env: { HOME: root, ARCHON_HOME: root, PATH: '' },
+      readConfig: async () => ({
+        scanPath: false,
+        plugins: [
+          {
+            plugin: 'github',
+            command: process.execPath,
+            args: [
+              '--no-env-file',
+              join(import.meta.dir, '../../../forge/src/fixtures/credential-plugin.ts'),
+            ],
+          },
+        ],
+      }),
+      write: async value => {
+        output.push(value);
+      },
+    }
+  );
+  expect(code).toBe(0);
+  expect(output[0]).toMatchObject({
+    ok: true,
+    result: { op: 'metadata', value: { capabilities: ['pr.view', 'resolve'] } },
+  });
+});
+
+/** An Archon home whose installed GitHub forge plugin is a file no host can execute. */
+function homeWithUnusableInstalledGithubPlugin(): string {
+  const home = trackTempRoot(mkdtempSync(join(tmpdir(), 'forge-source-')));
+  const plugins = getPluginsPath(home);
+  mkdirSync(plugins, { recursive: true });
+  const exe = process.platform === 'win32' ? '.exe' : '';
+  writeFileSync(join(plugins, `archon-forge-github${exe}`), 'not an executable', { mode: 0o755 });
+  return home;
+}
+
+async function githubMetadata(
+  home: string,
+  dependencies: Parameters<typeof forgeCommand>[2] = {}
+): Promise<unknown> {
+  const output: unknown[] = [];
+  await forgeCommand(
+    'metadata',
+    { data: JSON.stringify({ host: 'github.com' }) },
+    {
+      env: { HOME: home, ARCHON_HOME: home, PATH: process.env.PATH },
+      readConfig: async () => ({ scanPath: false }),
+      write: async value => {
+        output.push(value);
+      },
+      ...dependencies,
+    }
+  );
+  return output[0];
+}
+
+test('a source checkout runs the GitHub plugin from source, whatever is installed', async () => {
+  expect(await githubMetadata(homeWithUnusableInstalledGithubPlugin())).toMatchObject({
+    ok: true,
+    result: {
+      op: 'metadata',
+      value: { name: 'github', capabilities: expect.arrayContaining(['resolve:subject']) },
+    },
+  });
+});
+
+test('a release binary loads the installed GitHub plugin and nothing from source', async () => {
+  expect(sourceForgePlugins(true)).toEqual([]);
+  expect(
+    await githubMetadata(homeWithUnusableInstalledGithubPlugin(), { sourcePlugins: [] })
+  ).toMatchObject({
+    ok: false,
+    error: { kind: 'process_failed', message: 'discovery:github: metadata handshake failed' },
+  });
+});
+
+async function checkForge(
+  data: object,
+  env: NodeJS.ProcessEnv,
+  mode = 'token'
+): Promise<{ code: number; response: unknown }> {
+  const output: unknown[] = [];
+  const code = await forgeCommand(
+    'check',
+    { data: JSON.stringify(data) },
+    {
+      env,
+      readConfig: async () => ({
+        scanPath: false,
+        plugins: [
+          {
+            plugin: 'test',
+            command: process.execPath,
+            args: [
+              '--no-env-file',
+              join(import.meta.dir, '../../../forge/src/fixtures/test-plugin.ts'),
+              '--mode',
+              mode,
+            ],
+          },
+        ],
+      }),
+      dispatch: async () => {
+        throw new Error('forge check must not dispatch an operation');
+      },
+      write: async value => {
+        output.push(value);
+      },
+    }
+  );
+  return { code, response: output[0] };
+}
+
+test('forge check names the plugin and credential source without dispatching or printing the token', async () => {
+  const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'forge-check-')));
+  const env = { HOME: root, ARCHON_HOME: root, PATH: '', TEST_FORGE_TOKEN: 'secret-token-value' };
+  const { code, response } = await checkForge(
+    { host: 'Forge.Example', operations: ['checks.state'] },
+    env
+  );
+  expect(code).toBe(0);
+  expect(response).toMatchObject({
+    ok: true,
+    result: {
+      op: 'check',
+      value: {
+        host: 'forge.example',
+        plugin: { name: 'test', version: '1.0.0' },
+        operations: ['checks.state'],
+        credentialSource: 'TEST_FORGE_TOKEN',
+      },
+    },
+  });
+  expect(JSON.stringify(response)).not.toContain('secret-token-value');
+});
+
+test('forge check exits 1 with a typed reason for a missing plugin, capability or credential', async () => {
+  const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'forge-check-')));
+  const env = { HOME: root, ARCHON_HOME: root, PATH: '' };
+
+  const unclaimed = await checkForge({ host: 'other.example', operations: [] }, env);
+  expect(unclaimed.code).toBe(1);
+  expect(unclaimed.response).toMatchObject({ ok: false, error: { kind: 'no_plugin_for_host' } });
+
+  // Capabilities are refused before the credential is read, so the absent token is not the reason.
+  const unsupported = await checkForge(
+    { host: 'forge.example', operations: ['checks.state', 'pr.merge'] },
+    env
+  );
+  expect(unsupported.code).toBe(1);
+  expect(unsupported.response).toMatchObject({
+    ok: false,
+    error: { kind: 'unsupported_op', message: 'plugin test does not support pr.merge' },
+    unsupported: ['pr.merge'],
+  });
+
+  const noCredential = await checkForge(
+    { host: 'forge.example', operations: ['checks.state'] },
+    env
+  );
+  expect(noCredential.code).toBe(1);
+  expect(noCredential.response).toMatchObject({ ok: false, error: { kind: 'no_credential' } });
+});
+
+test('forge check under a source checkout answers for the source GitHub plugin', async () => {
+  const home = homeWithUnusableInstalledGithubPlugin();
+  const output: unknown[] = [];
+  const code = await forgeCommand(
+    'check',
+    { data: JSON.stringify({ host: 'github.com', operations: ['resolve:subject'] }) },
+    {
+      env: { HOME: home, ARCHON_HOME: home, PATH: process.env.PATH, GH_TOKEN: 'secret-token' },
+      readConfig: async () => ({ scanPath: false }),
+      write: async value => {
+        output.push(value);
+      },
+    }
+  );
+  expect(output[0]).toMatchObject({
+    ok: true,
+    result: {
+      op: 'check',
+      value: { host: 'github.com', plugin: { name: 'github' }, operations: ['resolve:subject'] },
+    },
+  });
+  expect(code).toBe(0);
 });

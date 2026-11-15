@@ -5,7 +5,8 @@
 <h1 align="center">Archon</h1>
 
 <p align="center">
-  The first open-source harness builder for AI coding. Make AI coding deterministic and repeatable.
+  The simplest way to build the software that builds your software.<br/>
+  YAML workflows that can do anything.
 </p>
 
 <p align="center">
@@ -20,330 +21,187 @@
 
 ---
 
-Archon is a workflow engine for AI coding agents. Define your development processes as YAML workflows - planning, implementation, validation, code review, PR creation - and run them reliably across all your projects.
+Archon is a factory builder. You describe how work should get done as YAML workflows, and Archon runs them with AI agents, scripts and your decisions in the places that need them. Software is the first factory: the bundled SDLC pack takes an issue to a merged pull request. The same engine runs any process you can describe.
 
-Like what Dockerfiles did for infrastructure and GitHub Actions did for CI/CD - Archon does for AI coding workflows. Think n8n, but for software development.
+Take yourself out of the loop and sit on top of it. Runs do the work, queues keep it moving, and a run comes to you only when it needs a decision you own.
 
-## Why Archon?
+## Why Archon
 
-When you ask an AI agent to "fix this bug", what happens depends on the model's mood. It might skip planning. It might forget to run tests. It might write a PR description that ignores your template. Every run is different.
+Ask a coding agent to fix a bug and the result depends on the run. It may skip the plan, forget the tests or ignore your PR template. You end up supervising every step.
 
-Archon fixes this. Encode your development process as a workflow. The workflow defines the phases, validation gates, and artifacts. The AI fills in the intelligence at each step, but the structure is deterministic and owned by you.
+Archon turns your process into a workflow you own. The workflow fixes the steps, the checks and the gates. The agent supplies the judgment inside each step. That gives you:
 
-- **Repeatable** - Same workflow, same sequence, every time. Plan, implement, validate, review, PR.
-- **Isolated** - Every workflow run gets its own git worktree. Run 5 fixes in parallel with no conflicts.
-- **Fire and forget** - Kick off a workflow, go do other work. Come back to a finished PR with review comments.
-- **Composable** - Mix deterministic nodes (bash scripts, tests, git ops) with AI nodes (planning, code generation, review). The AI only runs where it adds value.
-- **Portable** - Define workflows once in `.archon/workflows/`, commit them to your repo. They work the same from CLI, Web UI, Slack, Telegram, or GitHub.
+- **The same process every time.** Plan, implement, review, validate, open the PR, in the order you wrote down.
+- **Human on the loop, not in it.** Queues take work forward on their own. When a run reaches a decision it can't make, it pauses as one attention item: what it is, why it matters, a recommendation and the choices. You answer and it carries on.
+- **Governance built in.** Approval gates, a full event log and transcript for every run, and the cost of every run, all stored in your own database.
+- **Your agents, your subscriptions.** Archon is not another coding agent. It runs Claude Code, Codex and Pi through their own CLIs and SDKs, with the accounts and project guidance you already have.
+- **Self-hosted.** One install on your machine or server. SQLite by default, PostgreSQL if you want it.
 
-## What It Looks Like
+## What it looks like
 
-Here's an example of an Archon workflow that plans, implements in a loop until tests pass, gets your approval, then creates the PR:
+A workflow is a graph of nodes. Agents judge, code computes, and you decide where it matters:
 
 ```yaml
 # .archon/workflows/build-feature.yaml
+name: build-feature
+description: Plan, implement until the tests pass, ask for approval, open the PR.
 nodes:
   - id: plan
-    prompt: "Explore the codebase and create an implementation plan"
+    prompt: "Read the request and the code. Write an implementation plan."
 
   - id: implement
     depends_on: [plan]
-    loop:                                      # AI loop - iterate until done
-      prompt: "Read the plan. Implement the next task. Run validation."
-      until: ALL_TASKS_COMPLETE
-      fresh_context: true                      # Fresh session each iteration
-
-  - id: run-tests
-    depends_on: [implement]
-    bash: "bun run validate"                   # Deterministic - no AI
-
-  - id: review
-    depends_on: [run-tests]
-    prompt: "Review all changes against the plan. Fix any issues."
+    loop:
+      prompt: "Implement the next step of the plan."
+      until_bash: "bun run test"          # your test command; code decides when it is done
+      max_iterations: 10
+      fresh_context: true
 
   - id: approve
-    depends_on: [review]
-    loop:                                      # Human approval gate
-      prompt: "Present the changes for review. Address any feedback."
-      until: APPROVED
-      interactive: true                        # Pauses and waits for human input
+    depends_on: [implement]
+    wait:                                 # the run pauses and asks you
+      attention: "Review the change. Approve, or reject to stop."
+      form: approval
 
-  - id: create-pr
+  - id: stop
     depends_on: [approve]
-    prompt: "Push changes and create a pull request"
+    when: "$approve.output.decision == 'reject'"
+    cancel: "Rejected at review."
+
+  - id: pr
+    depends_on: [approve]
+    when: "$approve.output.decision == 'approve'"
+    prompt: "Push the branch and open a pull request."
 ```
 
-Tell your coding agent what you want, and Archon handles the rest:
-
-```
-You: Use archon to add dark mode to the settings page
-
-Agent: I'll run the archon-idea-to-pr workflow for this.
-       → Creating isolated worktree on branch archon/task-dark-mode...
-       → Planning...
-       → Implementing (task 1/4)...
-       → Implementing (task 2/4)...
-       → Tests failing - iterating...
-       → Tests passing after 2 iterations
-       → Code review complete - 0 issues
-       → PR ready: https://github.com/you/project/pull/47
+```mermaid
+flowchart LR
+  plan["plan<br/>(agent)"] --> implement["implement<br/>(agent, loops until the tests pass)"]
+  implement --> approve{"approve<br/>(waits for you)"}
+  approve -- reject --> stop["stop"]
+  approve -- approve --> pr["pr<br/>(agent)"]
 ```
 
-## Previous Version
-
-Looking for the original Python-based Archon (task management + RAG)? It's fully preserved on the [`archive/v1-task-management-rag`](https://github.com/coleam00/Archon/tree/archive/v1-task-management-rag) branch.
-
-## Getting Started
-
-> **Most users should start with the [Full Setup](#full-setup-5-minutes)** - it walks you through credentials, installs the Archon skill into your projects, and gives you the web console.
->
-> **Already have Claude Code and just want the CLI?** Jump to the [Quick Install](#quick-install-30-seconds).
-
-### Full Setup (5 minutes)
-
-Clone the repo and use the guided setup wizard. This configures credentials, platform integrations, and copies the Archon skill into your target projects.
-
-<details>
-<summary><b>Prerequisites</b> - Bun, Claude Code, and the GitHub CLI</summary>
-
-**Bun** - [bun.sh](https://bun.sh)
+Save it in your repository's `.archon/workflows/`, swap `bun run test` for your own test command, and run it:
 
 ```bash
-# macOS/Linux
-curl -fsSL https://bun.sh/install | bash
-
-# Windows (PowerShell)
-irm bun.sh/install.ps1 | iex
+archon workflow run build-feature "Add dark mode to the settings page"
 ```
 
-**GitHub CLI** - [cli.github.com](https://cli.github.com/)
+Repository runs get their own git worktree by default, so several can work on one repository at once.
 
-```bash
-# macOS
-brew install gh
+## A software factory: issue in, merged PR out
 
-# Windows (via winget)
-winget install GitHub.cli
+The bundled `sdlc` pack is a working factory for a repository:
 
-# Linux (Debian/Ubuntu)
-sudo apt install gh
-```
+1. **You open an issue.** `archon-intake` checks it against the current code and decides what it needs: a plan, an investigation, straight to delivery, or a maintainer's look.
+2. **The build queue picks it up.** `archon-build-queue` claims the next ready issue, writes the brief and runs `archon-ship`: plan, implement, review through specialist lenses, fix the findings, wait for CI. It stops at a pull request whose review says Ready, asking once for any check no round can run, or at one a maintainer's `ready` answer hands on; the merge gate checks either the same way.
+3. **The merge queue lands it.** `archon-merge-queue` merges the clear ready pull requests that merge cleanly, through a gate that checks the review verdict and CI at the head commit and that the base branch is not red. The queue judges open review threads itself and sends a pull request that conflicts back to the build queue.
+4. **You answer what's unclear.** A scope question, a schema change or a stuck round becomes one attention item with a recommendation. Your answer is written into the issue as the new scope.
+5. **Nothing found along the way is lost.** `archon-discoveries` reads what runs noticed outside their task and files it, tracks it on an existing issue, or drops it.
 
-**Claude Code** - [claude.ai/code](https://claude.ai/code)
+Archon builds Archon: of the 524 pull requests merged into this repository between 1 and 19 October 2026, Archon runs built 363.
 
-```bash
-# macOS/Linux/WSL
-curl -fsSL https://claude.ai/install.sh | bash
+You start the queues by hand or bind them to a schedule or issue events with a [trigger](https://archon.diy/guides/workflow-triggers/). The pack binds nothing by default. The pack reaches GitHub through the forge plugin (`archon plugin add coleam00/Archon/plugins/forge-github`); see [the forge path](https://archon.diy/reference/forge/#use-the-forge-path-in-the-sdlc-pack). [The SDLC factory](https://archon.diy/getting-started/sdlc-factory/) introduces it and links its setup guide, and [SDLC pack workflows](https://archon.diy/reference/sdlc-workflows/) describes every workflow in it.
 
-# Windows (PowerShell)
-irm https://claude.ai/install.ps1 | iex
-```
+## Build any factory
 
-</details>
+Workflows are not tied to code. A node can be an agent prompt, a bash command, a script, a loop, a wait for a person or a child workflow, so any process with steps, checks and decisions fits: content production, research, operations, support. Write it as YAML, keep its commands and scripts beside it, and share it as a pack.
 
-```bash
-git clone https://github.com/coleam00/Archon
-cd Archon
-bun install
-claude
-```
+## A reliable core, extensible at the seams
 
-Then say: **"Set up Archon"**
+The core stays small: the workflow engine, isolation, durable state, the attention queue and an audit trail. Everything that talks to the outside world plugs in through a published contract, and you can build your own plugin for any of them:
 
-The setup wizard walks you through everything: CLI installation, authentication, platform selection, and copies the Archon skill to your target repo.
+| Plugin kind | What it adds | Maintained here |
+|---|---|---|
+| Workflow pack | Workflows, commands and scripts | `sdlc` |
+| Provider | An agent runtime | Claude Code, Codex, Pi |
+| Forge | A code host | GitHub |
+| Chat | A conversation surface | Slack |
 
-### Quick Install (30 seconds)
+GitHub is the registry: publish in your own repository and install with `archon plugin add owner/repo`. See [Publish a plugin](https://archon.diy/guides/publishing-plugins/) and the [plugin index](https://archon.diy/plugins/).
 
-Already have Claude Code set up? Install the standalone CLI binary and skip the wizard.
+## Quickstart
 
-**macOS / Linux**
-```bash
-curl -fsSL https://archon.diy/install | bash
-```
+1. Install [Claude Code](https://claude.ai/code) and sign in, or install Codex.
+2. Install Archon. The installer asks which providers to add:
 
-> **x64 compatibility:** The macOS/Linux quick install requires AVX2 on x64
-> CPUs. Older Intel/AMD hardware and virtual machines that mask AVX2 should use
-> the [source installation guide](https://archon.diy/getting-started/installation/#from-source).
-> ARM64 quick installs are unaffected.
+   ```bash
+   curl -fsSL https://archon.diy/install | bash        # macOS / Linux
+   irm https://archon.diy/install.ps1 | iex             # Windows (PowerShell)
+   brew install coleam00/archon/archon                 # Homebrew, then: archon setup
+   ```
 
-**Windows (PowerShell)**
-```powershell
-irm https://archon.diy/install.ps1 | iex
-```
+3. Run a workflow in any git repository:
 
-**Homebrew**
-```bash
-brew install coleam00/archon/archon
-```
+   ```bash
+   cd your-project
+   archon workflow list
+   archon workflow run archon-investigate "Why does the login test fail?"
+   ```
 
-> **Compiled binaries need a `CLAUDE_BIN_PATH`.** The quick-install binaries
-> don't bundle Claude Code. Install it separately, then point Archon at it:
->
-> ```bash
-> # macOS / Linux / WSL
-> curl -fsSL https://claude.ai/install.sh | bash
-> export CLAUDE_BIN_PATH="$HOME/.local/bin/claude"
->
-> # Windows (PowerShell)
-> irm https://claude.ai/install.ps1 | iex
-> $env:CLAUDE_BIN_PATH = "$env:USERPROFILE\.local\bin\claude.exe"
-> ```
->
-> Or set `assistants.claude.claudeBinaryPath` in `~/.archon/config.yaml`.
-> The Docker image ships Claude Code pre-installed. See [AI Assistants → Binary path configuration](https://archon.diy/getting-started/ai-assistants/#binary-path-configuration-compiled-binaries-only) for details.
+4. Watch runs and answer their questions in the web console with `archon serve`, or from the terminal with `archon workflow attention`.
 
-### Start Using Archon
+To let your coding agent drive Archon for you, run `archon skill add` in your project, then ask it to "use archon to fix issue #42".
 
-Once you've completed either setup path, go to your project and start working:
+Other installs (from source, Docker, servers), provider setup and the Claude Code binary path are in the [installation guide](https://archon.diy/getting-started/installation/). The [quick start](https://archon.diy/getting-started/quick-start/) shows how to write a brief a run can deliver against.
 
-```bash
-cd /path/to/your/project
-claude
-```
+## Connect a platform
 
-```
-Use archon to fix issue #42
-```
+The CLI and web console work out of the box. Connect a chat platform or forge to start and follow runs from there:
 
-```
-What archon workflows do I have? When would I use each one?
-```
-
-The coding agent handles workflow selection, branch naming, and worktree isolation for you. Projects are registered automatically the first time they're used.
-
-> **Important:** Always run Claude Code from your target repo, not from the Archon repo. The setup wizard copies the Archon skill into your project so it works from there.
-
-## Web UI
-
-Archon includes a web console for running workflows, inspecting runs, and chatting with your coding agent. Run `archon serve` to start it, whichever way you installed. A binary downloads the matching Web UI on first run. A source checkout serves the copy you build: run `bun run build:web` once from the repo root, then `archon serve`.
-
-Register a project with **Add project** in the project rail, then enter a GitHub URL or local path. Select the project to start a run or open its chat.
-
-**Key pages:**
-- **Runs** - All runs and project-scoped runs, with status filters and live progress
-- **Run detail** - Event log, artifacts, workflow graph when project context is available, and applicable governance actions
-- **Project chat** - Real-time assistant text and tool activity for the selected project
-- **Settings** - Provider credentials, model tiers and aliases, assistant defaults, system status, and GitHub identity
-- **Workflow builder** - Experimental visual authoring for a bounded set of workflow node forms
-
-See the [Web UI Guide](https://archon.diy/adapters/web/) for full documentation.
-
-## What Can You Automate?
-
-Archon ships with workflows for common development tasks:
-
-| Workflow | What it does |
-|----------|-------------|
-| `archon-assist` | General Q&A, debugging, exploration - full Claude Code agent with all tools |
-| `archon-fix-github-issue` | Classify issue → investigate/plan → implement → validate → PR → smart review → self-fix |
-| `archon-create-issue` | Classify problem → gather context → investigate → create GitHub issue |
-| `archon-issue-review-full` | Comprehensive fix + full multi-agent review pipeline for GitHub issues |
-| `archon-piv-loop` | Guided Plan-Implement-Validate loop with human review between iterations |
-| `archon-idea-to-pr` | Feature idea → plan → implement → validate → PR → 5 parallel reviews → self-fix |
-| `archon-plan-to-pr` | Execute existing plan → implement → validate → PR → review → self-fix |
-| `archon-feature-development` | Implement feature from plan → validate → create PR |
-| `archon-adversarial-dev` | Build a complete application from scratch using adversarial development |
-| `archon-smart-pr-review` | Classify PR complexity → run targeted review agents → synthesize findings |
-| `archon-comprehensive-pr-review` | Multi-agent PR review (5 parallel reviewers) with automatic fixes |
-| `archon-validate-pr` | Thorough PR validation testing both main and feature branches |
-| `archon-architect` | Architectural sweep, complexity reduction, codebase health improvement |
-| `archon-refactor-safely` | Safe refactoring with type-check hooks and behavior verification |
-| `archon-interactive-prd` | Create a PRD through guided conversation |
-| `archon-ralph-dag` | PRD implementation loop - iterate through stories until done |
-| `archon-workflow-builder` | Generate a new Archon workflow YAML for your project |
-| `archon-remotion-generate` | Generate or modify Remotion video compositions with AI |
-| `archon-resolve-conflicts` | Detect merge conflicts → analyze both sides → resolve → validate → commit |
-
-Archon ships 19 default workflows - run `archon workflow list` or describe what you want and the router picks the right one.
-
-**Or define your own.** Keep a workflow copyable by placing its YAML, commands, and scripts together under `.archon/workflows/<pack>/<workflow>/`; both directory names are yours. The same tree works in target repos and under `~/.archon/workflows/`. Existing flat workflows and shared `.archon/commands/` / `.archon/scripts/` remain supported. Same-named workflow files in your repo override bundled defaults.
-
-See [Authoring Workflows](https://archon.diy/guides/authoring-workflows/) and [Authoring Commands](https://archon.diy/guides/authoring-commands/).
-
-## Add a Platform
-
-The Web UI and CLI work out of the box. Optionally connect a chat platform for remote access:
-
-| Platform | Setup time | Guide |
-|----------|-----------|-------|
-| **Telegram** | 5 min | [Telegram Guide](https://archon.diy/adapters/telegram/) |
-| **Slack** | 15 min | [Slack Guide](https://archon.diy/adapters/slack/) |
-| **GitHub Webhooks** | 15 min | [GitHub Guide](https://archon.diy/adapters/github/) |
-| **Discord** | 5 min | [Discord Guide](https://archon.diy/adapters/community/discord/) |
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Platform Adapters (Web UI, CLI, Telegram, Slack,       │
-│                    Discord, GitHub)                     │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│                     Orchestrator                        │
-│          (Message Routing & Context Management)         │
-└─────────────┬───────────────────────────┬───────────────┘
-              │                           │
-      ┌───────┴────────┐          ┌───────┴────────┐
-      │                │          │                │
-      ▼                ▼          ▼                ▼
-┌───────────┐  ┌────────────┐  ┌──────────────────────────┐
-│  Command  │  │  Workflow  │  │    AI Assistant Clients  │
-│  Handler  │  │  Executor  │  │   (Claude / Codex / Pi)  │
-│  (Slash)  │  │  (YAML)    │  │                          │
-└───────────┘  └────────────┘  └──────────────────────────┘
-      │              │                      │
-      └──────────────┴──────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│          SQLite / PostgreSQL (14 core tables)           │
-│  Codebases • Conversations • Sessions • Workflow Runs   │
-│   Isolation Environments • Messages • Workflow Events   │
-│    Users • User Identities • Workflow Node Sessions     │
-│         Codebase Env Vars • User GitHub Tokens          │
-│           User Provider Keys • User AI Prefs            │
-│          (+ Better Auth tables, Postgres only)          │
-└─────────────────────────────────────────────────────────┘
-```
+| Platform | Guide |
+|---|---|
+| Slack | [Slack guide](https://archon.diy/adapters/slack/) |
+| Telegram | [Telegram guide](https://archon.diy/adapters/telegram/) |
+| GitHub webhooks | [GitHub guide](https://archon.diy/adapters/github/) |
+| Discord | [Discord guide](https://archon.diy/adapters/community/discord/) |
 
 ## Documentation
 
-Full documentation is available at **[archon.diy/docs](https://archon.diy/docs/)**.
+Full documentation is at **[archon.diy/docs](https://archon.diy/docs/)**.
 
 | Topic | Description |
-|-------|-------------|
-| [Getting Started](https://archon.diy/getting-started/overview/) | Setup guide (Web UI or CLI) |
-| [The Book of Archon](https://archon.diy/book/) | 10-chapter narrative tutorial |
-| [CLI Reference](https://archon.diy/reference/cli/) | Full CLI reference |
-| [Authoring Workflows](https://archon.diy/guides/authoring-workflows/) | Create custom YAML workflows |
-| [Authoring Commands](https://archon.diy/guides/authoring-commands/) | Create reusable AI commands |
-| [Configuration](https://archon.diy/reference/configuration/) | All config options, env vars, YAML settings |
-| [AI Assistants](https://archon.diy/getting-started/ai-assistants/) | Claude, Codex, and Pi setup details |
-| [Deployment](https://archon.diy/deployment/) | Docker, VPS, production setup |
-| [Architecture](https://archon.diy/reference/architecture/) | System design and internals |
+|---|---|
+| [Quickstart](https://archon.diy/getting-started/quick-start/) | Install and first run |
+| [Workflow language](https://archon.diy/reference/workflow-language/) | Write your own YAML workflows |
+| [Operate runs](https://archon.diy/getting-started/operate/) | Watch runs, answer the ones that need you, read results |
+| [CLI reference](https://archon.diy/reference/cli/) | Every command and flag |
+| [Configuration](https://archon.diy/reference/configuration/) | Config options, model tiers and aliases, env vars |
+| [AI assistants](https://archon.diy/getting-started/ai-assistants/) | Claude Code, Codex and Pi setup |
+| [Deployment](https://archon.diy/deployment/) | Docker, VPS and production setup |
+| [Architecture](https://archon.diy/reference/architecture/) | Packages and boundaries |
 | [Troubleshooting](https://archon.diy/reference/troubleshooting/) | Common issues and fixes |
 
-**For AI tools:** Point your LLM at [`/llms.txt`](https://archon.diy/llms.txt) for an index of all documentation, [`/llms-full.txt`](https://archon.diy/llms-full.txt) for the complete docs in a single file, or [`/llms-small.txt`](https://archon.diy/llms-small.txt) for a condensed version.
+**For AI tools:** point your LLM at [`/llms.txt`](https://archon.diy/llms.txt) for an index of the docs, [`/llms-full.txt`](https://archon.diy/llms-full.txt) for all of them in one file, or [`/llms-small.txt`](https://archon.diy/llms-small.txt) for a condensed version.
+
+## Previous version
+
+Looking for the original Python-based Archon (task management and RAG)? It is preserved on the [`archive/v1-task-management-rag`](https://github.com/coleam00/Archon/tree/archive/v1-task-management-rag) branch.
 
 ## Telemetry
 
-Archon sends a few anonymous events so maintainers can see which workflows get real usage, on what platforms, and whether runs succeed — and prioritize accordingly. **No PII, ever.** Events: `archon_started` (once per CLI invocation or server boot; `archon serve` reports as the server, and a detached run's worker process is counted by the command that started it), `archon_active` (daily heartbeat while a server is running, so long-running installs stay counted), `chat_turn_handled` (each direct AI chat turn — platform, provider, model, duration, and usage totals; never message content), `workflow_invoked` (each workflow start, and again for each resumed segment), `workflow_completed` / `workflow_failed` / `workflow_cancelled` (sent once when a run's final status is saved, whichever path ended it), `workflow_approval_resolved` (each human approve/reject decision — the binary resolution only, never comments or reasons), and `codebase_registered` (a pure count when a project is registered — no name, path, or URL).
+Archon sends a few anonymous events so maintainers can see which workflows get real usage, on what platforms, and whether runs succeed, and prioritize accordingly. **No PII, ever.** Events: `archon_started` (at most once a day each for the CLI and the server, with the store it uses: `files`, `sqlite` or `postgresql`; `archon serve` reports as the server, and a detached run's worker process is counted by the command that started it), `archon_active` (daily heartbeat while a server is running, so long-running installs stay counted), `chat_turn_handled` (each direct AI chat turn: platform, provider, model, duration, and usage totals; never message content), `workflow_invoked` (each workflow start, and again for each resumed segment), `workflow_completed` / `workflow_failed` / `workflow_cancelled` (sent once when a run's final status is saved, whichever path ended it), `workflow_approval_resolved` (each human approve/reject decision: the binary resolution only, never comments or reasons), and `codebase_registered` (a pure count when a project is registered; no name, path, or URL).
 
 **What's collected (categorical only):**
-- **Workflow name** — the real name for *bundled* (Archon-authored) workflows; `"custom"` for your own workflows, so private names never leave your machine. The discovery source (`bundled`/`global`/`project`) is sent alongside.
-- **Run shape & outcome** — platform (`cli`/`web`/`slack`/…), provider and model ids, node count, how many nodes of each type, graph depth and widest fan-out, how many distinct commands are referenced, the total inline prompt size as a bucket (`none`/`lt_1k`/`1k_5k`/`5k_20k`/`gte_20k` characters), which node types and features are used (loop/approval/script/bash, structured output, persisted sessions, MCP, skills, fresh-context loops), whether the run is interactive, isolated in a worktree, a resume, or a child of another run, the outcome, duration (from the run's first start to its end, including approval and wait time), a categorical exit or cancel reason, and a fixed-enum failure class recorded where the first failed node failed (`fatal`/`transient`/`unknown` for provider errors; `timeout`, `exec_failed`, `output_contract`, `max_iterations`, `child_failed`, `cancelled`, `config` for engine-detected causes — never raw error text) plus that node's type.
-- **Run reference** — `run_ref`, a one-way hash of the install UUID and the run id, so a run's start, resumes and outcome can be joined. The run id itself is never sent.
-- **Bundled ancestry** — when one of your workflows is a copy of a bundled workflow, the bundled workflow's name and whether the copy is `identical` or `modified` (`derived_from`, `derived_similarity`). Only the bundled name is sent; nothing about your copy's name, node ids or prompts.
-- **Chat activity** — one event per direct-chat AI turn with platform, provider, model, duration, and completed/failed; a turn whose provider errors out mid-turn counts as failed. Message content, prompts, and conversation ids are never sent.
-- **Aggregate usage** — provider-reported gross input, output, optional cache-read/cache-write token totals (with a flag when those totals are a floor), and cost (USD) per workflow run across all of its resumed segments (a parent run's total includes its child runs' spend, so sum spend over runs that are not children), plus direct-chat usage and total loop iterations. Numeric totals only — never the content the tokens represent.
-- **Machine context** — OS, architecture, Archon version, runtime, whether it's a binary build, the install channel (`binary`/`docker`/`source`), the short commit of the running build when known, whether stderr is a terminal, and a CI flag.
-- **Deployment shape** (server only) — which adapters are enabled (booleans), database kind (`sqlite`/`postgresql`), whether web auth and multi-user mode are on, and the GitHub auth mode. Configuration *values* (tokens, URLs, hosts) are never sent.
+
+- **Workflow name**: the real name for *bundled* (Archon-authored) workflows; `"custom"` for your own workflows, so private names never leave your machine. The discovery source (`bundled`/`global`/`project`) is sent alongside.
+- **Run shape & outcome**: platform (`cli`/`web`/`slack`/…), provider and model ids, node count, how many nodes of each type, graph depth and widest fan-out, how many distinct commands are referenced, the total inline prompt size as a bucket (`none`/`lt_1k`/`1k_5k`/`5k_20k`/`gte_20k` characters), which node types and features are used (loop/approval/script/bash, structured output, persisted sessions, MCP, skills, fresh-context loops), whether the run is interactive, isolated in a worktree, a resume, or a child of another run, the outcome, duration (from the run's first start to its end, including approval and wait time), a categorical exit or cancel reason, and a fixed-enum failure class recorded where the first failed node failed (`fatal`/`transient`/`unknown` for provider errors; `timeout`, `exec_failed`, `output_contract`, `max_iterations`, `child_failed`, `cancelled`, `config` for engine-detected causes; never raw error text) plus that node's type.
+- **Run reference**: `run_ref`, a one-way hash of the install UUID and the run id, so a run's start, resumes and outcome can be joined. The run id itself is never sent.
+- **Bundled ancestry**: when one of your workflows is a copy of a bundled workflow, the bundled workflow's name and whether the copy is `identical` or `modified` (`derived_from`, `derived_similarity`). Only the bundled name is sent; nothing about your copy's name, node ids or prompts.
+- **Workflow no match**: `workflow_no_match`, a count of agent decisions that no available workflow fits, with only the transport (`native_tool` or `cli`).
+- **Chat activity**: one event per direct-chat AI turn with platform, provider, model, duration, and completed/failed; a turn whose provider errors out mid-turn counts as failed. Message content, prompts, and conversation ids are never sent.
+- **Aggregate usage**: provider-reported gross input, output, optional cache-read/cache-write token totals (with a flag when those totals are a floor), and cost (USD) per workflow run across all of its resumed segments (a parent run's total includes its child runs' spend, so sum spend over runs that are not children), plus direct-chat usage and total loop iterations. Numeric totals only, never the content the tokens represent.
+
+- **Machine context**: OS, architecture, Archon version, runtime, whether it's a binary build, the install channel (`binary`/`docker`/`source`), the short commit of the running build when known, whether stderr is a terminal, and a CI flag.
+- **Store kind**: where runs are kept, `files`, `sqlite` or `postgresql`, sent on `archon_started` by the CLI and the server.
+- **Deployment shape** (server only): which adapters are enabled (booleans), how many chat plugins it hosts (a count; plugin names are not sent), database kind (`sqlite`/`postgresql`), whether web auth and multi-user mode are on, and the GitHub auth mode. Configuration *values* (tokens, URLs, hosts) are never sent.
 - A random install UUID stored at `$ARCHON_HOME/telemetry-id` (`~/.archon/telemetry-id` by default, `/.archon/telemetry-id` in Docker). Nothing else.
 - A `schema_version` number on every event, bumped whenever this list changes.
 
-**What's *not* collected:** your code, prompts, messages, custom workflow names, workflow descriptions, git remotes, file paths, usernames, tokens, AI output, error message text, your IP address, your geographic location — none of it.
+Workflow runs and direct-chat turns both report optional `cache_read_tokens`, `cache_write_tokens`, and true-only `cache_partial`. An unreported axis is absent; a reported zero stays zero. When `cache_partial` is true, cache totals are floors because some contributing results did not report cache usage. When telemetry is enabled and stderr is a terminal, the updated first-run notice appears once again for existing installs to disclose direct-chat cache capture. Headless installs show no notice; see [telemetry settings](https://archon.diy/reference/configuration/#telemetry) for capture details and opt-outs.
+
+**What's *not* collected:** your code, prompts, messages, custom workflow names, workflow descriptions, git remotes, file paths, usernames, tokens, AI output, error message text, your IP address, your geographic location. None of it.
 
 **Opt out:** set any of these in your environment:
 
@@ -353,7 +211,7 @@ DO_NOT_TRACK=1        # de facto standard honored by Astro, Bun, Prisma, Nuxt, e
 POSTHOG_API_KEY=off   # off | 0 | false | disabled | "" all disable
 ```
 
-CI environments (`CI=true`) are auto-disabled — forks running fixtures in GitHub Actions, CircleCI, etc. do not send events.
+CI environments (`CI=true`) are auto-disabled: forks running fixtures in GitHub Actions, CircleCI, etc. do not send events.
 
 **Check the current state:** run `archon telemetry status` to see whether telemetry is enabled, why (if not), the install UUID, and the active host. Run `archon telemetry reset` to rotate the install UUID. `archon doctor` also surfaces the current state in its check list.
 
@@ -363,11 +221,9 @@ Self-host PostHog or use a different project by setting `POSTHOG_API_KEY` and `P
 
 ## Contributing
 
-Contributions welcome! See the open [issues](https://github.com/coleam00/Archon/issues) for things to work on.
+Contributions welcome. See the open [issues](https://github.com/coleam00/Archon/issues) for things to work on, and read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a pull request.
-
-## Star History
+## Star history
 
 [![Star History Chart](https://api.star-history.com/chart?repos=coleam00/Archon&type=date&legend=top-left)](https://www.star-history.com/?repos=coleam00%2FArchon&type=date&legend=top-left)
 

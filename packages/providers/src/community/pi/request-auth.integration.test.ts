@@ -18,7 +18,7 @@
  * (no `mock.module` shim) and asserts:
  *   - a credentialless custom provider (`apiKey: '$VAR'`) loaded from a
  *     per-call models.json with substituted values resolves the credential
- *     correctly when the var is in `requestEnv`;
+ *     correctly when the var is in the substitution env;
  *   - the same provider with `${VAR}` left literal (because the var is
  *     missing or protected) fails with the SDK's standard "no value for
  *     env var" error — confirming the protected-env contract holds at the
@@ -35,11 +35,11 @@
  * uses. If the SDK ever fails to import, every other Pi test fails too —
  * this test will surface the same failure with an actionable label.
  *
- * Mock-isolation note: `provider.test.ts` mocks
- * `@earendil-works/pi-coding-agent` at module scope, and Bun's
+ * Mock isolation: `provider-test-fixture.ts` mocks the Pi SDK at module
+ * scope for the provider unit tests, and Bun's
  * `mock.module()` is process-global, irreversible, AND matches all
  * subpath imports of a mocked package (AGENTS.md, #2240; verified against
- * bun 1.3.11). Running this test alongside `provider.test.ts` in a single
+ * bun 1.3.11). Running this test alongside the provider unit tests in a single
  * `bun test <file1> <file2>` invocation therefore contaminates the SDK
  * here even when we use a deep subpath — the SDK is loaded by file path,
  * but the mock registration matches by package specifier and is applied to
@@ -58,12 +58,20 @@
  * The file-mode test (which doesn't need the SDK) runs unconditionally.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-import { buildCustomProviderModelsPath } from './request-auth';
+import type { ModelRuntime as PiModelRuntime } from '@earendil-works/pi-coding-agent';
+
+import { trackTempRoots } from '@archon/paths/test-utils';
+
+import {
+  buildCustomProviderModelsPath,
+  createRequestModelRuntime,
+  getUserModelsStorePath,
+} from './request-auth';
 
 interface ModelRuntimeCtor {
   create(options?: {
@@ -79,7 +87,7 @@ interface ModelRuntimeCtor {
 
 /**
  * Load the REAL `ModelRuntime` class via a deep subpath that
- * `provider.test.ts`'s `mock.module('@earendil-works/pi-coding-agent', …)`
+ * `provider-test-fixture.ts`'s `mock.module('@earendil-works/pi-coding-agent', …)`
  * does not match in isolation. Resolved from the package's main entry —
  * bun's hoisted install path is opaque, so we derive `dist/core/model-runtime.js`
  * from the resolved `dist/index.js` location.
@@ -107,12 +115,11 @@ async function loadRealModelRuntime(): Promise<ModelRuntimeCtor> {
  * `realSdkAvailable` and used by `test.skipIf(...)` below. This is the
  * reviewer's option 2 ("Skip the test when `import.meta.resolve` probes a
  * mock — fragile"), and it IS fragile: if the mock factory grows
- * `getModel` (it shouldn't, since `provider.test.ts` only stubs the
+ * `getModel` (it shouldn't, since `provider-test-fixture.ts` only stubs the
  * auth-call surface), the probe would silently say the SDK is real when it
- * isn't. The trade-off is acceptable because (a) `provider.test.ts` is the
- * only file in this package that mocks the SDK, (b) the SDK's auth-call
+ * isn't. The shared mock lives in `provider-test-fixture.ts`; the SDK's auth-call
  * surface is large and not stubbed today (it's the point of the unit tests
- * there to NOT stub the full surface), and (c) the CI runs each file in
+ * there to NOT stub the full surface). CI runs each file in
  * its own `bun test` process so the probe always returns `true` in CI.
  */
 async function probeRealSdkAvailable(): Promise<boolean> {
@@ -144,7 +151,7 @@ if (!realSdkAvailable) {
   console.warn(
     '\n⚠️  request-auth.integration.test.ts: skipping SDK-dependent tests\n' +
       '   Real ModelRuntime is not available in this bun process — the\n' +
-      "   '@earendil-works/pi-coding-agent' mock from provider.test.ts is in\n" +
+      "   '@earendil-works/pi-coding-agent' mock from provider-test-fixture.ts is in\n" +
       '   effect. Run this file in its own bun invocation to exercise the\n' +
       '   real SDK end-to-end:\n' +
       '\n' +
@@ -155,7 +162,14 @@ if (!realSdkAvailable) {
   );
 }
 
-const createdDirs: string[] = [];
+// Every test points tmpdir() at a root it owns, so the per-call files written
+// under tmpdir()/archon-pi-models (and the fixture dirs below) are removed with
+// that root instead of piling up in the real tmpdir.
+// node:os tmpdir() reads TMPDIR on POSIX and TMP/TEMP on Windows.
+const trackTempRoot = trackTempRoots();
+const TMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
+let scratchTmp = '';
+let originalTmpEnv: (string | undefined)[] = [];
 let originalAgentDir: string | undefined;
 let originalProcessEnv: {
   GH_TOKEN?: string;
@@ -168,13 +182,15 @@ let originalProcessEnv: {
 function makeUserModelsDir(providers: Record<string, unknown>): string {
   const dir = mkdtempSync(join(tmpdir(), 'archon-pi-int-user-'));
   writeFileSync(join(dir, 'models.json'), JSON.stringify({ providers }));
-  createdDirs.push(dir);
   process.env.PI_CODING_AGENT_DIR = dir;
   return dir;
 }
 
 describe('buildCustomProviderModelsPath integration with the real pi-coding-agent SDK', () => {
   beforeEach(() => {
+    scratchTmp = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-pi-int-tmp-')));
+    originalTmpEnv = TMP_ENV_KEYS.map(key => process.env[key]);
+    for (const key of TMP_ENV_KEYS) process.env[key] = scratchTmp;
     originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     // Make sure we don't leak the user's actual ~/.pi/agent/models.json into
     // the SDK's default lookup — point it at a non-existent dir.
@@ -196,9 +212,11 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
   });
 
   afterEach(() => {
-    for (const dir of createdDirs.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    TMP_ENV_KEYS.forEach((key, i) => {
+      const value = originalTmpEnv[i];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    });
     if (originalAgentDir === undefined) {
       delete process.env.PI_CODING_AGENT_DIR;
     } else {
@@ -233,7 +251,7 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
 
       const perCallPath = buildCustomProviderModelsPath({
         provider: 'mygw',
-        requestEnv: { MYGW_API_KEY: 'request-secret', MYGW_PROJECT: 'project-123' },
+        env: { MYGW_API_KEY: 'request-secret', MYGW_PROJECT: 'project-123' },
         protectedEnvKeys: [],
       });
       expect(perCallPath).toBeDefined();
@@ -274,7 +292,7 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
       // No `${VAR}` references in the user entry → no per-call file needed.
       const perCallPath = buildCustomProviderModelsPath({
         provider: 'mygw',
-        requestEnv: { MYGW_API_KEY: 'unused' },
+        env: { MYGW_API_KEY: 'unused' },
         protectedEnvKeys: [],
       });
       expect(perCallPath).toBeUndefined();
@@ -293,7 +311,7 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
   test.skipIf(!realSdkAvailable)(
     'protected ${VAR} references produce a per-call file with a host-env-independent blocker placeholder',
     async () => {
-      // GH_TOKEN is in requestEnv but is protected — the per-call file must
+      // GH_TOKEN is in the substitution env but is protected — the per-call file must
       // NOT contain the literal GH_TOKEN value (security contract), AND it
       // must NOT fall through to process.env.GH_TOKEN at SDK resolve time.
       makeUserModelsDir({
@@ -307,7 +325,7 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
 
       const perCallPath = buildCustomProviderModelsPath({
         provider: 'mygw',
-        requestEnv: { GH_TOKEN: 'acting-user-secret' },
+        env: { GH_TOKEN: 'acting-user-secret' },
         protectedEnvKeys: ['GH_TOKEN'],
       });
       // Substitution happened (placeholder written). The literal protected
@@ -320,7 +338,7 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
       expect(written.providers.mygw.apiKey).not.toContain('acting-user-secret');
 
       // The SDK's own resolveConfigValue fails because the placeholder name
-      // is provably absent from any context — no requestEnv, no process.env
+      // is provably absent from any context — no substitution env, no process.env
       // can supply `__ARCHON_BLOCKED_GH_TOKEN__`. The error message names the
       // placeholder so an operator debugging the failure sees the
       // deliberate-blocker message rather than guessing why a credential
@@ -356,7 +374,7 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
 
       const perCallPath = buildCustomProviderModelsPath({
         provider: 'mygw',
-        requestEnv: { GH_TOKEN: 'acting-user-secret' },
+        env: { GH_TOKEN: 'acting-user-secret' },
         protectedEnvKeys: ['GH_TOKEN'],
       });
       expect(perCallPath).toBeDefined();
@@ -388,6 +406,112 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
     }
   );
 
+  test.skipIf(!realSdkAvailable)(
+    'the per-call models.json outlives a provider registration until release()',
+    async () => {
+      // Pi re-reads modelsPath on refresh() and treats a missing file as an
+      // empty config; registerProvider() ends with a background refresh(). The
+      // custom provider must survive that for the whole session.
+      makeUserModelsDir({
+        mygw: {
+          baseUrl: 'https://gateway.example/v1',
+          api: 'openai-completions',
+          apiKey: '${MYGW_API_KEY}',
+          models: [{ id: 'demo' }],
+        },
+      });
+      const ModelRuntime = (await loadRealModelRuntime()) as unknown as typeof PiModelRuntime;
+      const { runtime, release } = await createRequestModelRuntime(
+        options => ModelRuntime.create(options),
+        undefined,
+        { provider: 'mygw', env: { MYGW_API_KEY: 'request-secret' }, protectedEnvKeys: [] }
+      );
+
+      runtime.registerProvider('other', {
+        baseUrl: 'https://other.example/v1',
+        api: 'openai-completions',
+        apiKey: 'other-key',
+        models: [
+          {
+            id: 'o1',
+            name: 'o1',
+            reasoning: false,
+            input: ['text'],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 1000,
+            maxTokens: 100,
+          },
+        ],
+      });
+      // Runs the same ModelConfig.load(modelsPath) as the background refresh
+      // registerProvider() started, and settles after it.
+      await runtime.refresh({ allowNetwork: false });
+
+      const model = runtime.getModel('mygw', 'demo');
+      expect(model).toBeDefined();
+      expect((await runtime.getAuth(model!))?.auth.apiKey).toBe('request-secret');
+
+      // Only the per-call file lives in the per-call directory, and release()
+      // removes it.
+      const perCallDir = join(scratchTmp, 'archon-pi-models');
+      expect(readdirSync(perCallDir)).toHaveLength(1);
+      release();
+      expect(readdirSync(perCallDir)).toEqual([]);
+    }
+  );
+
+  test.skipIf(!realSdkAvailable)(
+    "the per-call runtime reads the user's models-store.json, not one beside the per-call file",
+    async () => {
+      // Pi derives the catalog store from dirname(modelsPath) unless told
+      // otherwise; a model the user's Pi learned into models-store.json must
+      // still resolve when the runtime reads a per-call models.json.
+      const userDir = makeUserModelsDir({
+        mygw: {
+          baseUrl: 'https://gateway.example/v1',
+          api: 'openai-completions',
+          apiKey: '${MYGW_API_KEY}',
+          models: [{ id: 'demo' }],
+        },
+      });
+      expect(getUserModelsStorePath()).toBe(join(userDir, 'models-store.json'));
+      writeFileSync(
+        getUserModelsStorePath(),
+        JSON.stringify({
+          openrouter: {
+            models: [
+              {
+                id: 'archon-test/store-only-model',
+                name: 'Archon store-only test model',
+                api: 'openai-completions',
+                baseUrl: 'https://openrouter.ai/api/v1',
+                provider: 'openrouter',
+                reasoning: false,
+                input: ['text'],
+                cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 131072,
+                maxTokens: 32768,
+              },
+            ],
+            checkedAt: Date.now(),
+            lastModified: Date.now(),
+          },
+        })
+      );
+      const ModelRuntime = (await loadRealModelRuntime()) as unknown as typeof PiModelRuntime;
+      const { runtime, release } = await createRequestModelRuntime(
+        options => ModelRuntime.create(options),
+        undefined,
+        { provider: 'mygw', env: { MYGW_API_KEY: 'request-secret' }, protectedEnvKeys: [] }
+      );
+      try {
+        expect(runtime.getModel('openrouter', 'archon-test/store-only-model')).toBeDefined();
+      } finally {
+        release();
+      }
+    }
+  );
+
   // The file-mode test does NOT need the SDK — it only checks the on-disk
   // permissions written by buildCustomProviderModelsPath. Runs whenever the
   // platform has POSIX permission bits, even when the SDK is contaminated, so
@@ -413,7 +537,7 @@ describe('buildCustomProviderModelsPath integration with the real pi-coding-agen
 
       const perCallPath = buildCustomProviderModelsPath({
         provider: 'mygw',
-        requestEnv: { MYGW_API_KEY: 'request-secret' },
+        env: { MYGW_API_KEY: 'request-secret' },
         protectedEnvKeys: [],
       });
       expect(perCallPath).toBeDefined();

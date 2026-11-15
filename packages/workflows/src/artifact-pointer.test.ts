@@ -1,3 +1,4 @@
+// @archon-test-isolated
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -23,6 +24,7 @@ describe('artifact pointers (#2453)', () => {
 
   function makeRun(id: string, overrides?: Partial<WorkflowRun>): WorkflowRun {
     return {
+      origin: { conversationId: 'conv' },
       id,
       workflow_name: 'wf',
       conversation_id: 'conv',
@@ -32,6 +34,7 @@ describe('artifact pointers (#2453)', () => {
       outcome: null,
       user_message: 'msg',
       metadata: {},
+      active_phase_started_at: null,
       started_at: new Date(),
       completed_at: null,
       last_activity_at: null,
@@ -41,6 +44,7 @@ describe('artifact pointers (#2453)', () => {
       adopted_from_run_id: null,
       output_root: outputRoot,
       checkout_baseline: null,
+      item_id: null,
       ...overrides,
     };
   }

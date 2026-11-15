@@ -37,7 +37,8 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -euo pipefail
-      test $taken.output = 'taken-ran' || { echo "taken did not run"; exit 1; }
+      taken=$taken.output
+      test "$taken" = 'taken-ran' || { echo "taken did not run"; exit 1; }
       echo 'join-all-done-ok'
 
   # none_failed_min_one_success: one success, one skip, zero failures -> fires.
@@ -48,8 +49,9 @@ nodes:
 
   # Running AFTER a skipped upstream is `trigger_rule: all_done`, NOT `always_run`.
   # `always_run` is a RESUME-CACHE opt-out ("re-run on resume even if a prior run
-  # completed it") — dag-node.ts:229-231. It cannot be observed without a resume, so
-  # it is declared here for coverage but nothing asserts on it.
+  # completed it") — see packages/workflows/src/schemas/dag-node-base.ts.
+  # It cannot be observed without a resume, so it is declared here for coverage
+  # but nothing asserts on it.
   - id: after-skip
     depends_on: [skipped]
     trigger_rule: all_done
@@ -75,9 +77,12 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -euo pipefail
-      test $join-all-done.output = 'join-all-done-ok'   || { echo 'all_done join did not fire'; exit 1; }
-      test $join-none-failed.output = 'join-none-failed-ok' || { echo 'none_failed join did not fire'; exit 1; }
-      test $after-skip.output = 'after-skip-ran'         || { echo 'all_done after a skip did not fire'; exit 1; }
+      all_done=$join-all-done.output
+      test "$all_done" = 'join-all-done-ok'   || { echo 'all_done join did not fire'; exit 1; }
+      none_failed=$join-none-failed.output
+      test "$none_failed" = 'join-none-failed-ok' || { echo 'none_failed join did not fire'; exit 1; }
+      after_skip=$after-skip.output
+      test "$after_skip" = 'after-skip-ran'         || { echo 'all_done after a skip did not fire'; exit 1; }
       lines=$(wc -l < ./.e2e-joins-counter)
       test "$lines" -ge 3 || { echo "until_bash exited early at $lines"; exit 1; }
       rm -f ./.e2e-joins-counter

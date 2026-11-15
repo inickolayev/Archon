@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { removeTempTree } from '@archon/paths/test-utils';
 import {
@@ -25,6 +25,7 @@ function config(overrides: Partial<NativeScheduleConfig> = {}): NativeScheduleCo
     programArguments: ['/opt/archon/bin/archon', 'trigger', 'fire', '--config', '/tmp/a&b.json'],
     workingDirectory: '/Users/example/Project <one>',
     archonHome: '/Users/example/.archon',
+    path: '/Users/example/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin',
     schedule: { intervalSeconds: 37, runAtLoad: false },
     ...overrides,
   };
@@ -37,13 +38,12 @@ async function scratchDirectory(): Promise<string> {
 }
 
 describe('renderMacosLaunchAgent', () => {
-  it('renders escaped arguments as an argv array with only ARCHON_HOME in the environment', () => {
+  it('renders escaped arguments as an argv array', () => {
     const rendered = renderMacosLaunchAgent(config());
 
     expect(rendered.label).toBe('com.archon.trigger.source-refresh');
     expect(rendered.plist).toContain('<string>/tmp/a&amp;b.json</string>');
     expect(rendered.plist).toContain('<string>/Users/example/Project &lt;one&gt;</string>');
-    expect(rendered.plist).toContain('<key>ARCHON_HOME</key>');
     expect(rendered.plist).toContain('<integer>37</integer>');
     expect(rendered.plist).toContain('<false/>');
     expect(rendered.plist).not.toContain('<key>Program</key>');
@@ -60,17 +60,31 @@ describe('renderMacosLaunchAgent', () => {
     expect(() =>
       renderMacosLaunchAgent(config({ schedule: { intervalSeconds: 0, runAtLoad: false } }))
     ).toThrow('positive integer');
+    expect(() => renderMacosLaunchAgent(config({ path: '' }))).toThrow('PATH must not be empty');
   });
 
-  it.skipIf(process.platform !== 'darwin')('produces a plist accepted by macOS', async () => {
-    const directory = await scratchDirectory();
-    const path = join(directory, 'job.plist');
-    await writeFile(path, renderMacosLaunchAgent(config()).plist);
+  it.skipIf(process.platform !== 'darwin')(
+    'gives the job exactly ARCHON_HOME and the installing PATH as macOS reads them',
+    async () => {
+      const directory = await scratchDirectory();
+      const path = join(directory, 'job.plist');
+      const pathWithMarkup = '/Users/example/tools & <bin>:/usr/bin';
+      await writeFile(path, renderMacosLaunchAgent(config({ path: pathWithMarkup })).plist);
 
-    await expect(execFileAsync('/usr/bin/plutil', ['-lint', path])).resolves.toMatchObject({
-      stdout: expect.stringContaining('OK'),
-    });
-  });
+      const { stdout } = await execFileAsync('/usr/bin/plutil', [
+        '-extract',
+        'EnvironmentVariables',
+        'json',
+        '-o',
+        '-',
+        path,
+      ]);
+      expect(JSON.parse(stdout)).toEqual({
+        ARCHON_HOME: '/Users/example/.archon',
+        PATH: pathWithMarkup,
+      });
+    }
+  );
 });
 
 describe('native schedule installation', () => {
@@ -169,5 +183,70 @@ describe('native schedule installation', () => {
     await expect(installMacosNativeSchedule(config(), { platform: 'linux' })).rejects.toThrow(
       'supported only on macOS'
     );
+  });
+});
+
+describe('workflow wake native schedule', () => {
+  it('installs the generated wake argv, preserves configuration and removes only that job', async () => {
+    const { workflowWakeScheduleConfig } = await import('../commands/workflow-continuations');
+    const generated = workflowWakeScheduleConfig(5);
+    const originalId = generated.id;
+    expect(workflowWakeScheduleConfig(10).id).toBe(originalId);
+    expect(generated.programArguments.slice(-4)).toEqual(['workflow', 'wake', '--watch', '--json']);
+    expect(generated.programArguments[0]).toBe(process.execPath);
+    expect(generated.programArguments[1]).toBe(resolve(process.argv[1]));
+    expect(generated.workingDirectory).toBe(generated.archonHome);
+    expect(generated.path).toBe(process.env.PATH ?? '');
+    const directory = await mkdtemp(join(tmpdir(), 'archon-wake-schedule-'));
+    tempRoots.push(directory);
+    const commands: string[][] = [];
+    const runtime = {
+      platform: 'darwin' as const,
+      uid: 501,
+      launchAgentsDirectory: directory,
+      runCommand: async (executable: string, args: readonly string[]) => {
+        commands.push([executable, ...args]);
+      },
+    };
+    const installed = await installMacosNativeSchedule(generated, runtime);
+    expect(await readFile(installed, 'utf8')).toContain('<string>wake</string>');
+    expect(await installMacosNativeSchedule(generated, runtime)).toBe(installed);
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toEqual([
+      '/bin/launchctl',
+      'print',
+      `gui/501/com.archon.trigger.${originalId}`,
+    ]);
+    await expect(
+      installMacosNativeSchedule(workflowWakeScheduleConfig(10), runtime)
+    ).rejects.toThrow(
+      /different configuration.*PATH.*archon workflow wake schedule remove.*install it again/
+    );
+    expect(await removeMacosNativeSchedule(originalId, runtime)).toBe(true);
+    expect(commands[2]).toEqual(['/bin/launchctl', 'bootout', 'gui/501', installed]);
+    expect(await removeMacosNativeSchedule(originalId, runtime)).toBe(false);
+  });
+
+  it('rejects an identical install when launchd registration cannot be verified and keeps the plist', async () => {
+    const directory = await scratchDirectory();
+    const path = join(directory, 'com.archon.trigger.source-refresh.plist');
+    const plist = renderMacosLaunchAgent(config()).plist;
+    await writeFile(path, plist);
+    const commands: string[][] = [];
+    await expect(
+      installMacosNativeSchedule(config(), {
+        platform: 'darwin',
+        uid: 501,
+        launchAgentsDirectory: directory,
+        runCommand: async (executable, args) => {
+          commands.push([executable, ...args]);
+          throw new Error('service not registered');
+        },
+      })
+    ).rejects.toThrow('service not registered');
+    expect(commands).toEqual([
+      ['/bin/launchctl', 'print', 'gui/501/com.archon.trigger.source-refresh'],
+    ]);
+    expect(await readFile(path, 'utf8')).toBe(plist);
   });
 });

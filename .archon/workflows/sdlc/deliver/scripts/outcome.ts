@@ -1,29 +1,27 @@
 /**
- * The delivery tail's terminal report.
+ * The delivery tail's result when the rounds ran to an ending: ready, or not ready
+ * and why. The `report` node relays it as the workflow's return.
  *
- * flip-ready owns the one irreversible public action and certifies the ready pull
- * request's URL as its declared result. This composes what the run's reader — usually
- * an orchestrating agent — actually receives, which is that URL plus whatever the
- * review recorded in the run's discovery sidecar.
+ * The last round's typed ending is the result, with the summary of the node that
+ * decided it. A last round that is not `done` means the loop ran out at its
+ * `max_iterations`, which is the `round_cap` ending.
  *
- * Bound inputs (`with:` bindings, canonical text in env):
- * - INPUTS_PR_URL: `$flip-ready.output.pr_url`, certified non-empty at the producer.
+ * Bound input: INPUTS_ROUNDS, the rounds loop's final `round` output.
  */
 
-import { artifactsDir, emit, refuse, trimmed } from '../../.shared/io.ts';
-import { caveats } from '../../.shared/report.ts';
+import { emit, input } from 'archon:script';
 
-const artifacts = artifactsDir();
-const listingFile = process.env.TYPED_ARTIFACTS_FILE;
-const url = trimmed(process.env.INPUTS_PR_URL);
+const rounds = JSON.parse(input('rounds')) as {
+  done: boolean;
+  ready: boolean;
+  reason: string;
+  pr_url: string;
+  summary: string;
+};
 
-if (url === '') {
-  refuse(
-    `outcome: flip-ready reported no pull request URL.${caveats(artifacts, { failed: true, listingFile })}`
-  );
-} else {
-  emit({
-    pr_url: url,
-    summary: `${url}${caveats(artifacts, { failed: false, listingFile })}`,
-  });
-}
+emit({
+  ready: rounds.ready,
+  reason: rounds.done ? rounds.reason : 'round_cap',
+  pr_url: rounds.pr_url,
+  summary: rounds.summary,
+});

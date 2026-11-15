@@ -1,4 +1,6 @@
+// @archon-test-isolated
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { join } from 'path';
 
 // Mock fs/promises before importing the module under test
 const mockReaddir = mock(async (_path: string): Promise<string[]> => []);
@@ -35,13 +37,12 @@ let mockHomeWorkflowsPath = '/home/workflows';
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getArchonHome: mock(() => '/home'),
-  getDefaultWorkflowsPath: mock(() => '/app/workflows/defaults'),
-  getDefaultCommandsPath: mock(() => '/app/commands/defaults'),
+  getBundledWorkflowsPath: mock(() => '/app/workflows'),
   getHomeScriptsPath: mock(() => mockHomeScriptsPath),
   getHomeWorkflowsPath: mock(() => mockHomeWorkflowsPath),
 }));
 
-import { discoverScripts, discoverScriptsForCwd, getDefaultScripts } from './script-discovery';
+import { discoverScripts, discoverScriptsForCwd } from './script-discovery';
 import { formatPackagedResourceReference } from './packaged-workflow';
 
 // On Windows, path.join produces backslashes (e.g. `\scripts\triage`). The
@@ -319,6 +320,26 @@ describe('discoverScriptsForCwd — merge repo + home with repo winning', () => 
     );
   });
 
+  test('preserves workflow directory context and cause for permission failures', async () => {
+    const workflowPath = join('/home/workflows', 'personal-pack', 'private-workflow');
+    const permissionError = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    mockReaddir.mockImplementation(async (path: string) => {
+      const p = norm(path);
+      if (p === '/home/workflows') return ['personal-pack'];
+      if (p === '/home/workflows/personal-pack') return ['private-workflow'];
+      return [];
+    });
+    mockStat.mockImplementation(async (path: string) => {
+      if (norm(path) === norm(workflowPath)) throw permissionError;
+      return { isDirectory: () => true };
+    });
+
+    await expect(discoverScriptsForCwd('/repo')).rejects.toMatchObject({
+      message: `Failed to inspect packaged workflow "${workflowPath}": permission denied`,
+      cause: permissionError,
+    });
+  });
+
   test('isolates identical local script names in repo and home packaged workflows', async () => {
     mockReaddir.mockImplementation(async (path: string) => {
       const p = norm(path);
@@ -378,19 +399,5 @@ describe('discoverScriptsForCwd — merge repo + home with repo winning', () => 
         'shared'
       ),
     ]);
-  });
-});
-
-describe('getDefaultScripts', () => {
-  test('returns an empty Map', () => {
-    const defaults = getDefaultScripts();
-    expect(defaults).toBeInstanceOf(Map);
-    expect(defaults.size).toBe(0);
-  });
-
-  test('returns a new Map each call', () => {
-    const a = getDefaultScripts();
-    const b = getDefaultScripts();
-    expect(a).not.toBe(b);
   });
 });

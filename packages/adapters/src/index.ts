@@ -1,6 +1,10 @@
 // Chat adapters
 export { TelegramAdapter } from './chat/telegram';
-export type { TelegramAccess, TelegramAuthorizer, TelegramSender } from './chat/telegram';
+export type {
+  TelegramAccess,
+  TelegramAuthorizer,
+  TelegramSender,
+} from './chat/telegram';
 export type {
   TelegramCallbackRequest,
   TelegramCallbackResponse,
@@ -9,7 +13,6 @@ export type {
 } from './chat/telegram';
 export { TurnStatus, describeTool } from './chat/telegram';
 export type { StatusTransport, TurnStatusOptions } from './chat/telegram';
-export { SlackAdapter, SlackWorkflowBridge } from './chat/slack';
 
 // Forge adapters
 export { GitHubAdapter } from './forge/github';

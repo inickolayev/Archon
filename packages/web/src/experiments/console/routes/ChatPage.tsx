@@ -9,6 +9,7 @@ import { WorkflowDock } from '../components/WorkflowDock';
 import { EmptyState } from '../components/EmptyState';
 import { StreamContextProvider } from '../lib/stream-context';
 import { useConversationSSE } from '../lib/sse';
+import { followTail } from '../lib/follow-tail';
 import { useEntity, invalidate } from '../store/cache';
 import { K } from '../store/keys';
 import * as skill from '../skills';
@@ -47,13 +48,35 @@ function activityMs(conversation: ConversationSummary): number {
   return Number.isNaN(ms) ? 0 : ms;
 }
 
+// The chat a person last had open in a project, for a bare `/chat` to return to.
+// Starting a run from the draft card creates a conversation of its own, so "the most
+// recent conversation" alone would land the person in that run's chat instead.
+const chatKey = (projectId: string): string => `archon.console.chat.${projectId}`;
+
+function readStoredChat(projectId: string): string | null {
+  try {
+    return localStorage.getItem(chatKey(projectId));
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredChat(projectId: string, conversationId: string): void {
+  try {
+    localStorage.setItem(chatKey(projectId), conversationId);
+  } catch {
+    /* storage unavailable: the choice lasts for this page only */
+  }
+}
+
 /**
  * Project-scoped agent chat. A tab peer of the runs view under a project.
  *
  * A project can hold many chats. The one on screen is named by the URL
  * (`/console/p/:projectId/chat/:conversationId`), so a reload or the Back
  * button returns to the same chat instead of silently landing on another;
- * `/chat` with no id redirects to the most recent one, and `/chat/new` is an
+ * `/chat` with no id redirects to the chat this browser last had open there
+ * (else the most recent one), and `/chat/new` is an
  * empty chat that becomes real on its first send (creation stays lazy — the
  * button can be pressed all day without writing a row).
  *
@@ -107,13 +130,20 @@ export function ChatPage(): ReactElement {
     [projectId]
   );
 
-  // Bare `/chat` adopts the most recent chat and puts it in the URL (replace,
-  // so Back still leaves the chat rather than bouncing between the two forms).
+  // Bare `/chat` adopts the chat last open here, else the most recent one, and
+  // puts it in the URL (replace, so Back still leaves the chat rather than
+  // bouncing between the two forms).
   useEffect(() => {
     if (conversationId !== undefined || projectId === undefined) return;
-    const latest = projectConversations[0];
-    if (latest !== undefined) navigate(chatPath(latest.id), { replace: true });
+    const stored = readStoredChat(projectId);
+    const pick = projectConversations.find(c => c.id === stored) ?? projectConversations[0];
+    if (pick !== undefined) navigate(chatPath(pick.id), { replace: true });
   }, [conversationId, projectId, projectConversations, navigate, chatPath]);
+
+  // Remember the chat on screen, so the bare `/chat` above can come back to it.
+  useEffect(() => {
+    if (projectId !== undefined && activeConvId !== null) writeStoredChat(projectId, activeConvId);
+  }, [projectId, activeConvId]);
 
   const { data: messages, error: messagesError } = useEntity<Message[]>(
     activeConvId !== null ? K.messages(activeConvId) : 'noop:no-conv',
@@ -323,24 +353,25 @@ export function ChatPage(): ReactElement {
     })();
   };
 
-  // Inline auto-scroll: stick to bottom on new messages if already near it.
-  // Mirrors RunDetailPage's variant.
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const lastBottomRef = useRef(true);
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el === null) return;
-    lastBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
-  });
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el === null || !lastBottomRef.current) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages?.length]);
-
-  // Jump-to-bottom affordance: `atBottom` (state) drives the button's visibility;
-  // `lastBottomRef` (above) drives the auto-scroll stickiness. Keep them in sync.
   const [atBottom, setAtBottom] = useState(true);
+
+  // Follow intent comes from navigation, never from geometry after content grows.
+  // The callback ref owns the observer across conditional content mounts.
+  const contentRef = useCallback((node: HTMLDivElement | null): (() => void) | undefined => {
+    if (node === null) return undefined;
+    lastBottomRef.current = true;
+    setAtBottom(true);
+    const observer = new ResizeObserver(() => {
+      followTail(scrollRef.current, lastBottomRef.current);
+    });
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
   const handleScroll = useCallback((): void => {
     const el = scrollRef.current;
     if (el === null) return;
@@ -351,8 +382,9 @@ export function ChatPage(): ReactElement {
   const scrollToBottom = useCallback((): void => {
     const el = scrollRef.current;
     if (el === null) return;
-    el.scrollTop = el.scrollHeight;
+    lastBottomRef.current = true;
     setAtBottom(true);
+    followTail(el, true);
   }, []);
 
   if (projectId === undefined) {
@@ -409,10 +441,10 @@ export function ChatPage(): ReactElement {
         <div
           ref={scrollRef}
           onScroll={handleScroll}
-          className="h-full overflow-y-auto px-[30px] pt-[26px] pb-[18px]"
+          className="h-full overflow-y-auto px-7.5 pt-6.5 pb-4.5"
         >
           {/* Match the composer's centered 940px column (design: .stream-inner) */}
-          <div className="mx-auto max-w-[940px]">
+          <div ref={contentRef} className="mx-auto max-w-235">
             {messageList.length === 0 && !busy ? (
               activeConvId === null ? (
                 <EmptyState
@@ -453,7 +485,7 @@ export function ChatPage(): ReactElement {
             type="button"
             onClick={scrollToBottom}
             aria-label="Jump to bottom"
-            className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-surface-elevated px-3 py-1 text-[11px] text-text-secondary shadow-md transition-colors hover:text-text-primary"
+            className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-surface-elevated px-3 py-1 text-console-11 text-text-secondary shadow-md transition-colors hover:text-text-primary"
           >
             <span aria-hidden>↓</span>
             Jump to bottom
@@ -464,16 +496,12 @@ export function ChatPage(): ReactElement {
       <WorkflowDock projectId={projectId} />
 
       {notice !== null ? (
-        <div className="shrink-0 border-t border-warning/30 bg-warning/[0.06] px-6 py-2 font-mono text-[11px] text-warning">
+        <div className="shrink-0 border-t border-warning/30 bg-warning/[0.06] px-6 py-2 font-mono text-console-11 text-warning">
           {notice}
         </div>
       ) : null}
 
-      {error !== null || loadError !== undefined ? (
-        <div className="shrink-0 border-t border-error/30 bg-error/[0.06] px-6 py-2 font-mono text-[11px] text-error">
-          {error ?? `Failed to load chat: ${loadError?.message ?? 'unknown error'}`}
-        </div>
-      ) : null}
+      <ChatError error={error} loadError={loadError} />
 
       {/* Keyed by conversation: a chat switch remounts the composer, so a draft
           or an attachment chip can never follow you into another chat (the
@@ -491,4 +519,18 @@ export function ChatPage(): ReactElement {
       />
     </section>
   );
+}
+
+function ChatError({
+  error,
+  loadError,
+}: {
+  error: string | null;
+  loadError: Error | undefined;
+}): ReactElement | null {
+  return error !== null || loadError !== undefined ? (
+    <div className="shrink-0 border-t border-error/30 bg-error/[0.06] px-6 py-2 font-mono text-console-11 text-error">
+      {error ?? `Failed to load chat: ${loadError?.message ?? 'unknown error'}`}
+    </div>
+  ) : null;
 }

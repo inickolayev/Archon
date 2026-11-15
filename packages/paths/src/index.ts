@@ -1,7 +1,6 @@
-// Archon path resolution utilities
+// Home and workspace paths
 export {
   expandTilde,
-  canonicalizeProjectPath,
   isDocker,
   isWSL,
   getWSLDistroName,
@@ -20,50 +19,69 @@ export {
   getHomeWorkflowsPath,
   getHomeCommandsPath,
   getHomeScriptsPath,
-  getLegacyHomeWorkflowsPath,
-  getCommandFolderSearchPaths,
-  getWorkflowFolderSearchPaths,
-  getAppArchonBasePath,
-  getDefaultCommandsPath,
-  getDefaultWorkflowsPath,
   logArchonPaths,
-  validateAppDefaultsPaths,
+  isInsideArchonHome,
+  getWebDistDir,
+  getServerDistDir,
+} from './home-paths';
+// Project and codebase paths
+export {
+  canonicalizeProjectPath,
   parseOwnerRepo,
+  toSafeNameSegment,
   resolveRepoProjectIdentity,
   getProjectRoot,
   getProjectSourcePath,
   getProjectWorktreesPath,
   getProjectArtifactsPath,
   getProjectLogsPath,
-  getRunArtifactsPath,
-  getRunLogPath,
   sanitizeScopeSegment,
-  getScopeArtifactsPath,
   resolveProjectStorageKey,
   getProjectStoragePaths,
   getStoragePathsForRoot,
-  isInsideArchonHome,
-  resolveRunStorageRoot,
-  getRunArtifactsDirForKey,
-  getRunArtifactsDirForRoot,
-  RUN_ARTIFACTS_ENGINE_SUBDIR,
-  isRunArtifactsEngineEntry,
-  getRunLogPathForRoot,
-  getRunWorkflowSourceDirForRoot,
   slugifyFolderName,
   getFolderProjectRoot,
   getFolderProjectArtifactsPath,
   getFolderProjectLogsPath,
-  getFolderRunArtifactsPath,
   ensureFolderProjectStructure,
   ensureProjectStructure,
   createProjectSourceSymlink,
+  ProjectSourceOccupiedError,
+  projectKeyForStorageRoot,
+  projectKeyForCodebase,
+} from './project-paths';
+export type { ProjectStorageKey, ProjectStoragePaths } from './project-paths';
+// Run and artifact paths
+export {
+  getRunArtifactsPath,
+  getRunLogPath,
+  getScopeArtifactsPath,
+  resolveRunStorageRoot,
+  getRunArtifactsDirForKey,
+  getRunArtifactsDirForRoot,
+  RUN_ARTIFACTS_ENGINE_SUBDIR,
+  getRunScratchDir,
+  isRunArtifactsEngineEntry,
+  getRunLogPathForRoot,
+  getRunWorkflowSourceDirForRoot,
+  getFolderRunArtifactsPath,
+} from './run-paths';
+// Source checkout paths
+export {
+  getAppArchonBasePath,
+  getBundledWorkflowsPath,
+  validateAppDefaultsPaths,
+  getSourceWebDistDir,
+  getSourceServerEntry,
+  getSourceProviderEntry,
+} from './source-tree-paths';
+// Command and workflow markdown discovery
+export {
+  getCommandFolderSearchPaths,
+  getWorkflowFolderSearchPaths,
   findMarkdownFilesRecursive,
   findCommandFiles,
-  getWebDistDir,
-  getSourceWebDistDir,
-} from './archon-paths';
-export type { ProjectStorageKey, ProjectStoragePaths } from './archon-paths';
+} from './markdown-discovery';
 
 // Detached workflow install identity
 export {
@@ -74,10 +92,17 @@ export {
 export type { DetachedInstallContext, DetachedInstallContextKey } from './detached-install-context';
 
 // Env loader
-export { loadArchonEnv, isVerboseBoot, getPluginsPath } from './env-loader';
+export { loadArchonEnv, isVerboseBoot, getPluginsPath, getArchonEnvNames } from './env-loader';
 
 // Logger
-export { createLogger, setLogLevel, getLogLevel, setLogDestination, rootLogger } from './logger';
+export {
+  createLogger,
+  setLogLevel,
+  getLogLevel,
+  setLogDestination,
+  setLogSink,
+  rootLogger,
+} from './logger';
 export type { Logger } from './logger';
 
 // Build-time constants (rewritten by scripts/build-binaries.sh)
@@ -86,6 +111,7 @@ export {
   BUNDLED_VERSION,
   BUNDLED_GIT_COMMIT,
   BUNDLED_WEB_DIST_SHA256,
+  BUNDLED_SERVER_SHA256,
 } from './bundled-build';
 
 // Compiled CLI discovery manifest
@@ -96,6 +122,7 @@ export type { InstallManifest } from './install-manifest';
 export {
   checkForUpdate,
   getCachedUpdateCheck,
+  takeCachedUpdateNotice,
   isNewerVersion,
   parseLatestRelease,
 } from './update-check';
@@ -111,20 +138,22 @@ export {
   captureArchonStarted,
   captureArchonActive,
   captureChatTurn,
+  captureWorkflowNoMatch,
   captureApprovalResolved,
   captureCodebaseRegistered,
   captureWorkflowTerminal,
+} from './telemetry';
+export {
+  WORKFLOW_TERMINAL_EVENT_TYPE,
   classifyWorkflowForTelemetry,
   TELEMETRY_SCHEMA_VERSION,
-  shutdownTelemetry,
-  isTelemetryDisabled,
-  getTelemetryStatus,
-  resetTelemetryId,
-} from './telemetry';
+} from './telemetry-events';
 export type {
   WorkflowInvokedProperties,
   ArchonStartedProperties,
+  ArchonStoreKind,
   ChatTurnProperties,
+  TelemetryUsageProperties,
   DeploymentShapeProperties,
   WorkflowTerminalProperties,
   WorkflowShapeProperties,
@@ -135,6 +164,7 @@ export type {
   WorkflowErrorClass,
   WorkflowNodeType,
   WorkflowTelemetrySource,
-  TelemetryStatus,
-  TelemetryDisabledReason,
-} from './telemetry';
+} from './telemetry-events';
+export { isTelemetryDisabled, getTelemetryStatus, resetTelemetryId } from './telemetry-consent';
+export type { TelemetryStatus, TelemetryDisabledReason } from './telemetry-consent';
+export { shutdownTelemetry } from './telemetry-transport';

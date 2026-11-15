@@ -3,22 +3,16 @@ import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
-import { collectBundleSources, readBundleContent, readBundleIndex } from './bundle-inventory';
+import { discoverScripts } from '../script-discovery';
+import { yamlCountError } from '../workflow-discovery/pack-layout';
+import {
+  collectBundleSources,
+  readBundleContent,
+  readBundleIndex,
+  readBundleRecords,
+} from './bundle-inventory';
 
 const track = trackTempRoots();
-
-test.each(['workflows/defaults/__proto__.yaml', 'commands/defaults/Uppercase.md'])(
-  'retains the strict legacy default filename contract for %s',
-  async path => {
-    const root = track(await mkdtemp(join(tmpdir(), 'archon-bundle-name-')));
-    await mkdir(join(root, 'workflows/defaults'), { recursive: true });
-    await mkdir(join(root, 'commands/defaults'), { recursive: true });
-    await writeFile(join(root, path), 'invalid default');
-    await expect(
-      collectBundleSources(join(root, 'workflows'), join(root, 'commands'), ['defaults'])
-    ).rejects.toThrow('Names must be kebab-case');
-  }
-);
 
 test('dereferences a linked workflow directory instead of silently omitting its runtime files', async () => {
   const root = track(await mkdtemp(join(tmpdir(), 'archon-bundle-link-')));
@@ -30,16 +24,14 @@ test('dereferences a linked workflow directory instead of silently omitting its 
   await writeFile(join(target, 'scripts/run.ts'), 'console.log(1);\n');
   // A directory junction exercises Windows link traversal without administrator rights.
   await symlink(target, join(pack, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
-  const selected = await collectBundleSources(join(root, 'workflows'), join(root, 'commands'), [
-    'selected',
-  ]);
+  const selected = await collectBundleSources(join(root, 'workflows'), ['selected']);
   expect(selected.map(file => file.relativePath)).toEqual([
     'workflows/selected/linked/main.yaml',
     'workflows/selected/linked/scripts/run.ts',
   ]);
 });
 
-test('the index selects exact runtime files, preserving authored paths and excluding fixtures and unindexed packs', async () => {
+test('the index selects exact runtime files, shared documents and metric views, preserving authored paths and excluding fixtures and unindexed packs', async () => {
   const root = track(await mkdtemp(join(tmpdir(), 'archon-bundle-index-')));
   const authored: Record<string, string> = {
     'workflows/selected/flow/main.yml': 'name: main\r\n',
@@ -48,6 +40,8 @@ test('the index selects exact runtime files, preserving authored paths and exclu
     'workflows/selected/flow/scripts/helpers/tool.py': 'print(1)\n',
     'workflows/selected/.shared/nested/helper.js': 'export const value = 1;\n',
     'workflows/selected/.shared/__init__.py': '',
+    'workflows/selected/.shared/policy/rule.md': 'Rule.\r\n',
+    'workflows/selected/.shared/metric-views.json': '{"cards":[]}\n',
     'workflows/selected/flow/fixtures/clean.stubs.yaml': 'fixture: true\n',
     'workflows/selected/flow/README.md': 'documentation',
     'workflows/selected/flow/scripts/helpers/deeper/ignored.ts': 'ignored',
@@ -64,12 +58,13 @@ test('the index selects exact runtime files, preserving authored paths and exclu
   await writeFile(indexPath, JSON.stringify({ packs: ['selected'] }));
   const selected = await collectBundleSources(
     join(root, 'workflows'),
-    join(root, 'commands'),
     await readBundleIndex(indexPath)
   );
   expect(selected.map(file => file.relativePath).sort()).toEqual([
     'workflows/selected/.shared/__init__.py',
+    'workflows/selected/.shared/metric-views.json',
     'workflows/selected/.shared/nested/helper.js',
+    'workflows/selected/.shared/policy/rule.md',
     'workflows/selected/flow/commands/check.md',
     'workflows/selected/flow/main.yml',
     'workflows/selected/flow/scripts/helpers/tool.py',
@@ -77,11 +72,94 @@ test('the index selects exact runtime files, preserving authored paths and exclu
   ]);
   for (const file of selected)
     expect(await readBundleContent(file)).toBe(authored[file.relativePath].replace(/\r\n/g, '\n'));
-  await expect(
-    collectBundleSources(join(root, 'workflows'), join(root, 'commands'), ['missing'])
-  ).rejects.toThrow('Indexed bundle pack "missing" directory not found');
+  await expect(collectBundleSources(join(root, 'workflows'), ['missing'])).rejects.toThrow(
+    'Indexed bundle pack "missing" directory not found'
+  );
   await writeFile(indexPath, JSON.stringify({ packs: ['selected', 'selected'] }));
   await expect(readBundleIndex(indexPath)).rejects.toThrow('Duplicate bundle pack');
   await writeFile(indexPath, JSON.stringify({ packs: ['../outside'] }));
   await expect(readBundleIndex(indexPath)).rejects.toThrow('Invalid bundle pack name');
+});
+
+test("a pack's shared script ships once and answers for each workflow without its own", async () => {
+  const root = track(await mkdtemp(join(tmpdir(), 'archon-bundle-shared-script-')));
+  await writeTree(root, {
+    'workflows/kit/borrows/borrows.yaml': 'name: borrows\n',
+    'workflows/kit/owns/owns.yaml': 'name: owns\n',
+    'workflows/kit/owns/scripts/check.ts': 'console.log("own");\n',
+    'workflows/kit/.shared/scripts/check.ts': 'console.log("shared");\n',
+    'workflows/kit/.shared/helper.ts': 'export const value = 1;\n',
+  });
+  const { scriptPacks } = await readBundleRecords(
+    await collectBundleSources(join(root, 'workflows'), ['kit'])
+  );
+  expect(scriptPacks.kit?.scripts).toEqual({
+    '__archon_pack__bundled:kit:borrows::check': {
+      path: '.shared/scripts/check.ts',
+      runtime: 'bun',
+    },
+    '__archon_pack__bundled:kit:owns::check': { path: 'owns/scripts/check.ts', runtime: 'bun' },
+  });
+  expect(Object.keys(scriptPacks.kit?.files ?? {}).sort()).toEqual([
+    '.shared/helper.ts',
+    '.shared/scripts/check.ts',
+    'owns/scripts/check.ts',
+  ]);
+});
+
+async function writeTree(root: string, files: Record<string, string>): Promise<void> {
+  for (const [path, content] of Object.entries(files)) {
+    await mkdir(dirname(join(root, path)), { recursive: true });
+    await writeFile(join(root, path), content);
+  }
+}
+
+test('a selected workflow folder without YAML fails generation', async () => {
+  const root = track(await mkdtemp(join(tmpdir(), 'archon-bundle-no-yaml-')));
+  await writeTree(root, {
+    'workflows/selected/flow/main.yaml': 'name: main\n',
+    'workflows/selected/flow-renamed/commands/step.md': 'step',
+  });
+  await expect(collectBundleSources(join(root, 'workflows'), ['selected'])).rejects.toThrow(
+    yamlCountError('selected/flow-renamed', 0).error
+  );
+});
+
+test('a workflow folder with two YAML files fails with the discovery error', async () => {
+  const root = track(await mkdtemp(join(tmpdir(), 'archon-bundle-crowded-')));
+  await writeTree(root, {
+    'workflows/selected/crowded/one.yaml': 'name: one\n',
+    'workflows/selected/crowded/two.yaml': 'name: two\n',
+  });
+  await expect(collectBundleSources(join(root, 'workflows'), ['selected'])).rejects.toThrow(
+    yamlCountError('selected/crowded', 2).error
+  );
+});
+
+test('discovery and bundle entry points infer the same runtimes', async () => {
+  const root = track(await mkdtemp(join(tmpdir(), 'archon-script-runtimes-')));
+  await writeTree(root, {
+    'kit/flow/main.yaml': 'name: main\n',
+    'kit/flow/scripts/typescript.ts': 'export {};\n',
+    'kit/flow/scripts/javascript.js': 'export {};\n',
+    'kit/flow/scripts/python.py': 'print(1)\n',
+    'kit/flow/scripts/ignored.txt': 'not a script\n',
+  });
+  const discovered = await discoverScripts(join(root, 'kit/flow/scripts'));
+  const { scriptPacks } = await readBundleRecords(await collectBundleSources(root, ['kit']));
+  const expected = { typescript: 'bun', javascript: 'bun', python: 'uv' } as const;
+  expect(
+    Object.fromEntries([...discovered].map(([name, script]) => [name, script.runtime]))
+  ).toEqual(expected);
+  expect(scriptPacks.kit?.scripts).toEqual({
+    '__archon_pack__bundled:kit:flow::typescript': {
+      path: 'flow/scripts/typescript.ts',
+      runtime: 'bun',
+    },
+    '__archon_pack__bundled:kit:flow::javascript': {
+      path: 'flow/scripts/javascript.js',
+      runtime: 'bun',
+    },
+    '__archon_pack__bundled:kit:flow::python': { path: 'flow/scripts/python.py', runtime: 'uv' },
+  });
 });

@@ -1,7 +1,9 @@
+import { createLogger } from '@archon/paths';
+import { missingProviderMessage, type ProviderDefaults } from '@archon/provider-contract';
+import { providerRegistry } from '@archon/providers';
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import {
-  getRegisteredProviders,
   getRegistration,
   InvalidProviderRunConfigError,
   isRegisteredProvider,
@@ -12,20 +14,29 @@ import {
   type ModelAliasPreset,
 } from '@archon/workflows/model-validation';
 import {
+  deprecatedQuotaPolicyWarning,
   workflowRunConfigLayerSchema,
   type WorkflowRunConfigInput,
   type WorkflowRunConfigLayer,
   type WorkflowRunConfigMetadata,
   type WorkflowRunConfigSource,
 } from '@archon/workflows/schemas/run-config';
+import { readWorkflowRunConfigMetadata } from '@archon/workflows/run-config';
 import { encryptToken, getEncryptionKey } from '../utils/token-crypto';
 import type { GlobalConfig, RepoConfig } from './config-types';
 import { unsealWorkflowRunConfigStructure } from './run-config-handoff';
+
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('config.run');
+  return cachedLog;
+}
 
 type ConfigKey = keyof GlobalConfig | keyof RepoConfig;
 type KeyClassification = { kind: 'runtime' } | { kind: 'unavailable'; reason: string };
 
 const keyClassifications = {
+  store: { kind: 'unavailable', reason: 'persistence is selected at install startup' },
   assistant: { kind: 'runtime' },
   defaultAssistant: { kind: 'runtime' },
   assistants: { kind: 'runtime' },
@@ -58,9 +69,9 @@ const keyClassifications = {
     kind: 'unavailable',
     reason: 'platform response streaming is process-scoped and has no per-run consumer',
   },
-  paths: {
+  attentionNotices: {
     kind: 'unavailable',
-    reason: 'workspace and worktree paths are resolved before run dispatch',
+    reason: 'attention notice routes are install-scoped and have no per-run consumer',
   },
   concurrency: {
     kind: 'unavailable',
@@ -71,6 +82,10 @@ const keyClassifications = {
     reason: 'recommended workflows are listing-only and have no run consumer',
   },
 } as const satisfies Record<ConfigKey, KeyClassification>;
+
+export const workflowRunConfigKeys = Object.entries(keyClassifications)
+  .filter(([, classification]) => classification.kind === 'runtime')
+  .map(([key]) => key);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -84,34 +99,55 @@ function validationError(error: { issues: { path: PropertyKey[]; message: string
 
 function assertRegisteredProvider(provider: string, path: string): void {
   if (isRegisteredProvider(provider)) return;
-  const available = getRegisteredProviders()
-    .map(entry => entry.id)
-    .sort()
-    .join(', ');
   throw new Error(
-    `Invalid run config at '${path}': unknown provider '${provider}'.` +
-      (available ? ` Available: ${available}.` : ' No providers are registered.')
+    `Invalid run config at '${path}': ${missingProviderMessage(providerRegistry, provider)}`
   );
 }
 
 function normalizePreset(path: string, preset: ModelAliasPreset): ModelAliasPreset {
   try {
-    return normalizeStrictRunModelPreset(preset);
+    return normalizeStrictRunModelPreset(providerRegistry, preset);
   } catch (error) {
     if (!(error instanceof RunModelPresetValidationError)) throw error;
     const issuePath = `${path}.${error.issue.field}`;
-    if (error.issue.kind === 'unknown-provider') {
-      const available = getRegisteredProviders()
-        .map(entry => entry.id)
-        .sort()
-        .join(', ');
-      throw new Error(
-        `Invalid run config at '${issuePath}': unknown provider '${error.issue.provider}'.` +
-          (available ? ` Available: ${available}.` : ' No providers are registered.')
-      );
-    }
     throw new Error(`Invalid run config at '${issuePath}': ${error.message}.`);
   }
+}
+
+function parseAssistantDefaults(
+  provider: string,
+  defaults: ProviderDefaults
+): Record<string, unknown> {
+  assertRegisteredProvider(provider, `assistants.${provider}`);
+  try {
+    return getRegistration(provider).parseConfig(defaults, 'run');
+  } catch (error) {
+    if (!(error instanceof InvalidProviderRunConfigError)) throw error;
+    const suffix = error.fieldPath ? `.${error.fieldPath}` : '';
+    throw new Error(`Invalid run config at 'assistants.${provider}${suffix}': ${error.message}.`);
+  }
+}
+
+function normalizeAssistants(
+  assistants: NonNullable<WorkflowRunConfigLayer['assistants']>
+): Record<string, Record<string, unknown>> {
+  const normalized: Record<string, Record<string, unknown>> = {};
+  for (const [provider, defaults] of Object.entries(assistants)) {
+    normalized[provider] = parseAssistantDefaults(provider, defaults);
+  }
+  return normalized;
+}
+
+function normalizePresets(
+  section: 'tiers' | 'aliases',
+  presets: Record<string, ModelAliasPreset>
+): Record<string, ModelAliasPreset> {
+  return Object.fromEntries(
+    Object.entries(presets).map(([name, preset]) => [
+      name,
+      normalizePreset(`${section}.${name}`, preset),
+    ])
+  );
 }
 
 /** Validate and normalize constraints owned by the live provider registry and lifecycle. */
@@ -119,38 +155,13 @@ export function normalizeRunConfigSemantics(layer: WorkflowRunConfigLayer): Work
   if (layer.assistant !== undefined) {
     assertRegisteredProvider(layer.assistant, 'assistant');
   }
-  const assistants: Record<string, Record<string, unknown>> = {};
-  for (const [provider, defaults] of Object.entries(layer.assistants ?? {})) {
-    assertRegisteredProvider(provider, `assistants.${provider}`);
-    try {
-      assistants[provider] = getRegistration(provider).parseConfig(defaults, 'run');
-    } catch (error) {
-      if (error instanceof InvalidProviderRunConfigError) {
-        const suffix = error.fieldPath ? `.${error.fieldPath}` : '';
-        throw new Error(
-          `Invalid run config at 'assistants.${provider}${suffix}': ${error.message}.`
-        );
-      }
-      throw error;
-    }
-  }
-  const tiers = Object.fromEntries(
-    Object.entries(layer.tiers ?? {}).map(([tier, preset]) => [
-      tier,
-      normalizePreset(`tiers.${tier}`, preset),
-    ])
-  );
-  const aliases = Object.fromEntries(
-    Object.entries(layer.aliases ?? {}).map(([alias, preset]) => [
-      alias,
-      normalizePreset(`aliases.${alias}`, preset),
-    ])
-  );
   return {
     ...layer,
-    ...(layer.assistants === undefined ? {} : { assistants }),
-    ...(layer.tiers === undefined ? {} : { tiers }),
-    ...(layer.aliases === undefined ? {} : { aliases }),
+    ...(layer.assistants === undefined
+      ? {}
+      : { assistants: normalizeAssistants(layer.assistants) }),
+    ...(layer.tiers === undefined ? {} : { tiers: normalizePresets('tiers', layer.tiers) }),
+    ...(layer.aliases === undefined ? {} : { aliases: normalizePresets('aliases', layer.aliases) }),
   };
 }
 
@@ -163,6 +174,18 @@ export function parseWorkflowRunConfig(
     throw new Error("Invalid run config at 'document': expected an object");
   }
 
+  assertRunConfigKeys(value);
+  const docs = value.docs;
+  assertRunConfigDocs(docs);
+  const candidate = runConfigCandidate(value, docs);
+  const parsed = workflowRunConfigLayerSchema.safeParse(candidate);
+  if (!parsed.success) throw validationError(parsed.error);
+  const warning = parsed.data.workflows && deprecatedQuotaPolicyWarning(parsed.data.workflows);
+  if (warning) getLog().warn({ source: source.label, warning }, 'run_config.quota_keys_deprecated');
+  return { layer: normalizeRunConfigSemantics(parsed.data), source };
+}
+
+function assertRunConfigKeys(value: Record<string, unknown>): void {
   for (const key of Object.keys(value)) {
     const classification = keyClassifications[key as ConfigKey] as KeyClassification | undefined;
     if (!classification) {
@@ -178,8 +201,9 @@ export function parseWorkflowRunConfig(
       "Run config cannot set both 'assistant' and 'defaultAssistant'; use one spelling."
     );
   }
+}
 
-  const docs = value.docs;
+function assertRunConfigDocs(docs: unknown): asserts docs is Record<string, unknown> | undefined {
   if (docs !== undefined) {
     if (!isRecord(docs)) {
       throw new Error("Invalid run config at 'docs': expected an object");
@@ -189,8 +213,13 @@ export function parseWorkflowRunConfig(
       throw new Error(`Unknown run config key 'docs.${unknownDocsKey}'.`);
     }
   }
+}
 
-  const candidate = {
+function runConfigCandidate(
+  value: Record<string, unknown>,
+  docs: Record<string, unknown> | undefined
+) {
+  return {
     ...(value.assistant !== undefined || value.defaultAssistant !== undefined
       ? { assistant: value.assistant ?? value.defaultAssistant }
       : {}),
@@ -201,9 +230,6 @@ export function parseWorkflowRunConfig(
     ...(isRecord(docs) && docs.path !== undefined ? { docsPath: docs.path } : {}),
     ...(value.env !== undefined ? { envVars: value.env } : {}),
   };
-  const parsed = workflowRunConfigLayerSchema.safeParse(candidate);
-  if (!parsed.success) throw validationError(parsed.error);
-  return { layer: normalizeRunConfigSemantics(parsed.data), source };
 }
 
 export async function loadWorkflowRunConfigFile(path: string): Promise<WorkflowRunConfigInput> {
@@ -229,17 +255,25 @@ function serializeLayer(layer: WorkflowRunConfigLayer): string {
 function configuredKeyPaths(layer: WorkflowRunConfigLayer): string[] {
   const paths: string[] = [];
   if (layer.assistant !== undefined) paths.push('assistant');
-  for (const [provider, defaults] of Object.entries(layer.assistants ?? {})) {
-    const fields = Object.keys(defaults);
-    if (fields.length === 0) paths.push(`assistants.${provider}`);
-    else for (const field of fields) paths.push(`assistants.${provider}.${field}`);
-  }
+  paths.push(...assistantKeyPaths(layer.assistants ?? {}));
   for (const name of Object.keys(layer.aliases ?? {})) paths.push(`aliases.${name}`);
   for (const name of Object.keys(layer.tiers ?? {})) paths.push(`tiers.${name}`);
   for (const field of Object.keys(layer.workflows ?? {})) paths.push(`workflows.${field}`);
   if (layer.docsPath !== undefined) paths.push('docs.path');
   for (const name of Object.keys(layer.envVars ?? {})) paths.push(`env.${name}`);
   return paths.sort();
+}
+
+function assistantKeyPaths(
+  assistants: NonNullable<WorkflowRunConfigLayer['assistants']>
+): string[] {
+  const paths: string[] = [];
+  for (const [provider, defaults] of Object.entries(assistants)) {
+    const fields = Object.keys(defaults);
+    if (fields.length === 0) paths.push(`assistants.${provider}`);
+    else for (const field of fields) paths.push(`assistants.${provider}.${field}`);
+  }
+  return paths;
 }
 
 export function sealWorkflowRunConfig(
@@ -260,4 +294,21 @@ export function unsealWorkflowRunConfig(
   metadata: WorkflowRunConfigMetadata
 ): WorkflowRunConfigLayer {
   return normalizeRunConfigSemantics(unsealWorkflowRunConfigStructure(metadata));
+}
+
+/**
+ * The run config another run was started with, for `--config-from-run`. A run started
+ * without one returns undefined: it ran on the install's config alone, so the new launch
+ * does too. The source label names the run it came from.
+ */
+export function workflowRunConfigFromRun(run: {
+  id: string;
+  metadata?: Record<string, unknown>;
+}): WorkflowRunConfigInput | undefined {
+  const sealed = readWorkflowRunConfigMetadata(run.metadata);
+  if (!sealed) return undefined;
+  return {
+    layer: unsealWorkflowRunConfig(sealed),
+    source: { kind: sealed.source.kind, label: `run ${run.id} (${sealed.source.label})` },
+  };
 }

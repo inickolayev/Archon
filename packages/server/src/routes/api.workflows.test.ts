@@ -1,3 +1,4 @@
+import { providerRegistry } from '@archon/providers';
 import { describe, test, expect, mock, spyOn, beforeEach } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
@@ -6,9 +7,12 @@ import { access, mkdir, readFile, rm, writeFile, symlink as fsSymlink } from 'fs
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import * as archonPaths from '@archon/paths';
+import * as packLayout from '@archon/workflows/pack-layout';
 import { removeTempTree } from '@archon/paths/test-utils';
 import { validationErrorHook } from './openapi-defaults';
 import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
+import { parseYaml } from '@archon/workflows/loader';
+import { workflowLoadErrorSchema } from './schemas/workflow.schemas';
 
 /** Test app factory: includes defaultHook to format validation errors as { error: string }. */
 function createTestApp(): OpenAPIHono {
@@ -18,14 +22,27 @@ function createTestApp(): OpenAPIHono {
 const mockDiscoverWorkflows = mock(async (_cwd: string | null) => ({
   workflows: [makeTestWorkflowWithSource({ name: 'deploy', description: 'Deploy app' }, 'bundled')],
   errors: [
-    { filename: '/tmp/.archon/workflows/bad.md', error: 'invalid', errorType: 'parse_error' },
+    {
+      filename: '/tmp/.archon/workflows/bad.md',
+      workflowName: 'acme/review-kit:review',
+      error: 'invalid',
+      errorType: 'read_error',
+      cause: Object.assign(new Error('permission denied'), {
+        code: 'EACCES',
+        path: '/private/host/source',
+      }),
+    },
   ],
 }));
 
 // Default: returns a valid workflow. Use mockReturnValueOnce in tests that need a parse failure.
-const mockParseWorkflow = mock<(typeof import('@archon/workflows/loader'))['parseWorkflow']>(
+const mockParseWorkflow = mock<typeof import('@archon/workflows/loader')['parseWorkflow']>(
   (content: string, _filename: string) => {
-    const name = /^name:\s*['"]?([^'"\n]+)['"]?$/m.exec(content)?.[1] ?? 'test';
+    const raw = parseYaml(content);
+    const name =
+      raw !== null && typeof raw === 'object' && 'name' in raw && typeof raw.name === 'string'
+        ? raw.name
+        : 'test';
     return {
       workflow: makeTestWorkflow({ name, description: 'Test workflow' }),
       error: null,
@@ -44,9 +61,14 @@ mock.module('@archon/core', () => ({
   loadConfig: mock(async () => ({})),
   loadRepoConfig: mockLoadRepoConfig,
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
-  getCommandFolderSearchPaths: mock(() => ['.archon/commands', '.archon/commands/defaults']),
-  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
-  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
+  getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
+  getBundledWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows'),
+  ProjectRegistrationError: class ProjectRegistrationError extends Error {},
+  inspectProjectBaseBranch: mock(async () => ({
+    kind: 'repo',
+    defaultBranch: 'dev',
+    reason: null,
+  })),
   cloneRepository: mock(async () => {}),
   registerRepository: mock(async () => ({ success: true })),
   removeWorktree: mock(async () => ({ success: true })),
@@ -70,13 +92,6 @@ mock.module('@archon/core', () => ({
 
 mock.module('@archon/workflows/workflow-discovery', () => ({
   discoverWorkflowsWithConfig: mockDiscoverWorkflows,
-  isValidWorkflowFolderSegment: (name: string) =>
-    !name.includes('/') &&
-    !name.includes('\\') &&
-    !name.includes('..') &&
-    !name.includes(':') &&
-    !!name &&
-    !name.startsWith('.'),
 }));
 mock.module('@archon/workflows/loader', () => ({
   parseWorkflow: mockParseWorkflow,
@@ -129,12 +144,12 @@ mock.module('@archon/workflows/command-validation', () => {
 });
 mock.module('@archon/workflows/defaults', () => ({
   BUNDLED_WORKFLOWS: {
-    'archon-assist': 'name: archon-assist\ndescription: Archon Assist\nnodes: []',
+    'archon-review': 'name: archon-review\ndescription: Archon Review\nnodes: []',
     test: 'name: legacy\ndescription: Filename collision\nnodes: []',
     'definition-file': 'name: test\ndescription: Declared name match\nnodes: []',
   },
   BUNDLED_COMMANDS: {
-    'archon-assist': '# archon-assist command',
+    'archon-review': '# archon-review command',
   },
   isBinaryBuild: mock(() => false),
 }));
@@ -146,7 +161,11 @@ mock.module('@archon/workflows/defaults', () => ({
 
 mock.module('@archon/core/db/conversations', () => ({}));
 mock.module('@archon/core/db/isolation-environments', () => ({}));
-mock.module('@archon/core/db/workflows', () => ({}));
+mock.module('@archon/core/db/workflows', () => ({
+  getRunIdsByIsolationEnvId: mock(async (): Promise<string[]> => []),
+  getWorkflowRunsByIds: mock(async () => []),
+  getWorkflowRunForAttention: mock(async () => null),
+}));
 mock.module('@archon/core/db/workflow-events', () => ({}));
 mock.module('@archon/core/db/messages', () => ({}));
 
@@ -174,9 +193,22 @@ describe('GET /api/workflows', () => {
     expect(body.workflows[0]?.workflow.name).toBe('deploy');
     expect(body.workflows[0]?.source).toBe('bundled');
     expect(body.workflows.workflows).toBeUndefined();
-    expect(mockDiscoverWorkflows).toHaveBeenCalledWith('/tmp/project', expect.any(Function));
+    expect(mockDiscoverWorkflows).toHaveBeenCalledWith(
+      '/tmp/project',
+      expect.any(Function),
+      providerRegistry
+    );
     expect(body.errors).toBeDefined();
     expect(Array.isArray(body.errors)).toBe(true);
+    expect(body.errors).toEqual(body.errors.map(error => workflowLoadErrorSchema.parse(error)));
+    expect(body.errors).toEqual([
+      {
+        filename: '/tmp/.archon/workflows/bad.md',
+        workflowName: 'acme/review-kit:review',
+        error: 'invalid',
+        errorType: 'read_error',
+      },
+    ]);
   });
 
   test('reports the workflow-level provider/model the AUTHOR declared', async () => {
@@ -225,7 +257,11 @@ describe('GET /api/workflows', () => {
     };
 
     // Discovery is invoked with null (not skipped), so bundled defaults can surface.
-    expect(mockDiscoverWorkflows).toHaveBeenLastCalledWith(null, expect.any(Function));
+    expect(mockDiscoverWorkflows).toHaveBeenLastCalledWith(
+      null,
+      expect.any(Function),
+      providerRegistry
+    );
     // The mocked discovery returns one bundled workflow regardless of cwd, so the
     // response is non-empty — proving the handler no longer short-circuits on no-cwd.
     expect(Array.isArray(body.workflows)).toBe(true);
@@ -410,19 +446,22 @@ describe('GET /api/workflows/:name', () => {
       ],
       errors: [],
     });
-    // Exact, or ignoring case, as the CLI and chat resolve a qualified name.
-    for (const name of ['acme/kit:review', 'ACME/Kit:Review']) {
-      mockDiscoverWorkflows.mockImplementationOnce(catalog);
-      const found = await app.request(`/api/workflows/${encodeURIComponent(name)}`);
-      expect(found.status).toBe(200);
-      expect(await found.json()).toMatchObject({
-        source: 'installed',
-        filename: 'acme/kit:review',
-        workflow: { name: 'acme/kit:review' },
-      });
-    }
+    mockDiscoverWorkflows.mockImplementationOnce(catalog);
+    const found = await app.request('/api/workflows/acme%2Fkit%3Areview');
+    expect(found.status).toBe(200);
+    expect(await found.json()).toMatchObject({
+      source: 'installed',
+      filename: 'acme/kit:review',
+      workflow: { name: 'acme/kit:review' },
+    });
     // No file exists for these either, so the file lookups that follow also miss.
-    for (const name of ['acme/kit:helper', 'acme/kit:copied', 'acme/kit:missing']) {
+    for (const name of [
+      'ACME/Kit:Review',
+      'acme/kit:rev',
+      'acme/kit:helper',
+      'acme/kit:copied',
+      'acme/kit:missing',
+    ]) {
       mockDiscoverWorkflows.mockImplementationOnce(catalog);
       const refused = await app.request(`/api/workflows/${encodeURIComponent(name)}`);
       expect(refused.status).toBe(404);
@@ -462,14 +501,14 @@ describe('GET /api/workflows/:name', () => {
     const app = createTestApp();
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
 
-    // No cwd → no readFile attempt → checks BUNDLED_WORKFLOWS → archon-assist found
+    // No cwd → no readFile attempt → checks BUNDLED_WORKFLOWS → archon-review found
     mockListCodebases.mockImplementationOnce(async () => []);
 
-    const response = await app.request('/api/workflows/archon-assist');
+    const response = await app.request('/api/workflows/archon-review');
     expect(response.status).toBe(200);
     const body = (await response.json()) as { source: string; filename: string; workflow: unknown };
     expect(body.source).toBe('bundled');
-    expect(body.filename).toBe('archon-assist.yaml');
+    expect(body.filename).toBe('archon-review.yaml');
     expect(body.workflow).toBeDefined();
   });
 
@@ -517,6 +556,50 @@ describe('GET /api/workflows/:name', () => {
     } finally {
       await rm(testDir, { recursive: true, force: true });
     }
+  });
+
+  test('returns the authored (un-normalized) form of a project workflow alongside it', async () => {
+    // The builder edits the authored shape; the normalized `workflow` cannot be
+    // saved back (the server's own validate rejects it), so the raw file must reach it.
+    const testDir = join(tmpdir(), `wf-get-authored-${Date.now()}`);
+    const workflowDir = join(testDir, '.archon', 'workflows');
+    await mkdir(workflowDir, { recursive: true });
+    await writeFile(
+      join(workflowDir, 'authored.yaml'),
+      'name: authored\r\ndescription: "Raw\r\n  workflow"\r\nnodes:\r\n  - id: plan\r\n    command: plan\r\n    settingSources: []\r\n'
+    );
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      const response = await app.request(`/api/workflows/authored?cwd=${testDir}`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { authored?: unknown };
+      expect(body.authored).toEqual({
+        name: 'authored',
+        description: 'Raw workflow',
+        nodes: [{ id: 'plan', command: 'plan', settingSources: [] }],
+      });
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
+  test('returns the authored form of a bundled workflow', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+    mockListCodebases.mockImplementationOnce(async () => []);
+
+    const response = await app.request('/api/workflows/archon-review');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { authored?: unknown };
+    expect(body.authored).toEqual({
+      name: 'archon-review',
+      description: 'Archon Review',
+      nodes: [],
+    });
   });
 
   test('returns project workflow when file uses .yml extension (matches discovery)', async () => {
@@ -637,19 +720,20 @@ describe('GET /api/workflows/:name', () => {
     }
   });
 
-  test('returns source-build default workflow when file uses .yml extension', async () => {
+  test('returns a source-build bundled pack workflow when its file uses .yml extension', async () => {
     const testDir = join(tmpdir(), `wf-defaults-yml-test-${Date.now()}`);
-    const defaultsDir = join(testDir, 'workflows', 'defaults');
-    await mkdir(defaultsDir, { recursive: true });
+    const bundledRoot = join(testDir, 'workflows');
+    const flowDir = join(testDir, 'workflows', 'some-pack', 'flow');
+    await mkdir(flowDir, { recursive: true });
     await writeFile(
-      join(defaultsDir, 'default-yml-wf.yml'),
+      join(flowDir, 'default-yml-wf.yml'),
       'name: default-yml-wf\ndescription: Default .yml workflow\nnodes:\n  - id: plan\n    command: plan\n'
     );
 
-    // Point the defaults lookup at the temp dir; keep home-scope at a
-    // nonexistent path so the handler falls through to the defaults source.
-    const defaultsPathSpy = spyOn(archonPaths, 'getDefaultWorkflowsPath').mockReturnValue(
-      defaultsDir
+    // Point the bundled lookup at the temp dir; keep home-scope at a
+    // nonexistent path so the handler falls through to the bundled source.
+    const defaultsPathSpy = spyOn(archonPaths, 'getBundledWorkflowsPath').mockReturnValue(
+      bundledRoot
     );
     const prevArchonHome = process.env.ARCHON_HOME;
     process.env.ARCHON_HOME = join(testDir, 'nonexistent-home');
@@ -666,7 +750,7 @@ describe('GET /api/workflows/:name', () => {
         workflow: unknown;
       };
       expect(body.source).toBe('bundled');
-      expect(body.filename).toBe('default-yml-wf.yml');
+      expect(body.filename).toBe('some-pack/flow/default-yml-wf.yml');
       expect(body.workflow).toBeDefined();
     } finally {
       defaultsPathSpy.mockRestore();
@@ -805,7 +889,7 @@ describe('GET /api/workflows/:name', () => {
 
     mockListCodebases.mockImplementationOnce(async () => []);
 
-    const response = await app.request('/api/workflows/archon-assist');
+    const response = await app.request('/api/workflows/archon-review');
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       workflow: Record<string, unknown>;
@@ -872,14 +956,137 @@ describe('GET /api/workflows/:name', () => {
     }
   });
 
+  test('surfaces the load error of a packaged workflow folder holding two YAML files', async () => {
+    const testDir = join(tmpdir(), `wf-get-crowded-packaged-${Date.now()}`);
+    const packageDir = join(testDir, '.archon', 'workflows', 'author-pack', 'test');
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(join(packageDir, 'one.yaml'), 'name: one\nnodes: []\n');
+    await writeFile(join(packageDir, 'two.yaml'), 'name: two\nnodes: []\n');
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/test?cwd=${testDir}`);
+      expect(response.status).toBe(500);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toBe(
+        "Workflow file is invalid: Packaged workflow 'author-pack/test' must contain exactly one .yaml or .yml file (found 2)."
+      );
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
+  test('surfaces the load error of an invalid packaged workflow folder found by its YAML stem', async () => {
+    const testDir = join(tmpdir(), `wf-get-invalid-folder-${Date.now()}`);
+    const packageDir = join(testDir, '.archon', 'workflows', 'author-pack', 'test..v2');
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(join(packageDir, 'test.yaml'), 'name: test\nnodes: []\n');
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/test?cwd=${testDir}`);
+      expect(response.status).toBe(500);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toBe(
+        "Workflow file is invalid: Invalid packaged workflow directory 'author-pack/test..v2'."
+      );
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
+  test("opens a packaged workflow whose name a malformed folder's YAML stem shares", async () => {
+    const testDir = join(tmpdir(), `wf-get-stem-shared-${Date.now()}`);
+    const packRoot = join(testDir, '.archon', 'workflows', 'team');
+    await mkdir(join(packRoot, 'flow'), { recursive: true });
+    await mkdir(join(packRoot, 'crowded'), { recursive: true });
+    await writeFile(join(packRoot, 'flow', 'flow.yaml'), 'name: flow\nnodes: []\n');
+    await writeFile(join(packRoot, 'crowded', 'flow.yaml'), 'name: flow\nnodes: []\n');
+    await writeFile(join(packRoot, 'crowded', 'two.yaml'), 'name: two\nnodes: []\n');
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/flow?cwd=${testDir}`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { filename: string };
+      expect(body.filename).toBe('team/flow/flow.yaml');
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
+  test('a malformed packaged folder does not answer to other workflow names', async () => {
+    const testDir = join(tmpdir(), `wf-get-beside-malformed-${Date.now()}`);
+    const packRoot = join(testDir, '.archon', 'workflows', 'author-pack');
+    await mkdir(join(packRoot, 'good'), { recursive: true });
+    await mkdir(join(packRoot, 'crowded'), { recursive: true });
+    await writeFile(join(packRoot, 'good', 'good.yaml'), 'name: good\nnodes: []\n');
+    await writeFile(join(packRoot, 'crowded', 'one.yaml'), 'name: one\nnodes: []\n');
+    await writeFile(join(packRoot, 'crowded', 'two.yaml'), 'name: two\nnodes: []\n');
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      expect((await app.request(`/api/workflows/good?cwd=${testDir}`)).status).toBe(200);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      expect((await app.request(`/api/workflows/absent-flow?cwd=${testDir}`)).status).toBe(404);
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
+  test('fails the lookup when a packaged workflow folder cannot be read', async () => {
+    const testDir = join(tmpdir(), `wf-get-unreadable-folder-${Date.now()}`);
+    const packDir = join(testDir, '.archon', 'workflows', 'author-pack');
+    await mkdir(join(packDir, 'locked'), { recursive: true });
+    // Permission bits cannot make a directory unreadable on Windows or as root, so the
+    // folder read failure is injected at the pack-layout seam.
+    const denied = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    const readFoldersSpy = spyOn(packLayout, 'readPackWorkflowFolders').mockResolvedValue({
+      folders: [
+        {
+          kind: 'error',
+          folder: 'locked',
+          error: packLayout.fileSystemError('author-pack/locked', 'Directory read', denied),
+          yamlFiles: [],
+        },
+      ],
+    });
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/test?cwd=${testDir}`);
+      expect(response.status).toBe(500);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toBe('Failed to read workflow');
+      expect(readFoldersSpy).toHaveBeenCalled();
+    } finally {
+      readFoldersSpy.mockRestore();
+      await removeTempTree(testDir);
+    }
+  });
+
   test('classifies a package in the app workflow root as bundled', async () => {
     const testDir = join(tmpdir(), `wf-get-source-bundle-${Date.now()}`);
     const workflowsRoot = join(testDir, '.archon', 'workflows');
     const packageDir = join(workflowsRoot, 'author-pack', 'release-flow');
     await mkdir(packageDir, { recursive: true });
     await writeFile(join(packageDir, 'definition.yaml'), 'name: test\nnodes: []\n');
-    const defaultsPathSpy = spyOn(archonPaths, 'getDefaultWorkflowsPath').mockReturnValue(
-      join(workflowsRoot, 'defaults')
+    const defaultsPathSpy = spyOn(archonPaths, 'getBundledWorkflowsPath').mockReturnValue(
+      workflowsRoot
     );
 
     try {
@@ -897,13 +1104,50 @@ describe('GET /api/workflows/:name', () => {
     }
   });
 
+  test('a malformed package in the app workflow root does not hide a home workflow of that name', async () => {
+    const testDir = join(tmpdir(), `wf-get-source-bundle-malformed-${Date.now()}`);
+    const workflowsRoot = join(testDir, '.archon', 'workflows');
+    const packageDir = join(workflowsRoot, 'author-pack', 'test');
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(join(packageDir, 'one.yaml'), 'name: one\nnodes: []\n');
+    await writeFile(join(packageDir, 'two.yaml'), 'name: two\nnodes: []\n');
+    const tmpHome = join(testDir, 'home');
+    await mkdir(join(tmpHome, 'workflows'), { recursive: true });
+    await writeFile(join(tmpHome, 'workflows', 'test.yaml'), 'name: test\nnodes: []\n');
+    const prevArchonHome = process.env.ARCHON_HOME;
+    process.env.ARCHON_HOME = tmpHome;
+    const defaultsPathSpy = spyOn(archonPaths, 'getBundledWorkflowsPath').mockReturnValue(
+      workflowsRoot
+    );
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/test?cwd=${testDir}`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { source: string; filename: string };
+      expect(body.source).toBe('global');
+      expect(body.filename).toBe('test.yaml');
+    } finally {
+      defaultsPathSpy.mockRestore();
+      if (prevArchonHome === undefined) {
+        delete process.env.ARCHON_HOME;
+      } else {
+        process.env.ARCHON_HOME = prevArchonHome;
+      }
+      await removeTempTree(testDir);
+    }
+  });
+
   test('keeps a flat workflow in the app workflow root project-scoped', async () => {
     const testDir = join(tmpdir(), `wf-get-source-project-${Date.now()}`);
     const workflowsRoot = join(testDir, '.archon', 'workflows');
     await mkdir(workflowsRoot, { recursive: true });
     await writeFile(join(workflowsRoot, 'test.yaml'), 'name: test\nnodes: []\n');
-    const defaultsPathSpy = spyOn(archonPaths, 'getDefaultWorkflowsPath').mockReturnValue(
-      join(workflowsRoot, 'defaults')
+    const defaultsPathSpy = spyOn(archonPaths, 'getBundledWorkflowsPath').mockReturnValue(
+      workflowsRoot
     );
 
     try {
@@ -929,7 +1173,7 @@ describe('GET /api/workflows/:name - cwd validation', () => {
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
 
     // default mock returns /tmp/project; /etc/secrets is not registered
-    const response = await app.request('/api/workflows/archon-assist?cwd=/etc/secrets');
+    const response = await app.request('/api/workflows/archon-review?cwd=/etc/secrets');
     expect(response.status).toBe(400);
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('Invalid cwd');
@@ -1182,6 +1426,39 @@ describe('PUT /api/workflows/:name', () => {
     }
   });
 
+  test('refuses to save when the name matches a malformed packaged workflow folder', async () => {
+    const testDir = join(tmpdir(), `wf-put-crowded-packaged-${Date.now()}`);
+    const workflowsRoot = join(testDir, '.archon', 'workflows');
+    const packageDir = join(workflowsRoot, 'author-pack', 'test');
+    const firstContent = 'name: one\nnodes: []\n';
+    const secondContent = 'name: two\nnodes: []\n';
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(join(packageDir, 'one.yaml'), firstContent);
+    await writeFile(join(packageDir, 'two.yaml'), secondContent);
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/test?cwd=${testDir}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ definition: { name: 'test', nodes: [] } }),
+      });
+      expect(response.status).toBe(500);
+      const body = (await response.json()) as { detail?: string };
+      expect(body.detail).toBe(
+        "Packaged workflow 'author-pack/test' must contain exactly one .yaml or .yml file (found 2)."
+      );
+      await expect(access(join(workflowsRoot, 'test.yaml'))).rejects.toThrow();
+      expect(await readFile(join(packageDir, 'one.yaml'), 'utf-8')).toBe(firstContent);
+      expect(await readFile(join(packageDir, 'two.yaml'), 'utf-8')).toBe(secondContent);
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
   test('refuses to overwrite a packaged workflow in the app bundled root', async () => {
     const testDir = join(tmpdir(), `wf-put-source-bundle-${Date.now()}`);
     const workflowsRoot = join(testDir, '.archon', 'workflows');
@@ -1189,8 +1466,8 @@ describe('PUT /api/workflows/:name', () => {
     const packagedPath = join(packageDir, 'definition.yaml');
     await mkdir(packageDir, { recursive: true });
     await writeFile(packagedPath, 'name: test\ndescription: Before\nnodes: []\n');
-    const defaultsPathSpy = spyOn(archonPaths, 'getDefaultWorkflowsPath').mockReturnValue(
-      join(workflowsRoot, 'defaults')
+    const defaultsPathSpy = spyOn(archonPaths, 'getBundledWorkflowsPath').mockReturnValue(
+      workflowsRoot
     );
 
     try {
@@ -1210,6 +1487,88 @@ describe('PUT /api/workflows/:name', () => {
       await rm(testDir, { recursive: true, force: true });
     }
   });
+
+  describe('keeps the authored YAML text', () => {
+    const commentedYaml = [
+      '# Top-level comment about the flow',
+      'name: my-flow',
+      "description: 'Commented flow'",
+      '',
+      'nodes:',
+      '  # the planning step',
+      '  - id: plan',
+      '    command: plan # inline note',
+      '',
+      '  # the build step',
+      '  - id: build',
+      '    depends_on: [plan]',
+      '    bash: |',
+      '      # not a YAML comment, part of the script',
+      '      echo build',
+      '',
+    ].join('\n');
+    const definition = {
+      name: 'my-flow',
+      description: 'Commented flow',
+      nodes: [
+        { id: 'plan', command: 'plan' },
+        {
+          id: 'build',
+          depends_on: ['plan'],
+          bash: '# not a YAML comment, part of the script\necho build\n',
+        },
+      ],
+    };
+
+    async function putOverCommentedFile(
+      body: typeof definition & { tags?: string[] },
+      source = commentedYaml
+    ): Promise<{ status: number; saved: string }> {
+      const testDir = join(tmpdir(), `wf-put-comments-${Date.now()}-${Math.random()}`);
+      const filePath = join(testDir, '.archon', 'workflows', 'my-flow.yaml');
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(filePath, source);
+      try {
+        const app = createTestApp();
+        registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+        mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+        const response = await app.request(`/api/workflows/my-flow?cwd=${testDir}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ definition: body }),
+        });
+        return { status: response.status, saved: await readFile(filePath, 'utf-8') };
+      } finally {
+        await removeTempTree(testDir);
+      }
+    }
+
+    test('an unchanged definition leaves the file byte-for-byte as it was', async () => {
+      const { status, saved } = await putOverCommentedFile(definition);
+      expect(status).toBe(200);
+      expect(saved).toBe(commentedYaml);
+    });
+
+    test('one changed field keeps the comments of everything else', async () => {
+      const edited = structuredClone(definition);
+      edited.nodes[0].command = 'plan-v2';
+      const { status, saved } = await putOverCommentedFile(edited);
+      expect(status).toBe(200);
+      expect(saved).toBe(
+        commentedYaml.replace('command: plan # inline note', 'command: plan-v2 # inline note')
+      );
+    });
+
+    test('editing a sequence block scalar saves only the changed tag', async () => {
+      const source = commentedYaml.replace('nodes:', 'tags:\n  - |- # keep\n    old\nnodes:');
+      const { status, saved } = await putOverCommentedFile(
+        { ...definition, tags: ['new'] },
+        source
+      );
+      expect(status).toBe(200);
+      expect(saved).toBe(source.replace('    old\n', '    new\n'));
+    });
+  });
 });
 
 describe('DELETE /api/workflows/:name', () => {
@@ -1217,11 +1576,11 @@ describe('DELETE /api/workflows/:name', () => {
     const app = createTestApp();
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
 
-    // archon-assist is in the real BUNDLED_WORKFLOWS
-    const response = await app.request('/api/workflows/archon-assist', { method: 'DELETE' });
+    // archon-review is in the real BUNDLED_WORKFLOWS
+    const response = await app.request('/api/workflows/archon-review', { method: 'DELETE' });
     expect(response.status).toBe(400);
     const body = (await response.json()) as { error: string };
-    expect(body.error).toContain('archon-assist');
+    expect(body.error).toContain('archon-review');
   });
 
   test('returns 404 when workflow file not found', async () => {
@@ -1453,6 +1812,64 @@ describe('DELETE /api/workflows/:name', () => {
     }
   });
 
+  test('refuses to delete when the name matches a malformed packaged workflow folder', async () => {
+    const testDir = join(tmpdir(), `wf-delete-crowded-packaged-${Date.now()}`);
+    const workflowsRoot = join(testDir, '.archon', 'workflows');
+    const packageDir = join(workflowsRoot, 'author-pack', 'test');
+    const flatPath = join(workflowsRoot, 'test.yaml');
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(join(packageDir, 'one.yaml'), 'name: one\nnodes: []\n');
+    await writeFile(join(packageDir, 'two.yaml'), 'name: two\nnodes: []\n');
+    await writeFile(flatPath, 'name: other\nnodes: []\n');
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      const response = await app.request(`/api/workflows/test?cwd=${testDir}`, {
+        method: 'DELETE',
+      });
+
+      expect(response.status).toBe(500);
+      const body = (await response.json()) as { detail?: string };
+      expect(body.detail).toBe(
+        "Packaged workflow 'author-pack/test' must contain exactly one .yaml or .yml file (found 2)."
+      );
+      await access(flatPath);
+      await access(join(packageDir, 'one.yaml'));
+      await access(join(packageDir, 'two.yaml'));
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
+  test('deletes a flat workflow that answers to the name beside a malformed packaged folder', async () => {
+    const testDir = join(tmpdir(), `wf-delete-flat-beside-malformed-${Date.now()}`);
+    const workflowsRoot = join(testDir, '.archon', 'workflows');
+    const packageDir = join(workflowsRoot, 'author-pack', 'test');
+    const flatPath = join(workflowsRoot, 'test.yaml');
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(join(packageDir, 'one.yaml'), 'name: one\nnodes: []\n');
+    await writeFile(join(packageDir, 'two.yaml'), 'name: two\nnodes: []\n');
+    await writeFile(flatPath, 'name: test\nnodes: []\n');
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      const response = await app.request(`/api/workflows/test?cwd=${testDir}`, {
+        method: 'DELETE',
+      });
+
+      expect(response.status).toBe(200);
+      await expect(access(flatPath)).rejects.toThrow();
+      await access(join(packageDir, 'one.yaml'));
+      await access(join(packageDir, 'two.yaml'));
+    } finally {
+      await removeTempTree(testDir);
+    }
+  });
+
   test('does not delete either package when declared workflow names collide', async () => {
     const testDir = join(tmpdir(), `wf-delete-packaged-collision-${Date.now()}`);
     const first = join(testDir, '.archon', 'workflows', 'pack-a', 'flow-a', 'a.yaml');
@@ -1485,8 +1902,8 @@ describe('DELETE /api/workflows/:name', () => {
     const packagedPath = join(packageDir, 'definition.yaml');
     await mkdir(packageDir, { recursive: true });
     await writeFile(packagedPath, 'name: test\nnodes: []\n');
-    const defaultsPathSpy = spyOn(archonPaths, 'getDefaultWorkflowsPath').mockReturnValue(
-      join(workflowsRoot, 'defaults')
+    const defaultsPathSpy = spyOn(archonPaths, 'getBundledWorkflowsPath').mockReturnValue(
+      workflowsRoot
     );
 
     try {
@@ -1615,8 +2032,8 @@ describe('GET /api/commands', () => {
     const response = await app.request('/api/commands');
     expect(response.status).toBe(200);
     const body = (await response.json()) as { commands: Array<{ name: string; source: string }> };
-    // archon-assist is in the real BUNDLED_COMMANDS
-    const archonAssist = body.commands.find(c => c.name === 'archon-assist');
+    // archon-review is in the real BUNDLED_COMMANDS
+    const archonAssist = body.commands.find(c => c.name === 'archon-review');
     expect(archonAssist).toBeDefined();
     expect(archonAssist?.source).toBe('bundled');
   });
@@ -1630,9 +2047,9 @@ describe('GET /api/commands', () => {
     try {
       const commandsDir = join(projectDir, '.archon', 'commands');
       await mkdir(commandsDir, { recursive: true });
-      // Created in reverse-alphabetical order. `archon-assist` also exists as a
+      // Created in reverse-alphabetical order. `archon-review` also exists as a
       // bundled command, so it exercises precedence as well as ordering.
-      for (const name of ['zz-order', 'mm-order', 'archon-assist', 'aa-order']) {
+      for (const name of ['zz-order', 'mm-order', 'archon-review', 'aa-order']) {
         await writeFile(join(commandsDir, `${name}.md`), `# ${name}`);
       }
       mockListCodebases.mockImplementation(async () => [{ default_cwd: projectDir }]);
@@ -1661,12 +2078,12 @@ describe('GET /api/commands', () => {
       const bundledOnly = (await (await app.request('/api/commands')).json()) as {
         commands: Array<{ name: string; source: string }>;
       };
-      const bundledIndex = bundledOnly.commands.findIndex(c => c.name === 'archon-assist');
+      const bundledIndex = bundledOnly.commands.findIndex(c => c.name === 'archon-review');
       expect(bundledOnly.commands[bundledIndex]).toEqual({
-        name: 'archon-assist',
+        name: 'archon-review',
         source: 'bundled',
       });
-      expect(first.commands[bundledIndex]).toEqual({ name: 'archon-assist', source: 'project' });
+      expect(first.commands[bundledIndex]).toEqual({ name: 'archon-review', source: 'project' });
     } finally {
       mockListCodebases.mockReset();
       await removeTempTree(projectDir);

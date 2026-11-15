@@ -62,7 +62,7 @@ export function LoopFields({
           line, and `bash -c "   "` exits 0). Whitespace INSIDE a value is kept — only
           an entirely-blank box means "not declared". */}
       <TextField
-        label="Until (completion signal, optional with until bash)"
+        label="Until (optional completion signal)"
         value={data.until ?? ''}
         mono
         placeholder="COMPLETE"
@@ -79,11 +79,11 @@ export function LoopFields({
           onChange({ ...data, until_bash: raw.trim().length > 0 ? raw : undefined });
         }}
       />
-      {/* Names a declared boolean in the node's `output_format`. That schema is carried
-          through the round-trip but is NOT editable in the builder today — there is no
-          output_format editor — so a loop created here needs its schema added in YAML.
-          The engine rejects a name that is not declared, required and boolean, so a
-          mismatch fails loudly at load rather than looping forever. */}
+      <p className="text-console-12 text-text-secondary">
+        New loops start with a placeholder check that never completes. Replace it with a real check
+        before running. Exit 0 completes the loop; leaving the placeholder reaches the iteration cap
+        and fails the node.
+      </p>
       <TextField
         label="Until field (boolean in output_format)"
         value={data.until_field ?? ''}
@@ -93,6 +93,11 @@ export function LoopFields({
           onChange({ ...data, until_field: raw.trim().length > 0 ? raw : undefined });
         }}
       />
+      <p className="text-console-12 text-text-secondary">
+        Until field requires an output_format schema on this node. Author the schema in YAML; the
+        builder does not edit output_format. The field must be declared in properties, listed in
+        required, and have type boolean if a string type is declared.
+      </p>
       <NumberField
         label="Max iterations"
         value={data.max_iterations}

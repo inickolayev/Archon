@@ -24,11 +24,11 @@ export function QuotedBlock({ quote, variant = 'chat' }: QuotedBlockProps): Reac
   const composer = variant === 'composer';
   return (
     <blockquote
-      className={`min-w-0 border-l-2 ${composer ? 'pl-[9px]' : 'my-[6px] pl-[10px]'}`}
+      className={`min-w-0 border-l-2 ${composer ? 'pl-2.25' : 'my-1.5 pl-2.5'}`}
       style={{ borderColor: 'color-mix(in oklch, var(--brand-teal), transparent 45%)' }}
     >
       <div
-        className="truncate font-mono text-[10px] font-bold uppercase tracking-[0.12em]"
+        className="truncate font-mono text-console-10 font-bold uppercase tracking-widest"
         style={{ color: 'var(--brand-teal)' }}
         title={quote.label}
       >
@@ -36,7 +36,7 @@ export function QuotedBlock({ quote, variant = 'chat' }: QuotedBlockProps): Reac
       </div>
       {quote.text.length > 0 ? (
         <div
-          className={`text-[13px] leading-[1.5] text-text-secondary ${
+          className={`text-console-13 leading-[1.5] text-text-secondary ${
             composer ? 'truncate' : 'whitespace-pre-wrap break-words'
           }`}
           title={composer ? quote.text : undefined}
@@ -44,7 +44,7 @@ export function QuotedBlock({ quote, variant = 'chat' }: QuotedBlockProps): Reac
           {quote.text}
         </div>
       ) : (
-        <div className="text-[12.5px] italic leading-[1.5] text-text-tertiary">
+        <div className="text-console-13 italic leading-[1.5] text-text-tertiary">
           no text — see what came with it
         </div>
       )}

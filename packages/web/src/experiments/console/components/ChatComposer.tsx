@@ -1,6 +1,7 @@
 import { Mic, Paperclip, Square, X } from 'lucide-react';
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
@@ -116,12 +117,22 @@ export function ChatComposer({
     if (quote !== null) textareaRef.current?.focus();
   }, [quote]);
 
-  const grow = (el: HTMLTextAreaElement): void => {
-    el.style.height = 'auto';
-    const next = Math.min(el.scrollHeight, MAX_HEIGHT);
-    el.style.height = `${next.toString()}px`;
-    el.style.overflowY = next >= MAX_HEIGHT ? 'auto' : 'hidden';
-  };
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (el === null) return;
+    const grow = (): void => {
+      el.style.height = 'auto';
+      const next = Math.min(el.scrollHeight, MAX_HEIGHT);
+      el.style.height = `${String(next)}px`;
+      el.style.overflowY = next >= MAX_HEIGHT ? 'auto' : 'hidden';
+    };
+    grow();
+    const observer = new ResizeObserver(grow);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+    };
+  }, [value, disabled, disabledReason]);
 
   const mintAttachment = (file: File): AttachmentMeta => ({
     id: String(idRef.current++),
@@ -176,7 +187,6 @@ export function ChatComposer({
     setFileError(null);
     if (fileInputRef.current !== null) fileInputRef.current.value = '';
     if (textareaRef.current !== null) {
-      textareaRef.current.style.height = 'auto';
       textareaRef.current.focus();
     }
   };
@@ -258,7 +268,7 @@ export function ChatComposer({
 
   return (
     <div
-      className="relative shrink-0 border-t border-border bg-surface px-[30px] py-[14px]"
+      className="relative shrink-0 border-t border-border bg-surface px-7.5 py-3.5"
       title={disabledReason}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
@@ -269,15 +279,15 @@ export function ChatComposer({
           aria-hidden
           className="brand-bar-soft pointer-events-none absolute inset-0 z-10 flex items-center justify-center"
         >
-          <span className="rounded border border-[color:var(--brand-magenta)] bg-surface px-3 py-1.5 font-mono text-[11px] text-[color:var(--brand-magenta)]">
+          <span className="rounded border border-[color:var(--brand-magenta)] bg-surface px-3 py-1.5 font-mono text-console-11 text-[color:var(--brand-magenta)]">
             drop files to attach
           </span>
         </div>
       ) : null}
-      <div className="mx-auto max-w-[940px]">
+      <div className="mx-auto max-w-235">
         {quote !== null ? (
           <div
-            className="mb-[10px] flex items-center gap-[8px] rounded-[10px] border bg-[color:var(--surface-elevated)] py-[7px] pl-[10px] pr-[7px]"
+            className="mb-2.5 flex items-center gap-2 rounded-lg border bg-[color:var(--surface-elevated)] py-1.75 pl-2.5 pr-1.75"
             style={{ borderColor: 'var(--border-bright)' }}
           >
             <QuotedBlock quote={quote} variant="composer" />
@@ -286,9 +296,9 @@ export function ChatComposer({
               onClick={onCancelQuote}
               aria-label="Cancel reply"
               title="Cancel reply · Esc"
-              className="ml-auto shrink-0 rounded p-[2px] text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+              className="ml-auto shrink-0 rounded p-0.5 text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
             >
-              <span aria-hidden className="text-[11px] leading-none">
+              <span aria-hidden className="text-console-11 leading-none">
                 ✕
               </span>
             </button>
@@ -296,18 +306,18 @@ export function ChatComposer({
         ) : null}
         {recorder.recording ? (
           <div
-            className="mb-[10px] flex items-center gap-[10px] rounded-[10px] border py-[7px] pl-[11px] pr-[7px]"
+            className="mb-2.5 flex items-center gap-2.5 rounded-lg border py-1.75 pl-2.75 pr-1.75"
             style={{ borderColor: 'var(--border-bright)', background: 'var(--surface-elevated)' }}
           >
             <span
               aria-hidden
-              className="h-[9px] w-[9px] shrink-0 animate-pulse rounded-full"
+              className="h-2.25 w-2.25 shrink-0 animate-pulse rounded-full"
               style={{ background: 'var(--brand-magenta)' }}
             />
-            <span className="font-mono text-[12px] text-text-primary" aria-live="polite">
+            <span className="font-mono text-console-12 text-text-primary" aria-live="polite">
               Recording {clockLabel(recorder.seconds)}
             </span>
-            <span className="font-mono text-[11px] text-text-tertiary">
+            <span className="font-mono text-console-11 text-text-tertiary">
               stops at {clockLabel(MAX_RECORDING_SECONDS)}
             </span>
             <button
@@ -315,10 +325,10 @@ export function ChatComposer({
               onClick={finishRecording}
               aria-label="Stop recording"
               title="Stop recording"
-              className="ml-auto flex h-[24px] shrink-0 items-center gap-[5px] rounded-md border px-[8px] font-mono text-[11px] text-text-primary transition-colors hover:bg-[color:var(--surface-hover)]"
+              className="ml-auto flex h-6 shrink-0 items-center gap-1.25 rounded-md border px-2 font-mono text-console-11 text-text-primary transition-colors hover:bg-[color:var(--surface-hover)]"
               style={{ borderColor: 'var(--border-bright)' }}
             >
-              <Square className="h-[11px] w-[11px]" />
+              <Square className="h-2.75 w-2.75" />
               stop
             </button>
             <button
@@ -326,14 +336,14 @@ export function ChatComposer({
               onClick={recorder.cancel}
               aria-label="Discard recording"
               title="Discard recording"
-              className="shrink-0 rounded p-[3px] text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+              className="shrink-0 rounded p-0.75 text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
             >
-              <X className="h-[13px] w-[13px]" />
+              <X className="h-3.25 w-3.25" />
             </button>
           </div>
         ) : null}
         {recorder.error !== null ? (
-          <div className="mb-[8px] font-mono text-[11px] text-error">{recorder.error}</div>
+          <div className="mb-2 font-mono text-console-11 text-error">{recorder.error}</div>
         ) : null}
         {files.length > 0 ? (
           <ChatAttachments
@@ -344,13 +354,13 @@ export function ChatComposer({
           />
         ) : null}
         {fileError !== null ? (
-          <div className="mb-[8px] font-mono text-[11px] text-error">{fileError}</div>
+          <div className="mb-2 font-mono text-console-11 text-error">{fileError}</div>
         ) : null}
         <div
-          className="flex items-end gap-[10px] rounded-[14px] border bg-[color:var(--surface-elevated)] py-[8px] pl-[14px] pr-[8px] transition-[border-color,box-shadow] focus-within:border-[color:color-mix(in_oklch,var(--brand-magenta),transparent_40%)] focus-within:shadow-[0_0_0_4px_color-mix(in_oklch,var(--brand-magenta),transparent_92%)]"
+          className="flex items-end gap-2.5 rounded-xl border bg-[color:var(--surface-elevated)] py-2 pl-3.5 pr-2 transition-[border-color,box-shadow] focus-within:border-[color:color-mix(in_oklch,var(--brand-magenta),transparent_40%)] focus-within:shadow-[0_0_0_4px_color-mix(in_oklch,var(--brand-magenta),transparent_92%)]"
           style={{ borderColor: 'var(--border-bright)' }}
         >
-          <div className="flex shrink-0 items-end gap-[6px] pb-[7px] text-text-tertiary">
+          <div className="flex shrink-0 items-end gap-1.5 pb-1.75 text-text-tertiary">
             <button
               type="button"
               onClick={() => {
@@ -359,7 +369,7 @@ export function ChatComposer({
               aria-label="Attach files"
               disabled={disabled || files.length >= MAX_FILES}
               title="Attach files"
-              className="flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary disabled:cursor-default disabled:opacity-50"
+              className="flex h-5.5 w-5.5 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary disabled:cursor-default disabled:opacity-50"
             >
               <Paperclip className="h-5 w-5" />
             </button>
@@ -381,7 +391,7 @@ export function ChatComposer({
                 aria-pressed={recorder.recording}
                 disabled={disabled || (!recorder.recording && files.length >= MAX_FILES)}
                 title={recorder.recording ? 'Stop recording' : 'Record a message'}
-                className="flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary disabled:cursor-default disabled:opacity-50"
+                className="flex h-5.5 w-5.5 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary disabled:cursor-default disabled:opacity-50"
                 style={recorder.recording ? { color: 'var(--brand-magenta)' } : undefined}
               >
                 <Mic className="h-5 w-5" />
@@ -393,7 +403,7 @@ export function ChatComposer({
               aria-label="Commands"
               disabled
               title="Commands (coming soon)"
-              className="flex h-[22px] items-center justify-center rounded-md px-[2px] text-[17px] leading-none transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary disabled:cursor-default disabled:opacity-50"
+              className="flex h-5.5 items-center justify-center rounded-md px-0.5 text-console-17 leading-none transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary disabled:cursor-default disabled:opacity-50"
             >
               /
             </button>
@@ -403,13 +413,12 @@ export function ChatComposer({
             value={value}
             onChange={e => {
               setValue(e.target.value);
-              grow(e.target);
             }}
             onKeyDown={onKeyDown}
             onPaste={onPaste}
             rows={1}
             placeholder={disabled ? (disabledReason ?? 'Waiting…') : 'Message the agent…'}
-            className="min-h-0 flex-1 resize-none bg-transparent py-[7px] text-[14.5px] leading-[1.5] text-text-primary placeholder:text-text-tertiary focus:outline-none disabled:opacity-50"
+            className="min-h-0 flex-1 resize-none bg-transparent py-1.75 text-console-15 leading-[1.5] text-text-primary placeholder:text-text-tertiary focus:outline-none disabled:opacity-50"
             style={{ maxHeight: `${MAX_HEIGHT.toString()}px` }}
           />
           <button
@@ -421,26 +430,26 @@ export function ChatComposer({
                 ? "A recording can't start a new chat — type a line first"
                 : 'Send · Enter'
             }
-            className="brand-bar flex h-[36px] shrink-0 items-center gap-[7px] rounded-[10px] px-[15px] text-[13px] font-bold text-white shadow-[0_6px_18px_-8px_color-mix(in_oklch,var(--brand-magenta),transparent_30%)] transition-[filter,transform] hover:brightness-110 active:translate-y-[1px] disabled:opacity-45 disabled:shadow-none disabled:hover:brightness-100"
+            className="brand-bar flex h-9 shrink-0 items-center gap-1.75 rounded-lg px-3.75 text-console-13 font-bold text-white shadow-[0_6px_18px_-8px_color-mix(in_oklch,var(--brand-magenta),transparent_30%)] transition-[filter,transform] hover:brightness-110 active:translate-y-px disabled:opacity-45 disabled:shadow-none disabled:hover:brightness-100"
           >
             Send
-            <span aria-hidden className="font-mono text-[10px] opacity-70">
+            <span aria-hidden className="font-mono text-console-10 opacity-70">
               ↵
             </span>
           </button>
         </div>
-        <div className="mt-[9px] flex items-center justify-between px-[2px] font-mono text-[11px] text-text-tertiary">
+        <div className="mt-2.25 flex items-center justify-between px-0.5 font-mono text-console-11 text-text-tertiary">
           <span />
           <span>
             <span
-              className="mr-1 inline-flex items-center rounded border px-[5px] py-[1px] font-mono text-[10.5px] text-text-secondary"
+              className="mr-1 inline-flex items-center rounded border px-1.25 py-px font-mono text-console-11 text-text-secondary"
               style={{ borderColor: 'var(--border-bright)' }}
             >
               ↵
             </span>
             send{' '}
             <span
-              className="ml-1 inline-flex items-center rounded border px-[5px] py-[1px] font-mono text-[10.5px] text-text-secondary"
+              className="ml-1 inline-flex items-center rounded border px-1.25 py-px font-mono text-console-11 text-text-secondary"
               style={{ borderColor: 'var(--border-bright)' }}
             >
               ⇧↵

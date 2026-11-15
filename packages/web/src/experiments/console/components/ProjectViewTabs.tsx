@@ -1,20 +1,23 @@
 import type { ReactElement } from 'react';
 import { Link } from 'react-router';
 
+type ProjectView = 'runs' | 'chat' | 'metrics';
+
 interface ProjectViewTabsProps {
   projectId: string;
-  active: 'runs' | 'chat';
+  active: ProjectView;
 }
 
-const TABS: readonly { key: 'runs' | 'chat'; label: string; suffix: string }[] = [
+const TABS: readonly { key: ProjectView; label: string; suffix: string }[] = [
   { key: 'runs', label: 'Runs', suffix: '' },
   { key: 'chat', label: 'Chat', suffix: '/chat' },
+  { key: 'metrics', label: 'Metrics', suffix: '/metrics' },
 ];
 
 /**
- * Runs | Chat tab control under a project. Active styling mirrors FilterChips
- * (brand-bar underline). Only meaningful when a project is scoped — chat is
- * project-scoped, so this is never rendered on the All-projects view.
+ * Runs | Chat | Metrics tab control under a project. Active styling mirrors
+ * FilterChips (brand-bar underline). Only meaningful when a project is scoped —
+ * chat is project-scoped, so this is never rendered on the All-projects view.
  */
 export function ProjectViewTabs({ projectId, active }: ProjectViewTabsProps): ReactElement {
   return (
@@ -26,7 +29,7 @@ export function ProjectViewTabs({ projectId, active }: ProjectViewTabsProps): Re
             key={key}
             to={`/console/p/${projectId}${suffix}`}
             aria-current={isActive ? 'page' : undefined}
-            className={`relative rounded px-2 py-1 text-[11px] font-medium uppercase tracking-wider transition-colors ${
+            className={`relative rounded px-2 py-1 text-console-11 font-medium uppercase tracking-wider transition-colors ${
               isActive
                 ? 'bg-surface-elevated text-text-primary'
                 : 'text-text-tertiary hover:text-text-primary'

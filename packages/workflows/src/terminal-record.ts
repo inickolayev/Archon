@@ -1,39 +1,81 @@
-import { z } from '@hono/zod-openapi';
 import { getRunArtifactsDirForRoot, resolveRunStorageRoot } from '@archon/paths/archon-paths';
 import {
+  type ArtifactManifest,
   RUN_GRAPH_METADATA_KEY,
   runGraphSchema,
   terminalRecordSchema,
   terminalStatusSchema,
+  type RunGraph,
+  type RunNodeState,
   type TerminalRecord,
+  WORKTREE_DISPOSITION_METADATA_KEY,
+  worktreeDispositionSchema,
+  type WorktreeDisposition,
 } from './schemas/terminal-record';
-import { nodeSkipReasonSchema, skipCauseSchema, type WorkflowRun } from './schemas/workflow-run';
+import {
+  nodeSkipReasonSchema,
+  readOwnedWorktree,
+  skipCauseSchema,
+  type WorkflowRun,
+} from './schemas/workflow-run';
 import { observeArtifactManifest } from './terminal-artifact-manifest';
-import { readNodeRecordEvent } from './node-record-reader';
+import {
+  nodeInvocationKey,
+  parseNodeInvocationKey,
+  readNodeRecordData,
+  readNodeRecordEvent,
+  type ReadNodeRecordEvent,
+} from './node-record-reader';
+import {
+  nodeOutcomesListingSchema,
+  type NodeOutcome,
+  type NodeOutcomesListing,
+} from './schemas/node-outcomes';
+import {
+  nodeFailureKindSchema,
+  type NodeFailureKind,
+  type NodeInvocation,
+} from './schemas/node-execution';
+import type { FanOutOutcome } from './schemas/fan-out-outcome';
 
 export interface TerminalRecordEvent {
   event_type: string;
   step_name?: string | null;
   data: unknown;
 }
-const eventDataSchema = z.record(z.string(), z.unknown());
-function eventData(value: unknown): Record<string, unknown> {
-  return eventDataSchema.parse(typeof value === 'string' ? JSON.parse(value) : (value ?? {}));
+function withFanOutOutcome(
+  state: RunNodeState,
+  fanOutOutcome: FanOutOutcome | undefined
+): RunNodeState {
+  return fanOutOutcome === undefined ? state : { ...state, fan_out_outcome: fanOutOutcome };
 }
 
-/** Fold ordered durable events; never reconstruct producer values from artifact contents. */
-export async function buildTerminalRecord(input: {
-  run: Pick<WorkflowRun, 'id' | 'status' | 'outcome' | 'metadata' | 'output_root'>;
-  events: readonly TerminalRecordEvent[];
-}): Promise<TerminalRecord> {
-  const { run, events } = input;
-  const graph = runGraphSchema.safeParse(run.metadata?.[RUN_GRAPH_METADATA_KEY]);
-  const nodes = new Map<string, TerminalRecord['nodes'][number]>();
+interface NodeEventFold {
+  graph: RunGraph | undefined;
+  nodes: Map<string, RunNodeState>;
+  outputs: Map<string, Record<string, unknown>>;
+  failureOrder: Map<string, number>;
+}
+
+/**
+ * Fold node-state events into one state per key. The terminal record keys by step path,
+ * so a loop body node keeps only its latest iteration; the node-outcome observation keys
+ * by invocation, so each iteration keeps its own entry. `node_id` is the step path either way.
+ */
+function foldNodeEvents(
+  run: Pick<WorkflowRun, 'id' | 'metadata'>,
+  events: readonly TerminalRecordEvent[],
+  keyOf: (path: string, loopPath: NodeInvocation['loopPath']) => string = path => path
+): NodeEventFold {
+  const parsed = runGraphSchema.safeParse(run.metadata?.[RUN_GRAPH_METADATA_KEY]);
+  const graph = parsed.success ? parsed.data : undefined;
+  const nodes = new Map<string, RunNodeState>();
   const outputs = new Map<string, Record<string, unknown>>();
   const failureOrder = new Map<string, number>();
-  if (graph.success)
-    for (const nodeId of graph.data.node_ids)
-      nodes.set(nodeId, { node_id: nodeId, state: 'pending' });
+  const folded = { graph, nodes, outputs, failureOrder };
+  if (graph)
+    for (const nodeId of graph.node_ids)
+      nodes.set(keyOf(nodeId, []), { node_id: nodeId, state: 'pending' });
   for (const [index, event] of events.entries()) {
     const nodeId = event.step_name;
     if (!nodeId) continue;
@@ -44,86 +86,253 @@ export async function buildTerminalRecord(input: {
       data: event.data,
     });
     if (!record) continue;
-    switch (record.eventType) {
-      case 'node_started':
-      case 'node_suspended':
-      case 'node_always_run_reset':
-      case 'node_prior_cache_invalidated':
-        nodes.set(nodeId, {
-          node_id: nodeId,
-          state:
-            record.eventType === 'node_started' || record.eventType === 'node_suspended'
-              ? 'running'
-              : 'pending',
-        });
-        outputs.delete(nodeId);
-        failureOrder.delete(nodeId);
-        break;
-      case 'node_completed':
-      case 'node_skipped_prior_success':
-        nodes.set(nodeId, { node_id: nodeId, state: 'completed' });
-        outputs.set(nodeId, record.data);
-        failureOrder.delete(nodeId);
-        break;
-      case 'node_failed': {
-        const data = record.data;
-        nodes.set(nodeId, {
-          node_id: nodeId,
-          state: 'failed',
-          ...(typeof data.error === 'string' ? { error: data.error } : {}),
-        });
-        outputs.delete(nodeId);
-        failureOrder.set(nodeId, index);
-        break;
-      }
-      case 'node_skipped': {
-        const data = record.data;
-        const reason = nodeSkipReasonSchema.safeParse(data.reason);
-        const cause = skipCauseSchema.safeParse(data.cause);
-        nodes.set(nodeId, {
-          node_id: nodeId,
-          state: 'skipped',
-          ...(reason.success ? { reason: reason.data } : {}),
-          ...(cause.success ? { cause: cause.data } : {}),
-        });
-        outputs.delete(nodeId);
-        failureOrder.delete(nodeId);
-        break;
-      }
+    // A cache record carries no invocation, so it folds with no loop frames: a loop
+    // body re-runs in full each iteration and never replays from the resume cache.
+    foldNodeRecord(
+      folded,
+      record,
+      keyOf(nodeId, record.metadata?.invocation.loopPath ?? []),
+      index
+    );
+  }
+  return folded;
+}
+
+function foldNodeRecord(
+  { nodes, outputs, failureOrder }: Omit<NodeEventFold, 'graph'>,
+  record: ReadNodeRecordEvent,
+  key: string,
+  index: number
+): void {
+  const nodeId = record.path;
+  switch (record.eventType) {
+    case 'node_started':
+    case 'node_suspended':
+    case 'node_always_run_reset':
+    case 'node_prior_cache_invalidated':
+      nodes.set(key, {
+        node_id: nodeId,
+        state:
+          record.eventType === 'node_started' || record.eventType === 'node_suspended'
+            ? 'running'
+            : 'pending',
+      });
+      outputs.delete(key);
+      failureOrder.delete(key);
+      break;
+    case 'node_completed':
+      nodes.set(
+        key,
+        withFanOutOutcome({ node_id: nodeId, state: 'completed' }, record.data.fan_out_outcome)
+      );
+      outputs.set(key, record.data);
+      failureOrder.delete(key);
+      break;
+    case 'node_skipped_prior_success':
+      // A replayed node keeps the slot record its earlier completion wrote.
+      nodes.set(
+        key,
+        withFanOutOutcome({ node_id: nodeId, state: 'completed' }, nodes.get(key)?.fan_out_outcome)
+      );
+      outputs.set(key, record.data);
+      failureOrder.delete(key);
+      break;
+    case 'node_failed': {
+      const data = record.data;
+      nodes.set(
+        key,
+        withFanOutOutcome(
+          {
+            node_id: nodeId,
+            state: 'failed',
+            ...(typeof data.error === 'string' ? { error: data.error } : {}),
+          },
+          data.fan_out_outcome
+        )
+      );
+      outputs.delete(key);
+      failureOrder.set(key, index);
+      break;
+    }
+    case 'node_skipped': {
+      const data = record.data;
+      const reason = nodeSkipReasonSchema.safeParse(data.reason);
+      const cause = skipCauseSchema.safeParse(data.cause);
+      nodes.set(key, {
+        node_id: nodeId,
+        state: 'skipped',
+        ...(reason.success ? { reason: reason.data } : {}),
+        ...(cause.success ? { cause: cause.data } : {}),
+      });
+      outputs.delete(key);
+      failureOrder.delete(key);
+      break;
+    }
+    default: {
+      const exhaustiveCheck: never = record.eventType;
+      throw new Error(`Unhandled NodeStateEventType: ${String(exhaustiveCheck)}`);
     }
   }
-  let returns: TerminalRecord['returns'];
-  const selected = graph.success ? graph.data.returns : undefined;
+}
+
+/** The engine's per-node state at any point in a run: the same fold the terminal record uses. */
+export function buildRunNodeStates(
+  run: Pick<WorkflowRun, 'id' | 'metadata'>,
+  events: readonly TerminalRecordEvent[]
+): RunNodeState[] {
+  return [...foldNodeEvents(run, events).nodes.values()];
+}
+
+/**
+ * What a running node observes as `$NODE_OUTCOMES_FILE`: every node invocation the run
+ * has recorded, in the order each first appeared, with a completed node's structured
+ * output. Graph nodes that have recorded nothing yet are `pending`.
+ */
+export function buildNodeOutcomes(
+  run: Pick<WorkflowRun, 'id' | 'metadata'>,
+  events: readonly TerminalRecordEvent[]
+): NodeOutcomesListing {
+  const { nodes, outputs, failureOrder } = foldNodeEvents(run, events, nodeInvocationKey);
+  const outcomes = [...nodes].map(([key, state]): NodeOutcome => {
+    const { loopPath } = parseNodeInvocationKey(key);
+    // The fold keeps output only for a completed entry and drops it on every later
+    // state, so a failed, running or reset node never lists one.
+    const data = outputs.get(key);
+    return {
+      ...state,
+      ...(loopPath.length > 0 ? { loop_group_path: loopPath } : {}),
+      ...(data && Object.hasOwn(data, 'structured_output')
+        ? { output: data.structured_output }
+        : {}),
+    };
+  });
+  const firstFailed = [...failureOrder].sort((left, right) => left[1] - right[1])[0]?.[0];
+  return nodeOutcomesListingSchema.parse({
+    run_id: run.id,
+    first_failed_node: firstFailed === undefined ? null : parseNodeInvocationKey(firstFailed).path,
+    nodes: outcomes,
+  });
+}
+
+/**
+ * Failed and cancelled runs keep their worktree without inspecting it; only a completed
+ * run's disposition needs git, so the executor assesses it and stores it in run metadata
+ * before the terminal write.
+ */
+function readWorktreeDisposition(
+  run: Pick<WorkflowRun, 'status' | 'metadata'>
+): WorktreeDisposition | undefined {
+  if (!readOwnedWorktree(run.metadata)) return undefined;
+  switch (run.status) {
+    case 'failed':
+      return { disposition: 'retained', reason: 'resumable' };
+    case 'cancelled':
+      return { disposition: 'retained', reason: 'cancelled' };
+    case 'completed': {
+      const parsed = worktreeDispositionSchema.safeParse(
+        run.metadata?.[WORKTREE_DISPOSITION_METADATA_KEY]
+      );
+      return parsed.success ? parsed.data : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function selectRecordedReturn({ graph, nodes, outputs }: NodeEventFold): TerminalRecord['returns'] {
+  const selected = graph?.returns;
   if (selected === undefined) {
-    returns = {
+    return {
       availability: 'unavailable',
       node_id: null,
-      reason: graph.success ? 'not_declared' : 'graph_unavailable',
+      reason: graph ? 'not_declared' : 'graph_unavailable',
     };
-  } else {
-    const data = outputs.get(selected);
-    if (nodes.get(selected)?.state !== 'completed') {
-      returns = { availability: 'unavailable', node_id: selected, reason: 'node_not_completed' };
-    } else if (data && Object.hasOwn(data, 'structured_output')) {
-      returns = { availability: 'available', node_id: selected, value: data.structured_output };
-    } else if (data?.node_output_truncated === true) {
-      returns = {
-        availability: 'truncated',
-        node_id: selected,
-        spill_path:
-          typeof data.node_output_spill_path === 'string' ? data.node_output_spill_path : null,
-        original_bytes:
-          typeof data.node_output_original_bytes === 'number'
-            ? data.node_output_original_bytes
-            : null,
-      };
-    } else if (typeof data?.node_output === 'string') {
-      returns = { availability: 'available', node_id: selected, value: data.node_output };
-    } else {
-      returns = { availability: 'unavailable', node_id: selected, reason: 'output_not_persisted' };
-    }
   }
+  const data = outputs.get(selected);
+  if (nodes.get(selected)?.state !== 'completed') {
+    return { availability: 'unavailable', node_id: selected, reason: 'node_not_completed' };
+  }
+  if (data && Object.hasOwn(data, 'structured_output')) {
+    return { availability: 'available', node_id: selected, value: data.structured_output };
+  }
+  if (data?.node_output_truncated === true) {
+    return {
+      availability: 'truncated',
+      node_id: selected,
+      spill_path:
+        typeof data.node_output_spill_path === 'string' ? data.node_output_spill_path : null,
+      original_bytes:
+        typeof data.node_output_original_bytes === 'number'
+          ? data.node_output_original_bytes
+          : null,
+    };
+  }
+  if (typeof data?.node_output === 'string') {
+    return { availability: 'available', node_id: selected, value: data.node_output };
+  }
+  return { availability: 'unavailable', node_id: selected, reason: 'output_not_persisted' };
+}
+
+function runArtifactsDir(run: Pick<WorkflowRun, 'id' | 'output_root'>): string | null {
   const root = resolveRunStorageRoot(run, null);
+  return root === null ? null : getRunArtifactsDirForRoot(root, run.id);
+}
+
+/**
+ * Walk the run's artifacts directory for its terminal record. This touches the
+ * filesystem, so never await it while holding a database write transaction or the
+ * file-store lock.
+ */
+export async function observeRunArtifacts(
+  run: Pick<WorkflowRun, 'id' | 'output_root'>
+): Promise<ArtifactManifest> {
+  return observeArtifactManifest(
+    runArtifactsDir(run),
+    resolveRunStorageRoot(run, null) ?? undefined,
+    run.id
+  );
+}
+
+/** Artifact manifests walked before a terminal transaction, keyed by run id. */
+export type TerminalArtifacts = ReadonlyMap<string, ArtifactManifest>;
+
+export async function observeTerminalArtifacts(
+  runs: readonly Pick<WorkflowRun, 'id' | 'output_root'>[]
+): Promise<TerminalArtifacts> {
+  return new Map(
+    await Promise.all(runs.map(async run => [run.id, await observeRunArtifacts(run)] as const))
+  );
+}
+
+/**
+ * The manifest a terminal write records: `observed` when it was walked for the run's
+ * current artifacts directory. A run can miss its walk between the caller's pre-read and
+ * its transaction (a reset finds a run that became resumable, or a pending run gains its
+ * `output_root`); it then records an empty manifest marked `not_observed`.
+ */
+export function terminalArtifactsFor(
+  run: Pick<WorkflowRun, 'id' | 'output_root'>,
+  observed: ArtifactManifest | undefined
+): ArtifactManifest {
+  const root = runArtifactsDir(run);
+  if (observed !== undefined && observed.root === root) return observed;
+  return {
+    root,
+    files: [],
+    limitations: [{ path: '', kind: 'root_unavailable', code: 'not_observed' }],
+  };
+}
+
+/** Fold ordered durable events; never reconstruct producer values from artifact contents. */
+export function buildTerminalRecord(input: {
+  run: Pick<WorkflowRun, 'id' | 'status' | 'outcome' | 'metadata'>;
+  events: readonly TerminalRecordEvent[];
+  artifacts: ArtifactManifest;
+}): TerminalRecord {
+  const { run, events, artifacts } = input;
+  const folded = foldNodeEvents(run, events);
+  const { nodes, failureOrder } = folded;
+  const worktreeDisposition = readWorktreeDisposition(run);
   return terminalRecordSchema.parse({
     run_id: run.id,
     status: terminalStatusSchema.parse(run.status),
@@ -131,12 +340,9 @@ export async function buildTerminalRecord(input: {
     error: typeof run.metadata?.error === 'string' ? run.metadata.error : null,
     first_failed_node: [...failureOrder].sort((left, right) => left[1] - right[1])[0]?.[0] ?? null,
     nodes: [...nodes.values()],
-    returns,
-    artifacts: await observeArtifactManifest(
-      root === null ? null : getRunArtifactsDirForRoot(root, run.id),
-      root ?? undefined,
-      run.id
-    ),
+    returns: selectRecordedReturn(folded),
+    artifacts,
+    ...(worktreeDisposition ? { worktree_disposition: worktreeDisposition } : {}),
   });
 }
 
@@ -149,7 +355,7 @@ export function getTerminalRecord(
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index];
     if (event?.event_type !== `workflow_${runStatus}`) continue;
-    const data = eventData(event.data);
+    const data = readNodeRecordData(event.data);
     if (data.terminal_record === undefined) return null;
     const record = terminalRecordSchema.parse(data.terminal_record);
     if (record.status !== runStatus)
@@ -157,4 +363,83 @@ export function getTerminalRecord(
     return record;
   }
   return null;
+}
+
+/**
+ * The `node_failed` event behind a record's `first_failed_node`: the last one for that
+ * node in `events`. Terminal telemetry and the attention stream both read the failure
+ * cause through this, so they agree on which event is the failure.
+ */
+export function firstFailedNodeEvent<E extends TerminalRecordEvent>(
+  record: Pick<TerminalRecord, 'first_failed_node'> | null,
+  events: readonly E[]
+): E | undefined {
+  const node = record?.first_failed_node;
+  if (node == null) return undefined;
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event?.event_type === 'node_failed' && event.step_name === node) return event;
+  }
+  return undefined;
+}
+
+/** The failure kind a `node_failed` event recorded; undefined when it recorded none. */
+export function recordedFailureKind(event: TerminalRecordEvent): NodeFailureKind | undefined {
+  const kind = nodeFailureKindSchema.safeParse(readNodeRecordData(event.data).failure_kind);
+  return kind.success ? kind.data : undefined;
+}
+
+const REASON_LINES = 2;
+const REASON_LINE_LENGTH = 200;
+
+/** The first line of `text` that says anything. */
+function firstLine(text: string): string | undefined {
+  return text
+    .split('\n')
+    .map(candidate => candidate.trim())
+    .find(candidate => candidate !== '');
+}
+
+/** What a returned value says in text: its lines, or each text field of an object as `key: text`. */
+function returnedText(value: unknown): string[] {
+  if (typeof value === 'string') return value.split('\n').map(line => line.trim());
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return [];
+  return Object.entries(value).flatMap(([key, field]) => {
+    const line = typeof field === 'string' ? firstLine(field) : undefined;
+    // A key is authored text too: one with a line break must not make the entry span lines.
+    // Only the breaks are replaced, so any other key is written as authored.
+    return line === undefined ? [] : [`${key.replace(/\s*[\r\n]+\s*/g, ' ')}: ${line}`];
+  });
+}
+
+const boundedReason = (lines: readonly string[]): string[] =>
+  lines
+    .filter(line => line !== '')
+    .slice(0, REASON_LINES)
+    .map(line =>
+      line.length > REASON_LINE_LENGTH ? `${line.slice(0, REASON_LINE_LENGTH - 1)}…` : line
+    );
+
+/**
+ * Why a run completed with a failed outcome, in at most two short lines: what its
+ * `returns:` node said, since that node authored the verdict. Empty for any other run and
+ * when the record holds no returned text. The attention stream carries this, because the
+ * workflow wrote it to be read as the run's result.
+ */
+export function failedOutcomeReason(record: TerminalRecord | null): string[] {
+  if (record?.status !== 'completed' || record.outcome !== 'failed') return [];
+  if (record.returns.availability !== 'available') return [];
+  return boundedReason(returnedText(record.returns.value));
+}
+
+/**
+ * Why a run that ended needs a look, for a reader of that one run: the failed-outcome
+ * reason, or for a failed run the first line of its first failed node's error, or else of
+ * the run's own. Error text is whatever a command or provider printed, so it stays out of
+ * the attention stream, which uses structured failure facts instead.
+ */
+export function terminalReason(record: TerminalRecord | null): string[] {
+  if (record?.status !== 'failed') return failedOutcomeReason(record);
+  const failed = record.nodes.find(node => node.node_id === record.first_failed_node);
+  return boundedReason([firstLine(failed?.error ?? record.error ?? '') ?? '']);
 }

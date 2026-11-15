@@ -1,14 +1,19 @@
 import { describe, expect, test } from 'bun:test';
 import type { MessageChunk } from '@archon/providers/types';
-import { isLostSessionResult, withRecoveredSession } from './session-recovery';
+import { withRecoveredSession } from './session-recovery';
 
+// The provider's structured "that session is not here" (see `sessionNotFound`).
 const LOST: MessageChunk = {
   type: 'result',
   isError: true,
   errorSubtype: 'error_during_execution',
   sessionId: 'gone-abc',
+  sessionNotFound: true,
 };
 const OK = (sessionId: string): MessageChunk => ({ type: 'result', sessionId });
+/** A result from the fresh attempt: the shared retry marks it as not resumed. */
+const FRESH = (chunk: MessageChunk): MessageChunk =>
+  chunk.type === 'result' ? { ...chunk, resumed: false } : chunk;
 const say = (text: string): MessageChunk => ({ type: 'agent_message_chunk', text });
 
 /** A provider that answers each attempt with a scripted chunk list. */
@@ -34,20 +39,6 @@ async function drain(stream: AsyncGenerator<MessageChunk>): Promise<MessageChunk
   return out;
 }
 
-describe('isLostSessionResult', () => {
-  test('recognises the provider result for a resume that found nothing', () => {
-    expect(isLostSessionResult(LOST)).toBe(true);
-  });
-
-  test('is not fooled by other failures or by a clean result', () => {
-    expect(isLostSessionResult({ type: 'result', isError: true, errorSubtype: 'rate_limit' })).toBe(
-      false
-    );
-    expect(isLostSessionResult(OK('live'))).toBe(false);
-    expect(isLostSessionResult(say('hello'))).toBe(false);
-  });
-});
-
 describe('withRecoveredSession', () => {
   test('passes a healthy turn through untouched and replays nothing', async () => {
     const provider = scriptedProvider([[say('hi'), OK('same-session')]]);
@@ -55,6 +46,7 @@ describe('withRecoveredSession', () => {
 
     const chunks = await drain(
       withRecoveredSession({
+        logContext: {},
         sendQuery: provider.sendQuery,
         prompt: 'PROMPT',
         resumeSessionId: 'live-1',
@@ -72,6 +64,30 @@ describe('withRecoveredSession', () => {
     expect(replayCalls).toBe(0);
   });
 
+  test('a failure the provider does not mark as a lost session is not retried', async () => {
+    const plainFailure: MessageChunk = {
+      type: 'result',
+      isError: true,
+      errorSubtype: 'error_during_execution',
+      sessionId: 'live-1',
+    };
+    const provider = scriptedProvider([[plainFailure]]);
+
+    const chunks = await drain(
+      withRecoveredSession({
+        logContext: {},
+        sendQuery: provider.sendQuery,
+        prompt: 'PROMPT',
+        resumeSessionId: 'live-1',
+        loadReplay: () => Promise.resolve('REPLAY'),
+        onSessionLost: () => Promise.resolve(),
+      })
+    );
+
+    expect(chunks).toEqual([plainFailure]);
+    expect(provider.calls).toHaveLength(1);
+  });
+
   test('a lost session is answered, not reported, with the history in front of it', async () => {
     const provider = scriptedProvider([[LOST], [say('carrying on'), OK('fresh-session')]]);
     const lost: (string | undefined)[] = [];
@@ -79,6 +95,7 @@ describe('withRecoveredSession', () => {
 
     const chunks = await drain(
       withRecoveredSession({
+        logContext: {},
         sendQuery: provider.sendQuery,
         prompt: 'PROMPT',
         resumeSessionId: 'gone-abc',
@@ -95,7 +112,7 @@ describe('withRecoveredSession', () => {
     );
 
     // The failing result never reaches the handler, so no error is shown.
-    expect(chunks).toEqual([say('carrying on'), OK('fresh-session')]);
+    expect(chunks).toEqual([say('carrying on'), FRESH(OK('fresh-session'))]);
     expect(lost).toEqual(['gone-abc']);
     expect(recovered).toEqual([{ replayed: true }]);
     expect(provider.calls).toHaveLength(2);
@@ -110,6 +127,7 @@ describe('withRecoveredSession', () => {
 
     const chunks = await drain(
       withRecoveredSession({
+        logContext: {},
         sendQuery: provider.sendQuery,
         prompt: 'PROMPT',
         resumeSessionId: 'gone-abc',
@@ -122,7 +140,7 @@ describe('withRecoveredSession', () => {
       })
     );
 
-    expect(chunks).toEqual([say('fresh start'), OK('fresh')]);
+    expect(chunks).toEqual([say('fresh start'), FRESH(OK('fresh'))]);
     expect(provider.calls[1]?.prompt).toBe('PROMPT');
     expect(recovered).toEqual([{ replayed: false }]);
   });
@@ -132,6 +150,7 @@ describe('withRecoveredSession', () => {
 
     const chunks = await drain(
       withRecoveredSession({
+        logContext: {},
         sendQuery: provider.sendQuery,
         prompt: 'PROMPT',
         loadReplay: () => Promise.resolve('REPLAY'),
@@ -148,6 +167,7 @@ describe('withRecoveredSession', () => {
 
     const chunks = await drain(
       withRecoveredSession({
+        logContext: {},
         sendQuery: provider.sendQuery,
         prompt: 'PROMPT',
         resumeSessionId: 'live-1',
@@ -173,6 +193,7 @@ describe('withRecoveredSession', () => {
 
     const chunks = await drain(
       withRecoveredSession({
+        logContext: {},
         sendQuery: provider.sendQuery,
         prompt: 'PROMPT',
         resumeSessionId: 'gone-abc',
@@ -181,7 +202,7 @@ describe('withRecoveredSession', () => {
       })
     );
 
-    expect(chunks).toEqual([warning, say('recovered'), OK('fresh')]);
+    expect(chunks).toEqual([warning, say('recovered'), FRESH(OK('fresh'))]);
     expect(provider.calls).toHaveLength(2);
   });
 
@@ -190,6 +211,7 @@ describe('withRecoveredSession', () => {
 
     const chunks = await drain(
       withRecoveredSession({
+        logContext: {},
         sendQuery: provider.sendQuery,
         prompt: 'PROMPT',
         resumeSessionId: 'gone-abc',
@@ -198,7 +220,7 @@ describe('withRecoveredSession', () => {
       })
     );
 
-    expect(chunks).toEqual([LOST]);
+    expect(chunks).toEqual([FRESH(LOST)]);
     expect(provider.calls).toHaveLength(2);
   });
 });

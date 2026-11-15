@@ -2,7 +2,8 @@
  * Web platform adapter implementing IPlatformAdapter with SSE stream management.
  * Bridge between the orchestrator and the React frontend via Server-Sent Events.
  */
-import type { IWebPlatformAdapter, MessageMetadata } from '@archon/core';
+import { webPolicy } from '@archon/adapters/web/policy';
+import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
 import type { PlatformStructuredEvent } from '@archon/workflows/deps';
 import { toolCallDisplayName } from '@archon/provider-contract';
 import { createLogger } from '@archon/paths';
@@ -17,7 +18,12 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-export class WebAdapter implements IWebPlatformAdapter {
+export class WebAdapter implements IPlatformAdapter {
+  readonly capabilities = {
+    canDetachProject: true as const,
+    messagePersistence: 'adapter',
+    defaultWorkflowDispatch: 'background',
+  } as const;
   /**
    * Per-conversation running tool stack for SSE duration tracking.
    * Uses a Map of toolCallId → start info so parallel DAG nodes don't
@@ -35,18 +41,19 @@ export class WebAdapter implements IWebPlatformAdapter {
   ) {}
 
   /**
-   * Register an SSE stream for a conversation.
-   * Closes any existing stream (browser refresh / new tab replaces old).
+   * Dashboard connections coexist; a conversation reconnect replaces its old stream.
    */
   registerStream(conversationId: string, stream: SSEWriter): void {
     this.transport.registerStream(conversationId, stream);
   }
 
   removeStream(conversationId: string, expectedStream?: SSEWriter): void {
-    this.transport.removeStream(conversationId, expectedStream);
-    // Clean up stale tool tracking state on SSE disconnect to prevent
-    // spurious tool_result events on the next message to this conversation.
-    this.runningTools.delete(conversationId);
+    // Clean up stale tool tracking state once the last writer is gone to prevent
+    // spurious tool_result events on the next message to this conversation. A
+    // stale writer leaving while another is live must not wipe live tool state.
+    if (this.transport.removeStream(conversationId, expectedStream)) {
+      this.runningTools.delete(conversationId);
+    }
   }
 
   /**
@@ -83,9 +90,6 @@ export class WebAdapter implements IWebPlatformAdapter {
       ...(metadata?.workflowResult ? { workflowResult: metadata.workflowResult } : {}),
     });
 
-    // Forward output to registered callback (for event bridge preview)
-    this.workflowBridge.emitOutput(conversationId, message);
-
     await this.transport.emit(conversationId, event);
 
     // Workflow result arrives after the parent lock is released (background dispatch),
@@ -101,72 +105,11 @@ export class WebAdapter implements IWebPlatformAdapter {
     let event: string;
 
     if (chunk.type === 'tool_call') {
-      const now = Date.now();
-      const name = toolCallDisplayName(chunk);
-      const input = chunk.rawInput ?? {};
-
-      // Buffer tool call for direct chat persistence (message metadata)
-      this.persistence.appendToolCall(conversationId, {
-        toolCallId: chunk.toolCallId,
-        name,
-        input,
-      });
-
-      // Track this tool's start for duration computation (supports parallel DAG nodes)
-      let convTools = this.runningTools.get(conversationId);
-      if (!convTools) {
-        convTools = new Map();
-        this.runningTools.set(conversationId, convTools);
-      }
-      convTools.set(chunk.toolCallId, { toolCallId: chunk.toolCallId, name, startedAt: now });
-
-      event = JSON.stringify({
-        type: 'tool_call',
-        toolCallId: chunk.toolCallId,
-        name,
-        input,
-        timestamp: now,
-      });
+      event = this.mapToolCall(conversationId, chunk);
     } else if (chunk.type === 'tool_call_update') {
-      const now = Date.now();
-      const convTools = this.runningTools.get(conversationId);
-      const tool = convTools?.get(chunk.toolCallId);
-      if (!tool) {
-        // The SSE event still goes out, but the UI cannot pair it to a running card.
-        getLog().warn(
-          { conversationId, toolCallId: chunk.toolCallId },
-          'web_adapter.tool_result_unmatched'
-        );
-      }
-      convTools?.delete(chunk.toolCallId);
-      const duration = now - (tool?.startedAt ?? now);
-      // The provider already capped the output (TOOL_OUTPUT_MAX_CHARS).
-      const output = chunk.output ?? '';
-      try {
-        this.persistence.appendToolResult(conversationId, chunk.toolCallId, output, duration, {
-          status: chunk.status,
-          exitCode: chunk.exitCode,
-        });
-      } catch (e: unknown) {
-        getLog().error({ conversationId, err: e }, 'tool_result_persist_failed');
-      }
-      event = JSON.stringify({
-        type: 'tool_result',
-        toolCallId: chunk.toolCallId,
-        name: tool?.name,
-        output,
-        status: chunk.status,
-        ...(chunk.exitCode !== undefined ? { exitCode: chunk.exitCode } : {}),
-        duration,
-        timestamp: now,
-      });
+      event = this.mapToolResult(conversationId, chunk);
     } else if (chunk.type === 'result') {
-      if (!chunk.sessionId) return;
-      event = JSON.stringify({
-        type: 'session_info',
-        sessionId: chunk.sessionId,
-        timestamp: Date.now(),
-      });
+      return;
     } else if (chunk.type === 'workflow_dispatch') {
       event = JSON.stringify({
         type: 'workflow_dispatch',
@@ -188,6 +131,76 @@ export class WebAdapter implements IWebPlatformAdapter {
     await this.transport.emit(conversationId, event);
   }
 
+  private mapToolCall(
+    conversationId: string,
+    chunk: Extract<PlatformStructuredEvent, { type: 'tool_call' }>
+  ): string {
+    const now = Date.now();
+    const name = toolCallDisplayName(chunk);
+    const input = chunk.rawInput === undefined ? {} : chunk.rawInput;
+
+    // Buffer tool call for direct chat persistence (message metadata)
+    this.persistence.appendToolCall(conversationId, {
+      toolCallId: chunk.toolCallId,
+      name,
+      input,
+    });
+
+    // Track this tool's start for duration computation (supports parallel DAG nodes)
+    let convTools = this.runningTools.get(conversationId);
+    if (!convTools) {
+      convTools = new Map();
+      this.runningTools.set(conversationId, convTools);
+    }
+    convTools.set(chunk.toolCallId, { toolCallId: chunk.toolCallId, name, startedAt: now });
+
+    return JSON.stringify({
+      type: 'tool_call',
+      toolCallId: chunk.toolCallId,
+      name,
+      input,
+      timestamp: now,
+    });
+  }
+
+  private mapToolResult(
+    conversationId: string,
+    chunk: Extract<PlatformStructuredEvent, { type: 'tool_call_update' }>
+  ): string {
+    const now = Date.now();
+    const convTools = this.runningTools.get(conversationId);
+    const tool = convTools?.get(chunk.toolCallId);
+    if (!tool) {
+      // The SSE event still goes out, but the UI cannot pair it to a running card.
+      getLog().warn(
+        { conversationId, toolCallId: chunk.toolCallId },
+        'web_adapter.tool_result_unmatched'
+      );
+    }
+    convTools?.delete(chunk.toolCallId);
+    const duration = now - (tool?.startedAt ?? now);
+    // The provider already capped the output (TOOL_OUTPUT_MAX_CHARS).
+    const output = chunk.output ?? '';
+    try {
+      this.persistence.appendToolResult(conversationId, chunk.toolCallId, output, duration, {
+        status: chunk.status,
+        exitCode: chunk.exitCode,
+      });
+    } catch (e: unknown) {
+      getLog().error({ conversationId, err: e }, 'tool_result_persist_failed');
+    }
+    return JSON.stringify({
+      type: 'tool_result',
+      toolCallId: chunk.toolCallId,
+      name: tool?.name,
+      output,
+      status: chunk.status,
+      ...(chunk.exitCode !== undefined ? { exitCode: chunk.exitCode } : {}),
+      duration,
+      timestamp: now,
+    });
+  }
+
   async ensureThread(originalConversationId: string): Promise<string> {
     return originalConversationId;
   }
@@ -197,7 +210,7 @@ export class WebAdapter implements IWebPlatformAdapter {
   }
 
   getPlatformType(): string {
-    return 'web';
+    return webPolicy.id;
   }
 
   async start(): Promise<void> {
@@ -278,20 +291,20 @@ export class WebAdapter implements IWebPlatformAdapter {
     return this.transport.hasActiveStream(conversationId);
   }
 
-  /**
-   * Bridge workflow events from a worker conversation to a parent conversation's SSE stream.
-   * Forwards compact progress events (step progress, status) and output previews.
-   */
-  setupEventBridge(workerConversationId: string, parentConversationId: string): () => void {
-    return this.workflowBridge.bridgeWorkerEvents(workerConversationId, parentConversationId);
-  }
-
-  registerOutputCallback(conversationId: string, callback: (text: string) => void): void {
-    this.workflowBridge.registerOutputCallback(conversationId, callback);
-  }
-
-  removeOutputCallback(conversationId: string): void {
-    this.workflowBridge.removeOutputCallback(conversationId);
+  async prepareBackgroundConversation(
+    context: Parameters<NonNullable<IPlatformAdapter['prepareBackgroundConversation']>>[0]
+  ): Promise<() => Promise<void>> {
+    const { workerConversationId, parentConversationId, conversationDbId } = context;
+    this.setConversationDbId(workerConversationId, conversationDbId);
+    // Worker workflow events are forwarded to the parent conversation's stream.
+    const unsubscribe = this.workflowBridge.bridgeWorkerEvents(
+      workerConversationId,
+      parentConversationId
+    );
+    return async () => {
+      unsubscribe();
+      await this.emitLockEvent(workerConversationId, false);
+    };
   }
 
   async emitRetract(conversationId: string): Promise<void> {

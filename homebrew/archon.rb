@@ -5,30 +5,30 @@
 # For development, see: https://github.com/coleam00/Archon
 
 class Archon < Formula
-  desc "Remote agentic coding platform - control AI assistants from anywhere"
+  desc "Governed agentic automation engine"
   homepage "https://github.com/coleam00/Archon"
-  version "0.11.1"
+  version "0.14.0"
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-darwin-arm64"
-      sha256 "b9338474fd3151d5d5402d76ae278105e65835f2e3506a93f0e5e4a378d10ede"
+      sha256 "784cc0fc070edb046f410d1d5de6b30a925fb40ecf1f70a2de23731048c6d3a4"
     end
     on_intel do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-darwin-x64"
-      sha256 "a78527fb8a204812a20857f1f6488f7eedf092370a252fad1efade2db1ec461f"
+      sha256 "7c144814e429c477886939c1f6f4f1cfaf262d9b83252178831f91149d46fec5"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-linux-arm64"
-      sha256 "2d85e5edf214dc249611499cf30a3e6ba0ea3061eced64563c9cc2c5879d2fb1"
+      sha256 "09663a0efe099d7e856064c60d220fc19b560118404bdfeb4a172a1b8ec6eb11"
     end
     on_intel do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-linux-x64"
-      sha256 "81ee5feaf4e6c8de19903a6c1252743228d235bbedb818dbee045b21df49d59d"
+      sha256 "996d9989933bd7214645840723c48a803e781256435a0f0d22eb4fe645985bab"
     end
   end
 
@@ -45,6 +45,20 @@ class Archon < Formula
     end
 
     bin.install binary_name => "archon"
+  end
+
+  def caveats
+    <<~EOS
+      Archon ships without AI providers. Add the ones you use:
+        archon setup
+      or directly:
+        archon provider add <claude|codex|pi>
+
+      Adding a provider connects Archon to your agent CLI or SDK; it does not install that CLI.
+
+      After `brew upgrade archon`, run `archon provider add` again for each
+      provider you use; installed providers must match the CLI version.
+    EOS
   end
 
   test do

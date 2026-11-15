@@ -3,10 +3,11 @@
  *
  * Wire syntax per atom: `$<nodeId>.output[.<field>] <op> <rhs>` (canonical),
  * `$<nodeId>.<field> <op> <rhs>` (shorthand) or `$INPUTS.<name> <op> <rhs>` (a
- * declared workflow input), where `<rhs>` is a single-quoted string literal or a
+ * declared workflow input), or `$LOOP_PREV.<nodeId>.output[.<field>]` in loop
+ * context, where `<rhs>` is a single-quoted string literal or a
  * bare number/boolean. `||` joins OR-clauses (outer, lower precedence) and `&&`
  * joins atoms within a clause (inner, higher precedence). Six operators:
- * `== != < > <= >=`. No parentheses. This mirrors the engine's one atom parser
+ * `== != < > <= >=`; the four numeric ones need a numeric RHS. No parentheses. This mirrors the engine's one atom parser
  * (`WHEN_ATOM_PATTERN` plus the follow-up rules in `parseWhenAtom`,
  * packages/workflows/src/when-atom.ts) so the builder and the runtime agree on
  * what parses.
@@ -18,28 +19,14 @@
  *
  * No React, no logging — errors surface via the `ParseResult` return value.
  */
+import { INPUTS_SCOPE, INPUTS_REF_PREFIX, INPUT_NAME_SOURCE } from '@/lib/input-ref';
 import { NODE_ID_SOURCE } from '@/lib/node-ref';
 import type { AtomNode, ParseResult, WhenAst, WhenOp } from '../types/when';
 
 /** A path segment (`output`, or a field name) — no hyphen, unlike a node id. */
 const SEGMENT_SOURCE = String.raw`[a-zA-Z_][a-zA-Z0-9_]*`;
 
-/**
- * The reserved scope name for workflow inputs (the engine's `WHEN_INPUTS_SCOPE`).
- * It can never be a node id — the engine's node schema rejects it outright — so
- * binding the name to the input scope here cannot shadow a real node.
- */
-const INPUTS_SCOPE = 'INPUTS';
-
-/**
- * An input name, as the engine's `with:` key validator defines it
- * (`INPUT_NAME_SOURCE` in packages/workflows/src/schemas/dag-node.ts).
- *
- * Identical to `NODE_ID_SOURCE` today, and kept separate anyway: they are
- * different vocabularies that happen to coincide, and writing the coincidence
- * into the code would hide a future widening of one from the reader.
- */
-const INPUT_NAME_SOURCE = String.raw`[a-zA-Z_][a-zA-Z0-9_-]*`;
+const OUTPUT_PATH_SOURCE = `${SEGMENT_SOURCE}(?:\\.${SEGMENT_SOURCE})*`;
 
 /**
  * Single-atom pattern, mirroring the engine's `WHEN_ATOM_PATTERN`:
@@ -47,7 +34,7 @@ const INPUT_NAME_SOURCE = String.raw`[a-zA-Z_][a-zA-Z0-9_-]*`;
  *   2. nodeId    — `$nodeId`, using the package-wide id grammar (`@/lib/node-ref`)
  *   3. segment1  — first path segment (`output` for canonical refs, else a
  *                  shorthand field name)
- *   4. segment2  — optional second segment (the field name when segment1 is `output`)
+ *   4. segment2  — optional object-field path (when segment1 is `output`)
  *   5. op        — one of the six operators
  *   6. quoted    — single-quoted RHS literal (may be empty)
  *   7. bare      — unquoted RHS: number (`-?\d+(.\d+)?`) or `true`/`false`
@@ -66,8 +53,15 @@ export const ATOM_PATTERN = new RegExp(
   '^(?:' +
     String.raw`\$${INPUTS_SCOPE}\.(${INPUT_NAME_SOURCE})` +
     '|' +
-    String.raw`\$(${NODE_ID_SOURCE})\.(${SEGMENT_SOURCE})(?:\.(${SEGMENT_SOURCE}))?` +
+    String.raw`\$(${NODE_ID_SOURCE})\.(${SEGMENT_SOURCE})(?:\.(${OUTPUT_PATH_SOURCE}))?` +
     ')' +
+    String.raw`\s*(==|!=|<=|>=|<|>)\s*` +
+    String.raw`(?:'([^']*)'|(-?\d+(?:\.\d+)?|true|false))$`
+);
+
+/** Loop-context branch, mirrored from the engine and pinned by the parity check. */
+export const LOOP_PREV_ATOM_PATTERN = new RegExp(
+  String.raw`^\$LOOP_PREV\.(${NODE_ID_SOURCE})\.output(?:\.(${OUTPUT_PATH_SOURCE}))?` +
     String.raw`\s*(==|!=|<=|>=|<|>)\s*` +
     String.raw`(?:'([^']*)'|(-?\d+(?:\.\d+)?|true|false))$`
 );
@@ -102,48 +96,110 @@ function splitOutsideQuotes(expr: string, sep: string): string[] {
   return parts;
 }
 
+type AtomParseResult = { ok: true; atom: AtomNode } | { ok: false; error: string };
+
+function parseComparison(
+  trimmed: string,
+  op: string | undefined,
+  quoted: string | undefined,
+  bare: string | undefined
+):
+  | { ok: true; comparison: Pick<AtomNode, 'op' | 'value' | 'bare'> }
+  | { ok: false; error: string } {
+  const rhs = quoted !== undefined ? quoted : bare;
+  if (op === undefined || rhs === undefined) {
+    return { ok: false, error: `cannot parse condition: "${trimmed}"` };
+  }
+  // The engine compares parseFloat on both sides, including quoted numeric prefixes.
+  if (op !== '==' && op !== '!=' && !Number.isFinite(parseFloat(rhs))) {
+    return {
+      ok: false,
+      error: `cannot parse condition: "${trimmed}" ('${op}' compares numbers, so the right-hand side must be a number)`,
+    };
+  }
+  return {
+    ok: true,
+    comparison: { op: op as WhenOp, value: rhs, ...(quoted === undefined ? { bare: true } : {}) },
+  };
+}
+
+function parseLoopPrevAtom(trimmed: string, match: RegExpExecArray): AtomParseResult {
+  const [, nodeId, field, op, quoted, bare] = match;
+  const result = parseComparison(trimmed, op, quoted, bare);
+  if (!result.ok) return result;
+  if (nodeId === undefined) {
+    return { ok: false, error: `cannot parse condition: "${trimmed}"` };
+  }
+  return {
+    ok: true,
+    atom: {
+      kind: 'loop_prev',
+      nodeId,
+      ...(field !== undefined ? { field } : {}),
+      ...result.comparison,
+    },
+  };
+}
+
 /** Parse a single atom. Returns the atom, or an error message. */
-function parseAtom(raw: string): { ok: true; atom: AtomNode } | { ok: false; error: string } {
+function parseAtom(raw: string, allowLoopPrev: boolean): AtomParseResult {
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
     return { ok: false, error: 'empty condition atom' };
   }
+  const loopPrev = allowLoopPrev ? LOOP_PREV_ATOM_PATTERN.exec(trimmed) : null;
+  if (loopPrev) return parseLoopPrevAtom(trimmed, loopPrev);
+
   const match = ATOM_PATTERN.exec(trimmed);
   if (!match) {
     return { ok: false, error: `cannot parse condition: "${trimmed}"` };
   }
   const [, inputName, nodeId, segment1, segment2, op, quoted, bare] = match;
-  if (op === undefined) {
-    return { ok: false, error: `cannot parse condition: "${trimmed}"` };
-  }
-
-  const rhs = quoted !== undefined ? quoted : bare;
-  if (rhs === undefined) {
-    return { ok: false, error: `cannot parse condition: "${trimmed}"` };
-  }
-  const spelling = quoted === undefined ? { bare: true as const } : {};
+  const result = parseComparison(trimmed, op, quoted, bare);
+  if (!result.ok) return result;
 
   if (inputName !== undefined) {
-    return {
-      ok: true,
-      atom: { kind: 'input', name: inputName, op: op as WhenOp, value: rhs, ...spelling },
-    };
+    return { ok: true, atom: { kind: 'input', name: inputName, ...result.comparison } };
   }
-
   if (nodeId === undefined || segment1 === undefined) {
     return { ok: false, error: `cannot parse condition: "${trimmed}"` };
   }
 
-  // Reached only by `$INPUTS.<a>.<b>` backtracking out of the input branch above: no
-  // node can carry the reserved id, so this is a malformed input ref rather than a
-  // node reference. The engine's parseWhenAtom rejects it the same way.
+  // Malformed input references can backtrack into the ordinary node branch.
   if (nodeId === INPUTS_SCOPE) {
     return {
       ok: false,
       error: `cannot parse condition: "${trimmed}" ('$${INPUTS_SCOPE}.<name>' names a workflow input and cannot carry a sub-field)`,
     };
   }
+  if (nodeId === 'LOOP_PREV') {
+    return {
+      ok: false,
+      error: `cannot parse condition: "${trimmed}" (invalid $LOOP_PREV reference)`,
+    };
+  }
 
+  const path = resolveNodePath(trimmed, nodeId, segment1, segment2);
+  if (!path.ok) return path;
+  const { field, shorthand } = path;
+  return {
+    ok: true,
+    atom: {
+      kind: 'node',
+      nodeId,
+      ...(field !== undefined ? { field } : {}),
+      ...(shorthand ? { shorthand: true } : {}),
+      ...result.comparison,
+    },
+  };
+}
+
+function resolveNodePath(
+  trimmed: string,
+  nodeId: string,
+  segment1: string,
+  segment2: string | undefined
+): { ok: true; field: string | undefined; shorthand: boolean } | { ok: false; error: string } {
   // Canonical-vs-shorthand path resolution, matching the engine's parseWhenAtom:
   //   `$node.output`        → bare output reference (field undefined)
   //   `$node.output.field`  → field access on the output
@@ -164,23 +220,15 @@ function parseAtom(raw: string): { ok: true; atom: AtomNode } | { ok: false; err
     field = segment1;
   }
 
-  const atom: AtomNode = {
-    kind: 'node',
-    nodeId,
-    op: op as WhenOp,
-    value: rhs,
-    ...(field !== undefined ? { field } : {}),
-    ...(shorthand ? { shorthand: true } : {}),
-    ...spelling,
-  };
-  return { ok: true, atom };
+  return { ok: true, field, shorthand };
 }
 
 /**
  * Parse a `when:` expression into a DNF AST (outer OR of inner AND-groups).
  * Returns `{ ok: false, error }` on the first malformed atom (fail-closed).
+ * As in the engine, previous-iteration references require loop context.
  */
-export function parse(input: string): ParseResult {
+export function parse(input: string, allowLoopPrev = false): ParseResult {
   const trimmed = input.trim();
   if (trimmed.length === 0) {
     return { ok: false, error: 'empty when expression' };
@@ -193,7 +241,7 @@ export function parse(input: string): ParseResult {
     const andParts = splitOutsideQuotes(clause, '&&');
     const group: AtomNode[] = [];
     for (const part of andParts) {
-      const result = parseAtom(part);
+      const result = parseAtom(part, allowLoopPrev);
       if (!result.ok) return { ok: false, error: result.error };
       group.push(result.atom);
     }
@@ -204,8 +252,11 @@ export function parse(input: string): ParseResult {
 }
 
 /** The wire spelling of an atom's left-hand side. */
-function formatRef(atom: AtomNode): string {
-  if (atom.kind === 'input') return `$${INPUTS_SCOPE}.${atom.name}`;
+export function formatRef(atom: AtomNode): string {
+  if (atom.kind === 'input') return `${INPUTS_REF_PREFIX}${atom.name}`;
+  if (atom.kind === 'loop_prev') {
+    return `$LOOP_PREV.${atom.nodeId}.output${atom.field === undefined ? '' : `.${atom.field}`}`;
+  }
   if (atom.shorthand && atom.field !== undefined) return `$${atom.nodeId}.${atom.field}`;
   if (atom.field !== undefined) return `$${atom.nodeId}.output.${atom.field}`;
   return `$${atom.nodeId}.output`;

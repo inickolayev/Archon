@@ -1,5 +1,12 @@
 import { z } from 'zod';
-import { checkResultSchema, type ForgeEvent } from './events';
+import {
+  checkResultSchema,
+  commentChangedEventSchema,
+  issueLifecycleEventSchema,
+  labelChangedEventSchema,
+  prLifecycleEventSchema,
+  type ForgeEvent,
+} from './events';
 import { repoRefSchema, type RepoRef } from './identity';
 
 type ForgeFieldValue = string | number | boolean;
@@ -20,6 +27,11 @@ export const forgeEventFieldSchema = z.enum([
   'pr.base.branch',
   'label.name',
   'label.id',
+  'label.actor.id',
+  'label.actor.login',
+  'comment.id',
+  'comment.author.id',
+  'comment.author.login',
   'check.revision',
   'check.unit.kind',
   'check.unit.id',
@@ -84,29 +96,20 @@ const selectorIdentitySchema = z.object({
 });
 const rawForgeEventSelectorSchema = z.discriminatedUnion('kind', [
   selectorIdentitySchema.extend({
-    kind: z.literal('issue.lifecycle'),
-    actions: z.array(z.enum(['opened', 'edited', 'closed', 'reopened'])).min(1),
+    kind: issueLifecycleEventSchema.shape.kind,
+    actions: z.array(issueLifecycleEventSchema.shape.action).min(1),
   }),
   selectorIdentitySchema.extend({
-    kind: z.literal('pr.lifecycle'),
-    actions: z
-      .array(
-        z.enum([
-          'opened',
-          'edited',
-          'head_updated',
-          'ready',
-          'drafted',
-          'closed',
-          'reopened',
-          'merged',
-        ])
-      )
-      .min(1),
+    kind: prLifecycleEventSchema.shape.kind,
+    actions: z.array(prLifecycleEventSchema.shape.action).min(1),
   }),
   selectorIdentitySchema.extend({
-    kind: z.literal('label.changed'),
-    actions: z.array(z.enum(['added', 'removed'])).min(1),
+    kind: labelChangedEventSchema.shape.kind,
+    actions: z.array(labelChangedEventSchema.shape.action).min(1),
+  }),
+  selectorIdentitySchema.extend({
+    kind: commentChangedEventSchema.shape.kind,
+    actions: z.array(commentChangedEventSchema.shape.action).min(1),
   }),
   selectorIdentitySchema.extend({
     kind: z.literal('check.changed'),
@@ -146,6 +149,19 @@ const fieldsByKind = {
     'subject.number',
     'label.name',
     'label.id',
+    'label.actor.id',
+    'label.actor.login',
+  ]),
+  'comment.changed': new Set<ForgeEventField>([
+    'event.kind',
+    'event.action',
+    'repository.host',
+    'repository.path',
+    'subject.kind',
+    'subject.number',
+    'comment.id',
+    'comment.author.id',
+    'comment.author.login',
   ]),
   'check.changed': new Set<ForgeEventField>([
     'event.kind',
@@ -236,6 +252,7 @@ function eventRepo(event: ForgeEvent): RepoRef {
     case 'pr.lifecycle':
       return event.pr.repo;
     case 'label.changed':
+    case 'comment.changed':
       return event.subject.ref.repo;
     case 'check.changed':
       return event.repo;
@@ -249,63 +266,64 @@ function eventSubject(event: ForgeEvent): { kind: 'issue' | 'pr'; number: number
     case 'pr.lifecycle':
       return { kind: 'pr', number: event.pr.number };
     case 'label.changed':
+    case 'comment.changed':
       return { kind: event.subject.kind, number: event.subject.ref.number };
     case 'check.changed':
       return undefined;
   }
 }
 
+type FieldReader = (event: ForgeEvent) => ForgeFieldValue | undefined;
+type ForgeEventOf<K extends ForgeEvent['kind']> = Extract<ForgeEvent, { kind: K }>;
+
+function isEventKind<K extends ForgeEvent['kind']>(
+  event: ForgeEvent,
+  kind: K
+): event is ForgeEventOf<K> {
+  return event.kind === kind;
+}
+
+/** Reads a field that only events of `kind` carry; absent (null) values read as undefined. */
+function fieldOf<K extends ForgeEvent['kind']>(
+  kind: K,
+  read: (event: ForgeEventOf<K>) => ForgeFieldValue | null | undefined
+): FieldReader {
+  return event => (isEventKind(event, kind) ? (read(event) ?? undefined) : undefined);
+}
+
+const FIELD_READERS: Readonly<Record<ForgeEventField, FieldReader>> = {
+  'event.kind': event => event.kind,
+  'event.action': event => event.action,
+  'repository.host': event => eventRepo(event).host,
+  'repository.path': event => eventRepo(event).path,
+  'subject.kind': event => eventSubject(event)?.kind,
+  'subject.number': event => eventSubject(event)?.number,
+  'issue.state': fieldOf('issue.lifecycle', event => event.state),
+  'pr.state': fieldOf('pr.lifecycle', event => event.state),
+  'pr.draft': fieldOf('pr.lifecycle', event => event.draft),
+  'pr.head.objectId': fieldOf('pr.lifecycle', event => event.head?.objectId),
+  'pr.head.branch': fieldOf('pr.lifecycle', event => event.head?.branch),
+  'pr.base.objectId': fieldOf('pr.lifecycle', event => event.base?.objectId),
+  'pr.base.branch': fieldOf('pr.lifecycle', event => event.base?.branch),
+  'label.name': fieldOf('label.changed', event => event.label.name),
+  'label.id': fieldOf('label.changed', event => event.label.id),
+  'label.actor.id': fieldOf('label.changed', event => event.actor?.id),
+  'label.actor.login': fieldOf('label.changed', event => event.actor?.login),
+  'comment.id': fieldOf('comment.changed', event => event.comment.id),
+  'comment.author.id': fieldOf('comment.changed', event => event.comment.author?.id),
+  'comment.author.login': fieldOf('comment.changed', event => event.comment.author?.login),
+  'check.revision': fieldOf('check.changed', event => event.revision),
+  'check.unit.kind': fieldOf('check.changed', event => event.unit.kind),
+  'check.unit.id': fieldOf('check.changed', event => event.unit.id),
+  'check.unit.name': fieldOf('check.changed', event => event.unit.name),
+  'check.nativeState': fieldOf('check.changed', event => event.nativeState),
+  'check.nativeResult': fieldOf('check.changed', event => event.nativeResult),
+  'check.phase': fieldOf('check.changed', event => event.phase),
+  'check.result': fieldOf('check.changed', event => event.result),
+};
+
 function fieldValue(event: ForgeEvent, field: ForgeEventField): ForgeFieldValue | undefined {
-  const repo = eventRepo(event);
-  const subject = eventSubject(event);
-  switch (field) {
-    case 'event.kind':
-      return event.kind;
-    case 'event.action':
-      return event.action;
-    case 'repository.host':
-      return repo.host;
-    case 'repository.path':
-      return repo.path;
-    case 'subject.kind':
-      return subject?.kind;
-    case 'subject.number':
-      return subject?.number;
-    case 'issue.state':
-      return event.kind === 'issue.lifecycle' ? (event.state ?? undefined) : undefined;
-    case 'pr.state':
-      return event.kind === 'pr.lifecycle' ? (event.state ?? undefined) : undefined;
-    case 'pr.draft':
-      return event.kind === 'pr.lifecycle' ? (event.draft ?? undefined) : undefined;
-    case 'pr.head.objectId':
-      return event.kind === 'pr.lifecycle' ? event.head?.objectId : undefined;
-    case 'pr.head.branch':
-      return event.kind === 'pr.lifecycle' ? (event.head?.branch ?? undefined) : undefined;
-    case 'pr.base.objectId':
-      return event.kind === 'pr.lifecycle' ? event.base?.objectId : undefined;
-    case 'pr.base.branch':
-      return event.kind === 'pr.lifecycle' ? (event.base?.branch ?? undefined) : undefined;
-    case 'label.name':
-      return event.kind === 'label.changed' ? event.label.name : undefined;
-    case 'label.id':
-      return event.kind === 'label.changed' ? (event.label.id ?? undefined) : undefined;
-    case 'check.revision':
-      return event.kind === 'check.changed' ? event.revision : undefined;
-    case 'check.unit.kind':
-      return event.kind === 'check.changed' ? event.unit.kind : undefined;
-    case 'check.unit.id':
-      return event.kind === 'check.changed' ? event.unit.id : undefined;
-    case 'check.unit.name':
-      return event.kind === 'check.changed' ? event.unit.name : undefined;
-    case 'check.nativeState':
-      return event.kind === 'check.changed' ? event.nativeState : undefined;
-    case 'check.nativeResult':
-      return event.kind === 'check.changed' ? (event.nativeResult ?? undefined) : undefined;
-    case 'check.phase':
-      return event.kind === 'check.changed' ? event.phase : undefined;
-    case 'check.result':
-      return event.kind === 'check.changed' ? (event.result ?? undefined) : undefined;
-  }
+  return FIELD_READERS[field](event);
 }
 
 export function matchForgeEvent(selector: ForgeEventSelector, event: ForgeEvent): boolean {

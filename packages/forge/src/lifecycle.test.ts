@@ -1,5 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { discoverPlugins } from './discovery';
 import { dispatchForge } from './dispatch';
 import {
@@ -30,6 +33,7 @@ const create = {
   body: 'A body',
   draft: true,
 } satisfies ForgeRequest;
+const draft = { operationId: 'draft-1', op: 'pr.draft', ref } satisfies ForgeRequest;
 const ready = { operationId: 'ready-1', op: 'pr.ready', ref } satisfies ForgeRequest;
 const marker = '<!-- archon-review-report -->';
 const upsert = {
@@ -81,11 +85,12 @@ describe('mutation evidence at the dispatch boundary', () => {
   });
 
   // Verification is not pr.edit-body's alone: a plugin's answer to a create, a
-  // ready flip or a comment upsert is the only claim dispatch has that the write
+  // ready/draft flip or a comment upsert is the only claim dispatch has that the write
   // did what it was asked, so each op's branch is exercised both ways.
   test.each([
     ['pr.create', create],
     ['pr.ready', ready],
+    ['pr.draft', draft],
     ['comment.upsert', upsert],
   ] as const)('accepts a %s result that answers the request', async (op, request) => {
     const result = await dispatch(request);
@@ -98,6 +103,7 @@ describe('mutation evidence at the dispatch boundary', () => {
   test.each([
     ['pr.create', 'a revision it was not asked for', create],
     ['pr.ready', 'a pull request still in draft', ready],
+    ['pr.draft', 'a pull request still ready', draft],
     ['comment.upsert', 'a body it did not write', upsert],
   ] as const)('refuses a %s result naming %s', async (op, _label, request) => {
     const result = await dispatch(request, 'mismatch');
@@ -129,7 +135,10 @@ describe('mutation evidence at the dispatch boundary', () => {
     const result = await dispatch(edit, 'refused');
     expect(result.response).toMatchObject({
       ok: false,
-      error: { kind: 'conflict', message: 'the forge said no' },
+      error: {
+        kind: 'conflict',
+        message: 'the forge said no (pr.edit-body on forge.example/a/b#42)',
+      },
       mutation: { op: 'pr.edit-body', target: ref, outcome: 'refused' },
     });
   });
@@ -224,6 +233,23 @@ test('a head selector accepts only an open pull request', async () => {
   });
 });
 
+test('a head selector for any state accepts a closed pull request from a plugin that declares it', async () => {
+  const anyState = {
+    operationId: 'head-any',
+    op: 'pr.view',
+    selector: { kind: 'head', repo: ref.repo, headRepo: ref.repo, head: 'feature', state: 'any' },
+  } satisfies ForgeRequest;
+  expect((await dispatch(anyState, 'closed')).response).toMatchObject({
+    ok: true,
+    result: { value: { pr: { state: 'closed' } } },
+  });
+  // A plugin that does not declare it would answer for the open pull request only.
+  expect((await dispatch(anyState, 'no-any-state')).response).toMatchObject({
+    ok: false,
+    error: { kind: 'unsupported_op' },
+  });
+});
+
 test('a pull request that a head selector did not find audits as an absence', () => {
   const response: ForgeResponse = {
     operationId: 'none',
@@ -234,5 +260,485 @@ test('a pull request that a head selector did not find audits as an absence', ()
     operationId: 'none',
     ok: true,
     result: { op: 'pr.view', value: null },
+  });
+});
+
+const issueCreate = {
+  operationId: 'issue',
+  op: 'workitem.create',
+  repo: ref.repo,
+  title: 'secret title',
+  body: `${marker}\nsecret body`,
+  marker,
+} satisfies ForgeRequest;
+const labelsSet = {
+  operationId: 'labels',
+  op: 'workitem.labels.set',
+  ref,
+  labels: ['a', 'b'],
+} satisfies ForgeRequest;
+const labelEnsure = {
+  operationId: 'ensure',
+  op: 'repo.label.ensure',
+  repo: ref.repo,
+  name: 'name',
+  color: 'abcdef',
+  description: 'secret description',
+} satisfies ForgeRequest;
+const labelAdd = {
+  operationId: 'label-add',
+  op: 'workitem.label.add',
+  subject: { kind: 'pr', ref },
+  name: 'queued',
+} satisfies ForgeRequest;
+const labelRemove = {
+  operationId: 'label-remove',
+  op: 'workitem.label.remove',
+  subject: { kind: 'issue', ref },
+  name: 'queued',
+} satisfies ForgeRequest;
+const issueComment = {
+  operationId: 'issue-comment',
+  op: 'workitem.comment.upsert',
+  subject: { kind: 'issue', ref },
+  marker,
+  body: `${marker}\nsecret body`,
+} satisfies ForgeRequest;
+const issueClose = {
+  operationId: 'close',
+  op: 'workitem.close',
+  ref,
+  reason: 'duplicate',
+} satisfies ForgeRequest;
+test.each([issueCreate, labelsSet, labelEnsure, labelAdd, labelRemove, issueComment, issueClose])(
+  'new mutation dispatch verifies proof and preserves unknown failures: $op',
+  async request => {
+    const result = await dispatch(request);
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: { op: request.op, value: { outcome: 'applied' } },
+    });
+    expect(result.audit.target).toEqual(mutationTarget(request));
+    for (const mode of ['mismatch', 'no-evidence'])
+      expect((await dispatch(request, mode)).response).toMatchObject({
+        ok: false,
+        mutation: { outcome: 'outcome_unknown' },
+      });
+    expect((await dispatch(request, 'refused')).response).toMatchObject({
+      ok: false,
+      mutation: { outcome: 'refused' },
+    });
+    const audit = JSON.stringify(result.audit);
+    for (const secret of ['secret title', 'secret body', 'secret description', marker])
+      expect(audit).not.toContain(secret);
+  }
+);
+test.each([labelAdd, labelRemove, issueComment])(
+  'a subject result must name the requested item kind: $op',
+  async request => {
+    expect((await dispatch(request, 'wrong-kind')).response).toMatchObject({
+      ok: false,
+      mutation: { outcome: 'outcome_unknown', target: ref },
+    });
+  }
+);
+
+test('a label listing must answer with open items of the requested repository', async () => {
+  const list = {
+    operationId: 'list',
+    op: 'workitem.list',
+    repo: ref.repo,
+    label: 'queued',
+  } satisfies ForgeRequest;
+  const result = await dispatch(list);
+  expect(result.response).toMatchObject({
+    ok: true,
+    result: {
+      op: 'workitem.list',
+      value: { label: 'queued', items: [{ kind: 'issue' }, { kind: 'pr' }] },
+    },
+  });
+  expect(result.audit.target).toEqual(ref.repo);
+  expect(JSON.stringify(result.audit.result)).toBe(JSON.stringify(result.response));
+  const closed = await dispatch(list, 'mismatch');
+  expect(closed.response).toMatchObject({ ok: false, error: { kind: 'invalid_response' } });
+  expect(closed.response).not.toHaveProperty('mutation');
+});
+
+test('dispatch permits recovery of closed marked issues with edited content', async () => {
+  expect((await dispatch(issueCreate, 'recovery')).response).toMatchObject({
+    ok: true,
+    result: { value: { changed: false, workitem: { state: 'closed' } } },
+  });
+});
+
+const merge = {
+  operationId: 'merge',
+  op: 'pr.merge',
+  ref,
+  method: 'squash',
+  conditions: { head: 'headsha' },
+} satisfies ForgeRequest;
+const rerun = {
+  operationId: 'rerun',
+  op: 'checks.rerun',
+  ref,
+  revision: 'headsha',
+  units: [
+    { unit: { kind: 'check', id: 'check-id', name: 'check' }, rerun: { id: 'run-id', attempt: 2 } },
+  ],
+} satisfies ForgeRequest;
+
+test('merges and reruns require complete applied evidence at dispatch', async () => {
+  for (const request of [merge, rerun]) {
+    expect((await dispatch(request)).response.ok).toBe(true);
+    expect((await dispatch(request, 'mismatch')).response).toMatchObject({
+      ok: false,
+      mutation: { outcome: 'outcome_unknown' },
+    });
+    const timeout = await dispatch(request, 'hang', 100);
+    expect(timeout.response).toMatchObject({ ok: false, mutation: { outcome: 'outcome_unknown' } });
+    if (!timeout.response.ok)
+      expect(timeout.response.mutation).toMatchObject(
+        request.op === 'pr.merge'
+          ? { merge: { method: merge.method, conditions: merge.conditions } }
+          : { rerun: { revision: rerun.revision, requested: rerun.units } }
+      );
+  }
+});
+
+test('unsupported or missing merge conditions do not launch the operation', async () => {
+  const discovery = await discoverPlugins({
+    config: {
+      plugins: [{ plugin: 'mutator', command: process.execPath, args: [fixture] }],
+      scanPath: false,
+    },
+  });
+  // If dispatch launches this missing executable, the response is a process failure.
+  for (const plugin of discovery.byHost.values()) plugin.command = '/missing-operation-executable';
+  for (const conditions of [
+    {},
+    { head: 'headsha', base: 'base' },
+    { head: 'headsha', tree: 'tree' },
+  ]) {
+    const result = await dispatchForge({ ...merge, conditions }, { discovery });
+    expect(result.response).toMatchObject({
+      ok: false,
+      error: { kind: conditions.head ? 'unsupported_op' : 'invalid_request' },
+      mutation: { outcome: 'refused' },
+    });
+  }
+  expect((await dispatch(merge, 'no-conditions')).response).toMatchObject({
+    ok: false,
+    error: { kind: 'unsupported_op' },
+    mutation: { outcome: 'refused' },
+  });
+});
+
+test('review bodies reach callers and only their digests reach the audit', async () => {
+  const result = await dispatch({ operationId: 'reviews', op: 'pr.reviews', ref });
+  expect(JSON.stringify(result.response)).toContain('private review body');
+  expect(JSON.stringify(result.audit)).not.toContain('private review body');
+  expect(JSON.stringify(result.audit)).toContain(contentDigest('private review body'));
+});
+
+test.each(['wrong-method', 'wrong-condition', 'unenforced'])(
+  'merge results cannot overstate enforcement or change the request: %s',
+  async mode => {
+    expect((await dispatch(merge, mode)).response).toMatchObject({
+      ok: false,
+      error: { kind: 'invalid_response' },
+      mutation: { outcome: 'outcome_unknown' },
+    });
+  }
+);
+
+test('a partial rerun result cannot certify complete success', async () => {
+  const request = {
+    ...rerun,
+    units: [
+      ...rerun.units,
+      { ...rerun.units[0], unit: { ...rerun.units[0].unit, id: 'another-check' } },
+    ],
+  };
+  expect((await dispatch(request, 'subset')).response).toMatchObject({
+    ok: false,
+    error: { kind: 'invalid_response' },
+    mutation: { outcome: 'outcome_unknown' },
+  });
+});
+
+test('a plugin without draft conversion refuses without executing the operation', async () => {
+  const discovery = await discoverPlugins({
+    config: {
+      plugins: [{ plugin: 'mutator', command: process.execPath, args: [fixture] }],
+      scanPath: false,
+    },
+  });
+  for (const plugin of discovery.byHost.values()) {
+    plugin.metadata.capabilities = plugin.metadata.capabilities.filter(op => op !== 'pr.draft');
+    plugin.command = '/missing-operation-executable';
+  }
+  expect((await dispatchForge(draft, { discovery })).response).toMatchObject({
+    ok: false,
+    error: { kind: 'unsupported_op' },
+    mutation: { op: 'pr.draft', outcome: 'refused' },
+  });
+});
+
+test('draft conversion accepts unchanged evidence and rejects a non-open read-back', async () => {
+  expect((await dispatch(draft, 'unchanged')).response).toMatchObject({
+    ok: true,
+    result: { op: 'pr.draft', value: { changed: false, pr: { is_draft: true } } },
+  });
+  expect((await dispatch(draft, 'not-open')).response).toMatchObject({
+    ok: false,
+    error: { kind: 'invalid_response' },
+    mutation: { outcome: 'outcome_unknown' },
+  });
+});
+
+describe('review threads and issue bodies', () => {
+  const reply = {
+    operationId: 'reply-1',
+    op: 'pr.thread.reply',
+    ref,
+    thread: 'thread-1',
+    body: 'Fixed in abc123.',
+  } satisfies ForgeRequest;
+  const resolve = {
+    operationId: 'resolve-1',
+    op: 'pr.thread.resolve',
+    ref,
+    thread: 'thread-1',
+  } satisfies ForgeRequest;
+  const editIssue = {
+    operationId: 'issue-body-1',
+    op: 'workitem.edit-body',
+    ref,
+    body: 'The contract.\n\n## Current scope\n\nA ruling.',
+  } satisfies ForgeRequest;
+
+  test('thread comment bodies reach callers and only their digests reach the audit', async () => {
+    const result = await dispatch({ operationId: 'threads', op: 'pr.threads', ref });
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: { op: 'pr.threads', value: { threads: [{ id: 'thread-1', resolved: false }] } },
+    });
+    expect(JSON.stringify(result.response)).toContain('private thread body');
+    expect(JSON.stringify(result.audit)).not.toContain('private thread body');
+    expect(JSON.stringify(result.audit)).toContain(contentDigest('private thread body'));
+  });
+
+  test('a thread and each comment say when they were created, so a late comment is visible', async () => {
+    const result = await dispatch({ operationId: 'threads', op: 'pr.threads', ref });
+    if (!result.response.ok || result.response.result.op !== 'pr.threads')
+      throw new Error(JSON.stringify(result.response));
+    const [thread] = result.response.result.value.threads;
+    expect(thread).toMatchObject({ createdAt: '2026-11-11T09:00:00Z', commit: 'a'.repeat(40) });
+    const reviewedAt = Date.parse('2026-11-11T10:00:00Z');
+    expect(
+      thread?.comments
+        .filter(comment => Date.parse(comment.createdAt ?? '') > reviewedAt)
+        .map(c => c.id)
+    ).toEqual(['c2']);
+    expect(thread?.comments.map(comment => comment.commit)).toEqual(['a'.repeat(40), null]);
+  });
+
+  test('a plugin that predates creation times still answers pr.threads', async () => {
+    const result = await dispatch(
+      { operationId: 'threads', op: 'pr.threads', ref },
+      'older-plugin'
+    );
+    if (!result.response.ok || result.response.result.op !== 'pr.threads')
+      throw new Error(JSON.stringify(result.response));
+    const [thread] = result.response.result.value.threads;
+    expect(thread).not.toHaveProperty('createdAt');
+    expect(thread?.comments.map(comment => comment.createdAt)).toEqual([undefined, undefined]);
+  });
+
+  test.each([reply, resolve, editIssue])(
+    'an applied $op that answers the request is accepted',
+    async request => {
+      expect((await dispatch(request)).response).toMatchObject({
+        ok: true,
+        result: { op: request.op, value: { outcome: 'applied' } },
+      });
+    }
+  );
+
+  test.each([reply, resolve, editIssue])(
+    'an applied $op that does not answer the request becomes outcome_unknown',
+    async request => {
+      expect((await dispatch(request, 'mismatch')).response).toMatchObject({
+        ok: false,
+        mutation: { op: request.op, outcome: 'outcome_unknown' },
+      });
+    }
+  );
+
+  test('conversation comment bodies reach callers and only their digests reach the audit', async () => {
+    const result = await dispatch({
+      operationId: 'comments',
+      op: 'workitem.comments',
+      subject: { kind: 'pr', ref },
+    });
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: {
+        op: 'workitem.comments',
+        value: { comments: [{ id: '7', author: { login: 'maintainer' } }] },
+      },
+    });
+    expect(JSON.stringify(result.response)).toContain('private conversation comment');
+    expect(JSON.stringify(result.audit)).not.toContain('private conversation comment');
+    expect(JSON.stringify(result.audit)).toContain(contentDigest('private conversation comment'));
+  });
+
+  test('patches and file text reach callers and only their digests reach the audit', async () => {
+    const files = await dispatch({ operationId: 'files', op: 'pr.files', ref });
+    const file = await dispatch({
+      operationId: 'file',
+      op: 'repo.file',
+      repo: ref.repo,
+      path: 'src/a.test.ts',
+      revision: 'headsha',
+    });
+    for (const [result, content] of [
+      [files, 'private patch'],
+      [file, 'private file text'],
+    ] as const) {
+      expect(JSON.stringify(result.response)).toContain(content);
+      expect(JSON.stringify(result.audit)).not.toContain(content);
+      expect(JSON.stringify(result.audit)).toContain(contentDigest(content));
+    }
+    // A file the forge has no patch for stays distinguishable from an empty patch.
+    expect(files.audit.result).toMatchObject({
+      ok: true,
+      result: { value: { files: [{ path: 'src/a.test.ts' }, { path: 'logo.png', patch: null }] } },
+    });
+  });
+
+  test.each([
+    {
+      operationId: 'checks-1',
+      op: 'checks.commit',
+      repo: ref.repo,
+      at: { kind: 'revision', revision: 'asked' },
+    },
+    { operationId: 'merge-state-1', op: 'pr.merge-state', ref },
+    { operationId: 'file-1', op: 'repo.file', repo: ref.repo, path: 'src/a.ts', revision: 'asked' },
+  ] satisfies ForgeRequest[])('a $op read that answers the request is accepted', async request => {
+    expect((await dispatch(request)).response).toMatchObject({ ok: true });
+  });
+
+  test.each([
+    {
+      operationId: 'checks-1',
+      op: 'checks.commit',
+      repo: ref.repo,
+      at: { kind: 'revision', revision: 'asked' },
+    },
+    { operationId: 'merge-state-1', op: 'pr.merge-state', ref },
+    { operationId: 'file-1', op: 'repo.file', repo: ref.repo, path: 'src/a.ts', revision: 'asked' },
+  ] satisfies ForgeRequest[])(
+    'a $op read about another commit or pull request is an invalid response',
+    async request => {
+      expect((await dispatch(request, 'mismatch')).response).toMatchObject({
+        ok: false,
+        error: { kind: 'invalid_response' },
+      });
+    }
+  );
+});
+
+describe('temporary failures at the dispatch boundary', () => {
+  const root = mkdtempSync(join(tmpdir(), 'forge-temporary-'));
+  afterAll(() => removeTempTree(root));
+  const view = {
+    operationId: 'view-1',
+    op: 'pr.view',
+    selector: { kind: 'number', ref },
+  } satisfies ForgeRequest;
+
+  /** Dispatch against a plugin whose first `fail` calls fail with `kind`. */
+  async function temporary(
+    request: ForgeRequest,
+    fail: number,
+    kind = 'unavailable'
+  ): Promise<{
+    result: Awaited<ReturnType<typeof dispatchForge>>;
+    calls: number;
+    waits: number[];
+  }> {
+    const calls = join(root, crypto.randomUUID());
+    const discovery = await discoverPlugins({
+      config: {
+        plugins: [
+          {
+            plugin: 'mutator',
+            command: process.execPath,
+            args: [
+              fixture,
+              '--mode',
+              'temporary',
+              '--calls',
+              calls,
+              '--fail',
+              String(fail),
+              '--kind',
+              kind,
+            ],
+          },
+        ],
+        scanPath: false,
+      },
+    });
+    const waits: number[] = [];
+    const result = await dispatchForge(request, {
+      discovery,
+      sleep: async ms => {
+        waits.push(ms);
+      },
+    });
+    return { result, calls: readFileSync(calls, 'utf8').length, waits };
+  }
+
+  test('a read that fails once and then succeeds returns the result and records the retry', async () => {
+    const { result, calls, waits } = await temporary(view, 1);
+    expect(result.response).toMatchObject({ ok: true, result: { op: 'pr.view' } });
+    expect(result.audit.retries).toBe(1);
+    expect(calls).toBe(2);
+    expect(waits).toEqual([1_000]);
+  });
+
+  test.each(['unavailable', 'rate_limited'])(
+    'a read that stays %s stops at the bound and names its operation and subject',
+    async kind => {
+      const { result, calls, waits } = await temporary(view, 99, kind);
+      expect(result.response).toEqual({
+        operationId: 'view-1',
+        ok: false,
+        error: {
+          kind,
+          message: 'the forge is down (pr.view on forge.example/a/b#42, retried 3 times)',
+        },
+      });
+      expect(result.audit.retries).toBe(3);
+      expect(calls).toBe(4);
+      expect(waits).toEqual([1_000, 2_000, 4_000]);
+    }
+  );
+
+  test('a mutation that fails temporarily runs once and keeps its outcome', async () => {
+    const { result, calls, waits } = await temporary(edit, 99);
+    expect(result.response).toMatchObject({
+      ok: false,
+      error: { kind: 'unavailable' },
+      mutation: { op: 'pr.edit-body', outcome: 'outcome_unknown' },
+    });
+    expect(result.audit.retries).toBe(0);
+    expect(calls).toBe(1);
+    expect(waits).toEqual([]);
   });
 });

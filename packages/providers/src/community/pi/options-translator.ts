@@ -5,11 +5,14 @@ import {
   createFindTool,
   createGrepTool,
   createLsTool,
+  createPowerShellTool,
   createReadTool,
   createWriteTool,
   type BashSpawnContext,
+  type AgentSession,
   type BashSpawnHook,
 } from '@earendil-works/pi-coding-agent';
+import { delimiter } from 'node:path';
 import type { ThinkingLevel } from '@earendil-works/pi-ai';
 
 /**
@@ -22,7 +25,7 @@ import type { ThinkingLevel } from '@earendil-works/pi-ai';
 type PiTool = ReturnType<typeof createCodingTools>[number];
 
 import type { NodeConfig } from '../../types';
-import { clampEffort, type AssertNever } from '@archon/paths/effort';
+import { clampEffort, type AssertNever } from '@archon/provider-contract';
 
 // ─── Thinking level ────────────────────────────────────────────────────────
 
@@ -89,21 +92,43 @@ const PI_TOOL_NAMES = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'] as
 export type PiToolName = (typeof PI_TOOL_NAMES)[number];
 
 /**
- * Build a Pi `spawnHook` that merges managed env vars into every bash
- * subprocess. Matches Claude/Codex precedence: caller-provided env keys
- * override Pi's inherited baseline. Returns undefined when `env` is empty
- * so bash spawns without an unnecessary hook allocation.
+ * Every built-in Pi can activate from its `defaultTools` setting. `powershell`
+ * is rebuilt with the user's defaults but stays outside `allowed_tools`.
+ */
+const PI_BUILTIN_TOOL_NAMES = [...PI_TOOL_NAMES, 'powershell'] as const;
+type PiBuiltinToolName = (typeof PI_BUILTIN_TOOL_NAMES)[number];
+
+/**
+ * Build a Pi `spawnHook` that merges managed env vars into every bash or
+ * PowerShell subprocess. Matches Claude/Codex precedence: caller-provided env keys
+ * override Pi's inherited baseline. A caller PATH (the run's `gh` shim) goes
+ * first, but Pi's baseline entries stay after it: Pi prepends its own bin dir,
+ * and replacing PATH outright would hide the tools Pi installed there.
+ * Returns undefined when `env` is empty so bash spawns without an unnecessary
+ * hook allocation.
  */
 function buildBashSpawnHook(env: Record<string, string> | undefined): BashSpawnHook | undefined {
   if (!env || Object.keys(env).length === 0) return undefined;
-  return (context: BashSpawnContext): BashSpawnContext => ({
-    ...context,
-    env: { ...context.env, ...env },
-  });
+  return (context: BashSpawnContext): BashSpawnContext => {
+    const merged = { ...context.env, ...env };
+    const basePath = context.env.PATH;
+    if (env.PATH !== undefined && basePath) {
+      const callerEntries = env.PATH.split(delimiter);
+      merged.PATH = [
+        ...callerEntries,
+        ...basePath.split(delimiter).filter(entry => !callerEntries.includes(entry)),
+      ].join(delimiter);
+    }
+    return { ...context, env: merged };
+  };
 }
 
 /** Map a normalized (lowercase) Pi tool name to its Pi-internal factory. */
-function buildPiTool(name: PiToolName, cwd: string, spawnHook: BashSpawnHook | undefined): PiTool {
+function buildPiTool(
+  name: PiBuiltinToolName,
+  cwd: string,
+  spawnHook: BashSpawnHook | undefined
+): PiTool {
   switch (name) {
     case 'read':
       return createReadTool(cwd);
@@ -119,14 +144,16 @@ function buildPiTool(name: PiToolName, cwd: string, spawnHook: BashSpawnHook | u
       return createFindTool(cwd);
     case 'ls':
       return createLsTool(cwd);
+    case 'powershell':
+      return spawnHook ? createPowerShellTool(cwd, { spawnHook }) : createPowerShellTool(cwd);
   }
 }
 
 export interface ResolvedTools {
   /**
-   * The tools array to pass to Pi, or `undefined` to leave Pi's default
-   * (read/bash/edit/write) in place. An empty array means "no tools —
-   * LLM-only response" which is a valid explicit setting.
+   * The built-in tools payload, or `undefined` to leave Pi's defaults in place.
+   * An empty array selects no built-in tools; separately supplied Archon tools
+   * and user extension tools are outside this filter.
    */
   tools: PiTool[] | undefined;
   /** Unknown tool names in allowed_tools / denied_tools (e.g. Claude-specific like WebFetch). */
@@ -141,15 +168,51 @@ const PI_DEFAULT_TOOL_NAMES = [
   'write',
 ] as const satisfies readonly PiToolName[];
 
+function isPiBuiltinToolName(name: string): name is PiBuiltinToolName {
+  return (PI_BUILTIN_TOOL_NAMES as readonly string[]).includes(name);
+}
+
 /**
- * Pi's default coding tools, rebuilt with managed-env injection. Used when
- * attaching native tools to a chat that had no tool restrictions: setting
- * `customTools` forces `noTools: 'builtin'`, so the defaults must be
- * re-supplied or the agent loses bash/read/edit/write.
+ * The default tools of a fresh Pi session, rebuilt with managed-env injection:
+ * the user's `defaultTools` setting (`SettingsManager.getDefaultTools()`), or
+ * Pi's default four when no settings layer sets it. Setting `customTools`
+ * forces `noTools: 'builtin'`, so an unrestricted node that adds a tool or an
+ * env-aware bash must re-supply its built-in defaults. Other names in the setting are
+ * extension tools, which activate on registration without being re-supplied.
  */
-export function buildDefaultPiTools(cwd: string, env?: Record<string, string>): PiTool[] {
+export function buildDefaultPiTools(
+  cwd: string,
+  env: Record<string, string> | undefined,
+  defaultToolNames: readonly string[] | undefined
+): PiTool[] {
   const spawnHook = buildBashSpawnHook(env);
-  return PI_DEFAULT_TOOL_NAMES.map(name => buildPiTool(name, cwd, spawnHook));
+  return (defaultToolNames ?? PI_DEFAULT_TOOL_NAMES)
+    .filter(isPiBuiltinToolName)
+    .map(name => buildPiTool(name, cwd, spawnHook));
+}
+
+/**
+ * The tools a fresh Pi session with no tool options starts with: the
+ * `defaultTools` setting (or Pi's default four) plus every extension tool that
+ * activates on registration. Mirrors `AgentSession`'s initial loadout so a
+ * reopened session can be reset to it; Pi 1.3+ otherwise restores the loadout
+ * its transcript records. Pi's own built-in tools carry the `builtin:<name>`
+ * source path; Archon loads no built-in extensions, so nothing else does.
+ */
+export function freshPiToolNames(
+  session: Pick<AgentSession, 'getAllTools' | 'getToolDefinition'>,
+  defaultToolNames: readonly string[] | undefined
+): string[] {
+  const extensionTools = session
+    .getAllTools()
+    .filter(
+      tool =>
+        tool.sourceInfo.path !== `builtin:${tool.name}` &&
+        (tool.exposure === 'direct' || tool.exposure === 'model-only') &&
+        session.getToolDefinition(tool.name)?.defaultActive !== false
+    )
+    .map(tool => tool.name);
+  return [...(defaultToolNames ?? PI_DEFAULT_TOOL_NAMES), ...extensionTools];
 }
 
 /**
@@ -158,12 +221,13 @@ export function buildDefaultPiTools(cwd: string, env?: Record<string, string>): 
  *
  * Semantics:
  *   - neither allow/deny set, no env → return undefined (Pi's default tools)
- *   - neither allow/deny set, env present → return Pi's default 4 tools with
- *     an env-aware bash, so codebase env vars reach bash subprocesses
- *   - allowed_tools: [] → return [] (explicit no-tools; valid Archon idiom)
- *   - allowed_tools: [X, Y] → only X, Y (normalized to lowercase)
+ *   - neither allow/deny set, env present → return the session's default tools
+ *     (see `buildDefaultPiTools`) with an env-aware bash, so codebase env vars
+ *     reach bash subprocesses
+ *   - allowed_tools: [] → return [] (no selected built-in tools)
+ *   - allowed_tools: [X, Y] → only supported built-ins X, Y (normalized to lowercase)
  *   - denied_tools subtracts from allowed_tools (or full set if allowed_tools absent)
- *   - tool names not in Pi's built-in set are silently dropped but reported
+ *   - tool names not in PI_TOOL_NAMES are dropped from this payload but reported
  *     via `unknownTools` so the caller can surface a warning.
  *
  * The `env` parameter is the caller's `requestOptions.env` merged with any
@@ -174,7 +238,8 @@ export function buildDefaultPiTools(cwd: string, env?: Record<string, string>): 
 export function resolvePiTools(
   cwd: string,
   nodeConfig?: NodeConfig,
-  env?: Record<string, string>
+  env?: Record<string, string>,
+  defaultToolNames?: readonly string[]
 ): ResolvedTools {
   const allowed = nodeConfig?.allowed_tools;
   const denied = nodeConfig?.denied_tools;
@@ -185,10 +250,7 @@ export function resolvePiTools(
     // a custom bash tool (Pi's default bashTool is pre-constructed with no
     // spawnHook and there's no way to retrofit env onto it).
     if (!spawnHook) return { tools: undefined, unknownTools: [] };
-    return {
-      tools: PI_DEFAULT_TOOL_NAMES.map(n => buildPiTool(n, cwd, spawnHook)),
-      unknownTools: [],
-    };
+    return { tools: buildDefaultPiTools(cwd, env, defaultToolNames), unknownTools: [] };
   }
 
   const knownSet = new Set<PiToolName>(PI_TOOL_NAMES);
@@ -236,5 +298,5 @@ export function resolvePiTools(
 // Skill resolution is shared across providers. Re-export `resolvePiSkills` as
 // an alias of the shared `resolveSkillDirectories` so existing Pi callers and
 // tests keep their import path stable.
-export { resolveSkillDirectories as resolvePiSkills } from '../../shared/skills';
-export type { ResolvedSkills } from '../../shared/skills';
+export { resolveSkillDirectories as resolvePiSkills } from '@archon/paths/skills';
+export type { ResolvedSkills } from '@archon/paths/skills';

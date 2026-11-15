@@ -33,7 +33,7 @@ export function ChatList({
 }: ChatListProps): ReactElement {
   if (conversations.length === 0) {
     return (
-      <p className="px-3 py-4 text-center text-[11px] text-text-tertiary">
+      <p className="px-3 py-4 text-center text-console-11 text-text-tertiary">
         No chats in this project yet.
       </p>
     );
@@ -57,14 +57,14 @@ export function ChatList({
             >
               <span className="flex items-center gap-1.5">
                 <span
-                  className={`truncate text-[12px] ${
+                  className={`truncate text-console-12 ${
                     isActive ? 'text-text-primary' : 'text-text-secondary'
                   }`}
                 >
                   {conversationLabel(conversation)}
                 </span>
               </span>
-              <span className="flex items-center gap-1.5 font-mono text-[10px] text-text-tertiary">
+              <span className="flex items-center gap-1.5 font-mono text-console-10 text-text-tertiary">
                 <PlatformBadge platformType={conversation.platformType} />
                 <span>
                   {conversation.lastActivityAt !== null

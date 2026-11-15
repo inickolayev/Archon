@@ -1,69 +1,31 @@
 /**
- * Zod schemas for dashboard workflow run types (enriched JOIN results).
+ * Zod schemas for workflow run requests and dashboard types (enriched JOIN results).
  */
 import { z } from '@hono/zod-openapi';
-import { workflowRunSchema, workflowRunStatusSchema } from '@archon/workflows/schemas/workflow-run';
 
-// ---------------------------------------------------------------------------
-// DashboardWorkflowRun
-// ---------------------------------------------------------------------------
-
-export const dashboardWorkflowRunSchema = workflowRunSchema.extend({
-  codebase_name: z.string().nullable(),
-  /**
-   * Display name of whoever asked for the run; null when nobody can be named (CLI runs).
-   * Optional rather than merely nullable: a caller that builds a dashboard row without going
-   * through the join — a test, a fixture — should not have to name a person to be valid.
-   */
-  user_display_name: z.string().nullish(),
-  platform_type: z.string().nullable(),
-  worker_platform_id: z.string().nullable(),
-  parent_platform_id: z.string().nullable(),
-  active_nodes: z.array(z.string().min(1)),
-  current_step_name: z.string().nullable(),
-  total_steps: z.number().nullable(),
-  current_step_status: z.enum(['running', 'completed', 'failed']).nullable(),
-  agents_completed: z.number().nullable(),
-  agents_failed: z.number().nullable(),
-  agents_total: z.number().nullable(),
+const signalWorkflowWaitFields = z.object({
+  event: z.string().min(1),
+  occurrence: z.string().min(1).optional(),
+  resumeAt: z.iso.datetime().optional(),
+  payload: z.unknown().optional(),
 });
 
-export type DashboardWorkflowRun = z.infer<typeof dashboardWorkflowRunSchema>;
+export const signalWorkflowWaitRequestSchema = z.union([
+  signalWorkflowWaitFields.required({ occurrence: true }),
+  signalWorkflowWaitFields.required({ resumeAt: true }),
+]);
 
-// ---------------------------------------------------------------------------
-// ListDashboardRunsOptions
-// ---------------------------------------------------------------------------
+export type SignalWorkflowWaitRequest = z.infer<typeof signalWorkflowWaitRequestSchema>;
 
-export const listDashboardRunsOptionsSchema = z.object({
-  status: z
-    .union([workflowRunStatusSchema, z.tuple([workflowRunStatusSchema], workflowRunStatusSchema)])
-    .optional(),
-  codebaseId: z.string().optional(),
-  search: z.string().optional(),
-  after: z.string().optional(),
-  before: z.string().optional(),
-  limit: z.number().optional(),
-  offset: z.number().optional(),
-});
+/**
+ * What the serving process observes about a running run's execution owner, by the rule
+ * `workflow wait` uses for `owner_lost`. `reachable`: an owner answers. `unreachable`: the
+ * recorded owner is on this host and user and no endpoint answers on two reads.
+ * `unknown`: this process cannot tell (another host or user, no recorded owner, or no
+ * answer in time). Observed per read and never persisted; it never changes the status.
+ */
+export const runOwnerObservationSchema = z.enum(['reachable', 'unreachable', 'unknown']);
 
-export type ListDashboardRunsOptions = z.infer<typeof listDashboardRunsOptionsSchema>;
+export type RunOwnerObservation = z.infer<typeof runOwnerObservationSchema>;
 
-// ---------------------------------------------------------------------------
-// DashboardRunsResult
-// ---------------------------------------------------------------------------
-
-export const dashboardRunsResultSchema = z.object({
-  runs: z.array(dashboardWorkflowRunSchema),
-  total: z.number(),
-  counts: z.object({
-    all: z.number(),
-    running: z.number(),
-    completed: z.number(),
-    failed: z.number(),
-    cancelled: z.number(),
-    pending: z.number(),
-    paused: z.number(),
-  }),
-});
-
-export type DashboardRunsResult = z.infer<typeof dashboardRunsResultSchema>;
+export * from '@archon/workflows/schemas/workflow-run-listing';

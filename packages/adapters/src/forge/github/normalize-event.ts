@@ -7,6 +7,7 @@ import {
   type ForgeEvent,
   type ForgeEventEnvelope,
 } from '@archon/forge';
+import { actor, userSchema } from './actor';
 
 type PrLifecycleAction = Extract<ForgeEvent, { kind: 'pr.lifecycle' }>['action'];
 
@@ -29,6 +30,7 @@ export const githubSourceCapabilities = {
       ] as const
     ).map(action => ({ kind: 'pr.lifecycle' as const, action })),
     ...(['added', 'removed'] as const).map(action => ({ kind: 'label.changed' as const, action })),
+    { kind: 'comment.changed', action: 'created' } as const,
     { kind: 'check.changed', action: 'changed', unitKind: 'check' } as const,
     { kind: 'check.changed', action: 'changed', unitKind: 'commit_status' } as const,
   ],
@@ -49,14 +51,12 @@ export type GitHubNormalizationResult =
   | { status: 'malformed'; reason: string };
 
 const repositorySchema = z.object({ full_name: z.string().min(1) });
-const senderSchema = z.object({
-  id: z.union([z.string().min(1), z.number().int()]),
-  login: z.string().min(1).nullable().optional(),
-});
+// A webhook sender is the REST user object. Deliveries omit it; they never send it as null.
+const senderSchema = userSchema.unwrap().optional();
 const baseSchema = z.object({
   action: z.string().min(1),
   repository: repositorySchema,
-  sender: senderSchema.optional(),
+  sender: senderSchema,
 });
 const issueSchema = baseSchema.extend({
   issue: z.object({
@@ -96,6 +96,17 @@ const pullRequestSchema = baseSchema.extend({
     })
     .optional(),
 });
+const issueCommentSchema = baseSchema.extend({
+  issue: z.object({
+    number: z.number().int().positive(),
+    pull_request: z.unknown().optional(),
+  }),
+  comment: z.object({
+    id: z.union([z.string().min(1), z.number().int()]),
+    user: userSchema,
+    created_at: z.iso.datetime({ offset: true }).nullable().optional(),
+  }),
+});
 const checkRunSchema = baseSchema.extend({
   check_run: z.object({
     id: z.union([z.string().min(1), z.number().int()]),
@@ -117,18 +128,11 @@ const statusSchema = z.object({
   created_at: z.iso.datetime({ offset: true }).nullable().optional(),
   updated_at: z.iso.datetime({ offset: true }).nullable().optional(),
   repository: repositorySchema,
-  sender: senderSchema.optional(),
+  sender: senderSchema,
 });
 
 function id(value: string | number | undefined): string | null {
   return value === undefined ? null : String(value);
-}
-
-function actor(
-  sender: z.infer<typeof senderSchema> | undefined,
-  host: string
-): SourceActor | undefined {
-  return sender ? { host, id: String(sender.id), login: sender.login ?? null } : undefined;
 }
 
 export function checkPhase(status: string): 'pending' | 'running' | 'completed' | 'unknown' {
@@ -154,167 +158,12 @@ function malformed(error: z.ZodError): GitHubNormalizationResult {
   };
 }
 
-export function normalizeGitHubWebhook(
-  payload: unknown,
-  context: GitHubEnvelopeContext
+function normalizeEnvelope(
+  event: ForgeEvent,
+  context: GitHubEnvelopeContext,
+  sourceActor: SourceActor | null,
+  occurredAt: string | null
 ): GitHubNormalizationResult {
-  let event: ForgeEvent;
-  let occurredAt: string | null = null;
-  let sourceActor: ReturnType<typeof actor>;
-  if (context.eventName === 'issues') {
-    const parsed = issueSchema.safeParse(payload);
-    if (!parsed.success) return malformed(parsed.error);
-    const value = parsed.data;
-    sourceActor = actor(value.sender, context.host);
-    occurredAt = value.issue.updated_at ?? null;
-    if (value.action === 'labeled' || value.action === 'unlabeled') {
-      if (!value.label) return { status: 'malformed', reason: 'label: Required for label action' };
-      event = {
-        kind: 'label.changed',
-        action: value.action === 'labeled' ? 'added' : 'removed',
-        subject: {
-          kind: 'issue',
-          ref: {
-            repo: { host: context.host, path: value.repository.full_name },
-            number: value.issue.number,
-          },
-        },
-        label: { name: value.label.name, id: id(value.label.id) },
-      };
-    } else if (['opened', 'edited', 'closed', 'reopened'].includes(value.action)) {
-      event = {
-        kind: 'issue.lifecycle',
-        action: value.action as 'opened' | 'edited' | 'closed' | 'reopened',
-        issue: {
-          repo: { host: context.host, path: value.repository.full_name },
-          number: value.issue.number,
-        },
-        state: value.issue.state,
-      };
-    } else
-      return { status: 'unsupported', reason: `Unsupported GitHub issues action: ${value.action}` };
-  } else if (context.eventName === 'pull_request') {
-    const parsed = pullRequestSchema.safeParse(payload);
-    if (!parsed.success) return malformed(parsed.error);
-    const value = parsed.data;
-    sourceActor = actor(value.sender, context.host);
-    occurredAt =
-      value.pull_request.merged_at ??
-      value.pull_request.closed_at ??
-      value.pull_request.updated_at ??
-      null;
-    if (value.action === 'labeled' || value.action === 'unlabeled') {
-      if (!value.label) return { status: 'malformed', reason: 'label: Required for label action' };
-      event = {
-        kind: 'label.changed',
-        action: value.action === 'labeled' ? 'added' : 'removed',
-        subject: {
-          kind: 'pr',
-          ref: {
-            repo: { host: context.host, path: value.repository.full_name },
-            number: value.pull_request.number,
-          },
-        },
-        label: { name: value.label.name, id: id(value.label.id) },
-      };
-    } else {
-      const action =
-        value.action === 'synchronize'
-          ? 'head_updated'
-          : value.action === 'ready_for_review'
-            ? 'ready'
-            : value.action === 'converted_to_draft'
-              ? 'drafted'
-              : value.action === 'closed' && value.pull_request.merged
-                ? 'merged'
-                : value.action;
-      if (
-        ![
-          'opened',
-          'edited',
-          'head_updated',
-          'ready',
-          'drafted',
-          'closed',
-          'reopened',
-          'merged',
-        ].includes(action)
-      )
-        return {
-          status: 'unsupported',
-          reason: `Unsupported GitHub pull_request action: ${value.action}`,
-        };
-      event = {
-        kind: 'pr.lifecycle',
-        action: action as PrLifecycleAction,
-        pr: {
-          repo: { host: context.host, path: value.repository.full_name },
-          number: value.pull_request.number,
-        },
-        state: value.pull_request.state,
-        draft: value.pull_request.draft ?? null,
-        head: value.pull_request.head
-          ? { objectId: value.pull_request.head.sha, branch: value.pull_request.head.ref ?? null }
-          : null,
-        base: value.pull_request.base
-          ? { objectId: value.pull_request.base.sha, branch: value.pull_request.base.ref ?? null }
-          : null,
-      };
-    }
-  } else if (context.eventName === 'check_run') {
-    const parsed = checkRunSchema.safeParse(payload);
-    if (!parsed.success) return malformed(parsed.error);
-    const value = parsed.data;
-    if (value.action !== 'created' && value.action !== 'completed') {
-      return { status: 'unsupported', reason: 'Unsupported GitHub check_run action' };
-    }
-    sourceActor = actor(value.sender, context.host);
-    occurredAt = value.check_run.completed_at ?? value.check_run.started_at ?? null;
-    event = {
-      kind: 'check.changed',
-      action: 'changed',
-      repo: { host: context.host, path: value.repository.full_name },
-      revision: value.check_run.head_sha,
-      unit: { kind: 'check', id: String(value.check_run.id), name: value.check_run.name },
-      nativeState: value.check_run.status,
-      phase: checkPhase(value.check_run.status),
-      nativeResult: value.check_run.conclusion ?? null,
-      result: checkResult(value.check_run.conclusion),
-      pullRequests: value.check_run.pull_requests.map(pr => ({
-        repo: { host: context.host, path: value.repository.full_name },
-        number: pr.number,
-      })),
-    };
-  } else if (context.eventName === 'status') {
-    const parsed = statusSchema.safeParse(payload);
-    if (!parsed.success) return malformed(parsed.error);
-    const value = parsed.data;
-    sourceActor = actor(value.sender, context.host);
-    occurredAt = value.updated_at ?? value.created_at ?? null;
-    event = {
-      kind: 'check.changed',
-      action: 'changed',
-      repo: { host: context.host, path: value.repository.full_name },
-      revision: value.sha,
-      unit: {
-        kind: 'commit_status',
-        id: String(value.id),
-        name: value.context ?? value.name ?? 'status',
-      },
-      nativeState: value.state,
-      phase: checkPhase(value.state),
-      nativeResult: value.state,
-      result: ['pending', 'queued'].includes(value.state)
-        ? null
-        : value.state === 'success'
-          ? 'success'
-          : ['failure', 'error'].includes(value.state)
-            ? 'failure'
-            : 'unknown',
-      pullRequests: [],
-    };
-  } else return { status: 'unsupported', reason: `Unsupported GitHub event: ${context.eventName}` };
-
   const envelope = forgeEventEnvelopeSchema.safeParse({
     schemaVersion: 1,
     sourceInstanceId: context.sourceInstanceId,
@@ -322,10 +171,255 @@ export function normalizeGitHubWebhook(
     contentDigest: context.contentDigest,
     receivedAt: context.receivedAt,
     occurredAt,
-    sourceActor,
+    // An envelope without a sender omits `sourceActor` rather than recording null.
+    sourceActor: sourceActor ?? undefined,
     event,
   });
   return envelope.success
     ? { status: 'normalized', envelope: envelope.data }
     : malformed(envelope.error);
+}
+
+function normalizeIssues(
+  payload: unknown,
+  context: GitHubEnvelopeContext
+): GitHubNormalizationResult {
+  let event: ForgeEvent;
+  const parsed = issueSchema.safeParse(payload);
+  if (!parsed.success) return malformed(parsed.error);
+  const value = parsed.data;
+  const sourceActor = actor(context.host, value.sender ?? null);
+  const occurredAt = value.issue.updated_at ?? null;
+  if (value.action === 'labeled' || value.action === 'unlabeled') {
+    if (!value.label) return { status: 'malformed', reason: 'label: Required for label action' };
+    event = {
+      kind: 'label.changed',
+      action: value.action === 'labeled' ? 'added' : 'removed',
+      subject: {
+        kind: 'issue',
+        ref: {
+          repo: { host: context.host, path: value.repository.full_name },
+          number: value.issue.number,
+        },
+      },
+      label: { name: value.label.name, id: id(value.label.id) },
+      // GitHub's sender on a labeled delivery is whoever changed the label.
+      actor: sourceActor,
+    };
+  } else if (
+    value.action === 'opened' ||
+    value.action === 'edited' ||
+    value.action === 'closed' ||
+    value.action === 'reopened'
+  ) {
+    event = {
+      kind: 'issue.lifecycle',
+      action: value.action,
+      issue: {
+        repo: { host: context.host, path: value.repository.full_name },
+        number: value.issue.number,
+      },
+      state: value.issue.state,
+    };
+  } else
+    return { status: 'unsupported', reason: `Unsupported GitHub issues action: ${value.action}` };
+  return normalizeEnvelope(event, context, sourceActor, occurredAt);
+}
+
+function prLifecycleAction(
+  action: string,
+  merged: boolean | undefined
+): PrLifecycleAction | undefined {
+  switch (action) {
+    case 'synchronize':
+      return 'head_updated';
+    case 'ready_for_review':
+      return 'ready';
+    case 'converted_to_draft':
+      return 'drafted';
+    case 'closed':
+      return merged ? 'merged' : 'closed';
+    case 'opened':
+    case 'edited':
+    case 'head_updated':
+    case 'ready':
+    case 'drafted':
+    case 'reopened':
+    case 'merged':
+      return action;
+    default:
+      return undefined;
+  }
+}
+
+function prRevision(revision: z.infer<typeof pullRequestSchema>['pull_request']['head']) {
+  return revision ? { objectId: revision.sha, branch: revision.ref ?? null } : null;
+}
+
+function normalizePullRequest(
+  payload: unknown,
+  context: GitHubEnvelopeContext
+): GitHubNormalizationResult {
+  let event: ForgeEvent;
+  const parsed = pullRequestSchema.safeParse(payload);
+  if (!parsed.success) return malformed(parsed.error);
+  const value = parsed.data;
+  const sourceActor = actor(context.host, value.sender ?? null);
+  const occurredAt =
+    value.pull_request.merged_at ??
+    value.pull_request.closed_at ??
+    value.pull_request.updated_at ??
+    null;
+  if (value.action === 'labeled' || value.action === 'unlabeled') {
+    if (!value.label) return { status: 'malformed', reason: 'label: Required for label action' };
+    event = {
+      kind: 'label.changed',
+      action: value.action === 'labeled' ? 'added' : 'removed',
+      subject: {
+        kind: 'pr',
+        ref: {
+          repo: { host: context.host, path: value.repository.full_name },
+          number: value.pull_request.number,
+        },
+      },
+      label: { name: value.label.name, id: id(value.label.id) },
+      // GitHub's sender on a labeled delivery is whoever changed the label.
+      actor: sourceActor,
+    };
+  } else {
+    const action = prLifecycleAction(value.action, value.pull_request.merged);
+    if (action === undefined)
+      return {
+        status: 'unsupported',
+        reason: `Unsupported GitHub pull_request action: ${value.action}`,
+      };
+    event = {
+      kind: 'pr.lifecycle',
+      action,
+      pr: {
+        repo: { host: context.host, path: value.repository.full_name },
+        number: value.pull_request.number,
+      },
+      state: value.pull_request.state,
+      draft: value.pull_request.draft ?? null,
+      head: prRevision(value.pull_request.head),
+      base: prRevision(value.pull_request.base),
+    };
+  }
+  return normalizeEnvelope(event, context, sourceActor, occurredAt);
+}
+
+function normalizeIssueComment(
+  payload: unknown,
+  context: GitHubEnvelopeContext
+): GitHubNormalizationResult {
+  const parsed = issueCommentSchema.safeParse(payload);
+  if (!parsed.success) return malformed(parsed.error);
+  const value = parsed.data;
+  if (value.action !== 'created')
+    return {
+      status: 'unsupported',
+      reason: `Unsupported GitHub issue_comment action: ${value.action}`,
+    };
+  const sourceActor = actor(context.host, value.sender ?? null);
+  const occurredAt = value.comment.created_at ?? null;
+  const ref = {
+    repo: { host: context.host, path: value.repository.full_name },
+    number: value.issue.number,
+  };
+  const event: ForgeEvent = {
+    kind: 'comment.changed',
+    action: 'created',
+    // GitHub delivers pull-request conversation comments as issue comments.
+    subject: value.issue.pull_request === undefined ? { kind: 'issue', ref } : { kind: 'pr', ref },
+    comment: {
+      id: String(value.comment.id),
+      author: actor(context.host, value.comment.user),
+    },
+  };
+  return normalizeEnvelope(event, context, sourceActor, occurredAt);
+}
+
+function normalizeCheckRun(
+  payload: unknown,
+  context: GitHubEnvelopeContext
+): GitHubNormalizationResult {
+  const parsed = checkRunSchema.safeParse(payload);
+  if (!parsed.success) return malformed(parsed.error);
+  const value = parsed.data;
+  if (value.action !== 'created' && value.action !== 'completed') {
+    return { status: 'unsupported', reason: 'Unsupported GitHub check_run action' };
+  }
+  const sourceActor = actor(context.host, value.sender ?? null);
+  const occurredAt = value.check_run.completed_at ?? value.check_run.started_at ?? null;
+  const event: ForgeEvent = {
+    kind: 'check.changed',
+    action: 'changed',
+    repo: { host: context.host, path: value.repository.full_name },
+    revision: value.check_run.head_sha,
+    unit: { kind: 'check', id: String(value.check_run.id), name: value.check_run.name },
+    nativeState: value.check_run.status,
+    phase: checkPhase(value.check_run.status),
+    nativeResult: value.check_run.conclusion ?? null,
+    result: checkResult(value.check_run.conclusion),
+    pullRequests: value.check_run.pull_requests.map(pr => ({
+      repo: { host: context.host, path: value.repository.full_name },
+      number: pr.number,
+    })),
+  };
+  return normalizeEnvelope(event, context, sourceActor, occurredAt);
+}
+
+function normalizeStatus(
+  payload: unknown,
+  context: GitHubEnvelopeContext
+): GitHubNormalizationResult {
+  const parsed = statusSchema.safeParse(payload);
+  if (!parsed.success) return malformed(parsed.error);
+  const value = parsed.data;
+  const sourceActor = actor(context.host, value.sender ?? null);
+  const occurredAt = value.updated_at ?? value.created_at ?? null;
+  const event: ForgeEvent = {
+    kind: 'check.changed',
+    action: 'changed',
+    repo: { host: context.host, path: value.repository.full_name },
+    revision: value.sha,
+    unit: {
+      kind: 'commit_status',
+      id: String(value.id),
+      name: value.context ?? value.name ?? 'status',
+    },
+    nativeState: value.state,
+    phase: checkPhase(value.state),
+    nativeResult: value.state,
+    result: ['pending', 'queued'].includes(value.state)
+      ? null
+      : value.state === 'success'
+        ? 'success'
+        : ['failure', 'error'].includes(value.state)
+          ? 'failure'
+          : 'unknown',
+    pullRequests: [],
+  };
+  return normalizeEnvelope(event, context, sourceActor, occurredAt);
+}
+
+export function normalizeGitHubWebhook(
+  payload: unknown,
+  context: GitHubEnvelopeContext
+): GitHubNormalizationResult {
+  switch (context.eventName) {
+    case 'issues':
+      return normalizeIssues(payload, context);
+    case 'pull_request':
+      return normalizePullRequest(payload, context);
+    case 'issue_comment':
+      return normalizeIssueComment(payload, context);
+    case 'check_run':
+      return normalizeCheckRun(payload, context);
+    case 'status':
+      return normalizeStatus(payload, context);
+    default:
+      return { status: 'unsupported', reason: `Unsupported GitHub event: ${context.eventName}` };
+  }
 }

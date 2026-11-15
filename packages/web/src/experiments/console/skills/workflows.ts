@@ -1,100 +1,26 @@
-import { requestJson } from '../lib/http';
-import {
-  toWorkflow,
-  type Workflow,
-  type WorkflowSource,
-  type RawWorkflowShape,
+import type { components } from '@/lib/api.generated';
+import type { QueryParams } from '../lib/api-types';
+import type {
+  WorkflowListResult,
+  LoadedWorkflow,
+  InstalledPackWorkflow,
+  WorkflowLoad,
 } from '../primitives/workflow';
-import type { WorkflowGraphNode } from '../primitives/workflow-graph';
+export type {
+  WorkflowListResult,
+  LoadedWorkflow,
+  InstalledPackWorkflow,
+  WorkflowLoad,
+} from '../primitives/workflow';
+import { requestJson } from '../lib/http';
+import { toWorkflow, type WorkflowSource } from '../primitives/workflow';
+import { nodeKind, type WorkflowGraphNode } from '../primitives/workflow-graph';
 import type { BuilderWorkflowDefinition } from '../builder/types';
 import type { WireWorkflowDefinition } from '../builder/types/wire';
 
-/**
- * A node as the LIST endpoint serves it: the engine's transform has already rewritten what the
- * author wrote (`command:` → `kind: 'agent'` + `source`, `bash:` → an exec node whose runtime
- * is the shell). Both forms are declared because the same shape names them — a definition that
- * has not been through the transform still carries the authoring fields.
- */
-interface RawNode {
-  id: string;
-  depends_on?: string[];
-  kind?: string;
-  source?: { kind?: string };
-  runtime?: string;
-  prompt?: string;
-  bash?: string;
-  command?: string;
-  cancel?: string;
-  approval?: unknown;
-  wait?: unknown;
-  loop?: unknown;
-  script?: unknown;
-}
-
-/**
- * Shares `RawWorkflowShape` with `toWorkflow`'s own wire type rather than re-declaring
- * the common fields: `listWorkflows` feeds these entries straight into `toWorkflow`, so
- * a field this copy omitted (as it once omitted `inputs`) would still compile and still
- * arrive at runtime, leaving the type quietly wrong. `nodes` is the one field only this
- * side needs — `getWorkflowGraph` reads it.
- */
-type RawWorkflow = RawWorkflowShape & {
-  nodes?: RawNode[];
-};
-
-interface WorkflowListEntry {
-  workflow: RawWorkflow;
-  filename?: string;
-  source: string;
-}
-
-interface WorkflowsResponse {
-  workflows: WorkflowListEntry[];
-  /** Repo-curated workflow names to pin on top, in declared order (PR #1929). */
-  recommended?: string[];
-  errors?: unknown[];
-}
-
-/** Discovered workflows plus the repo-curated recommended names (declared order). */
-export interface WorkflowListResult {
-  workflows: Workflow[];
-  recommended: string[];
-}
-
 export async function listWorkflows(cwd?: string): Promise<WorkflowListResult> {
-  const qs = cwd !== undefined ? `?cwd=${encodeURIComponent(cwd)}` : '';
-  const res = await requestJson<WorkflowsResponse>(`/api/workflows${qs}`);
+  const res = await requestJson('/api/workflows', 'get', { query: { cwd } });
   return { workflows: res.workflows.map(toWorkflow), recommended: res.recommended ?? [] };
-}
-
-export function nodeKind(n: RawNode): WorkflowGraphNode['kind'] {
-  // The transformed form first: it is what the endpoint actually serves, and reading the
-  // authoring fields alone made every command node in the graph render as a prompt.
-  switch (n.kind) {
-    case 'agent':
-      return n.source?.kind === 'command' ? 'command' : 'prompt';
-    case 'exec':
-      return n.runtime === 'sh' ? 'bash' : 'script';
-    case 'gate':
-      return 'approval';
-    case 'wait':
-      return 'wait';
-    case 'halt':
-      return 'cancel';
-    case 'loop':
-    case 'loop_group':
-      return 'loop';
-    default:
-      break;
-  }
-  if (n.loop !== undefined) return 'loop';
-  if (n.approval !== undefined) return 'approval';
-  if (n.wait !== undefined) return 'wait';
-  if (n.cancel !== undefined) return 'cancel';
-  if (n.bash !== undefined) return 'bash';
-  if (n.command !== undefined) return 'command';
-  if (n.script !== undefined) return 'script';
-  return 'prompt';
 }
 
 /**
@@ -107,8 +33,7 @@ export function nodeKind(n: RawNode): WorkflowGraphNode['kind'] {
  * across subfoldered workflows.
  */
 export async function getWorkflowGraph(name: string, cwd?: string): Promise<WorkflowGraphNode[]> {
-  const qs = cwd !== undefined ? `?cwd=${encodeURIComponent(cwd)}` : '';
-  const res = await requestJson<WorkflowsResponse>(`/api/workflows${qs}`);
+  const res = await requestJson('/api/workflows', 'get', { query: { cwd } });
   const match = res.workflows.find(w => w.workflow.name === name);
   if (match === undefined) {
     throw new Error(`Workflow not found: ${name}`);
@@ -123,12 +48,6 @@ export async function getWorkflowGraph(name: string, cwd?: string): Promise<Work
   );
 }
 
-// ---------------------------------------------------------------------------
-// PR-3 connected-mode CRUD verbs. The single-name endpoints below are the live
-// seam the builder's BuilderConnected route saves through. URL/body shaping is
-// extracted into pure builders so it can be unit-tested without `fetch`.
-// ---------------------------------------------------------------------------
-
 /**
  * Where a loaded workflow lives. Read-only for `bundled` and `installed` (see `isReadOnlySource`).
  * Re-exported from `primitives/workflow` (single source of truth) so the union
@@ -136,52 +55,13 @@ export async function getWorkflowGraph(name: string, cwd?: string): Promise<Work
  */
 export type { WorkflowSource };
 
-/** Save target — bundled opens read-only, so Save-as always writes a project override. */
-export type WorkflowSaveSource = 'project' | 'global';
-
-/** `GET /api/workflows/:name` response. */
-export interface GetWorkflowResponse {
-  workflow: WireWorkflowDefinition;
-  filename: string;
-  /**
-   * Where the workflow came from. `Workflow['source']` widens to
-   * `WorkflowSource | (string & {})` so an unrecognised value (#2578) is
-   * surfaced verbatim rather than silently collapsed — the single-endpoint
-   * wire shape and `LoadedWorkflow` must match `Workflow.source` for the
-   * load-state chain to type-check end-to-end without a cast.
-   */
-  source: Workflow['source'];
+export function isInstalledPackWorkflow(load: WorkflowLoad): load is InstalledPackWorkflow {
+  return 'installedPack' in load;
 }
 
-/** Normalized result of `loadWorkflow`. */
-export interface LoadedWorkflow {
-  definition: WireWorkflowDefinition;
-  filename: string;
-  /**
-   * Where the workflow came from. Same widening rationale as
-   * `GetWorkflowResponse.source`: an unrecognised value reaches the editor
-   * verbatim and the downstream helpers (`isReadOnlySource`, `saveTargetFor`)
-   * — both accepting `string` — decide what to do with it.
-   */
-  source: Workflow['source'];
-}
-
-/**
- * `POST /api/workflows/validate` response — HTTP 200 even when invalid.
- * Discriminated on `valid` so a `valid:false` body always carries the (possibly
- * empty) `errors` field and the `valid:true` branch cannot claim errors.
- */
-export type ValidateWorkflowResponse = { valid: true } | { valid: false; errors?: string[] };
-
-/** Build the single-name GET/PUT/DELETE path with an encoded `?cwd=` query. */
-export function buildWorkflowPath(name: string, cwd: string): string {
-  return `/api/workflows/${encodeURIComponent(name)}?cwd=${encodeURIComponent(cwd)}`;
-}
-
-/** Build the PUT/DELETE path, appending `&source=` to the cwd query. */
-export function buildSavePath(name: string, cwd: string, source: WorkflowSaveSource): string {
-  return `${buildWorkflowPath(name, cwd)}&source=${source}`;
-}
+export type WorkflowSaveSource = NonNullable<QueryParams<'/api/workflows/{name}', 'put'>['source']>;
+export type GetWorkflowResponse = components['schemas']['GetWorkflowResponse'];
+export type ValidateWorkflowResponse = components['schemas']['ValidateWorkflowResponse'];
 
 /**
  * Load a single workflow definition by name for the selected project.
@@ -190,9 +70,20 @@ export function buildSavePath(name: string, cwd: string, source: WorkflowSaveSou
  * `.archon/workflows/<subdir>/` (matches `getWorkflowGraph`'s note). Workflows
  * in subfolders won't load here — callers surface a "not found" empty state.
  */
-export async function loadWorkflow(name: string, cwd: string): Promise<LoadedWorkflow> {
-  const res = await requestJson<GetWorkflowResponse>(buildWorkflowPath(name, cwd));
-  return { definition: res.workflow, filename: res.filename, source: res.source };
+export async function loadWorkflow(name: string, cwd: string): Promise<WorkflowLoad> {
+  const res = await requestJson('/api/workflows/{name}', 'get', {
+    params: { name },
+    query: { cwd },
+  });
+  if (res.authored === undefined) {
+    if (res.source === 'installed') return { installedPack: true, name };
+    // Editing the normalized form would open every node as unrecognised and
+    // write them back as empty prompts — refuse rather than corrupt on save.
+    throw new Error(`GET /api/workflows/${name} returned no authored form; cannot edit it`);
+  }
+  // The server parsed this same mapping with parseWorkflow before answering.
+  const definition = res.authored as unknown as WireWorkflowDefinition;
+  return { definition, filename: res.filename, source: res.source };
 }
 
 /** Persist (create or update) a workflow YAML via PUT `?cwd=&source=`. */
@@ -201,11 +92,14 @@ export async function saveWorkflow(
   definition: WireWorkflowDefinition,
   opts: { cwd: string; source: WorkflowSaveSource }
 ): Promise<LoadedWorkflow> {
-  const res = await requestJson<GetWorkflowResponse>(buildSavePath(name, opts.cwd, opts.source), {
-    method: 'PUT',
-    body: JSON.stringify({ definition }),
+  const res = await requestJson('/api/workflows/{name}', 'put', {
+    params: { name },
+    query: opts,
+    body: { definition },
   });
-  return { definition: res.workflow, filename: res.filename, source: res.source };
+  // The file now holds exactly `definition` (the PUT response carries only the
+  // normalized form), so that is the authored definition to report back.
+  return { definition, filename: res.filename, source: res.source };
 }
 
 /** Delete a user-defined workflow via DELETE `?cwd=&source=`. Bundled deletes 400 server-side. */
@@ -213,7 +107,7 @@ export async function deleteWorkflow(
   name: string,
   opts: { cwd: string; source: WorkflowSaveSource }
 ): Promise<void> {
-  await requestJson(buildSavePath(name, opts.cwd, opts.source), { method: 'DELETE' });
+  await requestJson('/api/workflows/{name}', 'delete', { params: { name }, query: opts });
 }
 
 /**
@@ -224,8 +118,5 @@ export async function deleteWorkflow(
 export function validateWorkflow(
   definition: BuilderWorkflowDefinition
 ): Promise<ValidateWorkflowResponse> {
-  return requestJson<ValidateWorkflowResponse>('/api/workflows/validate', {
-    method: 'POST',
-    body: JSON.stringify({ definition }),
-  });
+  return requestJson('/api/workflows/validate', 'post', { body: { definition } });
 }

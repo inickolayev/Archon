@@ -42,7 +42,6 @@ nodes:
 
   # 3. Structured output — exercises Pi's best-effort output_format path
   #    (schema appended to prompt + JSON extracted from result text).
-  #    This is the same machinery the maintainer-standup synthesis relies on.
   - id: json
     prompt: |
       Return a JSON object with two fields, no fences and no prose:
@@ -64,10 +63,10 @@ nodes:
   - id: assert
     depends_on: [hello, identify, json]
     bash: |
-      math="$hello.output"
-      ident="$identify.output"
-      jname="$json.output.name"
-      jok="$json.output.ok"
+      math=$hello.output
+      ident=$identify.output
+      jname=$json.output.name
+      jok=$json.output.ok
 
       echo "── results ──"
       echo "math      = $math"

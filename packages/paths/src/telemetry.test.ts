@@ -1,29 +1,24 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn, jest } from 'bun:test';
 import { tmpdir } from 'os';
+import { setImmediate } from 'node:timers/promises';
 import { join } from 'path';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'fs';
 
 import {
-  isTelemetryDisabled,
   captureWorkflowInvoked,
   captureArchonStarted,
   captureArchonActive,
   captureChatTurn,
+  captureWorkflowNoMatch,
   captureApprovalResolved,
   captureCodebaseRegistered,
   captureWorkflowTerminal,
-  runRefForTelemetry,
-  classifyWorkflowForTelemetry,
-  sanitizeModelForTelemetry,
-  shutdownTelemetry,
   resetTelemetryForTests,
-  getOrCreateTelemetryId,
-  getTelemetryStatus,
-  resetTelemetryId,
-  resolveInstallChannel,
-  NOTICE_STAMP_FILENAME,
-  TELEMETRY_SCHEMA_VERSION,
 } from './telemetry';
+import { removeTempTree } from './test-utils';
+import { claimDailyStart, NOTICE_STAMP_FILENAME } from './telemetry-consent';
+import { runRefForTelemetry, TELEMETRY_SCHEMA_VERSION } from './telemetry-events';
+import { shutdownTelemetry } from './telemetry-transport';
 
 const ENV_VARS = [
   'ARCHON_HOME',
@@ -50,214 +45,6 @@ function restoreEnv(saved: Record<string, string | undefined>): void {
   }
 }
 
-describe('telemetry opt-out detection', () => {
-  let saved: Record<string, string | undefined>;
-
-  beforeEach(() => {
-    saved = saveEnv();
-    resetTelemetryForTests();
-  });
-
-  afterEach(() => {
-    restoreEnv(saved);
-    resetTelemetryForTests();
-  });
-
-  test('enabled by default when no opt-out env vars set', () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    expect(isTelemetryDisabled()).toBe(false);
-  });
-
-  test('CI=true disables telemetry', () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.POSTHOG_API_KEY;
-    process.env.CI = 'true';
-    expect(isTelemetryDisabled()).toBe(true);
-  });
-
-  test('CI=1 does not disable (only "true" is honored, not "1")', () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.POSTHOG_API_KEY;
-    process.env.CI = '1';
-    expect(isTelemetryDisabled()).toBe(false);
-  });
-
-  test.each(['true', 'True', 'TRUE'])(
-    'CI=%s disables (case-insensitive, AppVeyor sets True)',
-    value => {
-      delete process.env.ARCHON_TELEMETRY_DISABLED;
-      delete process.env.DO_NOT_TRACK;
-      delete process.env.POSTHOG_API_KEY;
-      process.env.CI = value;
-      expect(isTelemetryDisabled()).toBe(true);
-    }
-  );
-
-  test('ARCHON_TELEMETRY_DISABLED=1 disables telemetry', () => {
-    process.env.ARCHON_TELEMETRY_DISABLED = '1';
-    expect(isTelemetryDisabled()).toBe(true);
-  });
-
-  test('DO_NOT_TRACK=1 disables telemetry', () => {
-    process.env.DO_NOT_TRACK = '1';
-    expect(isTelemetryDisabled()).toBe(true);
-  });
-
-  test('ARCHON_TELEMETRY_DISABLED=0 does not disable (strict "1" match)', () => {
-    process.env.ARCHON_TELEMETRY_DISABLED = '0';
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    expect(isTelemetryDisabled()).toBe(false);
-  });
-
-  test('empty POSTHOG_API_KEY override disables telemetry', () => {
-    process.env.POSTHOG_API_KEY = '';
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    expect(isTelemetryDisabled()).toBe(true);
-  });
-
-  test.each(['off', 'OFF', '0', 'false', 'disabled'])(
-    'POSTHOG_API_KEY=%s disables telemetry',
-    value => {
-      process.env.POSTHOG_API_KEY = value;
-      delete process.env.ARCHON_TELEMETRY_DISABLED;
-      delete process.env.DO_NOT_TRACK;
-      delete process.env.CI;
-      expect(isTelemetryDisabled()).toBe(true);
-    }
-  );
-
-  test('POSTHOG_API_KEY=phc_custom is treated as enabled (self-host)', () => {
-    process.env.POSTHOG_API_KEY = 'phc_custom_self_hosted_key';
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    expect(isTelemetryDisabled()).toBe(false);
-  });
-});
-
-describe('getTelemetryStatus', () => {
-  let saved: Record<string, string | undefined>;
-  let tmpHome: string;
-
-  beforeEach(() => {
-    saved = saveEnv();
-    tmpHome = mkdtempSync(join(tmpdir(), 'archon-telemetry-status-'));
-    process.env.ARCHON_HOME = tmpHome;
-    resetTelemetryForTests();
-  });
-
-  afterEach(() => {
-    restoreEnv(saved);
-    resetTelemetryForTests();
-    rmSync(tmpHome, { recursive: true, force: true });
-  });
-
-  test('reports enabled + embedded key source when no env vars set', () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    delete process.env.POSTHOG_HOST;
-    const status = getTelemetryStatus();
-    expect(status.enabled).toBe(true);
-    expect(status.disabledReason).toBeNull();
-    expect(status.keySource).toBe('embedded');
-    expect(status.distinctId).toMatch(/^[0-9a-f-]+$/);
-    expect(status.host).toContain('posthog');
-  });
-
-  test('does not create a telemetry-id file when inspected while disabled', () => {
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    process.env.ARCHON_TELEMETRY_DISABLED = '1';
-    const status = getTelemetryStatus();
-    expect(status.enabled).toBe(false);
-    expect(status.distinctId).toMatch(/^[0-9a-f-]+$/);
-    // Opted-out users inspecting status must not have a UUID materialized for them.
-    expect(existsSync(join(tmpHome, 'telemetry-id'))).toBe(false);
-  });
-
-  test('reports CI as the disabled reason', () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    process.env.CI = 'true';
-    const status = getTelemetryStatus();
-    expect(status.enabled).toBe(false);
-    expect(status.disabledReason).toBe('CI');
-  });
-
-  test('reports POSTHOG_API_KEY when explicit "off" value is set', () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    process.env.POSTHOG_API_KEY = 'off';
-    const status = getTelemetryStatus();
-    expect(status.enabled).toBe(false);
-    expect(status.disabledReason).toBe('POSTHOG_API_KEY');
-    expect(status.keySource).toBe('none');
-  });
-
-  test('reports env key source for non-default API key', () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    process.env.POSTHOG_API_KEY = 'phc_self_hosted';
-    const status = getTelemetryStatus();
-    expect(status.enabled).toBe(true);
-    expect(status.keySource).toBe('env');
-  });
-
-  test('precedence: ARCHON_TELEMETRY_DISABLED wins over CI', () => {
-    process.env.ARCHON_TELEMETRY_DISABLED = '1';
-    process.env.CI = 'true';
-    expect(getTelemetryStatus().disabledReason).toBe('ARCHON_TELEMETRY_DISABLED');
-  });
-});
-
-describe('resetTelemetryId', () => {
-  let saved: Record<string, string | undefined>;
-  let tmpHome: string;
-
-  beforeEach(() => {
-    saved = saveEnv();
-    tmpHome = mkdtempSync(join(tmpdir(), 'archon-telemetry-reset-'));
-    process.env.ARCHON_HOME = tmpHome;
-    resetTelemetryForTests();
-  });
-
-  afterEach(() => {
-    restoreEnv(saved);
-    resetTelemetryForTests();
-    rmSync(tmpHome, { recursive: true, force: true });
-  });
-
-  test('writes a new UUID to telemetry-id and returns it', () => {
-    const id1 = getOrCreateTelemetryId();
-    const id2 = resetTelemetryId();
-    expect(id2).not.toBe(id1);
-    expect(id2).toMatch(/^[0-9a-f-]+$/);
-    const onDisk = readFileSync(join(tmpHome, 'telemetry-id'), 'utf8').trim();
-    expect(onDisk).toBe(id2);
-  });
-
-  test('updates the in-process cache so subsequent calls see the new ID', () => {
-    resetTelemetryId();
-    const cached = getOrCreateTelemetryId();
-    const onDisk = readFileSync(join(tmpHome, 'telemetry-id'), 'utf8').trim();
-    expect(cached).toBe(onDisk);
-  });
-});
-
 describe('first-run notice (via captureWorkflowInvoked)', () => {
   let saved: Record<string, string | undefined>;
   let tmpHome: string;
@@ -277,11 +64,11 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
     resetTelemetryForTests();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     Object.defineProperty(process.stderr, 'isTTY', { value: originalIsTTY, configurable: true });
     restoreEnv(saved);
     resetTelemetryForTests();
-    rmSync(tmpHome, { recursive: true, force: true });
+    await removeTempTree(tmpHome);
   });
 
   function setTTY(value: boolean): void {
@@ -304,6 +91,41 @@ describe('first-run notice (via captureWorkflowInvoked)', () => {
     expect(writeSpy).toHaveBeenCalledTimes(1);
     expect(String(writeSpy.mock.calls[0]?.[0])).toContain('anonymous usage telemetry');
     expect(existsSync(stampPath())).toBe(true);
+    writeSpy.mockRestore();
+  });
+
+  test('renews the notice for v7 installs and honors the v8 stamp across processes', () => {
+    writeFileSync(join(tmpHome, 'telemetry-notice-shown-v7'), 'old');
+    setTTY(true);
+    const writeSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    expect(String(writeSpy.mock.calls[0]?.[0])).toContain(
+      'Archon collects anonymous usage telemetry — now also cache-read/cache-write\n' +
+        'token counts for direct chat turns, plus whether cache totals are partial\n' +
+        '(numbers only, never message content).'
+    );
+    const notice = String(writeSpy.mock.calls[0]?.[0]).replace(/\s+/g, ' ');
+    for (const disclosure of [
+      'the shape of each workflow (node-type counts, depth, fan-out, how many commands it uses, a prompt-size bucket)',
+      "for a copy of a bundled workflow, which bundled one it came from — never your own workflow's name, description or text",
+      'an anonymous per-run reference (a hash, never the run id), cancelled runs',
+      'how Archon was installed (binary, Docker, or source), the build commit',
+      'chat activity (platform/provider/model, never message content)',
+      'aggregate usage totals (token counts, cost, durations, loop iterations)',
+      'approval decisions (approved/rejected only), deployment shape, a categorical failure class',
+      'workflow name, run outcome, OS/arch, and version',
+      'Still no code, prompts, file paths, IP, or personal data',
+      'see README "Telemetry"',
+      'Opt out anytime: DO_NOT_TRACK=1 or ARCHON_TELEMETRY_DISABLED=1',
+    ]) {
+      expect(notice).toContain(disclosure);
+    }
+    expect(NOTICE_STAMP_FILENAME).toBe('telemetry-notice-shown-v8');
+    expect(existsSync(stampPath())).toBe(true);
+    resetTelemetryForTests();
+    captureWorkflowInvoked({ runId: 'run-2', isChild: false, workflowName: 'w' });
+    expect(writeSpy).toHaveBeenCalledTimes(1);
     writeSpy.mockRestore();
   });
 
@@ -368,76 +190,66 @@ describe('captureWorkflowInvoked when disabled', () => {
   });
 });
 
-describe('telemetry ID persistence', () => {
-  let saved: Record<string, string | undefined>;
-  let tmpHome: string;
+interface WireEvent {
+  event: string;
+  properties: Record<string, unknown>;
+}
 
-  beforeEach(() => {
-    saved = saveEnv();
-    tmpHome = mkdtempSync(join(tmpdir(), 'archon-telemetry-test-'));
-    process.env.ARCHON_HOME = tmpHome;
-    // Force-disable actual network capture — we only exercise the ID path.
-    process.env.ARCHON_TELEMETRY_DISABLED = '1';
-    resetTelemetryForTests();
-  });
+const TEST_FLUSH_TIMEOUT_MS = 10000;
 
-  afterEach(() => {
-    restoreEnv(saved);
-    resetTelemetryForTests();
-    rmSync(tmpHome, { recursive: true, force: true });
-  });
+async function captureTelemetry(capture: () => void): Promise<WireEvent[]> {
+  delete process.env.ARCHON_TELEMETRY_DISABLED;
+  delete process.env.DO_NOT_TRACK;
+  delete process.env.CI;
+  delete process.env.POSTHOG_API_KEY;
+  const bodies: (string | Blob)[] = [];
+  const fetchImpl = Object.assign(
+    (url: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
+      options?.signal?.throwIfAborted();
+      const body = options?.body;
+      if (String(url).endsWith('/batch/') && (typeof body === 'string' || body instanceof Blob)) {
+        bodies.push(body);
+      }
+      return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
+    },
+    { preconnect: (): void => undefined }
+  );
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
+  try {
+    try {
+      capture();
+    } finally {
+      // Wire assertions need delivery even when CPU contention exceeds the exit budget.
+      await shutdownTelemetry(TEST_FLUSH_TIMEOUT_MS);
+    }
+    const events: WireEvent[] = [];
+    for (const body of bodies) {
+      const text =
+        typeof body === 'string'
+          ? body
+          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
+      events.push(...(JSON.parse(text) as { batch: WireEvent[] }).batch);
+    }
+    return events;
+  } finally {
+    fetchSpy.mockRestore();
+  }
+}
 
-  test('calling capture while disabled does not create a telemetry-id file', () => {
-    captureWorkflowInvoked({ runId: 'run-1', isChild: false, workflowName: 'w' });
-    expect(existsSync(join(tmpHome, 'telemetry-id'))).toBe(false);
-  });
-
-  test('an existing telemetry-id file is preserved (not overwritten)', async () => {
-    const { writeFileSync, mkdirSync } = await import('fs');
-    const existingId = '11111111-1111-4111-8111-111111111111';
-    mkdirSync(tmpHome, { recursive: true });
-    writeFileSync(join(tmpHome, 'telemetry-id'), existingId, 'utf8');
-
-    resetTelemetryForTests();
-
-    // Direct, synchronous call — no network, no fire-and-forget, no timer.
-    const resolved = getOrCreateTelemetryId();
-
-    expect(resolved).toBe(existingId);
-    const stored = readFileSync(join(tmpHome, 'telemetry-id'), 'utf8').trim();
-    expect(stored).toBe(existingId);
-  });
-});
-
-describe('classifyWorkflowForTelemetry', () => {
-  test('bundled workflows report their real name', () => {
-    expect(classifyWorkflowForTelemetry('implement', 'bundled')).toEqual({
-      workflow_name: 'implement',
-      workflow_source: 'bundled',
-    });
-  });
-
-  test('project workflows are redacted to "custom" and report their source', () => {
-    expect(classifyWorkflowForTelemetry('deploy-acme-prod', 'project')).toEqual({
-      workflow_name: 'custom',
-      workflow_source: 'project',
-    });
-  });
-
-  test('global workflows are also redacted to "custom"', () => {
-    expect(classifyWorkflowForTelemetry('my-global', 'global')).toEqual({
-      workflow_name: 'custom',
-      workflow_source: 'global',
-    });
-  });
-
-  test('undefined source defaults to the privacy-safe custom/project treatment', () => {
-    expect(classifyWorkflowForTelemetry('anything', undefined)).toEqual({
-      workflow_name: 'custom',
-      workflow_source: 'project',
-    });
-  });
-});
+function eventProperties(
+  events: WireEvent[],
+  name: string,
+  workflowName?: string
+): Record<string, unknown> {
+  const event = events.find(
+    event =>
+      event.event === name &&
+      (workflowName === undefined || event.properties.workflow_name === workflowName)
+  );
+  if (!event)
+    throw new Error(`Missing telemetry event: ${name} (${workflowName ?? 'any workflow'})`);
+  return event.properties;
+}
 
 describe('new capture functions are fire-and-forget no-throw', () => {
   let saved: Record<string, string | undefined>;
@@ -450,10 +262,10 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     resetTelemetryForTests();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     restoreEnv(saved);
     resetTelemetryForTests();
-    rmSync(tmpHome, { recursive: true, force: true });
+    await removeTempTree(tmpHome);
   });
 
   test('captureArchonStarted does not throw (disabled)', () => {
@@ -462,21 +274,55 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureArchonStarted does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    // Stub the transport so the enabled path never touches the network, then
-    // flush deterministically before restoring (no flaky timers / real ingest).
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureArchonStarted({ surface: 'server' })).not.toThrow();
-      await shutdownTelemetry();
+    });
+  });
+
+  test('wire capture survives compression completing after the production exit deadline', async () => {
+    const compressed = Promise.withResolvers<void>();
+    const releaseCompression = Promise.withResolvers<void>();
+    const originalBlob = Response.prototype.blob;
+    const blobSpy = spyOn(Response.prototype, 'blob').mockImplementation(async function (
+      this: Response
+    ) {
+      const body = await originalBlob.call(this);
+      compressed.resolve();
+      await releaseCompression.promise;
+      return body;
+    });
+    jest.useFakeTimers();
+    try {
+      const captured = captureTelemetry(() => captureArchonStarted({ surface: 'cli' }));
+      await compressed.promise;
+      // Hold the real gzip result past 75 ms, then drain deadline reactions before delivery.
+      jest.advanceTimersByTime(76);
+      await setImmediate();
+      releaseCompression.resolve();
+      const events = await captured;
+      expect(eventProperties(events, 'archon_started')).toMatchObject({
+        schema_version: TELEMETRY_SCHEMA_VERSION,
+        surface: 'cli',
+        $ip: '',
+        $process_person_profile: false,
+      });
     } finally {
-      fetchSpy.mockRestore();
+      releaseCompression.resolve();
+      jest.useRealTimers();
+      blobSpy.mockRestore();
     }
+  });
+
+  test('archon_started is sent once per surface per UTC day', async () => {
+    const events = await captureTelemetry(() => {
+      captureArchonStarted({ surface: 'cli' });
+      captureArchonStarted({ surface: 'cli' });
+      captureArchonStarted({ surface: 'server' });
+    });
+    const started = events.filter(event => event.event === 'archon_started');
+    expect(started.map(event => event.properties.surface)).toEqual(['cli', 'server']);
+    expect(claimDailyStart('cli')).toBe(false);
+    expect(claimDailyStart('cli', new Date(Date.now() + 24 * 60 * 60 * 1000))).toBe(true);
   });
 
   test('captureArchonActive does not throw (disabled)', () => {
@@ -485,19 +331,38 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureArchonActive does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureArchonActive({ surface: 'server' })).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
+  });
+
+  test('no-match decisions have a separate anonymous event from ordinary chat', async () => {
+    const events = await captureTelemetry(() => {
+      captureChatTurn({ outcome: 'completed' });
+      captureWorkflowNoMatch('native_tool');
+      captureWorkflowNoMatch('cli');
+    });
+    expect(eventProperties(events, 'chat_turn_handled')).toMatchObject({ outcome: 'completed' });
+    expect(eventProperties(events, 'workflow_no_match')).toMatchObject({
+      $process_person_profile: false,
+      $ip: '',
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+      transport: 'native_tool',
+    });
+    expect(
+      events
+        .filter(event => event.event === 'workflow_no_match')
+        .map(event => event.properties.transport)
+    ).toEqual(['native_tool', 'cli']);
+  });
+
+  test('no-match reporting respects telemetry opt-out on both transports', async () => {
+    const events = await captureTelemetry(() => {
+      process.env.DO_NOT_TRACK = '1';
+      captureWorkflowNoMatch('native_tool');
+      captureWorkflowNoMatch('cli');
+    });
+    expect(events).toEqual([]);
   });
 
   test('captureChatTurn does not throw (disabled)', () => {
@@ -509,21 +374,11 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureChatTurn does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() =>
         captureChatTurn({ platform: 'web', provider: 'codex', outcome: 'completed' })
       ).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureApprovalResolved does not throw (disabled)', () => {
@@ -533,19 +388,9 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureApprovalResolved does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureApprovalResolved({ resolution: 'approved' })).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureChatTurn accepts v4 usage fields without throwing (disabled)', () => {
@@ -590,19 +435,9 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureCodebaseRegistered does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() => captureCodebaseRegistered()).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureArchonStarted accepts deployment-shape props without throwing (disabled)', () => {
@@ -614,7 +449,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         webAuthEnabled: true,
         multiUser: false,
         githubAuthMode: 'app',
-        adapterSlack: true,
+        chatPluginIds: ['slack'],
         adapterTelegram: false,
         adapterDiscord: false,
         adapterGitea: false,
@@ -624,60 +459,27 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureArchonStarted serializes deployment shape to wire properties (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const bodies: (string | Blob)[] = [];
-    const fetchImpl = Object.assign(
-      (
-        _url: Parameters<typeof fetch>[0],
-        options?: Parameters<typeof fetch>[1]
-      ): Promise<Response> => {
-        const body = (options as { body?: unknown } | undefined)?.body;
-        if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
-        return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
-      },
-      { preconnect: (): void => undefined }
-    );
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
-    try {
+    const events = await captureTelemetry(() => {
       captureArchonStarted({
         surface: 'server',
+        store: 'postgresql',
         dbKind: 'postgresql',
         webAuthEnabled: true,
         githubAuthMode: 'app',
-        adapterSlack: true,
+        chatPluginIds: ['slack', 'community-chat'],
         // multiUser and the remaining adapter booleans intentionally omitted —
         // absent fields must be omitted from the wire, not sent as undefined.
       });
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-
-    interface WireEvent {
-      event: string;
-      properties: Record<string, unknown>;
-    }
-    // posthog-node gzips the /batch/ body into a Blob; decompress to inspect.
-    const events: WireEvent[] = [];
-    for (const body of bodies) {
-      const text =
-        typeof body === 'string'
-          ? body
-          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
-      const payload = JSON.parse(text) as { batch?: WireEvent[] };
-      events.push(...(payload.batch ?? []));
-    }
-    const started = events.find(e => e.event === 'archon_started');
-    expect(started).toBeDefined();
-    const props = started!.properties;
+    });
+    const props = eventProperties(events, 'archon_started');
     expect(props.surface).toBe('server');
+    expect(props.store).toBe('postgresql');
     expect(props.db_kind).toBe('postgresql');
     expect(props.web_auth_enabled).toBe(true);
     expect(props.github_auth_mode).toBe('app');
     expect(props.adapter_slack).toBe(true);
+    expect(props.chat_plugins).toBe(2);
+    expect(JSON.stringify(props)).not.toContain('community-chat');
     // Omitted fields must not appear on the wire at all
     expect('multi_user' in props).toBe(false);
     expect('adapter_telegram' in props).toBe(false);
@@ -687,25 +489,8 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     expect(props.$ip).toBe('');
   });
 
-  test('captureChatTurn serializes v4 usage fields to snake_case wire keys (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const bodies: (string | Blob)[] = [];
-    const fetchImpl = Object.assign(
-      (
-        _url: Parameters<typeof fetch>[0],
-        options?: Parameters<typeof fetch>[1]
-      ): Promise<Response> => {
-        const body = (options as { body?: unknown } | undefined)?.body;
-        if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
-        return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
-      },
-      { preconnect: (): void => undefined }
-    );
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
-    try {
+  test('captureChatTurn serializes usage and cache fields to snake_case wire keys (enabled)', async () => {
+    const events = await captureTelemetry(() => {
       captureChatTurn({
         platform: 'web',
         provider: 'claude',
@@ -715,28 +500,18 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         costUsd: 0.03,
         tokensIn: 900,
         tokensOut: 210,
+        cacheReadTokens: 700,
+        cacheWriteTokens: 0,
+        cachePartialTokens: true,
       });
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-
-    interface WireEvent {
-      event: string;
-      properties: Record<string, unknown>;
-    }
-    const events: WireEvent[] = [];
-    for (const body of bodies) {
-      const text =
-        typeof body === 'string'
-          ? body
-          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
-      const payload = JSON.parse(text) as { batch?: WireEvent[] };
-      events.push(...(payload.batch ?? []));
-    }
-    const turn = events.find(e => e.event === 'chat_turn_handled');
-    expect(turn).toBeDefined();
-    const props = turn!.properties;
+    });
+    const props = eventProperties(events, 'chat_turn_handled');
+    expect(props).toMatchObject({
+      cache_read_tokens: 700,
+      cache_write_tokens: 0,
+      cache_partial: true,
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+    });
     expect(props.model).toBe('sonnet');
     expect(props.duration_ms).toBe(5120);
     expect(props.cost_usd).toBe(0.03);
@@ -768,14 +543,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
   });
 
   test('captureWorkflowCompleted does not throw (enabled)', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"status":"ok"}', { status: 200 })
-    );
-    try {
+    await captureTelemetry(() => {
       expect(() =>
         captureWorkflowTerminal({
           outcome: 'failed',
@@ -784,28 +552,11 @@ describe('new capture functions are fire-and-forget no-throw', () => {
           exitReason: 'unhandled_error',
         })
       ).not.toThrow();
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    });
   });
 
   test('captureWorkflowTerminal serializes run identity, outcome events, cache totals and machine context', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const bodies: (string | Blob)[] = [];
-    const fetchImpl = Object.assign(
-      (_url: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
-        const body = (options as { body?: unknown } | undefined)?.body;
-        if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
-        return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
-      },
-      { preconnect: (): void => undefined }
-    );
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
-    try {
+    const events = await captureTelemetry(() => {
       captureWorkflowTerminal({
         outcome: 'completed',
         runId: 'run-db-id-1',
@@ -834,26 +585,8 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         workflowSource: 'project',
         cancelReason: 'operator',
       });
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-
-    const events: Array<{ event: string; properties: Record<string, unknown> }> = [];
-    for (const body of bodies) {
-      const raw =
-        typeof body === 'string'
-          ? body
-          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
-      const payload = JSON.parse(raw) as {
-        batch?: Array<{ event: string; properties: Record<string, unknown> }>;
-      };
-      events.push(...(payload.batch ?? []));
-    }
-    const completed = events.filter(event => event.event === 'workflow_completed');
-    const exact = completed.find(
-      event => event.properties.workflow_name === 'implement'
-    )?.properties;
+    });
+    const exact = eventProperties(events, 'workflow_completed', 'implement');
     expect(exact).toMatchObject({
       schema_version: TELEMETRY_SCHEMA_VERSION,
       run_ref: runRefForTelemetry('run-db-id-1'),
@@ -871,7 +604,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
 
     // Identical totals, but only a floor. Without the flag these two would pool together
     // and bias aggregate cache figures low across installs (#2662).
-    const floor = completed.find(event => event.properties.workflow_name === 'plan')?.properties;
+    const floor = eventProperties(events, 'workflow_completed', 'plan');
     expect(floor).toMatchObject({
       schema_version: TELEMETRY_SCHEMA_VERSION,
       cache_read_tokens: 70,
@@ -881,27 +614,13 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     // The event name carries the outcome, so neither it nor is_builtin is repeated.
     expect(exact).not.toHaveProperty('outcome');
     expect(exact).not.toHaveProperty('is_builtin');
-    const cancelled = events.find(event => event.event === 'workflow_cancelled')?.properties;
+    const cancelled = eventProperties(events, 'workflow_cancelled');
     expect(cancelled).toMatchObject({ workflow_name: 'custom', cancel_reason: 'operator' });
     // Only the hashed reference leaves the machine, never the run's database id.
     expect(JSON.stringify(events)).not.toContain('run-db-id');
   });
   test('captureWorkflowInvoked serializes workflow shape and bundled ancestry', async () => {
-    delete process.env.ARCHON_TELEMETRY_DISABLED;
-    delete process.env.DO_NOT_TRACK;
-    delete process.env.CI;
-    delete process.env.POSTHOG_API_KEY;
-    const bodies: (string | Blob)[] = [];
-    const fetchImpl = Object.assign(
-      (_url: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
-        const body = (options as { body?: unknown } | undefined)?.body;
-        if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
-        return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
-      },
-      { preconnect: (): void => undefined }
-    );
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
-    try {
+    const events = await captureTelemetry(() => {
       captureWorkflowInvoked({
         runId: 'run-shape',
         isChild: false,
@@ -914,21 +633,10 @@ describe('new capture functions are fire-and-forget no-throw', () => {
           commandRefs: 1,
           promptCharsBucket: '1k_5k',
         },
-        ancestry: { derivedFrom: 'archon-create-issue', derivedSimilarity: 'modified' },
+        ancestry: { derivedFrom: 'archon-implement', derivedSimilarity: 'modified' },
       });
-      await shutdownTelemetry();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-    const events: Array<{ event: string; properties: Record<string, unknown> }> = [];
-    for (const body of bodies) {
-      const raw =
-        typeof body === 'string'
-          ? body
-          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
-      events.push(...((JSON.parse(raw) as { batch?: typeof events }).batch ?? []));
-    }
-    const invoked = events.find(event => event.event === 'workflow_invoked')?.properties;
+    });
+    const invoked = eventProperties(events, 'workflow_invoked');
     expect(invoked).toMatchObject({
       schema_version: TELEMETRY_SCHEMA_VERSION,
       workflow_name: 'custom',
@@ -938,58 +646,11 @@ describe('new capture functions are fire-and-forget no-throw', () => {
       max_fan_out: 2,
       command_refs: 1,
       prompt_chars_bucket: '1k_5k',
-      derived_from: 'archon-create-issue',
+      derived_from: 'archon-implement',
       derived_similarity: 'modified',
     });
     // A node type with no nodes is left out rather than sent as zero.
     expect(invoked).not.toHaveProperty('nodes_loop');
     expect(JSON.stringify(events)).not.toContain('acme-intake');
-  });
-});
-
-describe('runRefForTelemetry', () => {
-  test('is a stable 16-hex reference per run that differs between runs', () => {
-    const ref = runRefForTelemetry('run-a');
-    expect(ref).toMatch(/^[0-9a-f]{16}$/);
-    expect(runRefForTelemetry('run-a')).toBe(ref);
-    expect(runRefForTelemetry('run-b')).not.toBe(ref);
-  });
-});
-
-describe('resolveInstallChannel', () => {
-  test('a source build is docker only when running in the Archon image', () => {
-    expect(resolveInstallChannel({})).toBe('source');
-    expect(resolveInstallChannel({ ARCHON_DOCKER: 'true' })).toBe('docker');
-  });
-});
-
-describe('sanitizeModelForTelemetry', () => {
-  test('forwards real model refs verbatim', () => {
-    for (const model of [
-      'sonnet',
-      'opus',
-      'claude-sonnet-4-6',
-      'gpt-5.6-sol',
-      'anthropic/claude-haiku-4-5',
-      'openrouter/qwen/qwen3-coder',
-      'opus[1m]',
-      'claude-opus-4-7[1m]',
-    ]) {
-      expect(sanitizeModelForTelemetry(model)).toBe(model);
-    }
-  });
-
-  test('drops free-text / non-categorical values so they cannot leak', () => {
-    expect(sanitizeModelForTelemetry('claude for the acme prod deploy')).toBeUndefined();
-    expect(sanitizeModelForTelemetry('john.doe@example.com is testing')).toBeUndefined();
-    expect(sanitizeModelForTelemetry('x'.repeat(100))).toBeUndefined();
-    expect(sanitizeModelForTelemetry('')).toBeUndefined();
-    expect(sanitizeModelForTelemetry('opus[1 m]')).toBeUndefined();
-    expect(sanitizeModelForTelemetry('opus[<script>]')).toBeUndefined();
-    expect(sanitizeModelForTelemetry('opus[1m][2m]')).toBeUndefined();
-  });
-
-  test('passes through undefined', () => {
-    expect(sanitizeModelForTelemetry(undefined)).toBeUndefined();
   });
 });

@@ -4,6 +4,7 @@ import {
   serializeNodeTranscript,
   serializeNodeEmitter,
   serializeNodeOutput,
+  nodeDisplayName,
   type NodeExecutionResult,
 } from './node-record-serialization';
 import type { WorkflowDeps } from './deps';
@@ -13,12 +14,16 @@ import { logWorkflowEvent } from './logger';
 import type { WorkflowEmitterEvent } from './event-emitter';
 import { getWorkflowEventEmitter } from './event-emitter';
 
-import type { NodeStateEventInput } from './store';
-import { readNodeRecordEvent, type ReadNodeRecordEvent } from './node-record-reader';
+import type { NodeStateEventInput, DurableNodeEventInput } from './store';
+import {
+  readNodeRecordEvent,
+  type NodeRecordEventEnvelope,
+  type ReadNodeRecordEvent,
+} from './node-record-reader';
 
 /** Storage rejection must leave node retry policy and reach the run failure boundary. */
 export class NodeEventWriteError extends Error {
-  constructor(event: NodeStateEventInput, cause: unknown) {
+  constructor(event: DurableNodeEventInput, cause: unknown) {
     const originalFailure = event.event_type === 'node_failed' ? event.data?.error : undefined;
     super(
       `Could not persist ${event.event_type} for ${event.step_name ?? 'unknown node'}: ${cause instanceof Error ? cause.message : String(cause)}${typeof originalFailure === 'string' ? `; original node failure: ${originalFailure}` : ''}`,
@@ -29,8 +34,8 @@ export class NodeEventWriteError extends Error {
 }
 
 export async function persistNodeEvent(
-  store: WorkflowDeps['store'],
-  event: NodeStateEventInput
+  store: Pick<WorkflowDeps['store'], 'persistWorkflowEvent'>,
+  event: DurableNodeEventInput
 ): Promise<void> {
   try {
     await store.persistWorkflowEvent(event);
@@ -53,23 +58,22 @@ export interface DerivedNodeStateSinks {
 }
 
 export interface NodeStateSinks extends DerivedNodeStateSinks {
-  store: WorkflowDeps['store'];
-}
-
-function commandNameOf(node: NodeStateSubject): string | undefined {
-  return node.kind === 'agent' && node.source.kind === 'command' ? node.source.name : undefined;
-}
-
-export function getNodeName(node: NodeStateSubject): string {
-  return commandNameOf(node) ?? node.id;
+  store: Pick<WorkflowDeps['store'], 'persistWorkflowEvent'>;
 }
 
 function transcriptContent(node: NodeStateSubject, record: ReadNodeRecordEvent): string {
   if (typeof record.data.command === 'string') return record.data.command;
-  if (node.kind === 'agent') return commandNameOf(node) ?? '<inline>';
+  if (node.kind === 'agent') return node.source.kind === 'command' ? node.source.name : '<inline>';
   if (node.kind === 'exec') return node.runtime === 'sh' ? '<bash>' : '<script>';
   if (typeof record.data.type === 'string') return `<${record.data.type}>`;
   return node.id;
+}
+
+function transcriptUsage(data: ReadNodeRecordEvent['data']) {
+  return {
+    ...(data.cost_usd !== undefined ? { cost_usd: data.cost_usd } : {}),
+    ...(data.tokens !== undefined ? { tokens: data.tokens } : {}),
+  };
 }
 
 export function deriveTranscriptEvent(
@@ -89,16 +93,14 @@ export function deriveTranscriptEvent(
         step: node.id,
         content,
         ...(record.data.duration_ms !== undefined ? { duration_ms: record.data.duration_ms } : {}),
-        ...(record.data.cost_usd !== undefined ? { cost_usd: record.data.cost_usd } : {}),
-        ...(record.data.tokens !== undefined ? { tokens: record.data.tokens } : {}),
+        ...transcriptUsage(record.data),
       };
     case 'node_failed':
       return {
         type: 'node_error',
         step: node.id,
         error: record.data.error ?? '',
-        ...(record.data.cost_usd !== undefined ? { cost_usd: record.data.cost_usd } : {}),
-        ...(record.data.tokens !== undefined ? { tokens: record.data.tokens } : {}),
+        ...transcriptUsage(record.data),
       };
     case 'node_skipped':
       return {
@@ -131,8 +133,31 @@ export function deriveEmitterEvent(
 ): WorkflowEmitterEvent | undefined {
   const record = readNodeRecordEvent(event);
   if (!record) return undefined;
+  return emitterEventFromRecord(record, { id: node.id, name: nodeDisplayName(node) });
+}
+
+/**
+ * The emitter event a persisted node row stands for, read from the row alone. A row
+ * written without its node descriptor is labelled by its step name.
+ */
+export function readNodeEmitterEvent(
+  row: NodeRecordEventEnvelope
+): WorkflowEmitterEvent | undefined {
+  const record = readNodeRecordEvent(row);
+  if (!record) return undefined;
+  const node = record.data.node;
+  return emitterEventFromRecord(
+    record,
+    node ? { id: node.id, name: nodeDisplayName(node) } : { id: record.path, name: record.path }
+  );
+}
+
+function emitterEventFromRecord(
+  record: ReadNodeRecordEvent,
+  node: { id: string; name: string }
+): WorkflowEmitterEvent | undefined {
   if (record.metadata) return serializeNodeEmitter(record.metadata);
-  const nodeName = getNodeName(node);
+  const nodeName = node.name;
   switch (record.eventType) {
     case 'node_started':
       return {
@@ -240,7 +265,7 @@ export async function recordDerivedExecution(
 export async function recordNodeState(
   sinks: NodeStateSinks,
   record: NodeStateRecord,
-  continuation: { sessionId?: string; resumed?: boolean } = {}
+  continuation: { resumed?: boolean } = {}
 ): Promise<NodeExecutionResult> {
   await persistNodeEvent(sinks.store, serializeNodeStateRecord(record));
   await recordDerivedExecution(sinks, record);
@@ -251,6 +276,8 @@ export async function recordNodeState(
     state: 'completed',
     output: output.text,
     ...(output.structured !== undefined ? { structuredOutput: output.structured } : {}),
-    ...(output.declaredFields !== undefined ? { declaredFields: output.declaredFields } : {}),
+    ...(output.declaredOutputPaths !== undefined
+      ? { declaredOutputPaths: output.declaredOutputPaths }
+      : {}),
   };
 }

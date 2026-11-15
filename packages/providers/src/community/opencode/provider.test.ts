@@ -201,6 +201,19 @@ async function createTempProjectDir(): Promise<string> {
 }
 
 describe('OpencodeProvider', () => {
+  test('diagnostic cancellation after probe entry rejects with the abort reason', async () => {
+    const controller = new AbortController();
+    const probe = mock((signal: AbortSignal) => {
+      expect(signal).toBe(controller.signal);
+      return new Promise<'ready'>(() => {});
+    });
+    const pending = new OpencodeProvider(probe).diagnose({ signal: controller.signal });
+    expect(probe).toHaveBeenCalledTimes(1);
+    const reason = new Error('diagnostic deadline reached');
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+  });
+
   beforeEach(() => {
     scriptedEvents = [];
     runtimeQueue.length = 0;
@@ -218,6 +231,54 @@ describe('OpencodeProvider', () => {
   afterEach(async () => {
     await Promise.all(Array.from(tempDirs, dir => rm(dir, { recursive: true, force: true })));
     tempDirs.clear();
+  });
+
+  test.each([
+    { options: { appendSystemPrompt: 'append' }, expected: 'append' },
+    {
+      options: { nodeConfig: { systemPrompt: 'node' }, appendSystemPrompt: 'append' },
+      expected: 'node',
+    },
+    {
+      options: {
+        systemPrompt: 'request',
+        nodeConfig: { systemPrompt: 'node' },
+        appendSystemPrompt: 'append',
+      },
+      expected: 'request',
+    },
+    {
+      options: {
+        nodeConfig: { systemPrompt: ['node', 'lines'] as string[] },
+        appendSystemPrompt: 'append',
+      },
+      expected: 'node\nlines',
+    },
+    {
+      options: {
+        systemPrompt: ['request', 'lines'] as string[],
+        nodeConfig: { systemPrompt: ['node', 'lines'] as string[] },
+        appendSystemPrompt: 'append',
+      },
+      expected: 'request\nlines',
+    },
+  ])('sends the selected system prompt to the SDK: $expected', async ({ options, expected }) => {
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
+    const result = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+        ...options,
+      })
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.failure).toBeUndefined();
+    expect(runtime.client.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: 'session-1' },
+      query: { directory: '/tmp' },
+      body: expect.objectContaining({ system: expected }),
+    });
   });
 
   test('a part-update stream yields one chunk per text or reasoning part, once it ends', async () => {
@@ -687,6 +748,7 @@ describe('OpencodeProvider', () => {
       });
     };
     const violations = await runProviderConformance({
+      capabilities: new OpencodeProvider().getCapabilities(),
       // Only the SDK's auth discriminator and HTTP status fields carry a class; anything
       // else, including auth-sounding text, is `unknown`.
       failureCases: [
@@ -974,6 +1036,158 @@ describe('OpencodeProvider', () => {
     ]);
   });
 
+  // OpenCode records each model step as its own assistant message, so a prompt that calls a
+  // tool produces two, each priced separately (recorded against opencode 1.1.49).
+  const assistantStep = (
+    id: string,
+    sessionID: string,
+    cost: number,
+    input: number,
+    output: number,
+    finish: string
+  ) => ({
+    type: 'message.updated',
+    properties: {
+      info: {
+        id,
+        role: 'assistant',
+        sessionID,
+        providerID: 'anthropic',
+        modelID: 'claude-sonnet',
+        cost,
+        finish,
+        tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    },
+  });
+
+  test('a tool-using prompt reports the usage of every assistant message it produced', async () => {
+    scriptedEvents = [
+      // A message is updated as it streams; only its latest figures count.
+      assistantStep('message-1', 'session-1', 0.0001, 50, 5, 'tool-calls'),
+      assistantStep('message-1', 'session-1', 0.00012, 100, 10, 'tool-calls'),
+      assistantStep('message-2', 'session-1', 0.00024, 200, 20, 'stop'),
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([
+      {
+        type: 'result',
+        sessionId: 'session-1',
+        tokens: {
+          input: 300,
+          output: 30,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 330,
+          cost: expect.closeTo(0.00036, 12),
+        },
+        cost: expect.closeTo(0.00036, 12),
+        stopReason: 'end_turn',
+        resolvedModel: { id: 'claude-sonnet' },
+      },
+    ]);
+  });
+
+  test('multi-agent usage sums every assistant message of each sub-agent', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    const runtime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      assistantStep('scout-1', 'scout-session', 0.1, 100, 10, 'tool-calls'),
+      assistantStep('scout-2', 'scout-session', 0.2, 200, 20, 'stop'),
+      assistantStep('reviewer-1', 'reviewer-session', 0.4, 400, 40, 'stop'),
+      { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+      { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'result',
+          cost: expect.closeTo(0.7, 12),
+          tokens: {
+            input: 700,
+            output: 70,
+            cacheRead: 0,
+            cacheWrite: 0,
+            total: 770,
+            cost: expect.closeTo(0.7, 12),
+          },
+        }),
+      ])
+    );
+  });
+
+  test('multi-agent cost includes a sub-agent whose tokens cannot normalize', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    runtimeQueue.push(
+      makeRuntime({
+        sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+      })
+    );
+    scriptedEvents = [
+      assistantStep('scout-1', 'scout-session', 0.25, 100, 10, 'stop'),
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'reviewer-1',
+            role: 'assistant',
+            sessionID: 'reviewer-session',
+            cost: 0.5,
+            tokens: { output: 20 },
+          },
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+      { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toContainEqual({
+      type: 'result',
+      cost: 0.75,
+      tokens: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.25 },
+    });
+  });
+
   test('session resume handoff falls back to a fresh session with warning', async () => {
     const runtime = makeRuntime({
       sessionGet: mock(async () => {
@@ -1222,6 +1436,90 @@ describe('OpencodeProvider', () => {
     expect(mockCreateOpencode).toHaveBeenCalledTimes(1);
   });
 
+  test.each(['create', 'resume', 'subscribe'] as const)(
+    'cancellation during single-session %s prevents prompt dispatch',
+    async stage => {
+      const controller = new AbortController();
+      const reason = new Error('cancel during setup');
+      const runtime = makeRuntime();
+      const cancel = async () => {
+        controller.abort(reason);
+        return { data: { id: 'session-1' }, stream: createEventStream([]) };
+      };
+      if (stage === 'create') runtime.client.session.create = mock(cancel);
+      if (stage === 'resume') runtime.client.session.get = mock(cancel);
+      if (stage === 'subscribe') runtime.client.event.subscribe = mock(cancel);
+      runtimeQueue.push(runtime);
+
+      const { error } = await consume(
+        new OpencodeProvider().sendQuery(
+          'hi',
+          '/tmp',
+          stage === 'resume' ? 'session-1' : undefined,
+          {
+            assistantConfig: TEST_MODEL,
+            abortSignal: controller.signal,
+          }
+        )
+      );
+
+      expect(error).toBe(reason);
+      expect(runtime.client.session.promptAsync).not.toHaveBeenCalled();
+      expect(runtime.server.close).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test.each(['subscribe', 'first-child', 'last-child', 'first-prompt'] as const)(
+    'cancellation during multi-agent %s prevents subsequent prompts',
+    async stage => {
+      const cwd = await createTempProjectDir();
+      const controller = new AbortController();
+      const reason = new Error('cancel during multi-agent setup');
+      let children = 0;
+      const runtime = makeRuntime({
+        subscribe: mock(async () => {
+          if (stage === 'subscribe') controller.abort(reason);
+          return { stream: createEventStream([]) };
+        }),
+        sessionCreate: mock(async () => {
+          children++;
+          if (stage === 'first-child' || (stage === 'last-child' && children === 2)) {
+            controller.abort(reason);
+          }
+          return { data: { id: `child-${children}` } };
+        }),
+        promptAsync: mock(async () => {
+          if (stage === 'first-prompt') controller.abort(reason);
+        }),
+      });
+      runtimeQueue.push(runtime);
+
+      const { error } = await consume(
+        new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+          assistantConfig: TEST_MODEL,
+          abortSignal: controller.signal,
+          nodeConfig: {
+            nodeId: 'review',
+            agents: {
+              first: { description: 'First', prompt: 'Review' },
+              second: { description: 'Second', prompt: 'Review' },
+            },
+          },
+        })
+      );
+
+      expect(error).toBe(reason);
+      expect(runtime.client.session.promptAsync).toHaveBeenCalledTimes(
+        stage === 'first-prompt' ? 1 : 0
+      );
+      if (stage === 'subscribe') expect(runtime.client.session.create).not.toHaveBeenCalled();
+      if (stage === 'first-prompt') {
+        expect(runtime.client.session.abort).toHaveBeenCalledTimes(2);
+      }
+      expect(runtime.server.close).toHaveBeenCalledTimes(1);
+    }
+  );
+
   test('abort propagates to the OpenCode session and surfaces aborted error', async () => {
     const runtime = makeRuntime({
       subscribe: mock(async () => ({
@@ -1334,7 +1632,8 @@ describe('OpencodeProvider', () => {
   });
 
   test('embedded runtime retries startup on port conflict and succeeds', async () => {
-    startupErrors.push(new Error('Failed to start server on port 4096'));
+    const startupError = Object.assign(new Error('Listener unavailable'), { code: 'EADDRINUSE' });
+    startupErrors.push(startupError);
     const runtime = makeRuntime({ close: mock(() => undefined) });
     runtimeQueue.push(runtime);
     scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
@@ -1365,7 +1664,7 @@ describe('OpencodeProvider', () => {
     expect(secondConfig?.server?.port).toBe(secondPort);
     expect(mockLogger.warn).toHaveBeenCalledWith(
       {
-        err: expect.any(Error),
+        err: startupError,
         startupPort: expect.any(Number),
         attempt: 1,
         maxAttempts: 3,
@@ -1374,8 +1673,14 @@ describe('OpencodeProvider', () => {
     );
   });
 
-  test('embedded runtime does not retry non-port startup errors', async () => {
-    startupErrors.push(new Error('OpenCode binary missing'));
+  test.each([
+    new Error('OpenCode binary missing'),
+    new Error('address already in use'),
+    new Error('EADDRINUSE'),
+    new Error('Failed to start server on port 4096'),
+    Object.assign(new Error('address already in use'), { code: 'EACCES' }),
+  ])('embedded runtime does not retry unclassified startup errors: %s', async startupError => {
+    startupErrors.push(startupError);
 
     const { chunks, failure } = await consume(
       new OpencodeProvider().sendQuery('no retry startup', '/tmp', undefined, {
@@ -1385,7 +1690,8 @@ describe('OpencodeProvider', () => {
 
     // Only the failure result precedes `settled`.
     expect(chunks).toEqual([expect.objectContaining({ type: 'result', isError: true })]);
-    expect(failure?.evidence).toContain('OpenCode binary missing');
+    expect(failure?.class).toBe('unknown');
+    expect(failure?.evidence).toContain(startupError.message);
     expect(mockCreateOpencode).toHaveBeenCalledTimes(1);
     expect(mockLogger.warn).not.toHaveBeenCalledWith(
       expect.any(Object),
@@ -1664,148 +1970,6 @@ describe('OpencodeProvider', () => {
     });
   });
 
-  test('external baseUrl mode is rejected to enforce managed runtime control', async () => {
-    const cwd = await createTempProjectDir();
-    const nodeConfig = {
-      agents: {
-        reviewer: {
-          description: 'Review agent',
-          prompt: 'Review safely',
-        },
-      },
-    };
-
-    const { chunks, failure } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    // Only the failure result precedes `settled`.
-    expect(chunks).toEqual([expect.objectContaining({ type: 'result', isError: true })]);
-    expect(failure?.evidence).toContain('external baseUrl mode is no longer supported');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-  });
-
-  test('external baseUrl mode is rejected even when pre-generated agent files exist', async () => {
-    const cwd = await createTempProjectDir();
-    const agentsDir = join(cwd, '.opencode', 'agents');
-    await mkdir(agentsDir, { recursive: true });
-    await writeFile(
-      join(agentsDir, 'archon-reviewer.md'),
-      ['---', 'name: archon-reviewer', 'description: "Review agent"', '---', '', 'Review'].join(
-        '\n'
-      ),
-      'utf8'
-    );
-    await writeFile(join(agentsDir, 'custom-agent.md'), '# user content\n', 'utf8');
-
-    const runtime = makeRuntime();
-    runtimeQueue.push(runtime);
-    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
-
-    const nodeConfig = {
-      agents: {
-        reviewer: {
-          description: 'Review agent',
-          prompt: 'Review',
-        },
-      },
-    };
-
-    const { failure } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    expect(failure?.evidence).toContain('external baseUrl mode is no longer supported');
-    expect(await readFile(join(agentsDir, 'custom-agent.md'), 'utf8')).toBe('# user content\n');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-  });
-
-  test('external baseUrl mode rejection happens before runtime/dispose side effects', async () => {
-    const cwd = await createTempProjectDir();
-    const agentsDir = join(cwd, '.opencode', 'agents');
-    await mkdir(agentsDir, { recursive: true });
-    await writeFile(
-      join(agentsDir, 'archon-reviewer.md'),
-      ['---', 'name: archon-reviewer', 'description: "Review agent"', '---', '', 'Review'].join(
-        '\n'
-      ),
-      'utf8'
-    );
-
-    const callOrder: string[] = [];
-    const runtime = makeRuntime({
-      instanceDispose: mock(async () => {
-        callOrder.push('dispose');
-        return true;
-      }),
-      promptAsync: mock(async () => {
-        callOrder.push('prompt');
-      }),
-    });
-    runtimeQueue.push(runtime);
-    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
-
-    const nodeConfig = {
-      nodeId: 'node-remote',
-      agents: {
-        reviewer: {
-          description: 'Review agent',
-          prompt: 'Review',
-        },
-      },
-    };
-
-    const { failure } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    expect(failure?.evidence).toContain('external baseUrl mode is no longer supported');
-    expect(runtime.client.instance.dispose).not.toHaveBeenCalled();
-    expect(callOrder).toEqual([]);
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-  });
-
-  test('external baseUrl mode rejects multi-agent execution with same deprecation error', async () => {
-    const cwd = await createTempProjectDir();
-    const agentsDir = join(cwd, '.opencode', 'agents');
-    await mkdir(agentsDir, { recursive: true });
-    await writeFile(join(agentsDir, 'archon-agent-a.md'), '---\nmode: subagent\n---\nA\n', 'utf8');
-    await writeFile(join(agentsDir, 'archon-agent-b.md'), '---\nmode: subagent\n---\nB\n', 'utf8');
-
-    const nodeConfig = {
-      nodeId: 'node-multi-remote',
-      agents: {
-        'agent-a': { description: 'A', prompt: 'A' },
-        'agent-b': { description: 'B', prompt: 'B' },
-      },
-    };
-
-    const { chunks, failure } = await consume(
-      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
-        assistantConfig: { ...TEST_MODEL, baseUrl: 'http://remote-opencode.local' },
-        nodeConfig,
-      })
-    );
-
-    // Only the failure result precedes `settled`.
-    expect(chunks).toEqual([expect.objectContaining({ type: 'result', isError: true })]);
-    expect(failure?.evidence).toContain('external baseUrl mode is no longer supported');
-    expect(mockCreateOpencodeClient).not.toHaveBeenCalled();
-    expect(mockCreateOpencode).not.toHaveBeenCalled();
-  });
-
   test('uses node prompt as task when agent is configured', async () => {
     const cwd = await createTempProjectDir();
     const runtime = makeRuntime();
@@ -1957,7 +2121,12 @@ describe('opencodeFailureClass', () => {
   });
 
   test('never classifies from the message text', () => {
-    for (const message of ['401 Unauthorized', 'rate limit exceeded', '429 too many requests']) {
+    for (const message of [
+      'Selected model is at capacity',
+      '401 Unauthorized',
+      'rate limit exceeded',
+      '429 too many requests',
+    ]) {
       expect(opencodeFailureClass(new Error(message))).toBe('unknown');
     }
   });

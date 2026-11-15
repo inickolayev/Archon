@@ -1,16 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { isAbsolute } from 'node:path';
-import { z } from '@hono/zod-openapi';
-import {
-  createForgeInputBindingSchema,
-  createForgeBindingSchema,
-  forgeEventSelectorSchema,
-  mapForgeInputs,
-  matchForgeEvent,
-} from '@archon/forge';
+import type { z } from '@hono/zod-openapi';
+import { type ForgeEvent, mapForgeInputs, matchForgeEvent } from '@archon/forge';
 import { normalizeGitHubWebhook } from './normalize-event';
 export { githubSourceCapabilities as capabilities } from './normalize-event';
-import { jsonValueSchema } from '@archon/workflows/output-ref';
+import type { JsonValue } from '@archon/workflows/output-ref';
 import {
   resourceStartBindingIntentSchema,
   type ResourceStartBindingIntent,
@@ -20,51 +13,56 @@ import type {
   WebhookSourcePluginFactory,
   WebhookSourceResult,
 } from '@archon/workflows/webhook-source-plugin';
+import { githubSourceBindingSchema, githubWebhookSourceConfigSchema } from './source-config';
 import { verifyGitHubWebhookSignature } from './webhook-signature';
 
-const bindingSchema = resourceStartBindingIntentSchema.omit({ bindingRevision: true }).extend({
-  selector: forgeEventSelectorSchema,
-  inputMapping: z.record(z.string(), createForgeInputBindingSchema(jsonValueSchema)),
-});
-
-export const githubWebhookSourceConfigSchema = z
-  .object({
-    version: z.literal(1),
-    webhookSecretEnv: z.string().min(1),
-    host: z.literal('github.com'),
-    bindings: z.array(bindingSchema),
-  })
-  .strict()
-  .superRefine((config, context) => {
-    const seen = new Set<string>();
-    const mappingSchema = createForgeBindingSchema(jsonValueSchema);
-    for (const [index, binding] of config.bindings.entries()) {
-      if (seen.has(binding.bindingId))
-        context.addIssue({
-          code: 'custom',
-          path: ['bindings', index, 'bindingId'],
-          message: 'Duplicate binding ID',
-        });
-      seen.add(binding.bindingId);
-      const mapping = mappingSchema.safeParse({
-        selector: binding.selector,
-        inputs: binding.inputMapping,
+function evaluateBindings(
+  configuredBindings: z.infer<typeof githubSourceBindingSchema>[],
+  event: ForgeEvent
+) {
+  const bindings: ResourceStartBindingIntent[] = [];
+  const evaluatedBindings: NonNullable<
+    Extract<WebhookSourceResult, { status: 'received' }>['acceptance']['evaluatedBindings']
+  > = [];
+  for (const binding of configuredBindings) {
+    const bindingRevision = createHash('sha256').update(JSON.stringify(binding)).digest('hex');
+    const { selector, inputMapping, ...intent } = binding;
+    if (!matchForgeEvent(selector, event)) {
+      evaluatedBindings.push({
+        bindingId: binding.bindingId,
+        bindingRevision,
+        status: 'unmatched',
+        reason: 'selector_did_not_match',
       });
-      if (!mapping.success)
-        for (const issue of mapping.error.issues)
-          context.addIssue({
-            code: 'custom',
-            path: ['bindings', index, ...issue.path],
-            message: issue.message,
-          });
-      if (!isAbsolute(binding.launch.cwd))
-        context.addIssue({
-          code: 'custom',
-          path: ['bindings', index, 'launch', 'cwd'],
-          message: 'Expected an absolute execution path',
-        });
+      continue;
     }
-  });
+    const mapped = mapForgeInputs(inputMapping, event);
+    if (!mapped.ok) {
+      evaluatedBindings.push({
+        bindingId: binding.bindingId,
+        bindingRevision,
+        status: 'rejected',
+        reason: `Input '${mapped.input}': ${mapped.reason}`,
+      });
+      continue;
+    }
+    // Field mappings carry event content; literal mappings are the operator's own values.
+    const literalInputs: Record<string, JsonValue> = {};
+    const eventInputs: Record<string, JsonValue> = {};
+    for (const [name, value] of Object.entries(mapped.inputs))
+      (inputMapping[name]?.source === 'field' ? eventInputs : literalInputs)[name] = value;
+    bindings.push(
+      resourceStartBindingIntentSchema.parse({
+        ...intent,
+        bindingRevision,
+        launch: { ...binding.launch, inputs: { ...binding.launch.inputs, ...literalInputs } },
+        eventInputs,
+      })
+    );
+  }
+  return { bindings, evaluatedBindings };
+}
+
 /** Configured source plugins run as trusted operator-installed code. */
 const createGitHubWebhookSource: WebhookSourcePluginFactory = ({
   sourceInstanceId,
@@ -135,44 +133,10 @@ const createGitHubWebhookSource: WebhookSourcePluginFactory = ({
           id: normalized.envelope.sourceActor.id,
         };
       }
-      const bindings: ResourceStartBindingIntent[] = [];
-      const evaluatedBindings: NonNullable<
-        Extract<WebhookSourceResult, { status: 'received' }>['acceptance']['evaluatedBindings']
-      > = [];
-      for (const binding of config.bindings) {
-        const bindingRevision = createHash('sha256').update(JSON.stringify(binding)).digest('hex');
-        if (!matchForgeEvent(binding.selector, normalized.envelope.event)) {
-          evaluatedBindings.push({
-            bindingId: binding.bindingId,
-            bindingRevision,
-            status: 'unmatched',
-            reason: 'selector_did_not_match',
-          });
-          continue;
-        }
-        const mapped = mapForgeInputs(binding.inputMapping, normalized.envelope.event);
-        if (!mapped.ok) {
-          evaluatedBindings.push({
-            bindingId: binding.bindingId,
-            bindingRevision,
-            status: 'rejected',
-            reason: `Input '${mapped.input}': ${mapped.reason}`,
-          });
-          continue;
-        }
-        bindings.push(
-          resourceStartBindingIntentSchema.parse({
-            bindingId: binding.bindingId,
-            bindingRevision,
-            hostId: binding.hostId,
-            runAsUserId: binding.runAsUserId,
-            resource: binding.resource,
-            capacity: binding.capacity,
-            overlap: binding.overlap,
-            launch: { ...binding.launch, inputs: { ...binding.launch.inputs, ...mapped.inputs } },
-          })
-        );
-      }
+      const { bindings, evaluatedBindings } = evaluateBindings(
+        config.bindings,
+        normalized.envelope.event
+      );
       const [first, ...rest] = bindings;
       return {
         status: 'received',

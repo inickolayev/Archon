@@ -1,16 +1,35 @@
+// @archon-test-isolated
+import { createWorkflowDeps } from './store-adapter';
 import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { trackTempRoots } from '@archon/paths/test-utils';
-import { captureWorkflowSource } from '../../../workflows/src/workflow-source';
+import {
+  WorkflowSourceUnavailableError,
+  captureWorkflowSource,
+} from '../../../workflows/src/workflow-source';
+import type { WorkflowDeps } from '@archon/workflows/deps';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { resolveRunWorkflow } from './resolve-run-workflow';
 
 const trackTempRoot = trackTempRoots();
 
+// Live discovery loads config; a stub keeps these tests off this machine's ~/.archon.
+function workflowDeps(): WorkflowDeps {
+  return {
+    ...createWorkflowDeps(),
+    loadConfig: async () => ({
+      assistant: 'claude',
+      assistants: { claude: {}, codex: {} },
+      commands: {},
+    }),
+  };
+}
+
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   return {
+    origin: { conversationId: 'conversation-1' },
     id: 'run-1',
     workflow_name: 'continued',
     conversation_id: 'conversation-1',
@@ -20,6 +39,7 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     outcome: null,
     user_message: 'continue',
     metadata: {},
+    active_phase_started_at: null,
     started_at: new Date(),
     completed_at: null,
     last_activity_at: null,
@@ -29,6 +49,7 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     adopted_from_run_id: null,
     output_root: null,
     checkout_baseline: null,
+    item_id: null,
     ...overrides,
   };
 }
@@ -68,6 +89,7 @@ describe('resolveRunWorkflow', () => {
     await writeWorkflow(source, 'Conflicting live graph');
 
     const result = await resolveRunWorkflow(
+      workflowDeps(),
       makeRun({
         metadata: capturedMetadata(capture),
       }),
@@ -90,6 +112,7 @@ describe('resolveRunWorkflow', () => {
     await rm(capture.anchor.root, { recursive: true });
 
     const result = await resolveRunWorkflow(
+      workflowDeps(),
       makeRun({ metadata: capturedMetadata(capture) }),
       source,
       {}
@@ -98,6 +121,8 @@ describe('resolveRunWorkflow', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.message).toContain('recorded workflow source is unavailable');
+      expect(result.sourceError).toBeInstanceOf(WorkflowSourceUnavailableError);
+      expect(result.sourceError?.path).toBe(join(capture.anchor.root, 'manifest.json'));
       expect(result.resumeHint).toBe('Start a fresh run to execute the current workflow.');
     }
   });
@@ -106,18 +131,37 @@ describe('resolveRunWorkflow', () => {
     const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-resolve-legacy-run-')));
     await writeWorkflow(root, 'Legacy live graph');
 
-    const result = await resolveRunWorkflow(makeRun(), root, {});
+    const result = await resolveRunWorkflow(workflowDeps(), makeRun(), root, {});
 
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.workflow.description).toBe('Legacy live graph');
   });
+
+  test.each(['CONTINUED', 'tinued', 'continue'])(
+    'refuses non-exact legacy workflow %s with a suggestion',
+    async requested => {
+      const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-exact-legacy-run-')));
+      await writeWorkflow(root, 'Exact name only');
+      const result = await resolveRunWorkflow(
+        workflowDeps(),
+        makeRun({ workflow_name: requested }),
+        root,
+        {}
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.message).toContain(`Workflow \`${requested}\` for run run-1 was not found`);
+        expect(result.message).toContain('Did you mean:\n  - continued');
+      }
+    }
+  );
 
   test('reports a malformed legacy workflow instead of treating it as absent', async () => {
     const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-malformed-legacy-run-')));
     await mkdir(join(root, '.archon', 'workflows'), { recursive: true });
     await writeFile(join(root, '.archon', 'workflows', 'continued.yaml'), 'name: [invalid');
 
-    const result = await resolveRunWorkflow(makeRun(), root, {});
+    const result = await resolveRunWorkflow(workflowDeps(), makeRun(), root, {});
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -126,23 +170,48 @@ describe('resolveRunWorkflow', () => {
     }
   });
 
-  test('reports a missing legacy workflow', async () => {
-    const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-missing-legacy-run-')));
+  test('refuses the run when its config fails to load', async () => {
+    const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-config-error-run-')));
+    await writeWorkflow(root, 'Legacy live graph');
+    const configError = new Error(
+      `Invalid model binding config in '${join(root, '.archon', 'config.yaml')}': tiers.medium.thinking`
+    );
 
-    const result = await resolveRunWorkflow(makeRun(), root, {});
+    const result = await resolveRunWorkflow(
+      {
+        ...workflowDeps(),
+        loadConfig: async () => {
+          throw configError;
+        },
+      },
+      makeRun(),
+      root,
+      {}
+    );
 
     expect(result).toEqual({
       ok: false,
-      message:
-        'Workflow `continued` for run run-1 was not found.\n\n' +
-        'Use /workflow list to check available workflows.',
+      message: `Failed to load workflows: ${configError.message}`,
     });
+  });
+
+  test('reports a missing legacy workflow', async () => {
+    const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-missing-legacy-run-')));
+
+    const result = await resolveRunWorkflow(workflowDeps(), makeRun(), root, {});
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toStartWith('Workflow `continued` for run run-1 was not found.');
+      expect(result.message).toContain('Did you mean:');
+      expect(result.message).toEndWith('Use /workflow list to check available workflows.');
+    }
   });
 
   test('spells the list command for the surface', async () => {
     const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-missing-legacy-run-')));
 
-    const result = await resolveRunWorkflow(makeRun(), root, {
+    const result = await resolveRunWorkflow(workflowDeps(), makeRun(), root, {
       formatWorkflowCommand: command => `/archon-workflow ${command}`,
     });
 

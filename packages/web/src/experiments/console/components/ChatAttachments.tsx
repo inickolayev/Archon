@@ -56,7 +56,7 @@ export function ChatAttachments({
   };
 
   return (
-    <ul className="mb-[10px] flex flex-wrap gap-[6px]">
+    <ul className="mb-2.5 flex flex-wrap gap-1.5">
       {files.map((f, index) => (
         <li
           key={f.id}
@@ -72,7 +72,7 @@ export function ChatAttachments({
           }}
           onDragEnd={onDragEnd}
           title="Drag to reorder"
-          className={`flex cursor-grab items-center gap-[6px] rounded-[8px] border bg-[color:var(--surface-elevated)] py-[4px] pl-[5px] pr-[5px] text-[11.5px] transition-opacity active:cursor-grabbing ${
+          className={`flex cursor-grab items-center gap-1.5 rounded-md border bg-[color:var(--surface-elevated)] py-1 pl-1.25 pr-1.25 text-console-12 transition-opacity active:cursor-grabbing ${
             dragIndex === index ? 'opacity-40' : ''
           }`}
           style={{
@@ -90,22 +90,22 @@ export function ChatAttachments({
               }}
               aria-label={`Open ${f.file.name} full screen`}
               title="Open full screen"
-              className="shrink-0 rounded-[5px] transition-opacity hover:opacity-80"
+              className="shrink-0 rounded-sm transition-opacity hover:opacity-80"
             >
               <img
                 src={f.previewUrl}
                 alt=""
                 draggable={false}
-                className="h-[26px] w-[26px] rounded-[5px] object-cover"
+                className="h-6.5 w-6.5 rounded-sm object-cover"
               />
             </button>
           ) : (
-            <span aria-hidden className="pl-[4px] font-mono text-[10px] text-text-tertiary">
+            <span aria-hidden className="pl-1 font-mono text-console-10 text-text-tertiary">
               ▤
             </span>
           )}
-          <span className="max-w-[180px] truncate text-text-primary">{f.file.name}</span>
-          <span className="font-mono text-[10px] text-text-tertiary">
+          <span className="max-w-45 truncate text-text-primary">{f.file.name}</span>
+          <span className="font-mono text-console-10 text-text-tertiary">
             {formatBytes(f.file.size)}
           </span>
           <button
@@ -114,9 +114,9 @@ export function ChatAttachments({
               onRemove(f.id);
             }}
             aria-label={`Remove ${f.file.name}`}
-            className="rounded p-[1px] text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
+            className="rounded p-px text-text-tertiary transition-colors hover:bg-[color:var(--surface-hover)] hover:text-text-primary"
           >
-            <span aria-hidden className="text-[11px] leading-none">
+            <span aria-hidden className="text-console-11 leading-none">
               ✕
             </span>
           </button>

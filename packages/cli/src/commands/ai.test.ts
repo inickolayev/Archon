@@ -114,10 +114,11 @@ mock.module('@archon/core/db/users', () => ({
 mock.module('./auth', () => ({ resolveCliUserId: () => 'cli-alice' }));
 mock.module('@archon/paths', () => ({ createLogger: noopLogger }));
 
-// @archon/providers is NOT mocked — register builtins so isRegisteredProvider()
-// (used by the tier/default commands) resolves claude/codex/etc.
-import { registerBuiltinProviders } from '@archon/providers';
+// @archon/providers is NOT mocked — register the providers exercised by the
+// tier/default commands so isRegisteredProvider() resolves them.
+import { registerBuiltinProviders, registerOpencodeProvider } from '@archon/providers/in-process';
 registerBuiltinProviders();
+registerOpencodeProvider();
 
 import {
   aiKeySetCommand,
@@ -350,6 +351,14 @@ describe('aiTierSetCommand', () => {
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
 
+  it('effort for a provider without reasoning control → 1, no write', async () => {
+    expect(await aiTierSetCommand('large', 'opencode', 'anthropic/claude-sonnet-4-6', 'high')).toBe(
+      1
+    );
+    expect(out()).toContain("Provider 'opencode' does not support effort");
+    expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
+  });
+
   it('missing model → 1', async () => {
     expect(await aiTierSetCommand('large', 'claude', undefined, undefined)).toBe(1);
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
@@ -392,6 +401,24 @@ describe('aiTierListCommand', () => {
     expect(text).toContain('default'); // unset tiers show their default
   });
 
+  it('--json preserves install and user tiers and gives the user override precedence', async () => {
+    loadConfigResult = {
+      assistant: 'claude',
+      tiers: { large: { provider: 'claude', model: 'opus' } },
+    };
+    userPrefsResult = { tiers: { large: { provider: 'codex', model: 'gpt-5.5' } } };
+
+    expect(await aiTierListCommand(true)).toBe(0);
+
+    expect(JSON.parse(jsonOut()).tiers).toContainEqual({
+      tier: 'large',
+      configured: { provider: 'claude', model: 'opus' },
+      user: { provider: 'codex', model: 'gpt-5.5' },
+      default: expect.any(Object),
+      effective: { provider: 'codex', model: 'gpt-5.5' },
+    });
+  });
+
   it('--json emits structured output', async () => {
     loadConfigResult = { assistant: 'claude', tiers: {} };
     expect(await aiTierListCommand(true)).toBe(0);
@@ -416,6 +443,13 @@ describe('aiDefaultCommand', () => {
       defaultAssistant: 'codex',
       assistants: { codex: { model: 'gpt-5.5' } },
     });
+  });
+
+  it('a deprecated provider prints its notice; a supported one does not', async () => {
+    expect(await aiDefaultCommand('opencode', undefined)).toBe(0);
+    expect(out()).toContain('OpenCode is deprecated');
+    expect(await aiDefaultCommand('codex', undefined)).toBe(0);
+    expect(out().match(/is deprecated/g)).toHaveLength(1);
   });
 
   it('unknown provider → 1, no write', async () => {

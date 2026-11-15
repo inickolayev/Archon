@@ -51,6 +51,39 @@ export function SubscriptionLoginFlow({
     const stale = (): boolean => superseded || cancelledRef.current;
     let started = false;
 
+    const pollAndCheckCompletion = async (sessionId: string): Promise<boolean> => {
+      try {
+        const submit = pendingCodeRef.current;
+        pendingCodeRef.current = undefined;
+        const res = await skill.pollProviderOAuth(provider, sessionId, submit);
+        if (stale()) return true;
+        // The authorize URL / device code can arrive via POLL rather than
+        // start (supersede latency) — merge late signals or the manual
+        // panel stays linkless forever while polling "pending".
+        setStart(prev => (prev ? mergeOAuthSignals(prev, res) : prev));
+        const polledMode = res.mode;
+        if (polledMode) {
+          setPhase(p => (p === 'error' ? p : polledMode));
+        }
+        if (res.status === 'connected') {
+          invalidate(K.providerConnections);
+          onDoneRef.current();
+          return true;
+        }
+        if (res.status === 'error') {
+          setPhase('error');
+          setMessage(res.detail ?? 'Login failed.');
+          return true;
+        }
+        return false;
+      } catch (e: unknown) {
+        if (stale()) return true;
+        setPhase('error');
+        setMessage(e instanceof Error ? e.message : 'Login poll failed.');
+        return true;
+      }
+    };
+
     const pollLoop = async (sessionId: string): Promise<void> => {
       const deadline = Date.now() + 10 * 60 * 1000; // bridge SESSION_TTL_MS
       for (;;) {
@@ -62,36 +95,7 @@ export function SubscriptionLoginFlow({
         }
         await new Promise(r => setTimeout(r, 2000));
         if (stale()) return;
-        try {
-          const submit = pendingCodeRef.current;
-          pendingCodeRef.current = undefined;
-          const res = await skill.pollProviderOAuth(provider, sessionId, submit);
-          if (stale()) return;
-          // The authorize URL / device code can arrive via POLL rather than
-          // start (supersede latency) — merge late signals or the manual
-          // panel stays linkless forever while polling "pending".
-          setStart(prev => (prev ? mergeOAuthSignals(prev, res) : prev));
-          const polledMode = res.mode;
-          if (polledMode) {
-            setPhase(p => (p === 'error' ? p : polledMode));
-          }
-          if (res.status === 'connected') {
-            invalidate(K.providerConnections);
-            onDoneRef.current();
-            return;
-          }
-          if (res.status === 'error') {
-            setPhase('error');
-            setMessage(res.detail ?? 'Login failed.');
-            return;
-          }
-          // 'pending' → keep polling
-        } catch (e: unknown) {
-          if (stale()) return;
-          setPhase('error');
-          setMessage(e instanceof Error ? e.message : 'Login poll failed.');
-          return;
-        }
+        if (await pollAndCheckCompletion(sessionId)) return;
       }
     };
 
@@ -123,7 +127,7 @@ export function SubscriptionLoginFlow({
   };
 
   return (
-    <div className="flex flex-col gap-2 rounded border border-border bg-surface-inset p-3 text-[12px] text-text-secondary">
+    <div className="flex flex-col gap-2 rounded border border-border bg-surface-inset p-3 text-console-12 text-text-secondary">
       <div className="flex items-center justify-between gap-3">
         <span className="font-medium text-text-primary capitalize">
           {displayName ?? provider} subscription login
@@ -131,7 +135,7 @@ export function SubscriptionLoginFlow({
         <button
           type="button"
           onClick={onDone}
-          className="shrink-0 rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary"
+          className="shrink-0 rounded border border-border px-2 py-0.5 text-console-11 text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary"
         >
           Cancel
         </button>
@@ -193,13 +197,13 @@ export function SubscriptionLoginFlow({
               }}
               placeholder="Paste code or localhost callback URL"
               autoComplete="off"
-              className="w-full rounded-[9px] border border-border bg-surface px-3 py-2 font-mono text-[12px] text-text-primary placeholder:text-text-tertiary focus:border-accent-bright/50 focus:outline-none"
+              className="w-full rounded-lg border border-border bg-surface px-3 py-2 font-mono text-console-12 text-text-primary placeholder:text-text-tertiary focus:border-accent-bright/50 focus:outline-none"
             />
             <button
               type="button"
               onClick={submitCode}
               disabled={code.trim() === ''}
-              className="brand-bar shrink-0 rounded px-3 py-1 text-[11px] font-medium text-white transition-all hover:brightness-110 disabled:opacity-40"
+              className="brand-bar shrink-0 rounded px-3 py-1 text-console-11 font-medium text-white transition-all hover:brightness-110 disabled:opacity-40"
             >
               Submit
             </button>
@@ -209,7 +213,7 @@ export function SubscriptionLoginFlow({
 
       {message !== null ? (
         <p
-          className={`font-mono text-[11px] ${phase === 'error' ? 'text-error' : 'text-text-tertiary'}`}
+          className={`font-mono text-console-11 ${phase === 'error' ? 'text-error' : 'text-text-tertiary'}`}
         >
           {message}
         </p>

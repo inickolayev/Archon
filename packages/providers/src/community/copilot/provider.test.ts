@@ -9,7 +9,7 @@
  * @archon/paths process-wide.
  */
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
-import type { SessionEvent } from '@github/copilot-sdk';
+import type { SessionConfig, SessionEvent } from '@github/copilot-sdk';
 
 import { createMockLogger } from '../../test/mocks/logger';
 
@@ -234,7 +234,7 @@ describe('CopilotProvider.sendQuery', () => {
   });
 
   test.each(['max', 'ultra', 'persistent'] as const)(
-    'workflow `effort: %s` maps to SDK `xhigh`',
+    'workflow `effort: %s` maps to SDK `max`',
     async effort => {
       const session = makeFakeSession();
       nextCreateSessionResult = session;
@@ -251,12 +251,12 @@ describe('CopilotProvider.sendQuery', () => {
       await collect(gen);
 
       const opts = createSessionSpy.mock.calls[0]![0] as { reasoningEffort?: string };
-      expect(opts.reasoningEffort).toBe('xhigh');
+      expect(opts.reasoningEffort).toBe('max');
     }
   );
 
   // #2556: `minimal` is a rung on Archon's shared ladder that Copilot's SDK
-  // lacks, so it clamps to the SDK's shallowest — the same treatment `max`
+  // lacks, so it clamps to the SDK's shallowest — the same treatment `ultra`
   // already gets at the top end. Only a value that is not a rung at all is
   // dropped.
   test('effort: minimal clamps to the SDK shallowest rung', async () => {
@@ -278,14 +278,49 @@ describe('CopilotProvider.sendQuery', () => {
     expect(opts.reasoningEffort).toBe('low');
   });
 
-  test('systemPrompt wraps to systemMessage with append mode', async () => {
+  test.each([
+    {
+      source: 'request systemPrompt',
+      expected: 'Be concise.',
+      options: {
+        systemPrompt: 'Be concise.',
+        nodeConfig: { systemPrompt: 'Lower-priority node prompt.' },
+        appendSystemPrompt: 'Lower-priority appended instructions.',
+      },
+    },
+    {
+      source: 'nodeConfig.systemPrompt',
+      expected: 'Be concise.',
+      options: {
+        nodeConfig: { systemPrompt: 'Be concise.' },
+        appendSystemPrompt: 'Lower-priority appended instructions.',
+      },
+    },
+    {
+      source: 'request array systemPrompt',
+      expected: 'Be\nconcise.',
+      options: {
+        systemPrompt: ['Be', 'concise.'] satisfies string[],
+        nodeConfig: { systemPrompt: 'Lower-priority node prompt.' },
+        appendSystemPrompt: 'Lower-priority appended instructions.',
+      },
+    },
+    {
+      source: 'node array systemPrompt',
+      expected: 'Be\nconcise.',
+      options: {
+        nodeConfig: { systemPrompt: ['Be', 'concise.'] satisfies string[] },
+        appendSystemPrompt: 'Lower-priority appended instructions.',
+      },
+    },
+  ])('$source appends to the default system message', async ({ expected, options }) => {
     const session = makeFakeSession();
     nextCreateSessionResult = session;
 
     const p = new CopilotProvider();
     const gen = p.sendQuery('hi', '/w', undefined, {
       model: 'gpt-5',
-      systemPrompt: 'Be concise.',
+      ...options,
     });
     const first = gen.next();
     await new Promise(resolve => setTimeout(resolve, 5));
@@ -293,9 +328,26 @@ describe('CopilotProvider.sendQuery', () => {
     await first;
     await collect(gen);
 
-    const opts = createSessionSpy.mock.calls[0]![0] as {
-      systemMessage?: { content: string; mode: string };
-    };
+    const opts = createSessionSpy.mock.calls[0]![0] as SessionConfig;
+    expect(opts.systemMessage).toEqual({ content: expected, mode: 'append' });
+  });
+
+  test('appendSystemPrompt appends to the default system message', async () => {
+    const session = makeFakeSession();
+    nextCreateSessionResult = session;
+
+    const p = new CopilotProvider();
+    const gen = p.sendQuery('hi', '/w', undefined, {
+      model: 'gpt-5',
+      appendSystemPrompt: 'Be concise.',
+    });
+    const first = gen.next();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    session.resolveSend(undefined);
+    await first;
+    await collect(gen);
+
+    const opts = createSessionSpy.mock.calls[0]![0] as SessionConfig;
     expect(opts.systemMessage).toEqual({ content: 'Be concise.', mode: 'append' });
   });
 
@@ -449,6 +501,7 @@ describe('CopilotProvider.sendQuery', () => {
       };
     }
     const violations = await runProviderConformance({
+      capabilities: new CopilotProvider().getCapabilities(),
       // Copilot's SDK exposes no structured failure class; only Archon's MCP config check
       // classifies its own error.
       failureCases: [
@@ -523,14 +576,14 @@ describe('CopilotProvider.sendQuery', () => {
     expect(session.disconnected).toBe(true);
   });
 
-  test('forkSession + persistSession boolean flags logged at debug (not thrown)', async () => {
+  test('a forkSession flag is logged at debug (not thrown)', async () => {
     const session = makeFakeSession();
     nextCreateSessionResult = session;
 
     const p = new CopilotProvider();
     const gen = p.sendQuery('hi', '/w', undefined, {
       model: 'gpt-5',
-      persistSession: false,
+      forkSession: true,
     });
     const first = gen.next();
     await new Promise(resolve => setTimeout(resolve, 5));
@@ -538,7 +591,7 @@ describe('CopilotProvider.sendQuery', () => {
     await first;
     await collect(gen);
 
-    // No throw, and no warn-level log for persistSession — debug is fine.
+    // No throw, and no warn-level log for forkSession — debug is fine.
     const warnCalls = mockLogger.warn.mock.calls;
     const sawUnsupported = warnCalls.some(args => args[1] === 'copilot.option_not_supported');
     expect(sawUnsupported).toBe(false);
@@ -570,6 +623,28 @@ describe('CopilotProvider.sendQuery', () => {
     expect(lastClientOpts?.connection).toBeUndefined();
   });
 
+  test("a run's identity in the request env reaches the Copilot runtime the agent's shell runs in", async () => {
+    const session = makeFakeSession();
+    nextCreateSessionResult = session;
+    const identity = {
+      WORKFLOW_ID: 'run-1',
+      ARCHON_WORKFLOW_CODEBASE_ID: 'selected-project',
+      ARCHON_NODE_EXECUTION: '{"runId":"run-1","path":"notes"}',
+      ARCHON_CLI_COMMAND: '["/opt/archon/bin/archon"]',
+    };
+
+    const p = new CopilotProvider();
+    const gen = p.sendQuery('hi', '/w', undefined, { model: 'gpt-5', env: identity });
+    const first = gen.next();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    session.resolveSend(undefined);
+    await first;
+    await collect(gen);
+
+    expect(lastClientOpts?.env).toMatchObject(identity);
+    expect(lastClientOpts?.baseDirectory).toBeUndefined();
+  });
+
   test('configDir override → client baseDirectory (COPILOT_HOME), sdk-1.0 placement', async () => {
     const session = makeFakeSession();
     nextCreateSessionResult = session;
@@ -595,7 +670,13 @@ describe('CopilotProvider.sendQuery', () => {
     const p = new CopilotProvider();
     const gen = p.sendQuery('hi', '/w', undefined, {
       model: 'gpt-5',
-      env: { COPILOT_GITHUB_TOKEN: 'ghp_copilot' },
+      env: {
+        COPILOT_GITHUB_TOKEN: 'ghp_copilot',
+        GH_TOKEN: 'host-gh',
+        GITHUB_TOKEN: 'host-github',
+      },
+      protectedEnvKeys: ['COPILOT_GITHUB_TOKEN'],
+      assistantConfig: { useLoggedInUser: true },
     });
     const first = gen.next();
     await new Promise(resolve => setTimeout(resolve, 5));

@@ -10,11 +10,14 @@
  * - `patch` and `set` are for the SSE dispatcher and skill-layer optimistic
  *   updates only.
  * - After the last unsubscribe, `cache`/`errors` are deliberately retained so
- *   a remount reads warm; only the per-key version counter is released.
+ *   a remount reads warm; only the per-key version counter is released. A key
+ *   whose value goes stale without any server push (a relative time window)
+ *   passes `revalidateOnSubscribe`: its first subscriber still reads warm, and
+ *   reloads it in place.
  *   `invalidate()` fully releases subscriber-less keys.
  * - A resubscribe that arrives while a previous, abandoned load for the key is
  *   still in flight starts its OWN loader; the orphaned load can no longer
- *   clobber the fresh result (per-key `loadSeq` guard, #2101).
+ *   clobber the fresh result (per-key `latestLoad` guard, #2101).
  *
  * Deliberately minimal. No React Query, no Zustand.
  */
@@ -28,20 +31,15 @@ const listeners = new Map<string, Set<Listener>>();
 const errors = new Map<string, Error>();
 const inflight = new Map<string, Promise<unknown>>();
 const loaders = new Map<string, () => Promise<unknown>>();
+const pendingRevalidation = new Set<string>();
 // Per-key change counter. `useEntity` snapshots THIS (not the cached value), so a
 // subscriber re-renders on every mutation — including the error transition, where
 // the value stays `undefined` and a value-identity snapshot would bail out and
 // never surface `error` (e.g. a 401 panel would hang on "Loading…").
 const versions = new Map<string, number>();
-// Per-key load sequence, bumped each time a load is initiated (via `ensureLoad`
-// or `revalidate`). A load captures the value at start and commits its result
-// only while the sequence still matches. This neutralizes a load orphaned by
-// the last unsubscribe — its promise keeps running (promises aren't
-// cancellable) — so it can't overwrite a value produced by a NEWER load that a
-// resubscriber started for the same key (#2101). Retained across unsubscribe
-// like `cache`/`errors` (so a load that settles with no resubscriber still
-// warms the cache) and released together with them by `invalidate()`.
-const loadSeq = new Map<string, number>();
+// Retained across unsubscribe to allow warm settles; invalidate releases it
+// together with cache/errors so abandoned loads cannot resurrect a purged key.
+const latestLoad = new Map<string, symbol>();
 
 function notify(key: string): void {
   // No subscribers ⇒ nothing snapshots the counter, so don't bump it — a late
@@ -55,25 +53,18 @@ function notify(key: string): void {
   for (const l of subs) l();
 }
 
-/**
- * Shared load runner for both load-initiation paths (`ensureLoad` on first
- * subscribe and `revalidate` on refetch/invalidate). Captures a per-key
- * sequence number so a stale settle — from a load whose key was torn down and
- * re-subscribed with a different loader — no-ops instead of clobbering the
- * current load's result (#2101).
- */
 function runLoad(key: string, loader: () => Promise<unknown>): void {
-  const seq = (loadSeq.get(key) ?? 0) + 1;
-  loadSeq.set(key, seq);
+  const token = Symbol();
+  latestLoad.set(key, token);
   const p = loader()
     .then(v => {
-      if ((loadSeq.get(key) ?? 0) !== seq) return; // superseded by a newer load for this key
+      if (latestLoad.get(key) !== token) return; // superseded by a newer load for this key
       cache.set(key, v);
       errors.delete(key);
       notify(key);
     })
     .catch((e: unknown) => {
-      if ((loadSeq.get(key) ?? 0) !== seq) return; // superseded — don't surface a stale error
+      if (latestLoad.get(key) !== token) return; // superseded — don't surface a stale error
       const err = e instanceof Error ? e : new Error(String(e));
       errors.set(key, err);
       notify(key); // surface the error; any stale value stays in cache
@@ -81,7 +72,10 @@ function runLoad(key: string, loader: () => Promise<unknown>): void {
     .finally(() => {
       // Only clear the entry if it's still THIS load's promise — a newer load
       // for the key may already own `inflight[key]`.
-      if (inflight.get(key) === p) inflight.delete(key);
+      if (inflight.get(key) === p) {
+        inflight.delete(key);
+        if (pendingRevalidation.delete(key)) revalidate(key);
+      }
     });
   inflight.set(key, p);
 }
@@ -125,10 +119,13 @@ function revalidate(key: string): void {
     cache.delete(key);
     errors.delete(key);
     versions.delete(key); // fully release the key — nothing subscribes, so nothing snapshots it
-    loadSeq.delete(key); // release the sequence alongside cache/errors (they move together)
+    latestLoad.delete(key);
     return;
   }
-  if (inflight.has(key)) return; // a revalidation is already in flight
+  if (inflight.has(key)) {
+    pendingRevalidation.add(key);
+    return;
+  }
   runLoad(key, loader);
 }
 
@@ -137,15 +134,19 @@ export function invalidate(keyPrefix: string): void {
   // concrete key (`run:abc`) or a prefix that fans out (`runs`).
   const matches = (key: string): boolean => key === keyPrefix || key.startsWith(`${keyPrefix}:`);
 
-  // Walk both the data cache AND the errors map. An errored key lives only in
-  // `errors`, so iterating `cache.keys()` alone would leave it permanently
-  // stuck — the loader would never refetch and the UI would require a full
-  // page reload to recover.
+  // Subscribed keys may still be loading their first value, or hold only an error.
   const toRefresh = new Set<string>();
   for (const key of [...cache.keys()]) {
     if (matches(key)) toRefresh.add(key);
   }
   for (const key of [...errors.keys()]) {
+    if (matches(key)) toRefresh.add(key);
+  }
+  for (const key of loaders.keys()) {
+    if (matches(key)) toRefresh.add(key);
+  }
+  // A cold load abandoned by its last subscriber leaves only its token behind.
+  for (const key of latestLoad.keys()) {
     if (matches(key)) toRefresh.add(key);
   }
   for (const key of toRefresh) {
@@ -166,7 +167,8 @@ export function clearAll(): void {
   cache.clear();
   errors.clear();
   inflight.clear();
-  loadSeq.clear();
+  latestLoad.clear(); // abandons in-flight loads: none of them may settle into the cleared cache
+  pendingRevalidation.clear();
   for (const key of subscribed) {
     versions.set(key, versionOf(key) + 1);
     for (const listener of listeners.get(key) ?? []) listener();
@@ -190,20 +192,30 @@ export function keysStartingWith(prefix: string): string[] {
  * Exported for tests; production code subscribes via `useEntity`, whose
  * `useSyncExternalStore` wiring guarantees the returned cleanup runs.
  */
+export interface SubscribeOptions {
+  revalidateOnSubscribe?: boolean;
+}
+
 export function subscribeKey(
   key: string,
   onStoreChange: Listener,
-  loader: () => Promise<unknown>
+  loader: () => Promise<unknown>,
+  options: SubscribeOptions = {}
 ): () => void {
   let subs = listeners.get(key);
   if (subs === undefined) {
     subs = new Set();
     listeners.set(key, subs);
   }
+  const first = subs.size === 0;
   subs.add(onStoreChange);
 
   loaders.set(key, loader);
-  ensureLoad(key);
+  if (options.revalidateOnSubscribe === true && first && cache.has(key) && !inflight.has(key)) {
+    runLoad(key, loader);
+  } else {
+    ensureLoad(key);
+  }
 
   return (): void => {
     const remainingSubs = listeners.get(key);
@@ -224,10 +236,15 @@ export function subscribeKey(
       versions.delete(key);
       // Detach any in-flight load. Promises aren't cancellable, so it keeps
       // running and may still warm the cache for a future remount (guarded by
-      // its `loadSeq`), but dropping it from `inflight` here means a resubscribe
+      // its `latestLoad` token), but dropping it from `inflight` here means a resubscribe
       // arriving before it settles runs its OWN loader via `ensureLoad` instead
       // of inheriting this abandoned request's eventual result (#2101).
       inflight.delete(key);
+      // An invalidation that arrived during that load is still owed a fresh read.
+      // With no subscriber left to make it, settle it the way `invalidate` settles
+      // a subscriber-less key: otherwise the abandoned load, already known stale,
+      // lands in the cache and the next mount reads it warm and never reloads.
+      if (pendingRevalidation.delete(key)) revalidate(key);
     }
   };
 }
@@ -255,14 +272,19 @@ export interface EntityView<T> {
  * remount. `notify` is the store's change signal; `getSnapshot` reads the per-key
  * version counter (see below) so error transitions re-render too.
  */
-export function useEntity<T>(key: string, loader: () => Promise<T>): EntityView<T> {
+export function useEntity<T>(
+  key: string,
+  loader: () => Promise<T>,
+  options: SubscribeOptions = {}
+): EntityView<T> {
   const loaderRef = useRef(loader);
   loaderRef.current = loader;
+  const { revalidateOnSubscribe } = options;
 
   const subscribe = useCallback(
     (onStoreChange: () => void): (() => void) =>
-      subscribeKey(key, onStoreChange, () => loaderRef.current()),
-    [key]
+      subscribeKey(key, onStoreChange, () => loaderRef.current(), { revalidateOnSubscribe }),
+    [key, revalidateOnSubscribe]
   );
 
   // Snapshot the per-key version counter (a number bumped on every `notify`), not

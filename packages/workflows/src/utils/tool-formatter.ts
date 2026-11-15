@@ -12,13 +12,13 @@
  * @param toolInput - Input parameters for the tool
  * @returns Formatted tool message with emoji and brief description
  */
-export function formatToolCall(toolName: string, toolInput?: Record<string, unknown>): string {
+export function formatToolCall(toolName: string, toolInput?: unknown): string {
   // Start with tool emoji and name
   let message = `🔧 ${toolName.toUpperCase()}`;
 
   // Add brief command/input info if available
-  if (toolInput) {
-    const briefInfo = extractBriefInfo(toolName, toolInput);
+  if (toolInput !== undefined) {
+    const briefInfo = formatToolInputBrief(toolName, toolInput);
     if (briefInfo) {
       message += `\n${briefInfo}`;
     }
@@ -34,65 +34,50 @@ export function formatToolCall(toolName: string, toolInput?: Record<string, unkn
  * @param toolInput - Tool input parameters
  * @returns Brief description of what the tool is doing
  */
-function extractBriefInfo(toolName: string, toolInput: Record<string, unknown>): string | null {
-  // Bash commands - show the command (truncated)
-  if (toolName === 'Bash' && toolInput.command) {
-    const cmd = toolInput.command as string;
-    return cmd.length > 100 ? cmd.substring(0, 100) + '...' : cmd;
-  }
-
-  // Read operations - show file path
-  if (toolName === 'Read' && toolInput.file_path) {
-    return `Reading: ${toolInput.file_path as string}`;
-  }
-
-  // Write operations - show file path
-  if (toolName === 'Write' && toolInput.file_path) {
-    return `Writing: ${toolInput.file_path as string}`;
-  }
-
-  // Edit operations - show file path
-  if (toolName === 'Edit' && toolInput.file_path) {
-    return `Editing: ${toolInput.file_path as string}`;
-  }
-
-  // Glob operations - show pattern
-  if (toolName === 'Glob' && toolInput.pattern) {
-    return `Pattern: ${toolInput.pattern as string}`;
-  }
-
-  // Grep operations - show pattern
-  if (toolName === 'Grep' && toolInput.pattern) {
-    return `Searching: ${toolInput.pattern as string}`;
-  }
-
-  // MCP tools - show tool name
-  if (toolName.startsWith('mcp__')) {
-    // Extract readable name from mcp__server__tool format
-    const parts = toolName.split('__');
-    if (parts.length >= 2) {
-      return `MCP: ${parts.slice(1).join(' ')}`;
-    }
-  }
-
-  // Generic handling for other tools - show JSON input (truncated)
-  const toolInputStr = JSON.stringify(toolInput);
-  if (toolInputStr.length > 80) {
-    return toolInputStr.substring(0, 80) + '...';
-  }
-  return toolInputStr;
+export function formatToolInputBrief(toolName: string, toolInput: unknown): string | null {
+  const brief = formatKnownToolInput(toolName, toolInput);
+  if (brief !== null) return brief;
+  if (toolName.startsWith('mcp__')) return `MCP: ${toolName.split('__').slice(1).join(' ')}`;
+  return formatJsonInput(toolInput);
 }
 
-/**
- * Format thinking/reasoning for display (optional)
- *
- * @param thinking - Thinking text from AI
- * @returns Formatted thinking message
- */
-export function formatThinking(thinking: string): string {
-  const maxLength = 200;
-  if (thinking.length > maxLength) {
-    return `💭 ${thinking.substring(0, maxLength)}...`;
+function formatKnownToolInput(toolName: string, input: unknown): string | null {
+  switch (toolName) {
+    case 'Bash': {
+      const command = stringInput(input, 'command');
+      return command === undefined ? null : truncate(command, 100);
+    }
+    case 'Read':
+      return formatStringInput(input, 'file_path', 'Reading');
+    case 'Write':
+      return formatStringInput(input, 'file_path', 'Writing');
+    case 'Edit':
+      return formatStringInput(input, 'file_path', 'Editing');
+    case 'Glob':
+      return formatStringInput(input, 'pattern', 'Pattern');
+    case 'Grep':
+      return formatStringInput(input, 'pattern', 'Searching');
+    default:
+      return null;
   }
-  return `💭 ${thinking}`;
+}
+
+function stringInput(input: unknown, key: string): string | undefined {
+  if (typeof input !== 'object' || input === null || !(key in input)) return undefined;
+  const value: unknown = Reflect.get(input, key);
+  return typeof value === 'string' ? value : undefined;
+}
+
+function formatStringInput(input: unknown, key: string, label: string): string | null {
+  const value = stringInput(input, key);
+  return value === undefined ? null : `${label}: ${value}`;
+}
+
+function formatJsonInput(input: unknown): string | null {
+  const text = JSON.stringify(input);
+  return text === undefined ? null : truncate(text, 80);
+}
+
+function truncate(text: string, length: number): string {
+  return text.length > length ? text.substring(0, length) + '...' : text;
 }

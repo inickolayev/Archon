@@ -4,6 +4,7 @@
 import { z } from '@hono/zod-openapi';
 import { conversationRowSchema } from '@archon/core/schemas/conversation';
 import { messageRowSchema } from '@archon/core/schemas/message';
+import { MAX_FILES_PER_MESSAGE, MAX_UPLOAD_BYTES } from '../../uploads/attachments';
 
 /** A conversation record (wire shape with ISO string dates). */
 export const conversationSchema = conversationRowSchema
@@ -19,9 +20,9 @@ export const conversationSchema = conversationRowSchema
 export const listConversationsQuerySchema = z.object({
   platform: z.string().optional(),
   codebaseId: z.string().optional(),
-  // Non-enforcing "mine" filter: 'true' restricts to the caller's own
-  // conversations when an identity resolves. Default lists everything. Enum
-  // makes the boolean contract explicit (the handler treats only 'true' as on).
+  // 'true' narrows every platform to the caller's own conversations when an
+  // identity resolves (always, where conversations are private). Enum makes the
+  // boolean contract explicit (the handler treats only 'true' as on).
   mine: z.enum(['true', 'false']).optional(),
 });
 
@@ -74,20 +75,27 @@ export const listMessagesQuerySchema = z.object({
 /** GET /api/conversations/:id/messages response. */
 export const messageListResponseSchema = z.array(messageSchema).openapi('MessageListResponse');
 
+const sharedMessageSchema = z.object({ message: z.string().min(1) });
+
 /** POST /api/conversations/:id/message JSON request body. */
-export const sendMessageBodySchema = z
-  .object({ message: z.string().min(1) })
-  .openapi('SendMessageBody');
+export const sendMessageBodySchema = sharedMessageSchema.openapi('SendMessageBody');
 
 /** POST /api/conversations/:id/message multipart request body (file uploads). */
-export const sendMessageMultipartSchema = z
-  .object({
-    message: z.string().min(1),
+export const sendMessageMultipartSchema = sharedMessageSchema
+  .extend({
+    // May be empty when a recording is attached: the transcript becomes the message.
+    message: z.string().openapi({
+      description:
+        'The message text. May be empty only when one of the files is a recording, ' +
+        'which is transcribed into the message.',
+    }),
     files: z
       .array(z.string().openapi({ format: 'binary' }))
-      .max(5)
+      .max(MAX_FILES_PER_MESSAGE)
       .optional()
-      .openapi({ description: 'Maximum 5 files; each file must be ≤ 10 MB' }),
+      .openapi({
+        description: `Repeated files parts, each at most ${MAX_UPLOAD_BYTES} bytes. Upload MIME type restrictions apply.`,
+      }),
   })
   .openapi('SendMessageMultipartBody');
 

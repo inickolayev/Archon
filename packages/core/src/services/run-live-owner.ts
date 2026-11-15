@@ -3,6 +3,17 @@ import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, rmSync, statSync 
 import { createServer, type Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  PREPARATION_HEADER,
+  TERMINATE_READY,
+  PREPARATION_TIMEOUT_MS,
+  readPreparationFrame,
+  writeOwnerPreparation,
+  type PrepareRunOwnerTermination,
+  type RunOwnerPreparedStop,
+  type RunOwnerTerminationPreparation,
+} from './run-owner-preparation';
+import { currentWindowsRunJob } from './windows-run-job';
 
 /** Idle lifetime for a connection that has not completed an owner handshake. */
 export const RUN_LIVE_OWNER_IPC_TIMEOUT_MS = 2_000;
@@ -13,10 +24,14 @@ const OWNER_ATTENTION = 'attention\n';
 const CONTROL_HANDOFF = 'control_handoff\n';
 const STOP_REQUEST = 'stop\n';
 const TERMINATE_REQUEST = 'terminate\n';
-const TERMINATE_READY = 'ready\n';
-const TERMINATION_LEASE_MS = 8_000;
-const OWNER_CLOSE_WAIT_MS = TERMINATION_LEASE_MS + RUN_LIVE_OWNER_IPC_TIMEOUT_MS;
-export const RUN_LIVE_OWNER_CONTROL_HANDOFF_GRACE_MS = OWNER_CLOSE_WAIT_MS;
+/**
+ * How long `close` waits for a controller holding a stop lease to release it before
+ * dropping the lease. A committed lease has no lifetime of its own: it lasts while both
+ * ends hold the connection open, because a stop can wait seconds terminating and
+ * confirming the tree with nothing to send (#3516). This bounds only the owner's own
+ * shutdown.
+ */
+const OWNER_CLOSE_WAIT_MS = 10_000;
 const STARTUP_RECHECK_MS = 50;
 const MAX_MESSAGE_BYTES = 256;
 
@@ -30,6 +45,7 @@ export interface RunLiveOwner {
   close(): Promise<void>;
   /** True only while a detached controller holds a stop lease. */
   isStopRequested(): boolean;
+  registerTerminationPreparation(prepare: PrepareRunOwnerTermination): () => void;
 }
 
 export type RunLiveOwnerWatchEvent = 'attention' | 'control_handoff' | 'disconnected';
@@ -38,15 +54,24 @@ export interface RunLiveOwnerWatch {
   unsubscribe(): void;
 }
 
+export type RunLiveOwnerWatchResult =
+  | { kind: 'attached'; handle: RunLiveOwnerWatch }
+  | { kind: 'unreachable' }
+  | { kind: 'unproven' };
+
 export interface RunLiveOwnerStopLease {
   readonly pid: number;
+  /** The Windows job object holding the owner's process tree, as the owner reported it. */
+  readonly windowsJob: string | undefined;
   /** Commit the lease before the caller starts terminating the process tree. */
-  commit(): Promise<void>;
+  commit(): Promise<RunOwnerPreparedStop | undefined>;
   release(): void;
   isLive(): boolean;
 }
 
-type StopResponse = { kind: 'unsupported' } | { kind: 'detached'; pid: number };
+type StopResponse =
+  | { kind: 'unsupported' }
+  | { kind: 'detached'; pid: number; windowsJob?: string };
 
 /**
  * Why a stop request got no termination lease.
@@ -284,6 +309,21 @@ export async function startRunLiveOwner(
   const watcherSockets = new Set<Socket>();
   const stopSockets = new Set<Socket>();
   const stopReleaseWaiters = new Set<() => void>();
+  let prepare: PrepareRunOwnerTermination | undefined;
+  let preparation: RunOwnerTerminationPreparation | undefined;
+
+  const prepareStop = (socket: Socket): void => {
+    if (!prepare) {
+      socket.write(TERMINATE_READY);
+      return;
+    }
+    try {
+      preparation ??= prepare();
+      void writeOwnerPreparation(socket, preparation).catch(() => socket.destroy());
+    } catch {
+      socket.destroy();
+    }
+  };
 
   const server = createServer(socket => {
     sockets.add(socket);
@@ -293,6 +333,52 @@ export async function startRunLiveOwner(
 
     let request = '';
     let phase: 'request' | 'watching' | 'lease' | 'terminating' = 'request';
+    const startWatching = (): void => {
+      phase = 'watching';
+      watcherSockets.add(socket);
+      socket.setTimeout(0);
+      socket.write(WATCH_READY);
+    };
+    const offerStopLease = (detachedProcessPid: number): void => {
+      phase = 'lease';
+      stopSockets.add(socket);
+      socket.setTimeout(RUN_LIVE_OWNER_IPC_TIMEOUT_MS, () => socket.destroy());
+      // `JSON.stringify` drops an unclaimed (undefined) job, so POSIX frames carry none.
+      socket.write(
+        stopResponseFrame({
+          kind: 'detached',
+          pid: detachedProcessPid,
+          windowsJob: currentWindowsRunJob(),
+        })
+      );
+    };
+    const beginTermination = (): void => {
+      phase = 'terminating';
+      socket.setTimeout(0);
+      for (const watcher of watcherSockets) watcher.write(CONTROL_HANDOFF);
+      prepareStop(socket);
+    };
+    /** Answer one request frame. False once the socket is finished with. */
+    const handleFrame = (frame: string): boolean => {
+      if (phase === 'request' && frame === WATCH_REQUEST) {
+        startWatching();
+        return true;
+      }
+      if (phase === 'request' && frame === STOP_REQUEST) {
+        if (options.detachedProcessPid === undefined) {
+          socket.end(stopResponseFrame({ kind: 'unsupported' }));
+          return false;
+        }
+        offerStopLease(options.detachedProcessPid);
+        return true;
+      }
+      if (phase === 'lease' && frame === TERMINATE_REQUEST) {
+        beginTermination();
+        return true;
+      }
+      socket.destroy();
+      return false;
+    };
     socket.on('data', chunk => {
       request += chunk;
       if (Buffer.byteLength(request) > MAX_MESSAGE_BYTES) {
@@ -303,29 +389,7 @@ export async function startRunLiveOwner(
       while (newline !== -1) {
         const frame = request.slice(0, newline + 1);
         request = request.slice(newline + 1);
-        if (phase === 'request' && frame === WATCH_REQUEST) {
-          phase = 'watching';
-          watcherSockets.add(socket);
-          socket.setTimeout(0);
-          socket.write(WATCH_READY);
-        } else if (phase === 'request' && frame === STOP_REQUEST) {
-          if (options.detachedProcessPid === undefined) {
-            socket.end(stopResponseFrame({ kind: 'unsupported' }));
-            return;
-          }
-          phase = 'lease';
-          stopSockets.add(socket);
-          socket.setTimeout(RUN_LIVE_OWNER_IPC_TIMEOUT_MS, () => socket.destroy());
-          socket.write(stopResponseFrame({ kind: 'detached', pid: options.detachedProcessPid }));
-        } else if (phase === 'lease' && frame === TERMINATE_REQUEST) {
-          phase = 'terminating';
-          socket.setTimeout(TERMINATION_LEASE_MS, () => socket.destroy());
-          for (const watcher of watcherSockets) watcher.write(CONTROL_HANDOFF);
-          socket.write(TERMINATE_READY);
-        } else {
-          socket.destroy();
-          return;
-        }
+        if (!handleFrame(frame)) return;
         newline = request.indexOf('\n');
       }
     });
@@ -333,6 +397,8 @@ export async function startRunLiveOwner(
       sockets.delete(socket);
       watcherSockets.delete(socket);
       if (stopSockets.delete(socket) && stopSockets.size === 0) {
+        preparation?.release();
+        preparation = undefined;
         for (const resolve of stopReleaseWaiters) resolve();
         stopReleaseWaiters.clear();
       }
@@ -387,6 +453,16 @@ export async function startRunLiveOwner(
       return closePromise;
     },
     isStopRequested: (): boolean => stopSockets.size > 0,
+    registerTerminationPreparation: hook => {
+      if (prepare) throw new Error('Run owner already has a termination preparation hook');
+      prepare = hook;
+      return () => {
+        if (prepare !== hook) return;
+        prepare = undefined;
+        preparation?.release();
+        preparation = undefined;
+      };
+    },
   };
 }
 
@@ -405,13 +481,13 @@ export async function withRunLiveOwner<T>(
 }
 
 /**
- * Attach to a live owner. `null` means the exact endpoint could not complete the
- * watch handshake. Once this resolves with a handle, disconnects are observable.
+ * Attach to a live owner. Only a missing or refused endpoint proves it unreachable;
+ * an incomplete handshake leaves ownership unproven. Attached disconnects are observable.
  */
 export function watchRunLiveOwner(
   runId: string,
   onEvent: (event: RunLiveOwnerWatchEvent) => void
-): Promise<RunLiveOwnerWatch | null> {
+): Promise<RunLiveOwnerWatchResult> {
   const path = runLiveOwnerPath(runId);
   return new Promise(resolve => {
     const socket = new Socket();
@@ -422,11 +498,11 @@ export function watchRunLiveOwner(
     let terminalFrame = false;
     let disconnectReported = false;
 
-    const unavailable = (): void => {
+    const unavailable = (kind: 'unreachable' | 'unproven' = 'unproven'): void => {
       if (settled) return;
       settled = true;
       socket.destroy();
-      resolve(null);
+      resolve({ kind });
     };
     const disconnected = (): void => {
       if (attached && !unsubscribed && !terminalFrame && !disconnectReported) {
@@ -436,8 +512,16 @@ export function watchRunLiveOwner(
     };
 
     socket.setEncoding('utf8');
-    socket.setTimeout(RUN_LIVE_OWNER_IPC_TIMEOUT_MS, unavailable);
-    socket.once('error', disconnected);
+    socket.setTimeout(RUN_LIVE_OWNER_IPC_TIMEOUT_MS, () => {
+      unavailable();
+    });
+    socket.once('error', error => {
+      if (attached) disconnected();
+      else {
+        const code = isNodeError(error) ? error.code : undefined;
+        unavailable(code !== undefined && NO_LISTENER_CODES.has(code) ? 'unreachable' : 'unproven');
+      }
+    });
     socket.once('end', disconnected);
     socket.once('close', disconnected);
     socket.once('connect', () => socket.write(WATCH_REQUEST));
@@ -460,10 +544,13 @@ export function watchRunLiveOwner(
           settled = true;
           socket.setTimeout(0);
           resolve({
-            unsubscribe: (): void => {
-              if (unsubscribed) return;
-              unsubscribed = true;
-              socket.destroy();
+            kind: 'attached',
+            handle: {
+              unsubscribe: (): void => {
+                if (unsubscribed) return;
+                unsubscribed = true;
+                socket.destroy();
+              },
             },
           });
         } else if (frame === OWNER_ATTENTION) {
@@ -518,7 +605,15 @@ function parseStopResponse(runId: string, raw: string): StopResponse {
   ) {
     throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid PID', 'unproven');
   }
-  return { kind: 'detached', pid: parsed.pid };
+  if (!('windowsJob' in parsed)) return { kind: 'detached', pid: parsed.pid };
+  if (typeof parsed.windowsJob !== 'string' || parsed.windowsJob === '') {
+    throw new RunLiveOwnerStopUnavailableError(
+      runId,
+      'owner returned an invalid response',
+      'unproven'
+    );
+  }
+  return { kind: 'detached', pid: parsed.pid, windowsJob: parsed.windowsJob };
 }
 
 /** Ask the exact-run owner for the detached process's termination lease. */
@@ -590,14 +685,16 @@ export function requestRunLiveOwnerStop(runId: string): Promise<RunLiveOwnerStop
         };
         resolve({
           pid: stopResponse.pid,
-          commit: async (): Promise<void> => {
+          windowsJob: stopResponse.windowsJob,
+          commit: async (): Promise<RunOwnerPreparedStop | undefined> => {
             if (committed) throw new Error('Run termination lease is already committed');
             if (released || socket.destroyed || socket.readableEnded) {
               throw new Error('Run owner ended before termination started');
             }
             committed = true;
-            await new Promise<void>((ready, rejectReady) => {
+            return new Promise<RunOwnerPreparedStop | undefined>((ready, rejectReady) => {
               let acknowledgement = '';
+              let report: RunOwnerPreparedStop | undefined;
               const cleanup = (): void => {
                 socket.off('data', onData);
                 socket.off('error', onError);
@@ -611,19 +708,31 @@ export function requestRunLiveOwnerStop(runId: string): Promise<RunLiveOwnerStop
               };
               const onData = (data: string): void => {
                 acknowledgement += data;
-                if (Buffer.byteLength(acknowledgement) > MAX_MESSAGE_BYTES) {
-                  failReady(new Error('Run owner acknowledgement exceeded its size limit'));
-                  return;
+                let newline = acknowledgement.indexOf('\n');
+                try {
+                  while (newline !== -1) {
+                    const frame = acknowledgement.slice(0, newline + 1);
+                    acknowledgement = acknowledgement.slice(newline + 1);
+                    if (Buffer.byteLength(frame) > MAX_MESSAGE_BYTES)
+                      throw new Error('Run owner acknowledgement exceeded its size limit');
+                    if (frame === TERMINATE_READY) {
+                      cleanup();
+                      socket.setTimeout(0);
+                      ready(report);
+                      return;
+                    }
+                    if (frame === PREPARATION_HEADER && !report) {
+                      report = { groups: [], warnings: [] };
+                      socket.setTimeout(PREPARATION_TIMEOUT_MS);
+                    } else if (report) readPreparationFrame(frame, report);
+                    else throw new Error('Run owner returned an invalid acknowledgement');
+                    newline = acknowledgement.indexOf('\n');
+                  }
+                  if (Buffer.byteLength(acknowledgement) > MAX_MESSAGE_BYTES)
+                    throw new Error('Run owner acknowledgement exceeded its size limit');
+                } catch (error) {
+                  failReady(error instanceof Error ? error : new Error(String(error)));
                 }
-                const readyNewline = acknowledgement.indexOf('\n');
-                if (readyNewline === -1) return;
-                if (acknowledgement.slice(0, readyNewline + 1) !== TERMINATE_READY) {
-                  failReady(new Error('Run owner returned an invalid acknowledgement'));
-                  return;
-                }
-                cleanup();
-                socket.setTimeout(TERMINATION_LEASE_MS, () => socket.destroy());
-                ready();
               };
               const onError = (error: Error): void => {
                 failReady(error);

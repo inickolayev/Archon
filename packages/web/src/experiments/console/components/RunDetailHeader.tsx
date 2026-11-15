@@ -1,11 +1,20 @@
+import { ToolCallAttentionSection } from './ToolCallAttentionSection';
 import { useEffect, useState, type ReactElement } from 'react';
 import { Link } from 'react-router';
-import { LiveDot } from './LiveDot';
+import { RunningDot } from './LiveDot';
+import { OwnerObservationHint } from './OwnerObservationHint';
 import { OriginBadge } from './OriginBadge';
-import type { Run } from '../primitives/run';
-import { shortRunId, formatElapsed, elapsedSince, formatCost } from '../lib/format';
+import { runPhaseStart, type Run } from '../primitives/run';
+import {
+  shortRunId,
+  formatElapsed,
+  elapsedSince,
+  formatCost,
+  formatDateTime,
+  ensureUtc,
+} from '../lib/format';
 import { useIsDocker, useIdeEnv, openInIde } from '../lib/health';
-import { runStatusLabel, statusTextClass } from '../lib/run-status';
+import { isRunLive, runElapsedLabel, runStatusLabel, statusTextClass } from '../lib/run-status';
 import { RunOutcomeBadge } from './RunOutcomeBadge';
 
 interface RunDetailHeaderProps {
@@ -14,18 +23,18 @@ interface RunDetailHeaderProps {
   projectId: string | undefined;
 }
 
-function useLiveElapsed(run: Run): string {
+function useLiveElapsed(run: Run, live: boolean): string {
   const [, tick] = useState(0);
   useEffect(() => {
-    if (run.status !== 'running') return;
+    if (!live) return;
     const handle = setInterval(() => {
       tick(n => n + 1);
     }, 1000);
     return (): void => {
       clearInterval(handle);
     };
-  }, [run.status]);
-  return formatElapsed(elapsedSince(run.startedAt, run.finishedAt ?? undefined));
+  }, [live]);
+  return formatElapsed(elapsedSince(runPhaseStart(run), run.finishedAt ?? undefined));
 }
 
 export function RunDetailHeader({
@@ -33,9 +42,8 @@ export function RunDetailHeader({
   projectName,
   projectId,
 }: RunDetailHeaderProps): ReactElement {
-  const elapsed = useLiveElapsed(run);
-  const isPaused = run.status === 'paused';
-  const isRunning = run.status === 'running';
+  const isLive = isRunLive(run);
+  const elapsed = useLiveElapsed(run, isLive);
   const isDocker = useIsDocker();
   const ideEnv = useIdeEnv();
   const canOpenIde = !isDocker && run.workingPath !== null && run.workingPath !== '';
@@ -57,7 +65,7 @@ export function RunDetailHeader({
       />
 
       {/* Breadcrumb */}
-      <div className="flex items-center gap-2 font-mono text-[12px]">
+      <div className="flex items-center gap-2 font-mono text-console-12">
         <Link
           to={projectId === undefined ? '/console' : `/console/p/${projectId}`}
           className="text-text-tertiary transition-colors hover:text-text-primary"
@@ -74,7 +82,7 @@ export function RunDetailHeader({
           title="Copy full run id"
         >
           <span className="brand-text">{shortRunId(run.id)}</span>
-          <span aria-hidden className="font-mono text-[10px] text-text-tertiary">
+          <span aria-hidden className="font-mono text-console-10 text-text-tertiary">
             ⧉
           </span>
         </button>
@@ -84,30 +92,16 @@ export function RunDetailHeader({
 
       {/* Status pill */}
       <div className="flex items-center gap-2">
-        {isRunning ? (
-          <LiveDot />
-        ) : isPaused ? (
-          <span aria-hidden className="h-2.5 w-2.5 animate-pulse rounded-full bg-warning" />
-        ) : (
-          <span
-            aria-hidden
-            className={`h-2 w-2 rounded-full ${
-              run.status === 'failed'
-                ? 'bg-error'
-                : run.status === 'completed'
-                  ? 'bg-success'
-                  : 'bg-text-tertiary'
-            }`}
-          />
-        )}
+        <RunStatusDot run={run} live={isLive} />
         <span
-          className={`text-[11px] font-semibold uppercase tracking-[0.14em] ${statusTextClass[run.status]}`}
+          className={`text-console-11 font-semibold uppercase tracking-console-label ${statusTextClass[run.status]}`}
         >
           {runStatusLabel(run)}
         </span>
       </div>
 
-      <RunOutcomeBadge outcome={run.outcome} />
+      <ToolCallAttentionSection run={run} />
+      <RunOutcomeBadge outcome={run.outcome} terminalRecord={run.terminalRecord} />
 
       {/* Workflow name */}
       <span className="text-sm font-medium text-text-primary">{run.workflow}</span>
@@ -115,17 +109,36 @@ export function RunDetailHeader({
       {/* Origin */}
       <OriginBadge origin={run.origin} />
 
-      {/* Cost + elapsed + IDE — right-aligned */}
-      <div className="ml-auto flex items-center gap-3">
+      {/* Timing, cost and IDE */}
+      <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1">
         {typeof run.costUsd === 'number' ? (
           <span
-            className="font-mono text-[12px] tabular-nums text-text-secondary"
-            title="Total agent cost"
+            className="font-mono text-console-12 tabular-nums text-text-secondary"
+            title="Reported agent cost; may be partial"
           >
-            {formatCost(run.costUsd)}
+            {`Reported cost ${formatCost(run.costUsd)} (may be partial)`}
           </span>
         ) : null}
-        <span className="font-mono text-[12px] tabular-nums text-text-tertiary">{elapsed}</span>
+        <span className="font-mono text-console-12 tabular-nums text-text-tertiary">
+          {runElapsedLabel(run, elapsed)}
+        </span>
+        <span className="font-mono text-console-12 text-text-tertiary">
+          Started <time dateTime={ensureUtc(run.startedAt)}>{formatDateTime(run.startedAt)}</time>
+        </span>
+        {run.activePhaseStartedAt != null ? (
+          <span className="font-mono text-console-12 text-text-tertiary">
+            Last started{' '}
+            <time dateTime={ensureUtc(run.activePhaseStartedAt)}>
+              {formatDateTime(run.activePhaseStartedAt)}
+            </time>
+          </span>
+        ) : null}
+        {run.finishedAt !== null ? (
+          <span className="font-mono text-console-12 text-text-tertiary">
+            Finished{' '}
+            <time dateTime={ensureUtc(run.finishedAt)}>{formatDateTime(run.finishedAt)}</time>
+          </span>
+        ) : null}
         {canOpenIde && run.workingPath !== null ? (
           <button
             type="button"
@@ -136,19 +149,21 @@ export function RunDetailHeader({
             aria-label="Open in IDE"
             className="rounded p-1 text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-primary"
           >
-            <span aria-hidden className="font-mono text-[12px] leading-none">
+            <span aria-hidden className="font-mono text-console-12 leading-none">
               ↗
             </span>
           </button>
         ) : null}
       </div>
 
+      <OwnerObservationHint run={run} className="w-full" />
+
       {/* Provenance sub-row: the input that started this run. `w-full` forces its
           own line in the flex-wrap header.
           TODO(#1882): add a "from chat →" link back to the originating
           conversation once the console chat route supports deep-linking. */}
       {run.userMessage !== '' ? (
-        <div className="flex w-full min-w-0 items-baseline gap-2 text-[12px]">
+        <div className="flex w-full min-w-0 items-baseline gap-2 text-console-12">
           <span className="shrink-0 font-mono text-text-tertiary">input</span>
           <span className="truncate font-mono text-text-secondary" title={run.userMessage}>
             {run.userMessage}
@@ -156,5 +171,26 @@ export function RunDetailHeader({
         </div>
       ) : null}
     </header>
+  );
+}
+
+function RunStatusDot({ run, live }: { run: Run; live: boolean }): ReactElement {
+  const isRunning = run.status === 'running';
+  const isPaused = run.status === 'paused';
+  return isRunning ? (
+    <RunningDot live={live} />
+  ) : isPaused ? (
+    <span aria-hidden className="h-2.5 w-2.5 animate-pulse rounded-full bg-warning" />
+  ) : (
+    <span
+      aria-hidden
+      className={`h-2 w-2 rounded-full ${
+        run.status === 'failed'
+          ? 'bg-error'
+          : run.status === 'completed'
+            ? 'bg-success'
+            : 'bg-text-tertiary'
+      }`}
+    />
   );
 }

@@ -13,12 +13,12 @@
  * out of `git show <tag>:…/sqlite.ts` recovers the vintage DDL exactly — without
  * checking out each tag or executing old code against its own dependency tree.
  * Up to v0.10.0 that literal is uninterpolated. From v0.11.0 it may interpolate
- * `${helper('literal')}`, where `helper` is a module-level function in the same
- * file whose whole body returns one template that interpolates only its single
- * string parameter; the extractor substitutes that call from the tag's own
- * source. Any other `${…}`, or a missing signature, makes this script FAIL
- * instead of writing a wrong fixture. The fix is a deliberate extractor change,
- * never a workaround.
+ * `${helper('literal')}`, where `helper` is a module-level function (exported
+ * or not) in the same file whose whole body returns one template that
+ * interpolates only its single string parameter; the extractor substitutes that
+ * call from the tag's own source. Any other `${…}`, or a missing signature,
+ * makes this script FAIL instead of writing a wrong fixture. The fix is a
+ * deliberate extractor change, never a workaround.
  *
  * Fixtures are checked in (unlike the Postgres baselines, read at CI time)
  * because the test that consumes them must also run in the shallow checkout of
@@ -36,6 +36,7 @@
 import { spawnSync } from 'child_process';
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
+import { isFinalReleaseTag } from './release-tags';
 
 const REPO_ROOT = resolve(import.meta.dir, '..');
 const ADAPTER_REPO_PATH = 'packages/core/src/db/adapters/sqlite.ts';
@@ -44,8 +45,24 @@ const CHECK_ONLY = process.argv.includes('--check');
 const SCHEMA_SIGNATURE = 'private createSchema(): void {';
 
 /**
+ * The final release tags in `git tag` output (`v<major>.<minor>.<patch>`), in the
+ * given order; tags of any other shape are ignored. Throws when
+ * none is left: an empty tag set would make write mode delete every checked-in
+ * fixture while exiting 0, so no release history means this script cannot run.
+ */
+export function releaseTags(gitTagOutput: string): string[] {
+  const tags = gitTagOutput.split('\n').filter(isFinalReleaseTag);
+  if (tags.length === 0) {
+    throw new Error(
+      'git tag listed no release tags — cannot regenerate vintage fixtures (shallow or broken checkout?)'
+    );
+  }
+  return tags;
+}
+
+/**
  * Deliberately `spawnSync` rather than `@archon/git`: this script must run in the
- * `schema-upgrade` CI job with no `bun install` (it imports nothing outside Node
+ * `schema-upgrade` CI job with no `bun install` (only local modules and Node
  * builtins), and reads history — `git show <ref>:<path>` — rather than
  * manipulating worktrees, which is what `@archon/git` covers. The argument array
  * means no ref ever reaches a shell.
@@ -57,12 +74,14 @@ function git(...args: string[]): { ok: boolean; stdout: string; stderr: string }
 }
 
 /**
- * The body of `function name(param: string): string { return `…`; }` in `source`,
+ * The body of `[export] function name(param: string): string { return `…`; }` in `source`,
  * with `arg` substituted for `${param}`. Throws when the helper is absent or its
  * body is anything but that single template return — an unresolvable call.
  */
 function resolveHelperCall(tag: string, source: string, name: string, arg: string): string {
-  const header = new RegExp(`\\nfunction ${name}\\((\\w+): string\\): string \\{\\s*return \``);
+  const header = new RegExp(
+    `\\n(?:export )?function ${name}\\((\\w+): string\\): string \\{\\s*return \``
+  );
   const match = header.exec(source);
   const unresolvable = new Error(
     `${tag}: cannot resolve \${${name}(…)} in createSchema() — extractor must be revisited`
@@ -128,14 +147,7 @@ function vintages(): Map<string, string> {
   if (!tagResult.ok) {
     throw new Error(`git tag failed: ${tagResult.stderr.trim() || '(no stderr)'}`);
   }
-  const tags = tagResult.stdout.split('\n').filter(Boolean);
-  if (tags.length === 0) {
-    // An empty tag set would make write mode delete every checked-in fixture
-    // while exiting 0; no release history means this script cannot run.
-    throw new Error(
-      'git tag listed no tags — cannot regenerate vintage fixtures (shallow or broken checkout?)'
-    );
-  }
+  const tags = releaseTags(tagResult.stdout);
   const oldestTagPerSchema = new Map<string, string>();
   let withoutAdapter = 0;
 
@@ -173,20 +185,15 @@ function vintages(): Map<string, string> {
   return oldestTagPerSchema;
 }
 
-/** Fixture filename for a tag. Tags are `vX.Y.Z`, so the name is injection-safe. */
+/** Fixture filename for a tag. Tags come from `releaseTags`, so the name is injection-safe. */
 function fixtureName(tag: string): string {
-  if (!/^v[\w.-]+$/.test(tag)) throw new Error(`unexpected tag shape: ${tag}`);
   return `${tag}.sql`;
 }
 
-function main(): void {
-  const expected = new Map<string, string>();
-  for (const [sql, tag] of vintages()) expected.set(fixtureName(tag), sql);
-
-  // No-exist is the normal first run; recursive keeps this idempotent afterwards.
-  mkdirSync(FIXTURES_DIR, { recursive: true });
-  const existing = new Set(readdirSync(FIXTURES_DIR).filter(f => f.endsWith('.sql')));
-
+function changedFixtures(
+  expected: ReadonlyMap<string, string>,
+  existing: ReadonlySet<string>
+): string[] {
   const changed: string[] = [];
   for (const [name, sql] of expected) {
     let current: string | undefined;
@@ -200,6 +207,20 @@ function main(): void {
   for (const name of existing) {
     if (!expected.has(name)) changed.push(name);
   }
+
+  return changed;
+}
+
+/** Regenerates the vintage fixtures, or with `--check` verifies they are current. */
+function main(): void {
+  const expected = new Map<string, string>();
+  for (const [sql, tag] of vintages()) expected.set(fixtureName(tag), sql);
+
+  // No-exist is the normal first run; recursive keeps this idempotent afterwards.
+  mkdirSync(FIXTURES_DIR, { recursive: true });
+  const existing = new Set(readdirSync(FIXTURES_DIR).filter(f => f.endsWith('.sql')));
+
+  const changed = changedFixtures(expected, existing);
 
   if (CHECK_ONLY) {
     if (changed.length > 0) {

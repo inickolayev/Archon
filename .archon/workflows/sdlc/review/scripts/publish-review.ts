@@ -2,35 +2,45 @@
  * Publish the review report as the pull request's one canonical comment.
  *
  * The reviewer judges and writes the report; this node owns the public write, so
- * every round edits the same marked comment instead of appending another. A
- * review whose scope was a working diff has no pull request and publishes
- * nothing. The verdict passes through unchanged either way: publication is not
- * what makes a review true.
+ * every round edits the same marked comment instead of appending another. A review
+ * whose scope was a working diff has no pull request and publishes nothing. The
+ * verdict passes through unchanged either way: publication is not what makes a
+ * review true.
+ *
+ * A report goes public only about the commit its round fixed at the start
+ * (review-round): the checkout must still be at it and the pull request's remote
+ * head must be it (../../.shared/review-head.ts). review-round already refused a
+ * pull-request URL whose head was another commit; this check is the one that covers
+ * every scope, after a review long enough for the head to move. Any mismatch
+ * refuses, so a verdict about one commit can never stand as the verdict on another. This node stamps that commit and the certified
+ * verdict on the comment itself (../../.shared/review-comment.ts) rather than trusting
+ * the report's text to name them; the merge queue's gate reads both. Once published, the
+ * report, its `findings.json` and that commit are kept together under `published/`
+ * beside the report: the set a later review continues from, with the commit as its cursor.
  *
  * Bound inputs (`with:` bindings, canonical text in env):
  * - INPUTS_SCOPE: the review's requested scope. Delivery passes its verified
  *   pull-request record here, and that record is then the only write target.
  * - INPUTS_PR: the qualified pull request the scope agent declared it reviewed,
- *   or `{}` for a working diff. It names the target of a standalone review.
+ *   or `null` for a working diff. It names the target of a standalone review;
+ *   under delivery the recorded pull request is the target whatever this says.
  * - INPUTS_REPORT: path to the report this node publishes.
- * - INPUTS_READY / INPUTS_ACTION / INPUTS_SUMMARY / INPUTS_REPORT_POINTER: the
- *   certified verdict fields this node forwards.
+ * - INPUTS_HEAD: the commit this round reviewed, as review-round fixed it.
+ * - INPUTS_READY / INPUTS_ACTION / INPUTS_SUMMARY / INPUTS_REPORT_POINTER /
+ *   INPUTS_DISCOVERIES / INPUTS_CONTRACT_LEFT: the certified verdict fields this
+ *   node forwards.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { nodeStartCommit } from '../../.shared/checkout.ts';
 import { upsertComment } from '../../.shared/pr.ts';
-import {
-  forgeSource,
-  parseQualifiedPr,
-  record,
-  sameRepo,
-  type QualifiedPr,
-} from '../../.shared/forge.ts';
-import { emit, note, refuse, text } from '../../.shared/io.ts';
-
-const MARKER = '<!-- archon-review-report -->';
+import { emit, input, refuse } from 'archon:script';
+import { parseQualifiedPr, type QualifiedPr } from '../../.shared/identity.ts';
+import { record } from '../../.shared/inputs.ts';
+import { REVIEW_MARKER, reviewCommentBody } from '../../.shared/review-comment.ts';
+import { requirePrHead } from '../../.shared/review-head.ts';
+import { PUBLISHED_DIR, REVIEWED_HEAD_FILE } from '../../.shared/review-item.ts';
 
 /** The pull request delivery recorded, when the scope is that JSON record. */
 function recordedPr(scope: string): QualifiedPr | undefined {
@@ -45,54 +55,51 @@ function recordedPr(scope: string): QualifiedPr | undefined {
 
 /** The pull request the scope agent declared, or undefined for a working diff. */
 function declaredPr(value: string): QualifiedPr | undefined {
-  const target = value.trim() || '{}';
-  const parsed: unknown = JSON.parse(target);
-  if (parsed === null || (typeof parsed === 'object' && Object.keys(parsed).length === 0)) {
-    return undefined;
-  }
-  return parseQualifiedPr(target);
-}
-
-function label(pr: QualifiedPr | undefined): string {
-  return pr ? `${pr.repo.host}/${pr.repo.path}#${String(pr.number)}` : 'no pull request';
+  const target = value.trim() || 'null';
+  return JSON.parse(target) === null ? undefined : parseQualifiedPr(target);
 }
 
 try {
-  const source = forgeSource(process.env.ARCHON_SDLC_FORGE);
   const verdict = {
-    ready: JSON.parse(text(process.env.INPUTS_READY)) as boolean,
-    action: text(process.env.INPUTS_ACTION),
-    findings_summary: text(process.env.INPUTS_SUMMARY),
-    report: JSON.parse(text(process.env.INPUTS_REPORT_POINTER)) as unknown,
+    ready: JSON.parse(input('ready')) as boolean,
+    action: input('action'),
+    findings_summary: input('summary'),
+    report: JSON.parse(input('report_pointer')) as unknown,
+    discoveries: JSON.parse(input('discoveries')) as unknown,
+    contract_left: JSON.parse(input('contract_left')) as unknown,
   };
-  const recorded = recordedPr(text(process.env.INPUTS_SCOPE));
-  const declared = declaredPr(text(process.env.INPUTS_PR));
-  if (
-    recorded &&
-    (declared?.number !== recorded.number || !sameRepo(declared.repo, recorded.repo))
-  ) {
-    throw new Error(
-      `the review scope declared ${label(declared)}, but delivery recorded ${label(recorded)}`
-    );
+  // Complete only on an empty list: a review that left anything open never lets a merge close the issue.
+  const coverage = Array.isArray(verdict.contract_left) && verdict.contract_left.length === 0 ? 'complete' : 'open';
+  const pr = recordedPr(input('scope')) ?? declaredPr(input('pr'));
+  const head = input('head').trim();
+  const reportPath = input('report');
+  const report = readFileSync(reportPath, 'utf8');
+  if (report.trim() === '') throw new Error('the review report is empty');
+  const checkout = nodeStartCommit();
+  if (checkout !== head) {
+    throw new Error(`this round reviewed ${head}, but the checkout is now at ${checkout}`);
   }
-  const pr = recorded ?? declared;
+  if (pr) requirePrHead(pr, head);
   if (!pr) {
-    note('publish-review: the review scope is a working diff, so no comment was published.');
-    emit(verdict);
+    console.error('publish-review: the review scope is a working diff, so no comment was published.');
   } else {
-    const directory = mkdtempSync(join(tmpdir(), 'archon-review-'));
-    try {
-      const marked = join(directory, 'comment.md');
-      const report = readFileSync(text(process.env.INPUTS_REPORT), 'utf8');
-      if (report.trim() === '') throw new Error('the review report is empty');
-      writeFileSync(marked, `${MARKER}\n${report}`);
-      const comment = upsertComment(pr, MARKER, marked, source);
-      note(`publish-review: canonical review comment at ${comment.url}`);
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-    emit(verdict);
+    const comment = upsertComment(
+      { kind: 'pr', ref: pr },
+      REVIEW_MARKER,
+      reviewCommentBody(head, verdict.ready, coverage, report)
+    );
+    console.error(`publish-review: canonical review comment at ${comment.url}`);
   }
+  // The set a later review continues from. The commit goes last: review-round reads it
+  // as the cursor, and a set without it continues nothing.
+  const published = join(dirname(reportPath), PUBLISHED_DIR);
+  rmSync(published, { recursive: true, force: true });
+  mkdirSync(published);
+  writeFileSync(join(published, 'report.md'), report);
+  const findings = join(dirname(reportPath), 'findings.json');
+  if (existsSync(findings)) copyFileSync(findings, join(published, 'findings.json'));
+  writeFileSync(join(published, REVIEWED_HEAD_FILE), `${head}\n`);
+  emit(verdict);
 } catch (error) {
   refuse(`publish-review: ${error instanceof Error ? error.message : String(error)}`);
 }

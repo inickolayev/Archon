@@ -1,3 +1,5 @@
+import { buildTierRows, printTierList } from './ai-tier-output';
+import { missingProviderMessage } from '@archon/provider-contract';
 /**
  * `archon ai` — per-user AI-provider credentials AND install-wide model config.
  *
@@ -26,6 +28,7 @@
  * $USER/$USERNAME, resolved to a stable Archon user via the 'cli' platform
  * identity so a connected key attaches to the same user across invocations.
  */
+import { providerRegistry } from '@archon/providers';
 import { password, text, isCancel, cancel } from '@clack/prompts';
 import { writeJsonLine } from '../utils/stdout';
 import { createLogger } from '@archon/paths';
@@ -52,11 +55,10 @@ import {
   type EffortRung,
   type UserAiPrefs,
 } from '@archon/core';
-import { isRegisteredProvider, getProviderInfoList } from '@archon/providers';
+import { isRegisteredProvider, getProviderInfoList, getRegistration } from '@archon/providers';
 import {
   TIER_NAMES,
   buildAiProfile,
-  isEffortValidForProvider,
   isTierName as isTierNameStrict,
   validEffortsForProvider,
 } from '@archon/workflows/model-validation';
@@ -354,19 +356,26 @@ function validateEntryInputs(
   effort: string | undefined
 ): effort is EffortRung | undefined {
   if (!isRegisteredProvider(provider)) {
-    console.error(`Unknown provider '${provider}'. Available: ${registeredProvidersList()}.`);
+    console.error(missingProviderMessage(providerRegistry, provider));
     return false;
   }
   if (effort !== undefined && !isEffortRung(effort)) {
     console.error(`Invalid effort '${effort}'.`);
     return false;
   }
-  if (effort !== undefined && !isEffortValidForProvider(provider, effort)) {
-    console.error(
-      `Invalid effort '${effort}' for provider '${provider}'. ` +
-        `Valid: ${validEffortsForProvider(provider)?.join(', ') ?? '(this provider has no effort setting)'}.`
-    );
-    return false;
+  if (effort !== undefined) {
+    const validEfforts = validEffortsForProvider(providerRegistry, provider);
+    if (validEfforts === null) {
+      console.error(`Provider '${provider}' does not support effort.`);
+      return false;
+    }
+    if (!validEfforts.includes(effort)) {
+      console.error(
+        `Invalid effort '${effort}' for provider '${provider}'. ` +
+          `Valid: ${validEfforts.join(', ')}.`
+      );
+      return false;
+    }
   }
   return true;
 }
@@ -492,22 +501,7 @@ export async function aiTierListCommand(json?: boolean): Promise<number> {
     } catch (err) {
       getLog().warn({ err: err as Error }, 'cli.ai_tier_list_defaults_failed');
     }
-    const toEntry = (
-      set: RawAliasEntry | undefined
-    ): { provider: string; model: string; effort?: string } | null =>
-      set ? { provider: set.provider, model: set.model, effort: set.effort } : null;
-    const rows = TIER_NAMES.map(tier => {
-      const installEntry = toEntry(configured[tier]);
-      const userEntry = toEntry(userTiers[tier]);
-      const def = toEntry(defaults[tier]);
-      return {
-        tier,
-        configured: installEntry,
-        user: userEntry,
-        default: def,
-        effective: userEntry ?? installEntry ?? def,
-      };
-    });
+    const rows = buildTierRows(configured, userTiers, defaults);
 
     if (json) {
       await writeJsonLine({
@@ -518,24 +512,7 @@ export async function aiTierListCommand(json?: boolean): Promise<number> {
       return 0;
     }
 
-    const assistantSuffix = userPrefs.defaultProvider
-      ? `${config.assistant}; yours: ${userPrefs.defaultProvider}`
-      : config.assistant;
-    console.log(`Model tiers (default assistant: ${assistantSuffix}):`);
-    for (const r of rows) {
-      const label = r.tier.padEnd(7);
-      if (r.user) {
-        const eff = r.user.effort ? ` (effort: ${r.user.effort})` : '';
-        console.log(`  ${label} ${r.user.provider}/${r.user.model}${eff} [just you]`);
-      } else if (r.configured) {
-        const eff = r.configured.effort ? ` (effort: ${r.configured.effort})` : '';
-        console.log(`  ${label} ${r.configured.provider}/${r.configured.model}${eff}`);
-      } else if (r.default) {
-        console.log(`  ${label} (default: ${r.default.provider}/${r.default.model})`);
-      } else {
-        console.log(`  ${label} (unset)`);
-      }
-    }
+    printTierList(config.assistant, userPrefs.defaultProvider, rows);
     return 0;
   } catch (err) {
     getLog().error({ err: err as Error }, 'cli.ai_tier_list_failed');
@@ -709,7 +686,7 @@ export async function aiDefaultCommand(
     return 1;
   }
   if (!isRegisteredProvider(provider)) {
-    console.error(`Unknown provider '${provider}'. Available: ${registeredProvidersList()}.`);
+    console.error(missingProviderMessage(providerRegistry, provider));
     return 1;
   }
   try {
@@ -725,13 +702,10 @@ export async function aiDefaultCommand(
         );
       }
     } else {
-      await setInstallDefault(provider, model);
-      if (model) {
-        console.log(`✓ Default assistant set to '${provider}' with default model '${model}'.`);
-      } else {
-        console.log(`✓ Default assistant set to '${provider}'.`);
-      }
+      await setAndReportInstallDefault(provider, model);
     }
+    const notice = getRegistration(provider).deprecationNotice;
+    if (notice) console.log(`! ${notice}`);
     return 0;
   } catch (err) {
     getLog().error(
@@ -759,10 +733,10 @@ export async function aiCapacityListCommand(json?: boolean): Promise<number> {
   }
   console.log('Provider attempts holding capacity:');
   for (const h of holders) {
-    const where = h.ownerOnThisHost ? 'this host' : 'another host';
-    console.log(
-      `  ${h.provider.padEnd(10)} ${h.attemptId}  ${h.owner.host} pid ${String(h.owner.pid)} (${where}) since ${h.acquiredAt}`
-    );
+    const owner = h.owner
+      ? `${h.owner.host} pid ${String(h.owner.pid)} (${h.ownerOnThisHost ? 'this host' : 'another host'})`
+      : h.invalidOwner;
+    console.log(`  ${h.provider.padEnd(10)} ${h.attemptId}  ${owner} since ${h.acquiredAt}`);
   }
   return 0;
 }
@@ -786,5 +760,17 @@ export async function aiCapacityReleaseCommand(attemptId: string | undefined): P
         `Provider attempt ${attemptId} belongs to a process still running on this host; it was not released.`
       );
       return 1;
+  }
+}
+
+async function setAndReportInstallDefault(
+  provider: string,
+  model: string | undefined
+): Promise<void> {
+  await setInstallDefault(provider, model);
+  if (model) {
+    console.log(`✓ Default assistant set to '${provider}' with default model '${model}'.`);
+  } else {
+    console.log(`✓ Default assistant set to '${provider}'.`);
   }
 }

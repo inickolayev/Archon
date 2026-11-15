@@ -9,20 +9,22 @@
  * undefined when the invocation is allowed.
  */
 
+export const RUN_PROJECT_CONFLICT_FLAGS = ['folder', 'base-branch', 'resume', 'dry-run'] as const;
+
 /** Workflow subcommands that continue an existing run. */
-const CONTINUE_SUBCOMMANDS = ['resume', 'approve', 'reject', 'respond'] as const;
+const CONTINUE_SUBCOMMANDS: readonly string[] = [
+  'resume',
+  'approve',
+  'reject',
+  'respond',
+  'answer',
+];
 
 /**
- * Whether a `workflow` subcommand continues an existing run rather than starting one.
- *
- * Exported because dispatch needs the same answer these guards do: a continuation reaches
- * `workflowRunCommand` exactly as `run` does, so it needs the same registry set up before
- * it gets there. Asking through this predicate keeps the list in one place — a second copy
- * at the dispatch site is how `resume`/`approve`/`reject`/`respond` came to be treated as
- * ordinary read-only subcommands.
+ * Continuations keep their model bindings and need an execution-capable host.
  */
 export function isContinueSubcommand(subcommand: string | undefined): boolean {
-  return CONTINUE_SUBCOMMANDS.includes(subcommand as (typeof CONTINUE_SUBCOMMANDS)[number]);
+  return subcommand !== undefined && CONTINUE_SUBCOMMANDS.includes(subcommand);
 }
 
 export const RESUME_RUN_CONFIG_CONFLICT =
@@ -47,33 +49,45 @@ export function rejectModelOnContinue(
 
 /**
  * Accepts run configuration and trigger deployment configuration on their owning commands.
+ * `--config-from-run` names another run's run config, which only `workflow run` takes.
  */
 export function rejectConfigOutsideRun(
   command: string | undefined,
   subcommand: string | undefined,
-  config: unknown
+  config: unknown,
+  configFromRun?: unknown
 ): string | undefined {
+  const workflowRun = command === 'workflow' && subcommand === 'run';
+  if (configFromRun !== undefined && !workflowRun) {
+    return 'Error: --config-from-run can only be used with workflow run.';
+  }
   const triggerConfig =
     command === 'trigger' && (subcommand === 'fire' || subcommand === 'schedule');
-  if (config !== undefined && !triggerConfig && (command !== 'workflow' || subcommand !== 'run')) {
+  if (config !== undefined && !triggerConfig && !workflowRun) {
     return 'Error: --config can only be used with workflow run, trigger fire, or trigger schedule.';
   }
   return undefined;
 }
 
 /**
- * Rejects a fresh --config on `workflow run --resume`: the resumed run keeps
- * the config it started with.
+ * Rejects a fresh --config or --config-from-run on `workflow run --resume`: the resumed
+ * run keeps the config it started with.
  */
 export function rejectConfigOnContinue(
   resume: boolean | undefined,
-  config: unknown
+  config: unknown,
+  configFromRun?: unknown
 ): string | undefined {
-  if (resume && config !== undefined) {
-    return (
-      'Error: --config cannot be used when continuing an existing workflow run. ' +
-      'The run keeps the config it started with.'
-    );
-  }
-  return undefined;
+  if (!resume) return undefined;
+  const flag =
+    config !== undefined
+      ? '--config'
+      : configFromRun !== undefined
+        ? '--config-from-run'
+        : undefined;
+  if (flag === undefined) return undefined;
+  return (
+    `Error: ${flag} cannot be used when continuing an existing workflow run. ` +
+    'The run keeps the config it started with.'
+  );
 }

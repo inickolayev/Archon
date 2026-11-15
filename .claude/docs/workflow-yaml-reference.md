@@ -17,7 +17,7 @@ Workflows are YAML files discovered from `.archon/workflows/` (recursively) plus
 ### `name` (required)
 - **Type**: non-empty string
 - **Used by**: Router for exact-match lookup; displayed in workflow list
-- **Example**: `name: archon-fix-github-issue-dag`
+- **Example**: `name: archon-ship`
 
 ### `description` (required)
 - **Type**: non-empty string (multiline supported)
@@ -165,7 +165,7 @@ Nodes are sorted topologically (Kahn's algorithm). Nodes in the same layer run c
 **`command:`** — Named command file, AI-executed
 ```yaml
 - id: plan
-  command: archon-create-plan
+  command: create-plan
 ```
 
 **`prompt:`** — Inline prompt string, AI-executed
@@ -194,7 +194,7 @@ Nodes are sorted topologically (Kahn's algorithm). Nodes in the same layer run c
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `timeout` | number (ms) | 120000 (2 min) | Total execution timeout for the subprocess |
+| `timeout` | number (ms) | none | Total execution timeout for the subprocess. Omitted: the node runs until it exits |
 
 ---
 
@@ -236,7 +236,7 @@ when: "$classify.output.complexity != 'trivial'"
 | `$USER_MESSAGE` | Alias for `$ARGUMENTS` |
 | `$WORKFLOW_ID` | Workflow run UUID |
 | `$ARTIFACTS_DIR` | Absolute path to run artifacts directory |
-| `$BASE_BRANCH` | Base branch from config or auto-detected |
+| `$BASE_BRANCH` | The run's resolved or recorded base branch. See the [Variable Reference](https://archon.diy/reference/variables/#workflow-variables) for resolution and child inheritance rules |
 | `$CONTEXT` / `$EXTERNAL_CONTEXT` / `$ISSUE_CONTEXT` | GitHub issue/PR context (empty string if none) |
 | `$PLAN` | Previous plan from session metadata |
 | `$IMPLEMENTATION_SUMMARY` | Previous execution summary |
@@ -254,7 +254,7 @@ when: "$classify.output.complexity != 'trivial'"
 | `$nodeId.output` | Full output string from completed node |
 | `$nodeId.output.field` | JSON field value from structured output |
 
-For bash node scripts, substituted values are shell-quoted for safety.
+In `bash:` and `until_bash:`, small output references are single-quoted inline; large outputs use an unquoted file-read substitution. Assign each reference to a variable, then quote that variable when using it. See the [assignment-then-quote examples](../../packages/docs-web/src/content/docs/reference/variables.md#shell-quoting-in-bash-vs-script).
 
 ---
 
@@ -296,12 +296,9 @@ Four rules enforced at `loader.ts:370-439`:
 
 | File | Mode | Key Features |
 |------|------|-------------|
-| `archon-feature-development.yaml` | `steps:` | Simple two-step sequential |
-| `archon-plan-to-pr.yaml` | `steps:` | 11 steps with parallel review block |
-| `archon-ralph-fresh.yaml` | `loop:` | `fresh_context: true`, `<promise>COMPLETE</promise>` |
-| `archon-smart-pr-review.yaml` | `nodes:` | `output_format`, `when:`, `trigger_rule: one_success` |
-| `archon-validate-pr.yaml` | `nodes:` | `idle_timeout: 1800000`, bash nodes, `trigger_rule: all_done` |
-| `archon-fix-github-issue-dag.yaml` | `nodes:` | Full lifecycle with all DAG features |
+| `sdlc/ship/archon-ship.yaml` | `nodes:` | `include:` composition, `when:` routing on structured output, `trigger_rule: none_failed_min_one_success` |
+| `sdlc/review/archon-review.yaml` | `nodes:` | Parallel `command:` fan-out with `context: fresh`, conditional lenses, `script:` publish |
+| `sdlc/deliver/archon-deliver.yaml` | `nodes:` | Composed delivery tail, bounded correction loop, `script:` gates |
 
 ---
 

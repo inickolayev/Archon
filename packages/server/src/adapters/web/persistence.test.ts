@@ -14,7 +14,7 @@ mock.module('@archon/paths', () => ({
 
 // Mock @archon/core/db/messages
 const mockAddMessage = mock<
-  (...args: Parameters<(typeof import('@archon/core/db/messages'))['addMessage']>) => Promise<void>
+  (...args: Parameters<typeof import('@archon/core/db/messages')['addMessage']>) => Promise<void>
 >(async () => {});
 mock.module('@archon/core/db/messages', () => ({
   addMessage: mockAddMessage,
@@ -40,6 +40,16 @@ describe('MessagePersistence', () => {
     persistence.stopPeriodicFlush();
     persistence.clearAll();
   });
+
+  test.each(['patch text', 0, false, null, ['a', 1]].map(input => [input] as const))(
+    'persists non-object tool input %j',
+    async input => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendToolCall('conv-1', { toolCallId: 'patch', name: 'apply_patch', input });
+      await persistence.flush('conv-1');
+      expect(mockAddMessage.mock.calls[0]?.[3]).toMatchObject({ toolCalls: [{ input }] });
+    }
+  );
 
   describe('flush — sync-clear before async work (race condition fix)', () => {
     test('clears buffer before async db write so new appendText creates fresh entry', async () => {
@@ -104,6 +114,38 @@ describe('MessagePersistence', () => {
       expect(mockAddMessage).not.toHaveBeenCalled();
     });
   });
+
+  test.each([1, 2])(
+    'stops after persistence write %s fails and warns without retrying',
+    async failAt => {
+      const emitEvent = mock(async (_conversationId: string, _event: string) => {});
+      persistence = new MessagePersistence(emitEvent);
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'first');
+      persistence.appendText('conv-1', 'second', { segment: 'new' });
+      persistence.appendText('conv-1', 'third', { segment: 'new' });
+      if (failAt === 2) mockAddMessage.mockResolvedValueOnce(undefined);
+      mockAddMessage.mockRejectedValueOnce(new Error('write rejected'));
+
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage.mock.calls.map(call => call[2])).toEqual(
+        failAt === 1 ? ['first'] : ['first', 'second']
+      );
+      expect(emitEvent).toHaveBeenCalledTimes(1);
+      expect(emitEvent.mock.calls[0]?.[0]).toBe('conv-1');
+      expect(JSON.parse(emitEvent.mock.calls[0]?.[1] ?? '{}')).toEqual({
+        type: 'warning',
+        message: 'Assistant response could not be saved to history',
+        timestamp: expect.any(Number),
+      });
+      await persistence.flush('conv-1');
+      expect(mockAddMessage).toHaveBeenCalledTimes(failAt);
+      persistence.appendText('conv-1', 'new response');
+      await persistence.flush('conv-1');
+      expect(mockAddMessage.mock.calls.at(-1)?.[2]).toBe('new response');
+    }
+  );
 
   describe('startPeriodicFlush / stopPeriodicFlush', () => {
     test('startPeriodicFlush is idempotent (double call does not create two timers)', () => {
@@ -473,12 +515,10 @@ describe('MessagePersistence', () => {
       // at flush time. With the shared helper, the new field reaches the DB
       // without editing this adapter.
       persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      // The assertion admits a field MessageMetadata does not declare yet.
       persistence.appendText('conv-1', 'plain text', {
         category: 'workflow_status',
-        // Cast widens the input — same trick the production callers will use
-        // when a real new field lands on MessageMetadata.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ...({ traceId: 'trace-abc' } as any),
+        traceId: 'trace-abc',
       } as Parameters<typeof persistence.appendText>[2]);
 
       await persistence.flush('conv-1');

@@ -1,5 +1,17 @@
-import { z } from '@hono/zod-openapi';
+import { z } from 'zod';
 import { jsonValueSchema } from '../output-ref';
+import { itemKeySchema, workflowRunOriginSchema } from './workflow-run';
+import {
+  DEFAULT_RESOURCE_CAPACITY,
+  declaredCapacitySchema,
+  notProviderResource,
+  resourceNameSchema,
+} from './resource-name';
+export {
+  DEFAULT_RESOURCE_CAPACITY,
+  PROVIDER_RESOURCE_PREFIX,
+  resourceNameSchema,
+} from './resource-name';
 
 const jsonObjectSchema = z.record(z.string(), jsonValueSchema);
 const preparedIsolationSchema = z.discriminatedUnion('kind', [
@@ -14,76 +26,151 @@ const preparedIsolationSchema = z.discriminatedUnion('kind', [
     .strict(),
 ]);
 
-export const preparedWorkflowLaunchSchema = z
+const preparedRunShape = {
+  id: z.string().uuid(),
+  workflow_name: z.string().min(1),
+  codebase_id: z.string().min(1),
+  user_message: z.string(),
+  metadata: jsonObjectSchema,
+  // Absent for a worktree lane: the checkout exists only once execution starts.
+  working_path: z.string().min(1).optional(),
+};
+// Only what the run row cannot carry: the origin, inputs and sealed run configuration
+// already live on `run`.
+const preparedExecutionSchema = z
+  .object({
+    cwd: z.string().min(1),
+    conversationId: z.string().min(1),
+    isolation: preparedIsolationSchema,
+  })
+  .strict();
+
+const preparedWorkflowLaunchV2Schema = z
+  .object({
+    version: z.literal(2),
+    run: z.object({ ...preparedRunShape, origin: workflowRunOriginSchema.optional() }).strict(),
+    execution: preparedExecutionSchema,
+  })
+  .strict();
+
+/**
+ * Launches written before runs could omit provenance. A queued one stays readable, and
+ * its conversation and acting user become the run's origin when it is read.
+ */
+const preparedWorkflowLaunchV1Schema = z
   .object({
     version: z.literal(1),
     run: z
       .object({
-        id: z.string().uuid(),
-        workflow_name: z.string().min(1),
+        ...preparedRunShape,
         conversation_id: z.string().min(1),
-        codebase_id: z.string().min(1),
-        user_message: z.string(),
-        metadata: jsonObjectSchema,
-        // Absent for a worktree lane: the checkout exists only once execution starts.
-        working_path: z.string().min(1).optional(),
         user_id: z.string().min(1),
       })
       .strict(),
-    // Only what the run row cannot carry: the acting user, conversation, inputs and
-    // sealed run configuration already live on `run`.
-    execution: z
-      .object({
-        cwd: z.string().min(1),
-        conversationId: z.string().min(1),
-        isolation: preparedIsolationSchema,
-      })
-      .strict(),
+    execution: preparedExecutionSchema,
   })
-  .strict();
-export type PreparedWorkflowLaunch = z.infer<typeof preparedWorkflowLaunchSchema>;
+  .strict()
+  .transform(
+    ({ run: { conversation_id, user_id, ...run }, execution }): PreparedWorkflowLaunch => ({
+      version: 2,
+      run: { ...run, origin: { conversationId: conversation_id, userId: user_id } },
+      execution,
+    })
+  );
+
+/** Reads either stored version; every reader receives version 2. */
+export const preparedWorkflowLaunchSchema = z.union([
+  preparedWorkflowLaunchV2Schema,
+  preparedWorkflowLaunchV1Schema,
+]);
+export type PreparedWorkflowLaunch = z.infer<typeof preparedWorkflowLaunchV2Schema>;
+
+export const ADMISSION_CHECKOUT_GUARD_METADATA_KEY = 'admission_checkout_guard';
+
+export class AdmissionCheckoutGuardError extends Error {
+  constructor(readonly requestId: string) {
+    super(
+      `Invalid ${ADMISSION_CHECKOUT_GUARD_METADATA_KEY} for request '${requestId}': expected a boolean`
+    );
+    this.name = 'AdmissionCheckoutGuardError';
+  }
+}
+
+/** Older writers did not record the declaration, so their launches remain guarded. */
+export function readAdmissionCheckoutGuard(launch: PreparedWorkflowLaunch): boolean {
+  const value = launch.run.metadata[ADMISSION_CHECKOUT_GUARD_METADATA_KEY];
+  if (value === undefined) return true;
+  if (typeof value !== 'boolean') throw new AdmissionCheckoutGuardError(launch.run.id);
+  return value;
+}
 
 /** Run metadata key naming the receipt binding that requested a resource start. */
 export const RESOURCE_START_METADATA_KEY = 'resource_start';
-export interface ResourceStartRunMetadata {
-  receiptId: string;
-  bindingId: string;
+export const resourceStartReceiptOriginSchema = z
+  .object({ receiptId: z.string().uuid(), bindingId: z.string().min(1) })
+  .strict();
+export type ResourceStartRunMetadata = z.infer<typeof resourceStartReceiptOriginSchema>;
+
+/**
+ * The receipt that requested this run's start, from its `resource_start` metadata.
+ * Attribution only: a missing or malformed origin reads as no receipt.
+ */
+export function readResourceStartReceiptId(
+  metadata: Readonly<Record<string, unknown>> | undefined
+): string | undefined {
+  const origin = resourceStartReceiptOriginSchema.safeParse(
+    metadata?.[RESOURCE_START_METADATA_KEY]
+  );
+  return origin.success ? origin.data.receiptId : undefined;
 }
 
 /**
- * Resource keys under this prefix are provider-attempt slots owned by core provider
- * admission. An operator-named resource cannot use it, so a trigger resource never
- * shares a slot, or its capacity, with a provider cap.
+ * `sourceActor.source` of a receipt that `archon trigger fire` accepted from inside a
+ * run: `id` is that run and `display` the node path. Provenance only; the started run
+ * still acts as its binding's run-as user.
  */
-export const PROVIDER_RESOURCE_PREFIX = 'provider:';
+export const RUN_SOURCE_ACTOR = 'archon-run';
 
-const notProviderResource = {
-  check: (name: string): boolean => !name.startsWith(PROVIDER_RESOURCE_PREFIX),
-  message: `Resource names starting with '${PROVIDER_RESOURCE_PREFIX}' are reserved for provider admission`,
-};
+/** The run and node that requested a start, or null when the source was not a run. */
+export function requestingRun(
+  actor: SourceReceiptInput['sourceActor']
+): { runId: string; nodePath: string | null } | null {
+  return actor?.source === RUN_SOURCE_ACTOR
+    ? { runId: actor.id, nodePath: actor.display ?? null }
+    : null;
+}
 
 /**
- * How many admitted holders a resource slot allows at once. It defaults to 1, so a
- * resource means "must not overlap" unless configured otherwise. Every binding that
- * names a resource must declare the same capacity; admission refuses a mismatch.
+ * How many admitted holders a resource slot allows at once, as a start declares it. It
+ * defaults to 1, so a resource means "must not overlap" unless configured otherwise. The
+ * install config's `concurrency.resources.<resource>` wins at admission.
  */
-export const resourceSlotCapacitySchema = z.number().int().min(1).default(1);
+export const resourceSlotCapacitySchema = declaredCapacitySchema.default(DEFAULT_RESOURCE_CAPACITY);
+
+export const resourceStartOverlapSchema = z.enum(['skip', 'queue']);
+export const startBindingPreparationStatusSchema = z.enum([
+  'pending',
+  'preparing',
+  'failed',
+  'rejected',
+  'unmatched',
+  'complete',
+]);
+export const sourceReceiptOutcomeSchema = z.enum([
+  'matched',
+  'unmatched',
+  'unsupported',
+  'malformed',
+]);
 
 export const resourceStartIntentSchema = z
   .object({
-    resource: z
-      .string()
-      .trim()
-      .min(1)
-      .refine(notProviderResource.check, notProviderResource.message),
+    resource: resourceNameSchema,
     capacity: resourceSlotCapacitySchema,
     hostId: z.string().trim().min(1),
-    overlap: z.enum(['skip', 'queue']),
+    overlap: resourceStartOverlapSchema,
     launch: preparedWorkflowLaunchSchema,
-    receipt: z
-      .object({ receiptId: z.string().uuid(), bindingId: z.string().min(1) })
-      .strict()
-      .optional(),
+    receipt: resourceStartReceiptOriginSchema.optional(),
   })
   .strict();
 export type ResourceStartIntent = z.infer<typeof resourceStartIntentSchema>;
@@ -111,6 +198,10 @@ export const resourceStartDispositionSchema = z.discriminatedUnion('status', [
     ]),
   }),
 ]);
+export const resourceStartRequestStatusSchema = z.union([
+  ...resourceStartDispositionSchema.options.map(option => option.shape.status),
+  z.literal('withdrawn'),
+]);
 export type ResourceStartDisposition = z.infer<typeof resourceStartDispositionSchema>;
 
 export const sourceReceiptInputSchema = z
@@ -129,6 +220,8 @@ export const sourceReceiptInputSchema = z
       })
       .strict()
       .nullable(),
+    /** The item this start is for. Every run the receipt starts belongs to it. */
+    itemKey: itemKeySchema.optional(),
   })
   .strict();
 export type SourceReceiptInput = z.infer<typeof sourceReceiptInputSchema>;
@@ -140,8 +233,9 @@ export const resourceStartBindingIntentSchema = z
     hostId: z.string().min(1),
     runAsUserId: z.string().min(1),
     resource: z.string().min(1).refine(notProviderResource.check, notProviderResource.message),
-    capacity: resourceSlotCapacitySchema,
-    overlap: z.enum(['skip', 'queue']),
+    /** Omitted, the start takes its workflow's declared capacity, else 1. */
+    capacity: declaredCapacitySchema.optional(),
+    overlap: resourceStartOverlapSchema,
     launch: z
       .object({
         cwd: z.string().min(1),
@@ -163,9 +257,30 @@ export const resourceStartBindingIntentSchema = z
         ]),
       })
       .strict(),
+    /**
+     * Inputs a source copied from its event, kept apart from the operator's literal
+     * `launch.inputs` and overriding them on a name clash. Preparation hands these only to
+     * a workflow that declares them, so untrusted event content never fills the
+     * passthrough of a workflow without `inputs:`. Operator configs omit this field. The
+     * SQL store never writes it into the `intent` column, which older binaries parse
+     * strictly; see `storableIntent` in core's resource-starts.
+     */
+    eventInputs: z.record(z.string(), jsonValueSchema).optional(),
   })
   .strict();
 export type ResourceStartBindingIntent = z.infer<typeof resourceStartBindingIntentSchema>;
+
+/** A receipt binding as stores report it, without any store's own bookkeeping. */
+export const startBindingInspectionSchema = z.object({
+  receiptId: z.string(),
+  bindingId: z.string(),
+  bindingRevision: z.string().nullable(),
+  hostId: z.string().nullable(),
+  status: startBindingPreparationStatusSchema,
+  ownerId: z.string().nullable(),
+  error: z.string().nullable(),
+  intent: resourceStartBindingIntentSchema.nullable(),
+});
 
 const sourceReceiptAcceptanceBaseSchema = z
   .object({
@@ -177,7 +292,7 @@ const sourceReceiptAcceptanceBaseSchema = z
           .object({
             bindingId: z.string().min(1),
             bindingRevision: z.string().min(1).nullable(),
-            status: z.enum(['unmatched', 'rejected']),
+            status: startBindingPreparationStatusSchema.extract(['unmatched', 'rejected']),
             reason: z.string(),
           })
           .strict()
@@ -189,11 +304,11 @@ const sourceReceiptAcceptanceBaseSchema = z
 export const sourceReceiptAcceptanceSchema = z
   .discriminatedUnion('outcome', [
     sourceReceiptAcceptanceBaseSchema.extend({
-      outcome: z.literal('matched'),
+      outcome: sourceReceiptOutcomeSchema.extract(['matched']),
       bindings: z.tuple([resourceStartBindingIntentSchema]).rest(resourceStartBindingIntentSchema),
     }),
     sourceReceiptAcceptanceBaseSchema.extend({
-      outcome: z.enum(['unmatched', 'unsupported', 'malformed']),
+      outcome: sourceReceiptOutcomeSchema.exclude(['matched']),
       bindings: z.tuple([]),
     }),
   ])

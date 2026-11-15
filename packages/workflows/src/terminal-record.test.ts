@@ -1,17 +1,28 @@
+// @archon-test-isolated
 import { afterEach, describe, expect, it, spyOn } from 'bun:test';
 import * as fsPromises from 'node:fs/promises';
 import { mkdtemp, mkdir, realpath, rename, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
+import { getArchonHome, getRunArtifactsDirForRoot } from '@archon/paths/archon-paths';
 import { removeTempTree } from '@archon/paths/test-utils';
 import { writeNodeArtifact } from './artifacts-index';
 import { observeArtifactManifest } from './terminal-artifact-manifest';
 import {
+  terminalReason,
+  buildNodeOutcomes,
+  buildRunNodeStates,
   buildTerminalRecord,
   getTerminalRecord,
+  terminalArtifactsFor,
   type TerminalRecordEvent,
 } from './terminal-record';
-import { RUN_GRAPH_METADATA_KEY } from './schemas/terminal-record';
+import { fanOutOutcome } from './schemas/fan-out-outcome';
+import {
+  type ArtifactManifest,
+  RUN_GRAPH_METADATA_KEY,
+  WORKTREE_DISPOSITION_METADATA_KEY,
+} from './schemas/terminal-record';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -271,11 +282,101 @@ describe('terminal artifact observation', () => {
       { path: '', kind: 'unreadable', code: 'ENOTDIR' },
     ]);
   });
+
+  it('does not walk node_modules or .git directories and records each as excluded', async () => {
+    const root = await scratch();
+    await writeFile(join(root, 'report.md'), 'report');
+    await mkdir(join(root, 'evidence', 'app', 'node_modules', 'pkg'), { recursive: true });
+    await writeFile(join(root, 'evidence', 'app', 'node_modules', 'pkg', 'index.js'), '');
+    await mkdir(join(root, 'evidence', 'app', '.git'), { recursive: true });
+    await writeFile(join(root, 'evidence', 'app', '.git', 'HEAD'), 'ref');
+    const readdirSpy = spyOn(fsPromises, 'readdir');
+    try {
+      const manifest = await observeArtifactManifest(root);
+      expect(manifest.files.map(file => file.path)).toEqual(['report.md']);
+      expect(manifest.limitations).toEqual([
+        { path: 'evidence/app/.git', kind: 'unsupported_entry', code: 'excluded_directory' },
+        {
+          path: 'evidence/app/node_modules',
+          kind: 'unsupported_entry',
+          code: 'excluded_directory',
+        },
+      ]);
+      const walked = readdirSpy.mock.calls.map(([path]) => String(path));
+      expect(walked).toContain(join(root, 'evidence', 'app'));
+      expect(walked.some(path => /node_modules|\.git/.test(path))).toBe(false);
+    } finally {
+      readdirSpy.mockRestore();
+    }
+  });
+
+  it('stops at the entry limit and records the first entry it did not list', async () => {
+    const root = await scratch();
+    for (const name of ['a', 'b', 'c', 'd', 'e']) await writeFile(join(root, name), name);
+    const manifest = await observeArtifactManifest(root, undefined, undefined, 3);
+    expect(manifest.files.map(file => file.path)).toEqual(['a', 'b', 'c']);
+    expect(manifest.limitations).toEqual([
+      { path: 'd', kind: 'unsupported_entry', code: 'entry_limit' },
+    ]);
+  });
+
+  it('stops the whole walk when the limit is reached inside a directory', async () => {
+    const root = await scratch();
+    await mkdir(join(root, 'a'));
+    await mkdir(join(root, 'b'));
+    for (const name of ['1', '2', '3']) await writeFile(join(root, 'a', name), name);
+    await writeFile(join(root, 'b', 'later'), 'later');
+    const manifest = await observeArtifactManifest(root, undefined, undefined, 3);
+    expect(manifest.files.map(file => file.path)).toEqual(['a/1', 'a/2']);
+    expect(manifest.limitations).toEqual([
+      { path: 'a/3', kind: 'unsupported_entry', code: 'entry_limit' },
+    ]);
+  });
+
+  it('counts directories toward the entry limit', async () => {
+    const root = await scratch();
+    for (const name of ['a', 'b', 'c', 'd']) await mkdir(join(root, name));
+    const manifest = await observeArtifactManifest(root, undefined, undefined, 2);
+    expect(manifest.files).toEqual([]);
+    expect(manifest.limitations).toEqual([
+      { path: 'c', kind: 'unsupported_entry', code: 'entry_limit' },
+    ]);
+  });
+
+  it('records a terminal write that missed its walk as not observed', () => {
+    const outputRoot = join(getArchonHome(), 'workspaces', 'owner', 'repo');
+    const rooted = { id: 'run-1', output_root: outputRoot };
+    const root = getRunArtifactsDirForRoot(outputRoot, 'run-1');
+    const observed = { root, files: [], limitations: [] };
+    expect(terminalArtifactsFor(rooted, observed)).toBe(observed);
+    const notObserved = (root: string | null): ArtifactManifest => ({
+      root,
+      files: [],
+      limitations: [{ path: '', kind: 'root_unavailable', code: 'not_observed' }],
+    });
+    expect(terminalArtifactsFor(rooted, undefined)).toEqual(notObserved(root));
+    expect(terminalArtifactsFor(rooted, { ...observed, root: null })).toEqual(notObserved(root));
+    expect(terminalArtifactsFor({ id: 'run-1', output_root: null }, observed)).toEqual(
+      notObserved(null)
+    );
+  });
 });
+
+// Every run here has no storage root, so its observed manifest is fixed.
+const unrooted = {
+  root: null,
+  files: [],
+  limitations: [{ path: '', kind: 'root_unavailable' as const }],
+};
+function fold(
+  input: Omit<Parameters<typeof buildTerminalRecord>[0], 'artifacts'>
+): ReturnType<typeof buildTerminalRecord> {
+  return buildTerminalRecord({ ...input, artifacts: unrooted });
+}
 
 describe('durable terminal projection', () => {
   it('preserves structured return values, failure cascades, and unstarted nodes without a report node', async () => {
-    const record = await buildTerminalRecord({
+    const record = fold({
       run: { ...run, metadata: { ...run.metadata, error: 'build failed' } },
       events: [
         node('node_completed', 'discover', {
@@ -318,8 +419,23 @@ describe('durable terminal projection', () => {
     ).toBeNull();
   });
 
+  it('selects the first surviving failure by event order rather than graph order', async () => {
+    const record = fold({
+      run,
+      events: [
+        node('node_failed', 'build', { error: 'earlier failure' }),
+        node('node_failed', 'discover', { error: 'later failure' }),
+      ],
+    });
+    expect(record.first_failed_node).toBe('build');
+    expect(record.nodes.filter(node => node.state === 'failed').map(node => node.node_id)).toEqual([
+      'discover',
+      'build',
+    ]);
+  });
+
   it('replay replaces stale success/failure and cancellation truthfully retains running states', async () => {
-    const record = await buildTerminalRecord({
+    const record = fold({
       run: { ...run, status: 'cancelled' },
       events: [
         node('node_failed', 'build', { error: 'first attempt' }),
@@ -339,8 +455,38 @@ describe('durable terminal projection', () => {
     });
   });
 
+  it("carries a fan-out node's slot record through a replay, and drops it when the node restarts", () => {
+    const fanOut = fanOutOutcome([
+      { index: 0, outcome: 'completed', child_run_id: 'c0' },
+      { index: 1, outcome: 'not_started', error: 'refused' },
+    ]);
+    const states = (events: TerminalRecordEvent[]) =>
+      buildRunNodeStates(run, events).find(n => n.node_id === 'build');
+    const completed = node('node_completed', 'build', {
+      node_output: '[]',
+      fan_out_outcome: fanOut,
+    });
+    expect(states([completed])).toEqual({
+      node_id: 'build',
+      state: 'completed',
+      fan_out_outcome: fanOut,
+    });
+    expect(states([completed, node('node_skipped_prior_success', 'build')])).toEqual({
+      node_id: 'build',
+      state: 'completed',
+      fan_out_outcome: fanOut,
+    });
+    expect(states([completed, node('node_started', 'build')])).toEqual({
+      node_id: 'build',
+      state: 'running',
+    });
+    expect(
+      states([node('node_failed', 'build', { error: 'refused all', fan_out_outcome: fanOut })])
+    ).toEqual({ node_id: 'build', state: 'failed', error: 'refused all', fan_out_outcome: fanOut });
+  });
+
   it('keeps spilled outputs as explicit pointers and distinguishes absent from empty output', async () => {
-    const record = await buildTerminalRecord({
+    const record = fold({
       run,
       events: [
         node('node_completed', 'discover', {
@@ -357,20 +503,18 @@ describe('durable terminal projection', () => {
       spill_path: '/not/read',
       original_bytes: 999999,
     });
+    expect(fold({ run, events: [node('node_completed', 'discover')] }).returns).toMatchObject({
+      reason: 'output_not_persisted',
+    });
     expect(
-      (await buildTerminalRecord({ run, events: [node('node_completed', 'discover')] })).returns
-    ).toMatchObject({ reason: 'output_not_persisted' });
-    expect(
-      (
-        await buildTerminalRecord({
-          run,
-          events: [node('node_skipped_prior_success', 'discover', { node_output: '' })],
-        })
-      ).returns
+      fold({
+        run,
+        events: [node('node_skipped_prior_success', 'discover', { node_output: '' })],
+      }).returns
     ).toEqual({ availability: 'available', node_id: 'discover', value: '' });
-    expect(
-      (await buildTerminalRecord({ run: { ...run, metadata: {} }, events: [] })).returns
-    ).toMatchObject({ reason: 'graph_unavailable' });
+    expect(fold({ run: { ...run, metadata: {} }, events: [] }).returns).toMatchObject({
+      reason: 'graph_unavailable',
+    });
   });
 
   it('surfaces malformed persisted records instead of treating corruption as history', () => {
@@ -379,5 +523,147 @@ describe('durable terminal projection', () => {
         { event_type: 'workflow_failed', data: { terminal_record: {} } },
       ])
     ).toThrow();
+  });
+
+  it('records why a run keeps the worktree it created, and nothing for one it did not', async () => {
+    const owned_worktree = {
+      envId: 'env-1',
+      creationId: '00000000-0000-4000-8000-000000000001',
+    };
+    const disposition = async (
+      status: 'completed' | 'failed' | 'cancelled',
+      metadata: Record<string, unknown>
+    ): Promise<unknown> =>
+      fold({ run: { ...run, status, metadata }, events: [] }).worktree_disposition;
+
+    expect(await disposition('failed', { owned_worktree })).toEqual({
+      disposition: 'retained',
+      reason: 'resumable',
+    });
+    expect(await disposition('cancelled', { owned_worktree })).toEqual({
+      disposition: 'retained',
+      reason: 'cancelled',
+    });
+    const assessed = { disposition: 'retained', reason: 'unpushed_commits', detail: '2' };
+    expect(
+      await disposition('completed', {
+        owned_worktree,
+        [WORKTREE_DISPOSITION_METADATA_KEY]: assessed,
+      })
+    ).toEqual(assessed);
+    expect(await disposition('completed', { owned_worktree })).toBeUndefined();
+    expect(
+      await disposition('failed', {
+        [WORKTREE_DISPOSITION_METADATA_KEY]: { disposition: 'release' },
+      })
+    ).toBeUndefined();
+  });
+});
+
+describe('node outcomes observation', () => {
+  it('reflects a resumed run: replayed nodes keep their output, a re-run failure clears', () => {
+    const listing = buildNodeOutcomes(run, [
+      node('node_completed', 'discover', { node_output: '{}', structured_output: { n: 1 } }),
+      node('node_failed', 'build', { error: 'boom' }),
+      // The resume replays `discover` from its prior success and re-runs `build`. The
+      // replay's payload differs, so the entry must come from the replay record itself.
+      node('node_skipped_prior_success', 'discover', { structured_output: { n: 2 } }),
+      node('node_started', 'build'),
+      node('node_completed', 'build', { node_output: 'ok' }),
+    ]);
+    expect(listing).toEqual({
+      run_id: 'run-1',
+      first_failed_node: null,
+      nodes: [
+        { node_id: 'discover', state: 'completed', output: { n: 2 } },
+        { node_id: 'build', state: 'completed' },
+        { node_id: 'report', state: 'pending' },
+        { node_id: 'untouched', state: 'pending' },
+      ],
+    });
+  });
+
+  it.each([
+    ['node_failed', { error: 'boom' }, 'failed'],
+    ['node_started', {}, 'running'],
+    ['node_always_run_reset', {}, 'pending'],
+  ] as const)('never lists a completed output once the node is %s', (eventType, data, state) => {
+    const listing = buildNodeOutcomes(run, [
+      node('node_completed', 'discover', { node_output: '{}', structured_output: { n: 1 } }),
+      node(eventType, 'discover', data),
+    ]);
+    expect(listing.nodes.find(entry => entry.node_id === 'discover')).toEqual({
+      node_id: 'discover',
+      state,
+      ...(eventType === 'node_failed' ? { error: 'boom' } : {}),
+    });
+  });
+});
+
+describe('why a run that ended needs a look', () => {
+  const record = (
+    fields: Partial<Parameters<typeof terminalReason>[0] & object>
+  ): Parameters<typeof terminalReason>[0] => ({
+    run_id: 'run-1',
+    status: 'completed',
+    outcome: null,
+    error: null,
+    first_failed_node: null,
+    nodes: [],
+    returns: { availability: 'unavailable', node_id: null, reason: 'not_declared' },
+    artifacts: { root: null, files: [], limitations: [] } as unknown as ArtifactManifest,
+    ...fields,
+  });
+  const returned = (value: unknown) =>
+    record({
+      outcome: 'failed',
+      returns: { availability: 'available', node_id: 'verdict', value },
+    });
+
+  it('a failed outcome gives what its returns node said, as a bounded excerpt', () => {
+    expect(
+      terminalReason(
+        returned({
+          green: false,
+          summary: '\nmain is red: lint fails on dev since 4b58832.\nSecond line, not shown.',
+          next: 'x'.repeat(400),
+          detail: 'a third text field, past the two-line bound',
+        })
+      )
+    ).toEqual([
+      'summary: main is red: lint fails on dev since 4b58832.',
+      `next: ${'x'.repeat(193)}…`,
+    ]);
+    expect(terminalReason(returned('\nItem 12 is stuck.\n\nIt waits on a review.\nMore.'))).toEqual(
+      ['Item 12 is stuck.', 'It waits on a review.']
+    );
+    expect(terminalReason(returned({ green: false }))).toEqual([]);
+    expect(
+      terminalReason(returned({ 'why\n it\r\nfailed': 'lint', 'build  step': 'tsc' }))
+    ).toEqual(['why it failed: lint', 'build  step: tsc']);
+  });
+
+  it("a failed run gives its first failed node's error, or else the run's own", () => {
+    const failed = record({
+      status: 'failed',
+      error: 'run stopped',
+      first_failed_node: 'build',
+      nodes: [{ node_id: 'build', state: 'failed', error: 'exit 2: tsc failed\nstack…' }],
+    });
+    expect(terminalReason(failed)).toEqual(['exit 2: tsc failed']);
+    expect(terminalReason({ ...failed!, nodes: [] })).toEqual(['run stopped']);
+  });
+
+  it('a run that needs no look, and a run with no record, give none', () => {
+    expect(terminalReason(record({}))).toEqual([]);
+    expect(
+      terminalReason(
+        record({
+          outcome: 'succeeded',
+          returns: { availability: 'available', node_id: 'verdict', value: 'All good.' },
+        })
+      )
+    ).toEqual([]);
+    expect(terminalReason(null)).toEqual([]);
   });
 });

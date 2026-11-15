@@ -9,20 +9,20 @@ sidebar:
   order: 11
 ---
 
-Many platforms are not a single repository — they're a **root directory holding N service repos** (`auth-service/`, `billing-service/`, …), often with no git at the root itself. Archon models this as a [folder project](/getting-started/concepts/#folder-projects-non-git-workspaces): register the root once, and every workflow and chat runs **in place** at that root by default, so the agent sees all contained repos at once. Opt into overlay-isolated, approval-gated container execution with `--container` (see the [Container isolation guide](/guides/container-isolation/)).
+Many platforms are not a single repository — they're a **root directory holding N service repos** (`auth-service/`, `billing-service/`, …), with or without git at the root itself. Archon models this as a **folder project**: a directory for which Archon applies no git machinery (no managed worktree, branch or pull request), whether or not it is a git repository. Folder projects also fit a single repository you want to run in place, or a business-operations folder with no git at all. They get identity, per-project env vars, run history and artifact storage like repo projects. Register the root once, and every workflow and chat runs **in place** at that root by default, so the agent sees all contained repos at once. Opt into overlay-isolated, approval-gated container execution with `--container` (see the [Container isolation guide](/guides/container-isolation/)).
 
 ## Register the root
 
-From the multi-repo root, run any workflow with `--folder`. The first run registers the folder project; later runs from anywhere under the root need no flag.
+From the multi-repo root, run any workflow with `--folder`. The first run registers the folder project; later runs from the root or ordinary subdirectories need no flag. For cross-service runs, start at the registered folder root or pass `--cwd ~/platform`. Running from inside a nested Git service repository resolves that service as its own repository project and registers it on first use.
 
 ```bash
-cd ~/platform          # contains auth-service/, billing-service/, ... — NOT itself a git repo
-archon workflow run assist --folder "List every service and its current branch"
+cd ~/platform          # contains auth-service/, billing-service/, ... — with or without git at the root
+archon workflow run archon-investigate --folder "How do these services call each other?"
 # → Registered folder project "platform" (~/platform)
 # → Folder project — running in place (no worktree isolation).
 ```
 
-You can also register from chat (`/register-project platform ~/platform` — a non-git path is auto-detected as a folder) or the web console's **Add Project** (paste the path).
+You can also register from chat (`/register-project --folder platform ~/platform`) or the web console's **Add Project** (choose **Local path**, paste the path and select **Register as a folder project**). These choices work for git roots too. Without an explicit choice, web and chat auto-detect non-git paths as folders and git paths as repos. An existing repo registration is not converted.
 
 ## How work happens across repos
 
@@ -42,7 +42,7 @@ Folder projects intentionally run in the live checkout — `--branch` and `--fro
 
 ```bash
 cd ~/platform/auth-service       # a real git repo
-archon workflow run implement --branch fix-auth "Fix the token refresh bug"
+archon workflow run archon-implement --branch fix-auth "Fix the token refresh bug"
 # → normal repo project: isolated worktree + branch, no --folder
 ```
 
@@ -53,4 +53,3 @@ The two models compose: keep the root registered as a folder project for cross-s
 - **Archon-managed branching/PRs spanning child repos** — the agent coordinates git across services itself; Archon does not create a composed multi-repo worktree (a future isolation backend may).
 - **A repo you want isolated per run** — register *that repo* directly (repo project), not the parent folder.
 
-See [Core Concepts → Folder Projects](/getting-started/concepts/#folder-projects-non-git-workspaces) for the underlying model.

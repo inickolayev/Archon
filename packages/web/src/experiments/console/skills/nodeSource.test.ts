@@ -4,7 +4,7 @@ import { buildNodeSourcePath } from './nodeSource';
 describe('buildNodeSourcePath', () => {
   test('encodes the workflow, the node and the project directory', () => {
     expect(buildNodeSourcePath('chesswin-announce', 'write', '/home/me/my project')).toBe(
-      '/api/workflows/chesswin-announce/nodes/write/source?cwd=%2Fhome%2Fme%2Fmy%20project'
+      '/api/workflows/chesswin-announce/nodes/write/source?cwd=%2Fhome%2Fme%2Fmy+project'
     );
   });
 

@@ -6,13 +6,11 @@ description: |
   no work remains. Actionable paths converge on the reviewed delivery tail.
   One governed run, one artifact store, no inherited issue assumptions.
 
-  Use when: a GitHub issue or request should be taken from current-truth check
+  Use when: an issue or request should be taken from current-truth check
   through to a reviewed PR — "fix this issue", "implement issue #123", "take
   this work item to a PR".
   NOT for: bypassing triage with already-prepared work (deliver directly),
   reviewing an existing PR, or merging.
-
-requires: [github]
 
 inputs:
   target:
@@ -20,111 +18,81 @@ inputs:
     description: >-
       What to take through the pipeline — an issue, document, plan, report, or
       free-form request. When empty, the run's trigger message is the target.
+  ci:
+    default: "forge"
+    description: The pack's `ci` setting, forwarded to delivery; an includer passes its own.
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
+  part:
+    default: ""
+    description: >-
+      The part of an approved multi-part plan this run delivers, forwarded
+      unchanged to delivery's reviews. archon-review's `part` input owns its
+      shape. Empty delivers the whole contract.
   publish:
     default: "false"
     description: >-
       Let triage write its derived labels to the tracker item — true or false.
       Off by default. Forwarded unchanged to triage; a scheduled ship run is the
       only place an unattended intake can turn it on.
+  pull_request:
+    default: ""
+    description: >-
+      The number of an open pull request this run continues, as the caller
+      resolved it; empty or `null` when it names none and leaves it to triage.
+      Delivery finishes a named one whichever route triage takes; triage naming a
+      different one refuses the run.
+  branch:
+    default: ""
+    description: >-
+      The branch a new pull request opens from, as the caller resolved it,
+      forwarded unchanged to delivery. When an open pull request already has that
+      head, the push updates it instead of opening another. Empty opens it from the
+      checkout's branch.
 
 # `delivered:false` is a valid completion: an honest "no work is owed" is a
 # successful run that shipped nothing, and lifecycle status and work outcome are
-# separate facts. Both were reported as `outcome: null` before the terminal
-# script could certify its own result.
-returns: outcome
+# separate facts.
+returns: build
 outcome_field: delivered
 
 nodes:
+  # Refuses the run before any agent spends when the forge plugin cannot
+  # act: no plugin for the host, or no usable credential.
+  - id: forge
+    script: forge-check
+    runtime: bun
+
   # The source is history, not a work order. Triage checks it against current
   # code and direction before deciding which kind of reasoning is still owed.
   - id: triage
-    include: archon-triage
+    include: archon-triage-block
+    depends_on: [forge]
     with:
       target: "$INPUTS.target"
       publish: "$INPUTS.publish"
 
-  - id: inv
-    include: archon-investigate
-    with:
-      target: >-
-        Investigate the unresolved causal question recorded in
-        $ARTIFACTS_DIR/triage.md. Read that assessment first; its confirmed facts
-        are context, while its unknowns are the investigation target.
+  # Everything after the verdict: investigate, plan or deliver by the route, and the
+  # terminal report. The build queue includes the same block with the route its own
+  # agent declared, so only this workflow triages inside the run.
+  - id: build
+    include: archon-build
     depends_on: [triage]
-    when: "$triage.output.route == 'investigate'"
-
-  # These three route markers form one join into delivery. Expected negative
-  # judgments skip their marker; contract failures inside the advisory package
-  # still fail normally. That keeps "not ready to build" distinct from "the
-  # workflow failed to execute" without weakening the spend boundary.
-  - id: gate-direct
-    bash: echo '{"gate":"direct"}'
-    depends_on: [triage]
-    when: "$triage.output.route == 'deliver'"
-
-  - id: gate-rooted
-    bash: echo '{"gate":"rooted"}'
-    depends_on: [inv]
-    when: "$inv.output.rooted == true"
-
-  - id: planned
-    include: archon-plan
     with:
+      route: "$triage.output.decision.route"
       work: >-
-        Plan the current work item from $ARTIFACTS_DIR/triage.md. Read that
-        assessment first, preserve its verified outcome and constraints, and
-        decide the implementation questions it identified.
-    depends_on: [triage]
-    when: "$triage.output.route == 'plan'"
-
-  - id: gate-planned
-    bash: echo '{"gate":"planned"}'
-    depends_on: [planned]
-    when: "$planned.output.ready == true"
-
-  - id: deliver
-    include: archon-deliver
-    with:
-      errors: "$INPUTS.errors"
-      work: >-
-        Deliver the work prepared by this run. Read $ARTIFACTS_DIR/triage.md
-        first. When present, plan.md or investigation.md is the detailed work
-        order and must be read in full; triage.md records which path produced it
-        and which source assumptions were corrected. On the direct route,
-        triage.md itself is the verified work order.
-    depends_on: [gate-direct, gate-rooted, gate-planned]
-    trigger_rule: none_failed_min_one_success
-
-  # One return for every legitimate terminal result. Negative advisory verdicts
-  # complete with the report that explains them; delivery is reported from the
-  # flip's certified URL the deliver branch returned (bound with if_skipped, so a
-  # skipped flip arrives as null) — see scripts/outcome.ts.
-  #
-  # Two dependencies carry the whole graph. `deliver` depends on all three spend
-  # gates, which depend on triage, inv and planned in turn, so nothing this node
-  # reports on can settle after it. `triage` is named because
-  # none_failed_min_one_success needs one completed dependency, and on the no_action
-  # route `deliver` is the skipped one.
-  #
-  # The gates' outputs used to be bound here to tell "delivery started and died
-  # mid-flight" apart from an advisory stop. A failed delivery now cascades an
-  # `upstream_failed` skip that blocks this join outright, so that case never
-  # reaches this node and the run's terminal record names the node that failed.
-  - id: outcome
-    script: outcome
-    runtime: bun
-    depends_on: [triage, deliver]
-    trigger_rule: none_failed_min_one_success
-    with:
-      route: "$triage.output.route"
+        The work item's assessment is $ARTIFACTS_DIR/triage.md, written by this
+        run's triage against the current repository. It records which route the
+        item takes and which source assumptions were corrected; its handoff is
+        the question to investigate, the decisions to plan, or the verified work
+        order.
+      related: "$triage.output.related"
+      contract: "$triage.output.decision.contract"
       summary: "$triage.output.summary"
-      delivered: { from: "$deliver.output.pr_url", if_skipped: null }
-    output_format:
-      type: object
-      properties:
-        delivered: { type: boolean }
-        summary: { type: string }
-      required: [delivered, summary]
+      pull_request: "$INPUTS.pull_request"
+      triage_pull_request: "$triage.output.decision.pull_request"
+      branch: "$INPUTS.branch"
+      ci: "$INPUTS.ci"
+      errors: "$INPUTS.errors"
+      part: "$INPUTS.part"

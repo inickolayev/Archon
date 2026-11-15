@@ -1,5 +1,6 @@
 import { readFile } from 'fs/promises';
 import { isAbsolute, resolve } from 'path';
+import { mcpServerMap } from '@archon/provider-contract';
 import { ClassifiedProviderError } from '../shared/failure';
 
 type EnvSource = Record<string, string | undefined>;
@@ -66,68 +67,34 @@ function expandEnvVars(
       );
     }
     const server = { ...(serverConfig as Record<string, unknown>) };
-    if (server.env !== undefined) {
-      if (typeof server.env !== 'object' || server.env === null || Array.isArray(server.env)) {
-        throw new ClassifiedProviderError(
-          'misconfigured',
-          `MCP config ${serverName}.env must be a JSON object of string values (got ${describeJsonType(server.env)})`
-        );
-      }
-      server.env = expandEnvVarsInRecord(
-        server.env as Record<string, unknown>,
+    for (const field of ['env', 'headers'] as const) {
+      if (server[field] === undefined) continue;
+      server[field] = expandServerRecord(
+        server[field],
         missingVars,
         envSource,
-        `${serverName}.env`
+        `${serverName}.${field}`
       );
     }
-    if (server.headers !== undefined) {
-      if (
-        typeof server.headers !== 'object' ||
-        server.headers === null ||
-        Array.isArray(server.headers)
-      ) {
-        throw new ClassifiedProviderError(
-          'misconfigured',
-          `MCP config ${serverName}.headers must be a JSON object of string values (got ${describeJsonType(server.headers)})`
-        );
-      }
-      server.headers = expandEnvVarsInRecord(
-        server.headers as Record<string, unknown>,
-        missingVars,
-        envSource,
-        `${serverName}.headers`
-      );
-    }
+
     result[serverName] = server;
   }
   return { expanded: result, missingVars };
 }
 
-function normalizeMcpConfig(
-  parsed: Record<string, unknown>,
-  mcpPath: string
-): Record<string, unknown> {
-  const keys = Object.keys(parsed);
-  if (!keys.includes('mcpServers')) {
-    return parsed;
-  }
-
-  if (keys.length > 1) {
+function expandServerRecord(
+  value: unknown,
+  missingVars: string[],
+  envSource: EnvSource,
+  fieldPath: string
+): Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new ClassifiedProviderError(
       'misconfigured',
-      `MCP config cannot mix top-level "mcpServers" with other keys: ${mcpPath}. Use either a direct server map or { "mcpServers": { ... } }.`
+      `MCP config ${fieldPath} must be a JSON object of string values (got ${describeJsonType(value)})`
     );
   }
-
-  const servers = parsed.mcpServers;
-  if (typeof servers !== 'object' || servers === null || Array.isArray(servers)) {
-    throw new ClassifiedProviderError(
-      'misconfigured',
-      `MCP config field "mcpServers" must be a JSON object: ${mcpPath}`
-    );
-  }
-
-  return servers as Record<string, unknown>;
+  return expandEnvVarsInRecord(value as Record<string, unknown>, missingVars, envSource, fieldPath);
 }
 
 /**
@@ -159,9 +126,9 @@ export async function loadMcpConfig(
     throw new Error(message);
   }
 
-  let parsed: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
+    parsed = JSON.parse(raw);
   } catch (parseErr) {
     const detail = (parseErr as SyntaxError).message;
     throw new ClassifiedProviderError(
@@ -170,15 +137,11 @@ export async function loadMcpConfig(
     );
   }
 
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new ClassifiedProviderError(
-      'misconfigured',
-      `MCP config must be a JSON object (Record<string, ServerConfig>): ${mcpPath}`
-    );
+  const serverMap = mcpServerMap(parsed);
+  if (!serverMap.ok) {
+    throw new ClassifiedProviderError('misconfigured', `${serverMap.error}: ${mcpPath}`);
   }
-
-  const normalized = normalizeMcpConfig(parsed, mcpPath);
-  const { expanded, missingVars } = expandEnvVars(normalized, envSource);
+  const { expanded, missingVars } = expandEnvVars(serverMap.servers, envSource);
   const serverNames = Object.keys(expanded);
   return { servers: expanded, serverNames, missingVars };
 }

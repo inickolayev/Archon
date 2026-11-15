@@ -1,30 +1,52 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { jobsGatedOnRunTests, testSuiteFailures, type NeedResult } from './test-suite-outcome';
+import { jobGates, testSuiteFailures, type NeedResult } from './test-suite-outcome';
 
 const SCRIPT = resolve(import.meta.dir, 'test-suite-outcome.ts');
 const WORKFLOW = readFileSync(resolve(import.meta.dir, '../.github/workflows/test.yml'), 'utf8');
-const GATED = jobsGatedOnRunTests(WORKFLOW);
+const GATED = jobGates(WORKFLOW);
 
-/** The needs context of a round: `changes` decided `runTests`, every other job as given. */
-function needs(runTests: string, results: Record<string, string>): Record<string, NeedResult> {
+/**
+ * The needs context of a round: `changes` decided `runTests`, and every other decision follows
+ * it unless the workspace or push-only decision is given, every other job as given.
+ */
+function needs(
+  runTests: string,
+  results: Record<string, string>,
+  runWorkspaceTests = runTests,
+  runPushOnly = runTests
+): Record<string, NeedResult> {
   return {
-    changes: { result: 'success', outputs: { 'run-tests': runTests } },
+    changes: {
+      result: 'success',
+      outputs: {
+        'run-tests': runTests,
+        'run-workspace-tests': runWorkspaceTests,
+        'run-full-matrix': runPushOnly,
+        'run-docker-build': runPushOnly,
+        'run-serve-binary': runPushOnly,
+      },
+    },
     ...Object.fromEntries(Object.entries(results).map(([job, result]) => [job, { result }])),
   };
 }
 
-/** Every gated job skipped, as on a documentation-only change. */
-const docsOnlySkips = Object.fromEntries([...GATED].map(job => [job, 'skipped']));
-const allSuccess = Object.fromEntries([...GATED, 'workflow-fixtures'].map(job => [job, 'success']));
+/** Every gated job skipped, as on a prose-only pull request or a push a pull request run proved. */
+const decisionSkips = Object.fromEntries([...GATED.keys()].map(job => [job, 'skipped']));
+const ALWAYS = ['static'];
+const PUSH_ONLY_OUTPUTS = ['run-full-matrix', 'run-docker-build', 'run-serve-binary'];
+const alwaysSuccess = Object.fromEntries(ALWAYS.map(job => [job, 'success']));
+const allSuccess = {
+  ...Object.fromEntries([...GATED.keys()].map(job => [job, 'success'])),
+  ...alwaysSuccess,
+};
 
 describe('Test Suite aggregate outcome', () => {
   test('reads the gated jobs from test.yml; jobs that run for every event are not gated', () => {
-    expect(GATED.has('test')).toBe(true);
-    expect(GATED.has('static')).toBe(true);
-    // No workflow-fixtures-windows in this fork: Windows is out of scope (ADR 0008).
-    expect(GATED.has('workflow-fixtures')).toBe(false);
+    expect(GATED.get('test')).toBe('run-workspace-tests');
+    expect(GATED.get('test-scripts')).toBe('run-tests');
+    expect(GATED.has('static')).toBe(false);
     expect(GATED.has('changes')).toBe(false);
   });
 
@@ -32,29 +54,55 @@ describe('Test Suite aggregate outcome', () => {
     expect(testSuiteFailures(needs('true', allSuccess), GATED)).toEqual([]);
   });
 
-  test('passes a documentation-only change that skips the gated jobs', () => {
-    const results = { ...docsOnlySkips, 'workflow-fixtures': 'success' };
+  test('passes a decision that skips the gated jobs', () => {
+    const results = { ...decisionSkips, ...alwaysSuccess };
     expect(testSuiteFailures(needs('false', results), GATED)).toEqual([]);
   });
 
-  test('fails a documentation-only change whose always-run job fails', () => {
-    const results = { ...docsOnlySkips, 'workflow-fixtures': 'failure' };
-    expect(testSuiteFailures(needs('false', results), GATED)).toEqual([
-      'workflow-fixtures finished with failure',
+  test.each(
+    ALWAYS.flatMap(job => ['failure', 'cancelled', 'skipped'].map(result => [job, result]))
+  )('fails always-run %s with %s even when the gated jobs skip', (job, result) => {
+    expect(
+      testSuiteFailures(
+        needs('false', { ...decisionSkips, ...alwaysSuccess, [job]: result }),
+        GATED
+      )
+    ).toEqual([`${job} finished with ${result}`]);
+  });
+
+  test('passes the workspace shards skipped on their own decision while the suite runs', () => {
+    const results = { ...allSuccess, test: 'skipped' };
+    expect(testSuiteFailures(needs('true', results, 'false'), GATED)).toEqual([]);
+  });
+
+  test('passes a pull request that leaves the push-only jobs to the push', () => {
+    const pushOnly = [...GATED].flatMap(([job, output]) =>
+      PUSH_ONLY_OUTPUTS.includes(output) ? [job] : []
+    );
+    const results = {
+      ...allSuccess,
+      ...Object.fromEntries(pushOnly.map(job => [job, 'skipped'])),
+    };
+    expect(testSuiteFailures(needs('true', results, 'true', 'false'), GATED)).toEqual([]);
+  });
+
+  test('fails the workspace shards skipped when their decision said to run them', () => {
+    const results = { ...allSuccess, test: 'skipped' };
+    expect(testSuiteFailures(needs('true', results, 'true'), GATED)).toEqual([
+      'test finished with skipped',
     ]);
   });
 
-  test('fails a skipped always-run job even on a documentation-only change', () => {
-    const results = { ...docsOnlySkips, 'workflow-fixtures': 'skipped' };
-    expect(testSuiteFailures(needs('false', results), GATED)).toEqual([
-      'workflow-fixtures finished with skipped',
+  test.each(['', 'maybe'])('fails an invalid workspace decision %j', value => {
+    expect(testSuiteFailures(needs('true', allSuccess, value), GATED)).toEqual([
+      `changes finished with success and run-workspace-tests=${value}`,
     ]);
   });
 
   test('fails a gated job skipped when the decision said to run it', () => {
-    const results = { ...allSuccess, test: 'skipped' };
+    const results = { ...allSuccess, 'docker-build': 'skipped' };
     expect(testSuiteFailures(needs('true', results), GATED)).toEqual([
-      'test finished with skipped',
+      'docker-build finished with skipped',
     ]);
   });
 
@@ -66,11 +114,13 @@ describe('Test Suite aggregate outcome', () => {
   });
 
   test('fails when the decision itself did not succeed or wrote no decision', () => {
-    const failed = { ...needs('false', docsOnlySkips), changes: { result: 'failure' } };
-    expect(testSuiteFailures(failed, GATED)).toEqual([
-      'changes finished with failure and run-tests=undefined',
-    ]);
-    expect(testSuiteFailures(needs('', docsOnlySkips), GATED)).toEqual([
+    const failed = { ...needs('false', decisionSkips), changes: { result: 'failure' } };
+    expect(testSuiteFailures(failed, GATED).sort()).toEqual(
+      [...new Set(GATED.values())]
+        .map(output => `changes finished with failure and ${output}=undefined`)
+        .sort()
+    );
+    expect(testSuiteFailures(needs('', decisionSkips, 'false', 'false'), GATED)).toEqual([
       'changes finished with success and run-tests=',
     ]);
   });
@@ -79,12 +129,85 @@ describe('Test Suite aggregate outcome', () => {
     const result = Bun.spawnSync(['bun', SCRIPT], {
       env: {
         ...process.env,
-        NEEDS: JSON.stringify(needs('false', { ...docsOnlySkips, 'workflow-fixtures': 'failure' })),
+        NEEDS: JSON.stringify(needs('false', { ...decisionSkips, static: 'failure' })),
       },
       stdout: 'pipe',
       stderr: 'pipe',
     });
     expect(result.exitCode).toBe(1);
-    expect(result.stderr.toString()).toContain('workflow-fixtures finished with failure');
+    expect(result.stderr.toString()).toContain('static finished with failure');
+  });
+});
+
+function record(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Expected a workflow mapping');
+  }
+  return Object.fromEntries(Object.entries(value));
+}
+
+const jobs = record(record(Bun.YAML.parse(WORKFLOW)).jobs);
+function jobSteps(job: Record<string, unknown>): Record<string, unknown>[] {
+  if (!Array.isArray(job.steps)) throw new Error('Expected workflow steps');
+  return job.steps.map(record);
+}
+
+describe('CI wiring', () => {
+  test('static runs independently of the selector', () => {
+    expect(record(jobs.static).needs).toBeUndefined();
+    expect(record(jobs.static).if).toBe('${{ !github.event.pull_request.draft }}');
+  });
+
+  test('the test shards run only when their change decision selects them', () => {
+    expect(record(jobs.test).needs).toBe('changes');
+    expect(record(jobs.test).if).toBe("needs.changes.outputs.run-workspace-tests == 'true'");
+    expect(record(jobs['test-scripts']).needs).toBe('changes');
+    expect(record(jobs['test-scripts']).if).toBe("needs.changes.outputs.run-tests == 'true'");
+    // Gating the pack job on its own decision would skip it on every run that leaves the pack
+    // alone, and a skipped job keeps a run of every job from proving its merge.
+    expect(record(jobs['test-pack']).if).toBe("needs.changes.outputs.run-tests == 'true'");
+  });
+
+  // An undeclared or misspelled output reads as empty, and a step gated on it skips while the
+  // job, and so the aggregate, stays green.
+  // A pull request leaves these to the push unless its change selects them. An ungated job on
+  // another OS would put its queue time back on every pull request.
+  test('every job off Linux, and both builds, run only on a push-only decision', () => {
+    const gate = (id: string): unknown => record(jobs[id]).if;
+    const offLinux = Object.keys(jobs).filter(id => {
+      const job = record(jobs[id]);
+      const os = record(record(job.strategy ?? {}).matrix ?? {}).os ?? job['runs-on'];
+      return JSON.stringify(os) !== '"ubuntu-latest"';
+    });
+    // No `-windows` jobs and no Windows leg of `serve-binary`: Windows is out of scope in this
+    // fork (ADR 0008). `serve-binary` still matches here through its one-entry `os` matrix.
+    expect(offLinux.sort()).toEqual(['file-store-primitives-macos', 'serve-binary']);
+    for (const id of offLinux.filter(id => id !== 'serve-binary')) {
+      expect({ id, if: gate(id) }).toEqual({
+        id,
+        if: "needs.changes.outputs.run-full-matrix == 'true'",
+      });
+    }
+    expect(gate('serve-binary')).toBe("needs.changes.outputs.run-serve-binary == 'true'");
+    expect(gate('docker-build')).toBe("needs.changes.outputs.run-docker-build == 'true'");
+  });
+
+  test.each([
+    'workspace-tests',
+    'pack-tests',
+    'pack-fixtures',
+    'full-matrix',
+    'docker-build',
+    'serve-binary',
+  ])('publishes the %s decision from the deciding step', mode => {
+    const output = `run-${mode}`;
+    const variable = output.replaceAll('-', '_');
+    const changes = record(jobs.changes);
+    expect(record(changes.outputs)[output]).toBe(`\${{ steps.decision.outputs.${output} }}`);
+    const decision = jobSteps(changes).find(step => step.id === 'decision');
+    expect(decision?.run).toContain(
+      `${variable}=$(bun scripts/should-run-test-suite.ts --${mode})`
+    );
+    expect(decision?.run).toContain(`echo "${output}=$${variable}" >> "$GITHUB_OUTPUT"`);
   });
 });

@@ -1,9 +1,11 @@
+import type { QueryParams } from '../lib/api-types';
 import type { RunStatus } from '../lib/run-status';
 import type { components } from '@/lib/api.generated';
 
 export type RunOrigin = 'web' | 'cli' | 'slack' | 'telegram' | 'discord' | 'github' | 'unknown';
 export type RunOutcome = components['schemas']['WorkflowRunOutcome'];
 type WorkflowRunMetadata = components['schemas']['WorkflowRunMetadata'];
+type WorkflowApproval = NonNullable<WorkflowRunMetadata['approval']>;
 type WorkflowWait = NonNullable<WorkflowRunMetadata['wait']>;
 type WorkflowRunStopReason = NonNullable<WorkflowRunMetadata['stop_reason']>;
 type WorkflowWaitOwnerField =
@@ -18,35 +20,47 @@ type NormalizedWorkflowWait<T extends WorkflowWait = WorkflowWait> = T extends W
   : never;
 
 export interface Run {
-  id: string;
-  projectId: string | null;
-  projectName: string | null;
+  id: WorkflowRun['id'];
+  projectId: WorkflowRun['codebase_id'];
+  projectName: components['schemas']['DashboardWorkflowRun']['codebase_name'];
   /** Total USD cost from the agent SDK. Populated for completed Claude runs;
    *  Pi/Codex runs may not report cost. Null when the run hasn't recorded any. */
   costUsd: number | null;
   /** DB id of the conversation this run belongs to. */
-  conversationId: string | null;
+  conversationId: WorkflowRun['conversation_id'];
   /**
-   * Platform-level conversation id (e.g. `cli-1776237248436-q61o4h`). This is
+   * Platform-level conversation id (e.g. `cli-1776237248436-9f86d081884c7d659a2feaa0c55ad015`). This is
    * the id the `/api/conversations/:id/messages` route accepts in its URL
    * path — the server looks conversations up by platform id, not DB id, on
    * that endpoint. Use this when fetching the run's messages.
    */
-  conversationPlatformId: string | null;
+  conversationPlatformId: DetailRun['conversation_platform_id'];
   /**
    * Platform id of the WORKER conversation for chat-dispatched (web) runs —
    * where a chat-dispatched run's messages actually live. See
    * runMessageConversationId() for how CLI vs. web runs are picked (#2048).
    */
-  workerPlatformId: string | null;
-  workflow: string;
+  workerPlatformId: components['schemas']['DashboardWorkflowRun']['worker_platform_id'];
+  workflow: WorkflowRun['workflow_name'];
   origin: RunOrigin;
   status: RunStatus;
+  /**
+   * What the server observes about a running run's execution owner. Null or absent when it
+   * makes no claim: the run is not running, or the payload carries no observation.
+   */
+  ownerObservation?: components['schemas']['DashboardWorkflowRun']['owner_observation'];
+  attention: components['schemas']['WorkflowRun']['attention'];
   outcome: RunOutcome;
-  startedAt: string;
-  finishedAt: string | null;
+  terminalRecord: components['schemas']['WorkflowRunDetail']['run']['terminal_record'];
+  startedAt: WorkflowRun['started_at'];
+  /**
+   * When the run's current execution phase began: set each time a resume or an answer
+   * continues the run, null for a run that has only its first phase.
+   */
+  activePhaseStartedAt?: WorkflowRun['active_phase_started_at'];
+  finishedAt: WorkflowRun['completed_at'];
   /** workflow_runs.working_path — used to join against worktrees. */
-  workingPath: string | null;
+  workingPath: WorkflowRun['working_path'];
   /**
    * Who asked for this run, by name — null when nobody can be named.
    *
@@ -56,11 +70,10 @@ export interface Run {
    * raises, and until now the answer existed only in the database.
    */
   startedBy: string | null;
-  userMessage: string;
-  activeNodes: string[];
-  /** Singular compatibility view, populated only when exactly one node is active. */
-  currentNode?: string | null;
+  userMessage: NonNullable<WorkflowRun['user_message']>;
+  activeNodes: NonNullable<components['schemas']['DashboardWorkflowRun']['active_nodes']>;
   lastTool?: string | null;
+  toolCallAttention?: NonNullable<WorkflowRunMetadata['tool_call_attention']>;
   /**
    * Pending human gate. Null once the gate is resolved (see gateResolved).
    * `completionSignaled` is true when an interactive-loop gate paused on an
@@ -74,9 +87,10 @@ export interface Run {
    */
   approval?: {
     nodeId: string;
+    pauseId?: WorkflowApproval['pauseId'];
     message: string;
     completionSignaled: boolean;
-    decisions: { id: string; label?: string }[];
+    decisions: NonNullable<WorkflowApproval['decisions']>;
     decisionsAuthored: boolean;
   } | null;
   /** Active durable wait cursor. Mutually exclusive with approval metadata. */
@@ -87,7 +101,7 @@ export interface Run {
    * approval surfaces hide (approval is null) and the card shows a
    * "resuming" hint instead of stale approve/reject buttons.
    */
-  gateResolved?: 'approved' | 'rejected' | null;
+  gateResolved?: WorkflowApproval['resolved'];
   /**
    * Why the run stopped, as the owning process recorded it (#3479). Null when it
    * stopped without one, or has not stopped. The run's `status` is unaffected: a
@@ -99,7 +113,16 @@ export interface Run {
    * spawned by a parent run's node; null for top-level runs. Drives the "child of"
    * affordance in the console so a sub-run isn't mistaken for an orphan top-level run.
    */
-  parentRunId?: string | null;
+  parentRunId?: WorkflowRun['parent_run_id'];
+}
+
+/**
+ * When the run last began executing: its latest phase start, or its creation when it
+ * has had only one phase. A resumed run keeps its creation time as `startedAt`, so
+ * measuring a duration from there would count the time it sat failed or paused.
+ */
+export function runPhaseStart(run: Pick<Run, 'startedAt' | 'activePhaseStartedAt'>): string {
+  return run.activePhaseStartedAt ?? run.startedAt;
 }
 
 export function runDetailPath(run: Pick<Run, 'id' | 'projectId'>): string {
@@ -109,49 +132,42 @@ export function runDetailPath(run: Pick<Run, 'id' | 'projectId'>): string {
     : `/console/p/${encodeURIComponent(run.projectId)}/r/${runId}`;
 }
 
-// Server shapes we read from. These track the real server schema loosely —
-// fields we don't use are omitted. The normalizer defends against missing
-// optional fields.
+type WorkflowRun = components['schemas']['WorkflowRun'];
+type DashboardWorkflowRun = components['schemas']['DashboardWorkflowRun'];
+type DetailRun = components['schemas']['WorkflowRunDetail']['run'];
+type RawWorkflowRun = Pick<
+  WorkflowRun,
+  'id' | 'workflow_name' | 'codebase_id' | 'status' | 'started_at'
+> &
+  Partial<
+    Pick<
+      WorkflowRun,
+      | 'conversation_id'
+      | 'outcome'
+      | 'completed_at'
+      | 'active_phase_started_at'
+      | 'working_path'
+      | 'user_message'
+      | 'metadata'
+      | 'attention'
+      | 'parent_run_id'
+    >
+  > &
+  Partial<
+    Pick<
+      DashboardWorkflowRun,
+      | 'codebase_name'
+      | 'user_display_name'
+      | 'platform_type'
+      | 'active_nodes'
+      | 'worker_platform_id'
+      | 'owner_observation'
+    >
+  > &
+  Partial<Pick<DetailRun, 'conversation_platform_id' | 'terminal_record'>>;
 
-interface RawWorkflowRun {
-  id: string;
-  workflow_name: string;
-  codebase_id: string | null;
-  conversation_id?: string | null;
-  /** Platform-level conversation id — exposed on the getRun response only. */
-  conversation_platform_id?: string | null;
-  /** Worker conversation platform id — getRun response only, web runs only. */
-  worker_platform_id?: string | null;
-  status: string;
-  outcome?: RunOutcome;
-  started_at: string;
-  completed_at?: string | null;
-  working_path?: string | null;
-  user_message?: string;
-  metadata?: WorkflowRunMetadata;
-  /** Only present on dashboard runs — enriched by server-side join. */
-  codebase_name?: string | null;
-  /** Display name of whoever asked for the run; absent/null when nobody can be named. */
-  user_display_name?: string | null;
-  platform_type?: string | null;
-  active_nodes?: string[];
-  current_step_name?: string | null;
-  /** Run-tree parent id (#2121 Phase 2); null/absent for top-level runs. */
-  parent_run_id?: string | null;
-}
-
-const KNOWN_STATUSES: readonly RunStatus[] = [
-  'running',
-  'paused',
-  'failed',
-  'completed',
-  'cancelled',
-];
-
-function normalizeStatus(s: string): RunStatus {
-  // Treat 'pending' as 'running' for UI purposes — it's transient.
-  if (s === 'pending') return 'running';
-  return (KNOWN_STATUSES as readonly string[]).includes(s) ? (s as RunStatus) : 'running';
+function normalizeStatus(status: WorkflowRun['status']): RunStatus {
+  return status === 'pending' ? 'running' : status;
 }
 
 function normalizeWorkflowWait(wait: WorkflowWait): NormalizedWorkflowWait {
@@ -187,7 +203,7 @@ export function normalizeOrigin(s: string | null | undefined): RunOrigin {
 function readCost(meta: WorkflowRunMetadata | undefined): number | null {
   if (meta === undefined) return null;
   const raw = meta.total_cost_usd;
-  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : null;
 }
 
 /**
@@ -203,80 +219,82 @@ export function runMessageConversationId(run: Run | undefined): string | null {
   return run.conversationPlatformId ?? run.workerPlatformId;
 }
 
+function readApproval(approval: WorkflowApproval | undefined): Run['approval'] {
+  return approval !== undefined && (approval.resolved ?? null) === null
+    ? {
+        nodeId: approval.nodeId,
+        pauseId: approval.pauseId,
+        message:
+          approval.type === 'child_workflow'
+            ? approval.childRunId
+              ? `Waiting on sub-run ${approval.childRunId}. Review the child run to continue.`
+              : 'Waiting on a sub-run. Review the child run to continue.'
+            : approval.message,
+        completionSignaled: approval.completionSignaled === true,
+        decisions: approval.decisions ?? [],
+        decisionsAuthored: approval.decisionsAuthored === true,
+      }
+    : null;
+}
+
+function readRunProvenance(raw: RawWorkflowRun) {
+  return {
+    projectId: raw.codebase_id,
+    projectName: raw.codebase_name ?? null,
+    conversationId: raw.conversation_id ?? null,
+    conversationPlatformId: raw.conversation_platform_id ?? null,
+    workerPlatformId: raw.worker_platform_id ?? null,
+    origin: normalizeOrigin(raw.platform_type),
+    parentRunId: raw.parent_run_id ?? null,
+  };
+}
+
 export function toRun(raw: RawWorkflowRun): Run {
   const activeNodes = Array.isArray(raw.active_nodes)
     ? raw.active_nodes.filter(nodeId => typeof nodeId === 'string' && nodeId.length > 0)
     : [];
   const approval = raw.metadata?.approval;
-  const isApprovalShape =
-    approval !== null &&
-    typeof approval === 'object' &&
-    approval !== undefined &&
-    'nodeId' in approval &&
-    typeof (approval as { nodeId: unknown }).nodeId === 'string';
-  // A resolved gate (approved/rejected, run paused only while awaiting
-  // auto-resume — see ApprovalContext.resolved on the server) is NOT a
-  // pending approval: surface it via gateResolved instead so approve/reject
-  // buttons never render for an already-resolved gate.
-  const resolvedRaw = isApprovalShape ? (approval as { resolved?: unknown }).resolved : undefined;
-  const gateResolved =
-    resolvedRaw === 'approved' || resolvedRaw === 'rejected' ? resolvedRaw : null;
-  const decisionsField = isApprovalShape
-    ? (approval as { decisions?: unknown }).decisions
-    : undefined;
-  const rawDecisions = Array.isArray(decisionsField) ? decisionsField : [];
-  const decisions = rawDecisions
-    .filter(
-      (d): d is { id: string; label?: string } =>
-        d !== null && typeof d === 'object' && typeof (d as { id?: unknown }).id === 'string'
-    )
-    .map(d => ({
-      id: d.id,
-      ...(typeof d.label === 'string' ? { label: d.label } : {}),
-    }));
-  const parsedApproval =
-    isApprovalShape && gateResolved === null
-      ? {
-          nodeId: (approval as { nodeId: string }).nodeId,
-          message:
-            'message' in approval && typeof (approval as { message: unknown }).message === 'string'
-              ? (approval as { message: string }).message
-              : '',
-          completionSignaled:
-            (approval as { completionSignaled?: unknown }).completionSignaled === true,
-          decisions: decisions.length > 0 ? decisions : [{ id: 'approve' }, { id: 'reject' }],
-          decisionsAuthored:
-            (approval as { decisionsAuthored?: unknown }).decisionsAuthored === true,
-        }
-      : null;
+  const gateResolved = approval?.resolved ?? null;
+  const parsedApproval = readApproval(approval);
   const wait = raw.metadata?.wait;
   const parsedWait: NormalizedWorkflowWait | null =
     wait === undefined ? null : normalizeWorkflowWait(wait);
 
   return {
+    ...readRunProvenance(raw),
     id: raw.id,
-    projectId: raw.codebase_id,
-    projectName: raw.codebase_name ?? null,
     costUsd: readCost(raw.metadata),
-    conversationId: raw.conversation_id ?? null,
-    conversationPlatformId: raw.conversation_platform_id ?? null,
-    workerPlatformId: raw.worker_platform_id ?? null,
     workflow: raw.workflow_name,
-    origin: normalizeOrigin(raw.platform_type),
     status: normalizeStatus(raw.status),
+    ownerObservation: raw.owner_observation,
+    attention: raw.attention ?? null,
     outcome: raw.outcome ?? null,
+    terminalRecord: raw.terminal_record ?? null,
     startedAt: raw.started_at,
+    activePhaseStartedAt: raw.active_phase_started_at ?? null,
     finishedAt: raw.completed_at ?? null,
     workingPath: raw.working_path ?? null,
     startedBy: raw.user_display_name ?? null,
     userMessage: raw.user_message ?? '',
     activeNodes,
-    currentNode: activeNodes.length === 1 ? (activeNodes[0] ?? null) : null,
     lastTool: null,
+    toolCallAttention: raw.status === 'running' ? (raw.metadata?.tool_call_attention ?? []) : [],
     approval: parsedWait === null ? parsedApproval : null,
     wait: parsedWait,
     gateResolved,
     stopReason: raw.metadata?.stop_reason ?? null,
-    parentRunId: raw.parent_run_id ?? null,
   };
+}
+
+export interface ListRunsOptions {
+  codebaseId?: QueryParams<'/api/dashboard/runs', 'get'>['codebaseId'];
+  status?: RunStatus;
+  limit?: number;
+  offset?: number;
+}
+
+type AttentionResponse = components['schemas']['RunsNeedingAttentionResponse'];
+export interface RunsAttention {
+  runs: Run[];
+  degraded: NonNullable<AttentionResponse['degraded']>;
 }

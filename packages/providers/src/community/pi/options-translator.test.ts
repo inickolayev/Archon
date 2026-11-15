@@ -60,7 +60,7 @@ describe('resolvePiTools', () => {
     expect(resolvePiTools(cwd, {})).toEqual({ tools: undefined, unknownTools: [] });
   });
 
-  test('allowed_tools: [] returns empty tools array (no-tools idiom)', () => {
+  test('allowed_tools: [] returns empty tools array (no built-in tools)', () => {
     const result = resolvePiTools(cwd, { allowed_tools: [] });
     expect(result.tools).toEqual([]);
     expect(result.unknownTools).toEqual([]);
@@ -123,6 +123,20 @@ describe('resolvePiTools', () => {
   test('no allow/deny with empty env → still returns undefined (Pi defaults)', () => {
     expect(resolvePiTools(cwd, undefined, {})).toEqual({ tools: undefined, unknownTools: [] });
     expect(resolvePiTools(cwd, {}, {})).toEqual({ tools: undefined, unknownTools: [] });
+  });
+
+  test("a run's identity in the request env reaches the command Pi's bash tool spawns", async () => {
+    const env = {
+      WORKFLOW_ID: 'run-1',
+      ARCHON_NODE_EXECUTION: '{"runId":"run-1","path":"notes"}',
+      ARCHON_CLI_COMMAND: '["/opt/archon/bin/archon"]',
+    };
+    const bash = resolvePiTools(tmpdir(), undefined, env).tools?.find(t => t.name === 'bash');
+    if (!bash) throw new Error('expected an env-aware bash tool');
+    const result = await bash.execute('call-1', {
+      command: 'printf "%s\\n" "$WORKFLOW_ID" "$ARCHON_NODE_EXECUTION" "$ARCHON_CLI_COMMAND"',
+    });
+    expect(result.content).toEqual([{ type: 'text', text: `${Object.values(env).join('\n')}\n` }]);
   });
 
   test('env passthrough does not affect unknown tool reporting', () => {

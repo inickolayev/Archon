@@ -32,7 +32,33 @@ You can feed this into tools like Swagger UI or use it to generate typed API cli
 
 ## Authentication
 
-None. Archon is a single-developer tool -- there is no authentication on the API by default. If you expose Archon on a network, use a reverse proxy or firewall to restrict access.
+Authentication is optional for a local or trusted solo install. When Web authentication is enabled, the API requires a Better Auth session or a trusted proxy identity unless `ARCHON_WEB_AUTH_REQUIRED=false`. The `/api/auth/` and `/api/health` surfaces are exempt from that general gate, but per-user endpoints still require an identity.
+
+The trusted identity header defaults to `X-Archon-User` and can be changed with `ARCHON_WEB_AUTH_HEADER`. Bind the server to loopback (`HOST=127.0.0.1`) or keep the app port reachable only through a trusted reverse proxy. The proxy must strip client-supplied identity headers. If the proxy supplies an identity header, it must set that value only from an authenticated identity. For network deployments, see the [reverse-proxy deployment guide](/deployment/reverse-proxy/#authentication-and-headers).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/auth/status` | Read Web auth availability and signup posture (no identity required) |
+| GET | `/api/auth/github` | Read the current user's GitHub connection status |
+| DELETE | `/api/auth/github` | Disconnect the current user's GitHub identity |
+| POST | `/api/auth/github/device/start` | Start a GitHub device login for the current user |
+| POST | `/api/auth/github/device/poll` | Poll a GitHub device login and persist the authorized connection |
+
+The GitHub connection routes require a resolved Web identity. The device login routes also require per-user GitHub to be enabled on the install.
+
+### Account and linked identities
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/auth/me` | The signed-in account (name, email, role) and the platform identities linked to it |
+| POST | `/api/auth/me/sign-out` | End the session; with a real session it also drops every pending account-link token |
+| GET | `/api/auth/me/identities` | Platform identities linked to the signed-in account |
+| DELETE | `/api/auth/me/identities/{platform}` | Unlink a platform identity (only `telegram`); history written through it stays with the account |
+| GET | `/api/auth/telegram/link/{token}` | Preview what a one-time Telegram link (issued by the bot) would connect; `404` once expired or spent |
+| POST | `/api/auth/telegram/link/{token}` | Spend the link: the Telegram identity now resolves to this account, and the chat is told |
+| GET | `/api/users/directory` | Every user who has written here (id, display name, email), for authorship labels |
+
+These routes require a resolved Web identity.
 
 ---
 
@@ -51,6 +77,12 @@ curl http://localhost:3090/api/health
 # {"status":"ok","adapter":"...","concurrency":{...},"runningWorkflows":0}
 ```
 
+`/api/health` is public, so its `concurrency` object carries counts and the oldest active and queued ages, never conversation ids. The per-conversation view is the authenticated `GET /api/dashboard/conversations`.
+
+`/api/health` also returns `storeId`, the opaque id of the Archon home the server serves. It is random and carries no path. To check that a server serves the home you mean, compare it with that home's `store-id` file; a running server for a home is recorded in `<ARCHON_HOME>/server.json`. See [Archon directories](/reference/archon-directories/).
+
+`commit` names the code the server is running: `sha` is the short commit hash and `committedAt` its commit date (ISO 8601). A server started from a source checkout reads it from the checkout once at startup, so it changes only on restart, not on a later `git pull`. A compiled binary reports the hash it was built from, with `committedAt` set to `null`. The key is omitted when there is no commit to name, for example in a source tree without its own `.git`. Settings → System shows the same value.
+
 ---
 
 ## Conversations
@@ -63,7 +95,9 @@ curl http://localhost:3090/api/health
 | PATCH | `/api/conversations/{id}` | Update a conversation (rename) |
 | DELETE | `/api/conversations/{id}` | Soft-delete a conversation |
 | GET | `/api/conversations/{id}/messages` | List messages in a conversation |
-| POST | `/api/conversations/{id}/message` | Send a message to a conversation |
+| POST | `/api/conversations/{id}/message` | Send a message to a conversation (JSON, or multipart with attachments; the text may be empty when a recording is attached, which is transcribed into the message) |
+| POST | `/api/conversations/{id}/stop` | Call off the turn running in a conversation; `{ stopped: false }` when nothing was running |
+| GET | `/api/conversations/{id}/image` | The bytes of the image at `?path=` that a reply named, re-validated against the conversation's own roots; `404` for any refusal |
 
 ### List Conversations
 
@@ -72,8 +106,11 @@ curl http://localhost:3090/api/conversations
 ```
 
 Query parameters:
-- `codebase_id` (optional) -- Filter by codebase
-- `include_deleted` (optional) -- Include soft-deleted conversations
+- `codebaseId` (optional) -- Filter by codebase
+- `platform` (optional) -- Filter by platform type
+- `mine` (optional) -- `true` narrows to the caller's own conversations on every platform when an identity resolves. Where conversations are private the list already holds only the caller's own web and CLI conversations, and `mine=true` also drops chat and forge conversations attributed to anyone else.
+
+Where web auth is enabled or `ARCHON_WEB_AUTH_HEADER` is set, web and CLI conversations are private to their owner; see [Security](/reference/security/#adapter-authorization) for the rules and status codes.
 
 ### Create a Conversation
 
@@ -88,10 +125,10 @@ Optionally specify a codebase:
 ```bash
 curl -X POST http://localhost:3090/api/conversations \
   -H "Content-Type: application/json" \
-  -d '{"codebase_id": "your-codebase-id"}'
+  -d '{"codebaseId": "your-codebase-id"}'
 ```
 
-Returns the created conversation with its `platform_conversation_id`.
+Returns the created conversation with its `conversationId`.
 
 ### Send a Message
 
@@ -135,17 +172,29 @@ Performs a soft delete -- the conversation is hidden but not destroyed.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/codebases` | List registered codebases |
+| GET | `/api/codebases` | List codebases with one representative per resolved repository remote |
 | GET | `/api/codebases/{id}` | Get a single codebase |
 | POST | `/api/codebases` | Register a codebase (clone or local path) |
-| DELETE | `/api/codebases/{id}` | Delete a codebase and clean up resources |
+| PATCH | `/api/codebases/{id}` | Rename a codebase |
+| DELETE | `/api/codebases/{id}` | Delete a codebase after container cleanup |
 | GET | `/api/codebases/{id}/environments` | List isolation environments for a codebase |
+| POST | `/api/codebases/base-branch` | Inspect the remote default branch without registering a project |
+| GET | `/api/codebases/{id}/config` | Get a codebase's merged config (defaults, global and its `.archon/config.yaml`) with secrets removed; `envKeys` lists its `env:` key names only |
+| GET | `/api/codebases/{id}/env` | List a codebase's environment variable keys (values are never returned) |
+| PUT | `/api/codebases/{id}/env` | Set or update a codebase environment variable |
+| DELETE | `/api/codebases/{id}/env/{key}` | Delete a codebase environment variable |
 
 ### List Codebases
 
 ```bash
 curl http://localhost:3090/api/codebases
 ```
+
+Returns codebases sorted by name. Repository registrations that resolve to the same remote use registration's remote equality rules, including GitHub HTTPS/SSH spellings, trailing slashes, `.git` suffixes, GitHub repository-path case variants, and equivalent local paths. Repository paths on other hosts remain case-sensitive. Only the most recently updated row for each resolved remote is returned. Folder registrations and rows without a repository URL remain separate.
+
+If a stored checkout path is invalid or a remote identity cannot be resolved, the affected row is returned unchanged and separately. Each failure logs a warning with the codebase ID, name and original error; healthy rows remain available. Database query failures still return HTTP 500.
+
+When all stored checkout paths validate, [`archon project list --json`](/reference/cli/#project-list) returns a complete inventory of registrations without collapsing duplicate remotes. An invalid stored checkout path makes that command fail and must be repaired before it can return the inventory. The API list summarizes duplicate remotes; it does not remove stored rows.
 
 ### Register a Codebase
 
@@ -165,13 +214,27 @@ curl -X POST http://localhost:3090/api/codebases \
   -d '{"path": "/home/user/projects/my-repo"}'
 ```
 
+### Rename a Codebase
+
+```bash
+curl -X PATCH http://localhost:3090/api/codebases/{id} \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-repo"}'
+```
+
+Returns the updated codebase. The name is trimmed and must be 1 to 255 characters. The response is `409` when another codebase already uses the name, or when the new name would change where Archon stores the project's worktrees, state, logs and artifacts. Repository state, logs and artifacts use the `owner/repo` name when supplied, otherwise `_local/<directory name>`; folder storage uses the slug of its name. Default worktree locations also use repository identity, which can come from the checkout path. A configured repo-local `worktree.path` instead anchors worktrees to the checkout. Rename checks the actual storage and worktree locations and succeeds only when they stay unchanged. The Web UI renames from the project's **More actions** menu or by double-clicking its name.
+
 ### Delete a Codebase
 
 ```bash
 curl -X DELETE http://localhost:3090/api/codebases/{id}
 ```
 
-Removes the codebase registration and cleans up associated worktrees and isolation environments.
+Removes the codebase registration and cleans up associated worktrees. If active container environments remain, returns `409` with their environment IDs and leaves the registration intact. Deletion does not remove containers or volumes. A worktree cleanup failure returns `500` and keeps the registration and unfinished cleanup records for retry. If a worktree is registered during cleanup, deletion returns `409`; retry the request to clean it up.
+
+If managed-workspace removal fails after the registration is deleted, the response is `500` and names the retained path. Resolve the filesystem error and remove that directory manually.
+
+Run `archon isolation cleanup 0` to remove eligible containers, then retry the DELETE request. Cleanup preserves containers owned by resumable runs; release those runs before cleanup.
 
 ### List Environments
 
@@ -179,7 +242,7 @@ Removes the codebase registration and cleans up associated worktrees and isolati
 curl http://localhost:3090/api/codebases/{id}/environments
 ```
 
-Returns the isolation environments (worktrees) associated with a codebase.
+Returns the active isolation environments (worktrees and containers) associated with a codebase.
 
 ---
 
@@ -194,6 +257,8 @@ Returns the isolation environments (worktrees) associated with a codebase.
 | POST | `/api/workflows/validate` | Validate a workflow definition (in-memory, no save) |
 | PUT | `/api/workflows/{name}` | Save (create or update) a workflow |
 | DELETE | `/api/workflows/{name}` | Delete a user-defined workflow |
+| GET | `/api/workflows/{name}/nodes/{nodeId}/source` | The command file, script file, or inline prompt/bash body one node runs, resolved in the workflow's own context |
+| DELETE | `/api/workflows/{name}/node-sessions` | Reset persisted per-node provider sessions with optional `scope` and `node` filters; omitting `scope` requires `confirm=all-scopes`, and returns `403` when conversations are private ([Security](/reference/security/#adapter-authorization)); there `scope` must name an existing conversation, and a web or CLI one must be the caller's own (chat and forge conversations need no ownership) |
 
 #### List Workflows
 
@@ -208,14 +273,14 @@ When `cwd` is omitted, Archon returns bundled default workflows and any from `~/
 
 Returns `{ workflows: [...], recommended: [...], errors?: [...] }`.
 
-- `workflows[]` — each entry is `{ workflow, source, parseWarnings? }`. `parseWarnings` contains warning messages identifying the keys the engine silently dropped from that workflow's YAML, each with the node it was found on and what to write instead (see [Unknown keys](/guides/authoring-workflows/#unknown-keys-are-reported-not-rejected)); it is **omitted entirely** when the workflow is clean, so its presence alone is the signal.
+- `workflows[]` — each entry is `{ workflow, source, parseWarnings? }`. `parseWarnings` contains warning messages identifying the keys the engine silently dropped from that workflow's YAML, each with the node it was found on and what to write instead (see [Unknown keys](/reference/workflow-language/#unknown-keys-are-reported-not-rejected)); it is **omitted entirely** when the workflow is clean, so its presence alone is the signal.
 - `recommended[]` — repo-owner-curated workflow names from `.archon/config.yaml`, filtered to discovered names and kept in declared order. Empty when there is no project context.
 - `errors[]` — YAML parsing failures encountered during discovery. Unlike `parseWarnings`, these workflows did **not** load.
 
 #### Get a Workflow
 
 ```bash
-curl http://localhost:3090/api/workflows/archon-assist
+curl http://localhost:3090/api/workflows/archon-investigate
 ```
 
 Query parameters:
@@ -263,17 +328,29 @@ Only user-defined workflows can be deleted. Bundled defaults cannot be removed.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/workflows/{name}/run` | Run a workflow (JSON or multipart) |
+| POST | `/api/workflows/{name}/run` | Run a workflow (JSON or multipart). A start the engine refuses (a workflow that does not resolve, a missing required input, an undeclared input, an unmet `requires:`) returns **400** with the engine's reason, and nothing is written or queued; for the input refusals it is the text `archon workflow run` prints. A start that names `adopt_run_id`, whose conversation sits in a worktree, or that continues a paused run of the same workflow in the conversation, is judged on the definition it will run and is answered on the conversation after a **200** |
 | GET | `/api/workflows/runs` | List workflow runs |
-| GET | `/api/workflows/runs/{runId}` | Get run details with events |
+| GET | `/api/workflows/runs/{runId}` | Get run details with events (provider events are served by the route below). `run.nodes[]` is the engine's per-node state; a `workflow:` fan-out node also carries `fan_out_outcome`, its [per-slot record and tally](/reference/workflow-language/#a-completed-fan-out-node-is-not-completed-child-work). See [node execution records](/reference/node-execution/) for event fields, reporting availability, and cost scope |
+| GET | `/api/workflows/runs/{runId}/provider-events` | The run's provider events as `{events: ProviderEventRecord[]}`: each is `{runId, stepName, attemptId, seq, observedAt, event}`, grouped by node and in emission order within one. `?step=` limits it to one node. `?attemptId=&afterSeq=` (both, and with `step`) returns only the events after that one: the attempt's later events and every later attempt's. Rows written before the engine recorded envelopes come back translated, with `attemptId: null`. Returns **400** for a partial cursor |
 | GET | `/api/runs/{runId}/artifacts` | List artifact files produced by a run |
+| GET | `/api/artifacts/{runId}/{filename}` | Read an artifact's bytes, typed from its extension (SVG, HTML and XML are served as `text/plain`; unknown types as a download); encode the complete relative filename, including slashes, as one path value |
 | GET | `/api/workflows/runs/by-worker/{platformId}` | Look up a run by worker conversation ID |
 | POST | `/api/workflows/runs/{runId}/cancel` | Cancel a running workflow: a run this server executes stops at its next status check; a run another process owns has that owner stopped first. Returns **409** with the reason, and leaves the run unchanged, when no owner answers (abandon it once its process is gone) or the owner cannot be stopped; **400** for a run that is not running |
-| POST | `/api/workflows/runs/{runId}/resume` | Resume a failed or paused workflow |
-| POST | `/api/workflows/runs/{runId}/abandon` | Abandon a run (running, paused, or failed); stops a live detached owner first and cascade-cancels non-terminal `workflow:` sub-run descendants. Returns **409** with the reason, and leaves the run unchanged, when an owner answers but cannot be stopped |
-| POST | `/api/workflows/runs/{runId}/approve` | Approve a paused workflow (400 if paused blocked on a `workflow:` child — approve the child) |
-| POST | `/api/workflows/runs/{runId}/reject` | Reject a paused workflow (400 if paused blocked on a `workflow:` child — reject the child) |
+| POST | `/api/workflows/runs/{runId}/resume` | Resume a failed or paused workflow. A run started outside the web UI resumes on the server and returns **409** with the reason, leaving the run unchanged, when its resource is full: a paused run that is ready to continue keeps its place and a continuation host continues it, and a failed run stays failed until it is resumed again. A run started from a web conversation reports the same wait in that conversation |
+| POST | `/api/workflows/runs/{runId}/abandon` | Abandon a run (running, paused, or failed); stops a live detached owner first, attempts to cancel discovered `workflow:` descendants except completed and cancelled runs within the [500-parent expansion bound](/reference/workflow-language/#max_parallel-bounds-concurrency-not-count), and attempts to remove the worktrees those runs created, keeping their branches. Owner warnings retain affected checkouts: inspect them (`lsof` when output is still held), resolve the warning, then abandon the cancelled run again to retry removal. Returns **409** with the reason, and leaves the run unchanged, when an owner answers but cannot be stopped or the run cannot be abandoned. A silent descendant also retains its checkout and the selected root's checkout, even if the root's owner stopped; each descendant needs its own owner check. If the selected sub-run has no answering endpoint, cancellation succeeds but its subtree's owned checkouts remain: silence does not prove the enclosing execution stopped. Inspect the owning execution and stop or abandon it only if you intend to stop its whole scope; repeated child-only abandonment may still retain the checkouts. |
+| POST | `/api/workflows/runs/{runId}/approve` | Approve a paused workflow; optional `expectedGate` refuses stale answers with 409 (400 if paused blocked on a `workflow:` child — approve the child) |
+| POST | `/api/workflows/runs/{runId}/reject` | Reject a paused workflow; optional `expectedGate` refuses stale answers with 409 (400 if paused blocked on a `workflow:` child — reject the child) |
+| POST | `/api/workflows/runs/{runId}/respond` | Resolve a paused gate with one of its declared decisions |
+| POST | `/api/workflows/runs/{runId}/answer` | Answer a paused attention wait in its declared form, naming the exact occurrence; `recommended: true` chooses the option it recommends, and `as` records a self-declared answerer |
+| POST | `/api/workflows/runs/{runId}/signal` | Signal an external event wait; use `occurrence` for an exact match |
 | DELETE | `/api/workflows/runs/{runId}` | Delete a terminal run and its events |
+
+For `/signal`, send `{ "event": "checks.complete", "occurrence": "<metadata.wait.pauseId>", "payload": { "conclusion": "success" } }`. The occurrence identifies the exact wait, including when deadlines repeat. The legacy `resumeAt` selector remains accepted and is required when `occurrence` is omitted; it cannot distinguish two occurrences with the same event and deadline. If both selectors are supplied, both must match. Waits persisted without a `pauseId` can still be signaled using `resumeAt`.
+
+`GET /api/workflows/runs` rejects the entire list if any row it reads has an unsupported
+persisted status. It returns HTTP 500 (`Failed to list workflow runs`), with no partial list;
+it never silently drops the offending row. Server logs record `WorkflowStatusReadError` with
+the offending run ID and exact stored value; the HTTP error does not include those details.
 
 Run responses expose `status` and `outcome` as separate fields. `status` is the execution
 lifecycle. `outcome` is the workflow-authored verdict (`"succeeded"`, `"failed"`, or `null`) and
@@ -286,19 +363,35 @@ runs. The list, detail, by-worker, and dashboard run endpoints preserve both fie
 
 ```bash
 # JSON (no attachments)
-curl -X POST http://localhost:3090/api/workflows/archon-assist/run \
+curl -X POST http://localhost:3090/api/workflows/archon-investigate/run \
   -H "Content-Type: application/json" \
-  -d '{"message": "Explain the auth module", "conversationId": "conv-123"}'
+  -d '{"message": "Why does login fail after a password reset?", "conversationId": "conv-123"}'
 
 # multipart (with file attachments — max 5 files, ≤10 MB each)
-curl -X POST http://localhost:3090/api/workflows/archon-assist/run \
+curl -X POST http://localhost:3090/api/workflows/archon-investigate/run \
   -F "conversationId=conv-123" \
   -F "message=Investigate this trace" \
   -F "files=@stacktrace.txt" \
   -F "files=@screenshot.png"
 ```
 
-**Supplying declared inputs.** A workflow that declares [`inputs:`](/guides/authoring-workflows/#running-a-workflow-that-declares-inputs) takes their values through an optional `inputs` map — a flat object of string values. Omit a name to take its declared `default:`.
+**Adoption and supersede.** JSON requests may supply `adopt_run_id` or `supersedes_run_id`,
+but cannot supply both. Unique prefixes resolve within the conversation's selected project;
+a prefix without a selected project is refused. Full IDs select the exact run without prefix
+lookup; adoption still requires the same project. Unknown or ambiguous targets and non-terminal
+targets return HTTP 400 before uploads, history writes or queuing. Ambiguity errors list candidate
+IDs. Targets are checked again when execution begins, since their status can change while queued.
+If the conversation would continue an existing run, either declaration
+is refused before continuation or its fresh fallback. The refusal names the existing run: resume
+it with `/workflow resume <id>`, abandon it with `/workflow abandon <id>` before retrying, or
+use a conversation with no open run. An accepted fresh supersede records the replaced run ID in
+`adopted_from_run_id` and `metadata.continuation.mode: "supersede"` on the new run.
+
+For an execution-time continuation refusal, the launch response still returns HTTP 200 with `accepted: true`.
+The refusal arrives as a `text` event on the conversation's SSE stream. Callers must read
+the stream to determine whether the workflow started; the JSON response alone does not confirm it.
+
+**Supplying declared inputs.** A workflow that declares [`inputs:`](/reference/workflow-language/#running-a-workflow-that-declares-inputs) takes their values through an optional `inputs` map — a flat object of string values. Omit a name to take its declared `default:`.
 
 ```bash
 # JSON: inputs is a nested object
@@ -325,7 +418,7 @@ curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
   -H "Content-Type: application/json" \
   -d '{"message":"fix #2481","conversationId":"conv-123",
        "tiers":{"large":"openai/gpt-5.6"},
-       "aliases":{"@reviewer":"codex/gpt-5.6-sol"}}'
+       "aliases":{"@reviewer":"codex/gpt-6.1-sol"}}'
 
 # multipart: each map is one JSON-encoded form field
 curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
@@ -351,7 +444,7 @@ curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
 curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
   -F "conversationId=conv-123" \
   -F "message=fix #2482" \
-  -F 'config={"docs":{"path":"handbook"},"workflows":{"quotaMaxAttempts":3}}'
+  -F 'config={"docs":{"path":"handbook"},"workflows":{"toolCallAttentionMs":600000}}'
 ```
 
 Supported inline keys are `assistant` or `defaultAssistant`, `assistants`, `tiers`, `aliases`, `workflows`, `docs.path`, and `env`. Unknown or ineffective keys fail with `400` and name the key. `configPath` is always rejected: HTTP callers cannot ask the server to read a filesystem path. Run metadata stores sealed replay content plus redacted source/key attribution, and resume uses the original layer without accepting replacement content.
@@ -378,15 +471,57 @@ Resumes the workflow from where it left off, skipping already-completed nodes. E
 # Approve (optionally with a comment)
 curl -X POST http://localhost:3090/api/workflows/runs/{runId}/approve \
   -H "Content-Type: application/json" \
-  -d '{"comment": "Looks good, proceed"}'
+  -d '{"comment": "Looks good, proceed", "expectedGate": {"nodeId": "review", "pauseId": "pause-id"}}'
 
 # Reject (optionally with a reason)
 curl -X POST http://localhost:3090/api/workflows/runs/{runId}/reject \
   -H "Content-Type: application/json" \
-  -d '{"reason": "Please add error handling first"}'
+  -d '{"reason": "Please add error handling first", "expectedGate": {"nodeId": "review", "pauseId": "pause-id"}}'
 ```
 
-**Sub-run child gates (#2121 Phase 2):** when a `workflow:` sub-run pauses at its own gate, its parent run pauses "blocked on child". Approve/reject the **child** run (its id is in the parent's block message) — the parent auto-resumes when the child completes. A child gate is the exception: it works for a 1:1 sub-run, but a child that pauses inside a `fan_out:` expansion **fails the node** instead — a parent has one approval slot and cannot hand it to N children, so gate before or after the fan-out node rather than inside a child of it. Calling approve/reject on the *parent's* id while it is blocked on a child returns **400** with a redirect to the child id. `abandon` on a parent cascade-cancels its non-terminal sub-run descendants; the response's `cascadeFailures` is non-zero if part of the tree could not be reached, and `blockedParentRunId` is set when the abandoned run was itself a child stranding a paused parent.
+Both routes accept optional `expectedGate: { nodeId, pauseId }`. For an approval
+gate with a `pauseId`, copy `nodeId` and `pauseId` from `run.metadata.approval`
+in the run detail response. For a legacy gate without `pauseId`, send its node ID
+as a string instead, for example `expectedGate: "review"`. This legacy identity
+can answer only a gate without a pause ID; it cannot answer a later gate with one. For an attention wait, use `run.attention.nodeId` as `nodeId` and
+`run.attention.occurrence` as `pauseId`. When
+the run is no longer paused at that gate occurrence, the request returns **409**
+and leaves the current pause unchanged. The identity is checked atomically with
+the answer write. Omitting `expectedGate` answers the current gate as before;
+`comment` and `reason` remain optional, and a request without a body is supported.
+
+These routes record the decision and return. The server's continuation scheduler then continues the run on the platform that started it, whichever surface answered; a container run, or a gate that was already paused when you upgraded to this version, is the exception and needs `archon workflow resume <run-id>`. The response message says which applies.
+
+**Sub-run child gates (#2121 Phase 2):** when a `workflow:` sub-run pauses at its own gate, its parent run pauses "blocked on child". Approve/reject the **child** run using the full `run.metadata.approval.childRunId` from the parent's run detail response. The stored block message contains only a short child label; a surface notice may include the full child command. The parent auto-resumes when the child completes. A child inside a `fan_out:` expansion pauses the same way: it stays paused as its own run, and the parent pauses on a `fan_out` gate listing every unfinished child, then continues once they finish. Calling approve/reject on the *parent's* id while it is blocked on a child returns **400** with a redirect to the child id (a fan-out parent's error names every child it waits on). `abandon` on a parent attempts to cancel discovered sub-run descendants except completed and cancelled runs within the [500-parent expansion bound](/reference/workflow-language/#max_parallel-bounds-concurrency-not-count). Completed and cancelled runs are left alone, but the walk still inspects beneath them. The response's `cascadeFailures` counts failed child cancellations, failed lookups, and unresolved subtrees beyond the bound. `blockedParentRunId` is set when the abandoned run was itself a child stranding a paused parent.
+
+---
+
+## Attention queue
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/runs/attention` | List attention queue items or count them with `countBy` |
+| GET | `/api/runs/attention/stream` | Stream the attention queue as server-sent events; `level=quiet\|notices\|protocol` selects how much, and `Last-Event-ID` resumes ([stream over HTTP](/getting-started/operate/#stream-over-http)) |
+| GET | `/api/runs/{runId}/attention` | Read `{ item: <attention item> }`, or `{ item: null }` when there is no queue item |
+| POST | `/api/runs/{runId}/attention/labels` | Set or remove labels on the exact attention wait occurrence a run is paused at |
+
+List and count responses add a `degraded` array when a paused row or a descendant needed
+to project its attention item cannot be read:
+`{ "type": "degraded", "reason": "run_unreadable", "runId": "<id>" }`.
+`runId` identifies the unreadable paused row, or an affected readable paused parent when
+its unreadable descendant is not paused. A parent blocked on an already-reported unreadable
+paused descendant is omitted without an additional warning; absence does not mean its block cleared.
+Readable runs and items remain available; counts cover readable matching items and may be incomplete.
+Project-scoped responses omit each warning's `runId` because the unreadable row's project membership cannot be established.
+Warnings survive project and label filters. Operator logs retain safe run IDs without stored origin contents.
+Use the logged unreadable run ID to locate the stored data to repair; a warning may name its
+readable parent instead. Read again after repair; warnings offer no run action and do not transition runs.
+Healthy responses omit `degraded`.
+
+Queue items include answerable pauses, `usage_limit` waits that continue automatically
+when a provider usage limit resets or a rate limit's wait ends (its reported reset, else a backoff), and `unreadable` pauses needing inspection. Branch on `kind` before acting:
+only `attention` and `awaiting_response` accept answers. Outside answerers can submit an
+answer through `/api/workflows/runs/{runId}/answer`. Answers and label writes that name a stale occurrence return `409`.
 
 ---
 
@@ -412,8 +547,16 @@ Returns `{ commands: [{ name, source: "bundled" | "project" }] }`.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/dashboard/runs` | List enriched workflow runs for the dashboard |
+| GET | `/api/dashboard/conversations` | Active and queued conversation processing in this server process, with acquisition and enqueue times |
 
 Query parameters include status filters, date ranges, and pagination. Used by the Command Center UI.
+
+`GET /api/dashboard/runs` rejects the entire result if a returned row or a status-count group
+contains an unsupported persisted status. Counts cover the filtered set before the status
+filter and pagination, so a bad row can fail the request even when it is outside the selected
+status or page. The response is HTTP 500 (`Failed to list dashboard runs`), with no partial
+list or counts. Server logs record `WorkflowStatusReadError` with an offending run ID and
+exact stored value; the HTTP error does not include those details.
 
 Each run includes `active_nodes`, ordered by unresolved `node_started` event order. Completion,
 failure, and both skip lifecycle events remove a node; `node_suspended` keeps it active; a retrying start adds it again. Concurrent
@@ -421,6 +564,49 @@ nodes remain separate entries. The compatibility fields `current_step_name` and
 `current_step_status` are populated only when exactly one node is active, and are `null` for zero
 or multiple active nodes. `total_steps` is `null`; observed lifecycle events do not define the
 workflow's total node count. This state describes node lifecycle, not process-owner liveness.
+
+Process-owner liveness is `owner_observation`, which dashboard runs and the run in
+`GET /api/workflows/runs/{runId}` carry. The server observes it per request, by the rule
+`archon workflow wait` uses for `owner_lost`: `reachable` when an owner answers,
+`unreachable` when the recorded owner is on the server's host and user and nothing answers,
+and `unknown` when the server cannot observe the owner (another host or user, no recorded
+owner, or no answer in time). It is `null` for a run that is not running. It is never stored
+and never changes `status`; how long a run has been quiet is not an input. The console shows
+a run whose owner is `unreachable` or `unknown` as not live and offers Abandon for
+`unreachable`.
+
+---
+
+## Metrics
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/metrics` | Aggregate stored metric records as a `MetricsReport` |
+| GET | `/api/metric-views` | The overview cards workflow packs declare, as `MetricViews` |
+
+```bash
+curl 'http://localhost:3090/api/metrics?name=factory.prs_merged&since=7d'
+```
+
+Query parameters, all optional: `since` (a duration such as `40m`, `24h`, `7d` or `2w`, or an ISO
+date or time; default 30 days before `until`), `until` (an ISO date or time; default now),
+`name`, `subject`, `codebaseId`, `compare` (an ISO date or time to split each
+instrument's records at) and `byModel` (a node id to split them by the model that ran it).
+The window is half-open. It returns the same `MetricsReport` `archon metrics --json`
+prints: per name, its definition and one entry per instrument and `measured_by` with
+`value`, `n`, `interval`, `cost`, `latest` and a daily `series`, a `compare` block when
+`compare` is given or a `by_model` block when `byModel` is, plus `refused[]`. Returns
+**400** for a malformed window or `compare`, an empty `byModel`, `compare` with `byModel`, and a
+`byModel` node none of the window's existing producing runs ran, with the AI node ids they
+did run in the error. The node is not checked when no producing run still exists: a window
+with no records returns an empty report, and records whose runs were all deleted are
+`unattributed`.
+
+`GET /api/metric-views` lists each pack's `.shared/metric-views.json` as `packs[]` (pack,
+source, `names` and `cards`) and the declarations that could not be read or did not
+validate as `errors[]`. With `codebaseId`, the codebase's project packs are included and its
+config decides whether bundled packs are; an unknown `codebaseId` returns **404**.
+See the [metrics guide](/guides/metrics/).
 
 ---
 
@@ -433,11 +619,13 @@ workflow's total node count. This state describes node lifecycle, not process-ow
 | PATCH | `/api/config/tiers` | Update model-tier presets (`small`/`medium`/`large`) |
 | PATCH | `/api/config/aliases` | Update `@custom` model aliases (per-key merge; `null` unsets) |
 | GET | `/api/providers/pi/models` | Pi's model catalog (cost/reasoning metadata; best-effort, `[]` on failure) |
-| GET | `/api/providers/{id}/supported-models` | Models the provider's own runtime offers now (Claude, Codex, Copilot — providers with `listsModels: true`); `503` with the runtime's reason when it can't answer |
+| GET | `/api/providers` | List registered AI providers |
+| GET | `/api/providers/{id}/supported-models` | Models the provider's own runtime offers now (providers with `listsModels: true`); `503` with the runtime's reason when it can't answer |
+| GET | `/api/providers/opencode/credentials` | Inspect OpenCode's backend catalog and install-wide auth state (metadata only; starts the embedded runtime on demand) |
 
 `GET /api/config` returns the safe config subset, now including the configured `tiers`, the built-in `tierDefaults` for the current default provider (what an unset tier resolves to), and the configured `aliases`.
 
-These config routes are **ungated** -- they write non-secret model config to `~/.archon/config.yaml` and work on solo installs (no `TOKEN_ENCRYPTION_KEY` required). Contrast with the [AI Provider Credentials](#ai-provider-credentials) routes below, which require an identity.
+These config routes write non-secret model config to `~/.archon/config.yaml` and work on solo installs without an identity or `TOKEN_ENCRYPTION_KEY`. They follow the general API authentication gate when enabled. Contrast with the [AI Provider Credentials](#ai-provider-credentials) routes below, which always require an identity.
 
 A `PATCH` whose resulting config would be invalid is refused with `400` and nothing is written. The `error` field names the refused key, for example `Invalid assistants config: 'assistants.codex.modelReasoningEffort': ...`. This includes an invalid value already in the file that the patch leaves in place: fix that key (in the same request or by editing the file) before other changes save.
 
@@ -514,8 +702,8 @@ curl http://localhost:3090/api/auth/providers \
 
 Returns `{ enabled, connections: [{ provider, kind, label }], available, subscriptionAvailable, agents }`:
 - `available` -- every **vendor** id you can connect an API key for (`anthropic`, `openai`, `github-copilot`, plus the Pi backends). Legacy `claude`/`codex`/`copilot` ids are accepted on writes and normalized.
-- `subscriptionAvailable` -- the subset that supports subscription (OAuth) login: **`anthropic`**, **`openai`**, and **`github-copilot`**. (The ChatGPT/Codex subscription runs an Archon-owned PKCE flow that captures the `id_token` the Codex CLI requires -- see [#1924](https://github.com/coleam00/Archon/issues/1924).)
-- `agents` -- the agent -> credential matrix: per registered agent `{ id, displayName, catalog: 'static'|'dynamic', ready, credentials: [{ vendor, displayName, kinds, connected, subscriptionAvailable, installEnv, ambientConfigured? }] }`. `installEnv`/`ambientConfigured` report server-side detection so readiness renders on solo installs too; OpenCode is `catalog:'dynamic'` (introspect via `GET /api/providers/opencode/credentials`).
+- `subscriptionAvailable` -- the subset that supports subscription (OAuth) login: **`anthropic`**, **`openai`**, and **`github-copilot`**. (The ChatGPT/Codex subscription runs an Archon-owned PKCE flow -- see [#1924](https://github.com/coleam00/Archon/issues/1924).)
+- `agents` -- the agent -> credential matrix: per registered agent `{ id, displayName, catalog: 'static'|'dynamic', ready, credentials: [{ vendor, displayName, kinds, connected, connectionConsumed, subscriptionAvailable, installEnv, ambientConfigured?, usable }] }`. `connectionConsumed` says whether the agent uses the `connected` credential's kind (a connected `anthropic` subscription is consumed by Claude Code, not Pi). `usable` is true for a consumed connection, install env, or detected ambient chain, and `ready` is true when any credential is `usable`. `installEnv` counts only the env vars that agent reads; `installEnv`/`ambientConfigured` report server-side detection so readiness renders on solo installs too; OpenCode is `catalog:'dynamic'` (introspect via `GET /api/providers/opencode/credentials`).
 
 ### Connect an API Key
 
@@ -563,6 +751,18 @@ The CLI equivalent of this whole surface is [`archon ai`](/reference/cli/#ai). F
 
 ---
 
+## Web push
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/web-push/key` | Get the browser push VAPID public key |
+| POST | `/api/web-push/subscriptions` | Subscribe this browser to push notifications for the current user |
+| DELETE | `/api/web-push/subscriptions` | Remove a browser push subscription by endpoint for the current user |
+
+Subscription writes require a resolved Web identity, including on solo installs.
+
+---
+
 ## System
 
 | Method | Path | Description |
@@ -587,7 +787,7 @@ These are Server-Sent Events (SSE) endpoints -- connect with `EventSource` in a 
 curl -N http://localhost:3090/api/stream/your-conversation-id
 ```
 
-Events are JSON-encoded with a `type` field. See the [Web UI documentation](/adapters/web/#sse-streaming) for the full list of event types.
+Events are JSON-encoded with a `type` field.
 
 ---
 
@@ -599,7 +799,7 @@ Events are JSON-encoded with a `type` field. See the [Web UI documentation](/ada
 # 1. Create a conversation
 CONV_ID=$(curl -s -X POST http://localhost:3090/api/conversations \
   -H "Content-Type: application/json" \
-  -d '{}' | jq -r '.platform_conversation_id')
+  -d '{}' | jq -r '.conversationId')
 
 # 2. Send a message
 curl -X POST http://localhost:3090/api/conversations/$CONV_ID/message \
@@ -616,12 +816,12 @@ curl http://localhost:3090/api/conversations/$CONV_ID/messages
 # 1. Create a conversation scoped to a codebase
 CONV_ID=$(curl -s -X POST http://localhost:3090/api/conversations \
   -H "Content-Type: application/json" \
-  -d '{"codebase_id": "your-codebase-id"}' | jq -r '.platform_conversation_id')
+  -d '{"codebaseId": "your-codebase-id"}' | jq -r '.conversationId')
 
 # 2. Start the workflow
-curl -X POST http://localhost:3090/api/workflows/archon-assist/run \
+curl -X POST http://localhost:3090/api/workflows/archon-investigate/run \
   -H "Content-Type: application/json" \
-  -d "{\"message\": \"How does auth work?\", \"conversationId\": \"$CONV_ID\"}"
+  -d "{\"message\": \"Why does login fail after a password reset?\", \"conversationId\": \"$CONV_ID\"}"
 
 # 3. Monitor via SSE
 curl -N http://localhost:3090/api/stream/$CONV_ID

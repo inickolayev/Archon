@@ -1,36 +1,10 @@
-/**
- * Shared structured-output helpers.
- *
- * Best-effort providers (Pi/Copilot) have no native JSON-mode equivalent to
- * Claude's `outputFormat` or Codex's `outputSchema`, so they use a two-step
- * approach:
- *   1. Augment the user prompt with a "respond with JSON matching this schema"
- *      instruction, so instruction-following models emit parseable JSON.
- *   2. After the run completes, parse the accumulated assistant transcript
- *      (`tryParseStructuredOutput`).
- *
- * When parsing fails it returns `undefined`. For a node that declared
- * `output_format`, the dag-executor re-asks best-effort providers up to 3× (with
- * the schema errors appended) and then FAILS the node — it no longer degrades
- * silently to a warning. Enforced providers fail fast (no reask).
- *
- * This module also owns the cross-provider validation layer the dag-executor
- * runs for EVERY provider (enforced and best-effort): `validateStructuredOutput()`
- * checks a parsed value against the node's declared JSON Schema (ajv), and
- * `formatSchemaErrors()` renders the failures for logs and the reask prompts.
- */
-// Direct `ajv` / `jsonrepair` imports (not via @hono/zod-openapi): @archon/providers
-// is an SDK-deps-only leaf package that must not pull in Hono. Precedent: the
-// direct `zod` import in claude/native-tools.ts (see CLAUDE.md Zod conventions).
-// ajv MUST resolve to ^8 — a transitive ajv@6 exists in the tree with a different
-// API/draft; the package.json `^8` dep pins it per package.
-import Ajv, { type ErrorObject, type ValidateFunction } from 'ajv';
 import { jsonrepair } from 'jsonrepair';
+import { isObjectSchemaNode, visitJsonSchema } from '@archon/provider-contract';
 
 /**
  * Append a "respond with JSON matching this schema" instruction to the user
- * prompt. Same wording originally authored for Pi — reused verbatim so
- * prompt drift across providers is zero.
+ * prompt, for a best-effort provider that has no structured channel. Pi asks
+ * for its `structured_output` tool call instead.
  */
 export function augmentPromptForJsonSchema(
   prompt: string,
@@ -139,317 +113,25 @@ function tryJsonParseObject(text: string): unknown {
 }
 
 /**
- * True when `node`'s shape marks it as a JSON-Schema object node: it declares
- * `type: 'object'` (or a type union including `'object'`) or carries a
- * `properties` map. OpenAI strict-mode requires `additionalProperties: false`
- * on exactly these nodes.
- */
-function isObjectSchemaNode(node: Record<string, unknown>): boolean {
-  const typeIncludesObject =
-    node.type === 'object' || (Array.isArray(node.type) && node.type.includes('object'));
-  return typeIncludesObject || 'properties' in node;
-}
-
-/**
- * Recursively inject `additionalProperties: false` on every object schema so a
- * JSON Schema satisfies OpenAI's Structured Outputs strict-mode validator.
- *
- * OpenAI rejects any `object` node that does not declare `additionalProperties:
- * false` (HTTP 400 invalid_json_schema). Claude and most other providers don't
- * require this, so workflow authors write portable `output_format` schemas and
- * the Codex provider adapts them here. Returns a deep clone — the caller's
- * schema object is never mutated.
- *
- * A pre-existing `additionalProperties` on an object — including a value
- * subschema like `additionalProperties: { type: 'string' }` (an open record /
- * map) — is replaced with `false`. OpenAI strict-mode forbids open or typed
- * additional properties, so `false` is the only value the API accepts; keeping
- * the subschema would just re-trigger the HTTP 400 this normalizer exists to fix.
- * Callers that want to warn the author before silently dropping those semantics
- * can detect the case up front with {@link hasOpenAdditionalProperties}.
- *
- * Scope: only `additionalProperties` is injected. The other strict-mode rule
- * (every key in `properties` must appear in `required`) is intentionally NOT
- * enforced here — forcing it would silently turn optional fields into required
- * ones. See issue #1843.
- */
-export function normalizeJsonSchemaForOpenAiStrict(
-  schema: Record<string, unknown>
-): Record<string, unknown> {
-  return normalizeNode(schema) as Record<string, unknown>;
-}
-
-/**
- * Recursive worker for {@link normalizeJsonSchemaForOpenAiStrict}. Walks any
- * JSON value (object, array, or scalar); only object nodes are closed. Kept
- * private so the public entry point can express the real `Record → Record`
- * contract while recursion still descends into arrays and scalars.
- */
-function normalizeNode(node: unknown): unknown {
-  if (Array.isArray(node)) {
-    return node.map(normalizeNode);
-  }
-  if (node === null || typeof node !== 'object') {
-    return node;
-  }
-
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    result[key] = normalizeNode(value);
-  }
-  if (isObjectSchemaNode(result)) {
-    result.additionalProperties = false;
-  }
-
-  return result;
-}
-
-/**
  * True if any object node in `schema` declares `additionalProperties` as
  * something other than `false` — e.g. `additionalProperties: true` or an
  * open-record subschema like `additionalProperties: { type: 'string' }`.
- * {@link normalizeJsonSchemaForOpenAiStrict} silently rewrites these to `false`
+ * Strict-mode schema preparation silently rewrites these to `false`
  * for OpenAI strict-mode; the Codex provider uses this to warn the author that
  * their open-record semantics were dropped. Detection reuses the normalizer's
  * object-node rule, so it never flags a node the normalizer would leave
  * untouched. See issue #1843.
  */
 export function hasOpenAdditionalProperties(schema: unknown): boolean {
-  if (Array.isArray(schema)) {
-    return schema.some(hasOpenAdditionalProperties);
-  }
-  if (schema === null || typeof schema !== 'object') {
-    return false;
-  }
-  const node = schema as Record<string, unknown>;
-  if (
-    isObjectSchemaNode(node) &&
-    'additionalProperties' in node &&
-    node.additionalProperties !== false
-  ) {
-    return true;
-  }
-  return Object.values(node).some(hasOpenAdditionalProperties);
-}
-
-// ─── Strict-mode required-coverage detection ──────────────────────────────────
-
-/**
- * A single object schema node whose `properties` keys are not fully covered by
- * its `required` array. `schemaPath` is a dotted path from the schema root
- * (e.g. `"output_format.properties.status"`).
- */
-export interface RequiredPropertyGap {
-  /** Dotted path from the schema root */
-  schemaPath: string;
-  /** Property keys declared in `properties` but absent from `required` */
-  missing: string[];
-}
-
-/**
- * Find every object schema node, at any depth, whose `properties` keys are not
- * fully covered by its `required` array. Only object nodes with a `properties`
- * map are checked (OpenAI strict-mode's target).
- *
- * `basePath` is prepended to every gap path so callers get meaningful
- * schema-root-relative locations (e.g. pass `'output_format'`).
- */
-export function findRequiredPropertyGaps(schema: unknown, basePath: string): RequiredPropertyGap[] {
-  return collectGaps(schema, basePath);
-}
-
-function collectGaps(
-  schema: unknown,
-  path: string,
-  out: RequiredPropertyGap[] = []
-): RequiredPropertyGap[] {
-  if (schema === null || typeof schema !== 'object') return out;
-  if (Array.isArray(schema)) {
-    schema.forEach((item, i) => collectGaps(item, `${path}[${i}]`, out));
-    return out;
-  }
-  const record = schema as Record<string, unknown>;
-  const properties = record.properties;
-  if (properties !== null && typeof properties === 'object' && !Array.isArray(properties)) {
-    const required = new Set(Array.isArray(record.required) ? (record.required as string[]) : []);
-    const missing = Object.keys(properties).filter(key => !required.has(key));
-    if (missing.length > 0) out.push({ schemaPath: path, missing });
-  }
-
-  const collectSchema = (key: string): void => {
-    if (key in record) collectGaps(record[key], `${path}.${key}`, out);
-  };
-  const collectSchemaArray = (key: string): void => {
-    const schemas = record[key];
-    if (!Array.isArray(schemas)) return;
-    schemas.forEach((item, index) => collectGaps(item, `${path}.${key}[${index}]`, out));
-  };
-  const collectSchemaMap = (key: string): void => {
-    const schemas = record[key];
-    if (schemas === null || typeof schemas !== 'object' || Array.isArray(schemas)) return;
-    for (const [name, subschema] of Object.entries(schemas)) {
-      collectGaps(subschema, `${path}.${key}.${name}`, out);
+  let found = false;
+  visitJsonSchema(schema, 'output_format', node => {
+    if (
+      isObjectSchemaNode(node) &&
+      'additionalProperties' in node &&
+      node.additionalProperties !== false
+    ) {
+      found = true;
     }
-  };
-
-  for (const key of [
-    'additionalProperties',
-    'unevaluatedProperties',
-    'propertyNames',
-    'contains',
-    'not',
-    'if',
-    'then',
-    'else',
-    'contentSchema',
-  ]) {
-    collectSchema(key);
-  }
-  if (Array.isArray(record.items)) collectSchemaArray('items');
-  else collectSchema('items');
-  for (const key of ['prefixItems', 'allOf', 'anyOf', 'oneOf']) collectSchemaArray(key);
-  for (const key of [
-    'properties',
-    'patternProperties',
-    'dependentSchemas',
-    'dependencies',
-    '$defs',
-    'definitions',
-  ]) {
-    collectSchemaMap(key);
-  }
-  return out;
-}
-
-// ─── Schema validation (ajv) ─────────────────────────────────────────────────
-
-/**
- * Single process-wide ajv instance. `strict: false` keeps it tolerant of the
- * dialect drift real author schemas carry (unknown keywords/formats are ignored
- * rather than throwing at compile time); `allErrors: true` surfaces every
- * failure at once so a reask prompt can list them all.
- */
-const ajv = new Ajv({ allErrors: true, strict: false });
-
-/**
- * Compiled-validator cache keyed by the schema object identity. Compilation is
- * the cost (validation is cheap), and the dag-executor passes the same
- * `node.output_format` object across a node's lifetime (including every reask
- * attempt), so a WeakMap keyed by reference is a free hit without holding the
- * schema alive past its node.
- */
-const validatorCache = new WeakMap<object, ValidateFunction>();
-
-/**
- * Compile `schema` once and keep the validator in {@link validatorCache}.
- * Throws ajv's compile error unchanged; both public entry points translate it.
- *
- * The `removeSchema` call drops ajv's OWN registry entry while keeping the
- * compiled function. Without it, a schema that declares `$id` registers that id
- * process-wide, and the next compile of an equivalent-but-distinct schema object
- * — the same workflow re-parsed for `/workflow list`, an include-expanded clone,
- * or a second run of the same file — throws `schema with key or id "…" already
- * exists`. That used to degrade to a warning; a compile failure is now fatal at
- * load and at the node boundary, so the duplicate registration would turn a
- * perfectly valid workflow into a spurious failure. Nothing here resolves a
- * `$ref` against another node's schema, so the registry has no other job.
- */
-function compileAndCache(schema: Record<string, unknown>): ValidateFunction {
-  try {
-    const validate = ajv.compile(schema);
-    validatorCache.set(schema, validate);
-    return validate;
-  } finally {
-    // ajv registers a `$id` BEFORE it resolves references, so a compile that throws on
-    // a dangling `$ref` still leaves the id registered; without this the author's next
-    // attempt with the same `$id` fails with "already exists" instead of their real error.
-    ajv.removeSchema(schema);
-  }
-}
-
-/**
- * Compile a declared `output_format` and report why ajv rejected it, or `null`
- * when it compiles. The workflow loader calls this for every node schema so a
- * contract that cannot be enforced fails the file BEFORE a provider is paid,
- * instead of surfacing as a runtime warning after the spend.
- *
- * `strict: false` keeps tolerated dialect annotations (unknown keywords and
- * formats) compiling, so only a schema ajv genuinely rejects — a dangling
- * `$ref`, an invalid keyword value — produces a message. A successful compile
- * warms the same cache {@link validateStructuredOutput} reads, so the load-time
- * check costs nothing at runtime.
- */
-export function compileOutputSchema(schema: Record<string, unknown>): string | null {
-  if (validatorCache.has(schema)) return null;
-  try {
-    compileAndCache(schema);
-    return null;
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
-  }
-}
-
-/**
- * Discriminated so the `errors` array only exists on the failure branch — the
- * caller can't read errors off a valid result, and a valid result can't smuggle
- * a non-empty errors list.
- */
-export type StructuredValidationResult = { valid: true } | { valid: false; errors: string[] };
-
-/**
- * Validate a parsed structured-output value against the node's declared JSON
- * Schema. Used for EVERY provider that declares `output_format` — even
- * SDK-enforced ones (Claude/Codex/OpenCode) need this net for the refusal /
- * `max_tokens`-truncation edges that bypass grammar-constrained decoding.
- *
- * The author's schema is validated as written — `additionalProperties` is NOT
- * required (that is an OpenAI-strict-mode concern handled separately by the
- * Codex normalizer), and optional fields stay optional.
- *
- * A schema ajv cannot compile (exotic dialect, bad `$ref`) is reported through
- * the `onCompileError` hook and the value is NOT judged here — the result is
- * `{ valid: true }` because this helper has no schema to judge against. Deciding
- * what an unenforceable contract means belongs to the caller: the dag-executor
- * fails the node, because {@link compileOutputSchema} already rejects such a
- * schema at load time, so reaching this branch means a declared contract would
- * otherwise cross a boundary unenforced.
- */
-export function validateStructuredOutput(
-  value: unknown,
-  schema: Record<string, unknown>,
-  onCompileError?: (message: string) => void
-): StructuredValidationResult {
-  let validate = validatorCache.get(schema);
-  if (!validate) {
-    try {
-      validate = compileAndCache(schema);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      onCompileError?.(message);
-      // Can't validate → don't block. The net only covers compilable schemas.
-      return { valid: true };
-    }
-  }
-
-  if (validate(value)) return { valid: true };
-  return { valid: false, errors: formatSchemaErrors(validate.errors) };
-}
-
-/**
- * Render ajv errors as `path: message` lines for reask prompts and logs.
- * `instancePath` is empty for a root-level failure (e.g. a missing top-level
- * required field), rendered as `(root)`. Returns a single generic line when ajv
- * reports a failure with no error detail (shouldn't happen with `allErrors`).
- */
-export function formatSchemaErrors(errors: ErrorObject[] | null | undefined): string[] {
-  if (!errors || errors.length === 0) {
-    return ['value does not match the declared schema'];
-  }
-  return errors.map(e => {
-    const path = e.instancePath && e.instancePath.length > 0 ? e.instancePath : '(root)';
-    const detail = e.params?.missingProperty
-      ? `${e.message} ('${String(e.params.missingProperty)}')`
-      : (e.message ?? 'invalid');
-    return `${path}: ${detail}`;
   });
+  return found;
 }

@@ -43,7 +43,7 @@ interface MessageItemProps {
 }
 
 const ERROR_BLOCK = (msg: string): ReactElement => (
-  <div className="mt-2 rounded border border-error/40 bg-error/10 px-2 py-1.5 font-mono text-[12px] text-error">
+  <div className="mt-2 rounded border border-error/40 bg-error/10 px-2 py-1.5 font-mono text-console-12 text-error">
     {msg}
   </div>
 );
@@ -90,9 +90,9 @@ export function MessageItem({
         }}
         aria-label="Reply to this message"
         title="Reply"
-        className="rounded p-[2px] text-text-tertiary opacity-0 transition-[opacity,color] hover:bg-[color:var(--surface-hover)] hover:text-text-primary focus-visible:opacity-100 group-hover/message:opacity-100"
+        className="rounded p-0.5 text-text-tertiary opacity-0 transition-[opacity,color] hover:bg-[color:var(--surface-hover)] hover:text-text-primary focus-visible:opacity-100 group-hover/message:opacity-100"
       >
-        <Reply className="h-[13px] w-[13px]" />
+        <Reply className="h-3.25 w-3.25" />
       </button>
     );
 
@@ -118,9 +118,9 @@ export function MessageItem({
   if (kind === 'user') {
     return (
       <div className="group/message flex flex-col items-end">
-        <header className="mb-2 flex flex-row-reverse items-center gap-[9px] font-mono">
+        <header className="mb-2 flex flex-row-reverse items-center gap-2.25 font-mono">
           <span
-            className="max-w-[260px] truncate rounded px-[7px] py-[2px] text-[10px] font-bold uppercase tracking-[0.14em]"
+            className="max-w-65 truncate rounded px-1.75 py-0.5 text-console-10 font-bold uppercase tracking-console-label"
             title={author ?? undefined}
             style={{
               color: 'var(--brand-magenta)',
@@ -132,21 +132,21 @@ export function MessageItem({
           <time
             dateTime={message.timestamp}
             title={clock}
-            className="text-[11px] tracking-[0.3px] text-text-tertiary"
+            className="text-console-11 tracking-console-detail text-text-tertiary"
           >
             {clock}
           </time>
           {replyButton}
         </header>
         {quotes.length > 0 ? (
-          <div className="mb-[7px] max-w-[76%] self-end">
+          <div className="mb-1.75 max-w-[76%] self-end">
             {quotes.map((quote, index) => (
               <QuotedBlock key={index} quote={quote} />
             ))}
           </div>
         ) : null}
         <div
-          className="max-w-[76%] self-end rounded-[14px_14px_4px_14px] px-[17px] py-[13px] text-[14.5px] leading-[1.5] break-words"
+          className="max-w-[76%] self-end rounded-xl rounded-br px-4.25 py-3.25 text-console-15 leading-[1.5] break-words"
           style={{
             background: 'color-mix(in oklch, var(--brand-magenta), transparent 94%)',
             border: '1px solid color-mix(in oklch, var(--brand-magenta), transparent 50%)',
@@ -173,9 +173,9 @@ export function MessageItem({
 
   return (
     <div className="group/message flex flex-col">
-      <header className="mb-2 flex items-center gap-[9px] font-mono">
+      <header className="mb-2 flex items-center gap-2.25 font-mono">
         <span
-          className="rounded px-[7px] py-[2px] text-[10px] font-bold uppercase tracking-[0.14em]"
+          className="rounded px-1.75 py-0.5 text-console-10 font-bold uppercase tracking-console-label"
           style={{
             color: 'var(--brand-teal)',
             background: 'color-mix(in oklch, var(--brand-teal), transparent 88%)',
@@ -186,13 +186,13 @@ export function MessageItem({
         <time
           dateTime={message.timestamp}
           title={clock}
-          className="text-[11px] tracking-[0.3px] text-text-tertiary"
+          className="text-console-11 tracking-console-detail text-text-tertiary"
         >
           {clock}
         </time>
         {replyButton}
       </header>
-      <div className="flex max-w-full items-start gap-[13px]">
+      <div className="flex max-w-full items-start gap-3.25">
         {log ? null : (
           <div className="shrink-0">
             <AgentAvatar size={30} />
@@ -200,7 +200,7 @@ export function MessageItem({
         )}
         <div className="min-w-0 flex-1">
           <div
-            className="rounded-[12px] border bg-[color:var(--surface-elevated)] px-4 py-[14px]"
+            className="rounded-console-12 border bg-[color:var(--surface-elevated)] px-4 py-3.5"
             style={
               log
                 ? {
@@ -217,8 +217,8 @@ export function MessageItem({
               <div
                 className={
                   log
-                    ? 'max-w-none font-mono text-[12px] leading-[1.7] text-text-secondary'
-                    : 'max-w-none text-[14.5px] leading-[1.62] text-text-primary'
+                    ? 'max-w-none font-mono text-console-12 leading-[1.7] text-text-secondary'
+                    : 'max-w-none text-console-15 leading-[1.62] text-text-primary'
                 }
               >
                 <MessageMarkdown

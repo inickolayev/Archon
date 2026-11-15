@@ -1,13 +1,37 @@
 /**
- * Filesystem and logging helpers shared by tests across packages.
+ * Filesystem, logging and environment helpers shared by tests across packages.
  *
  * This module is test-only. Nothing in `src/` imports it; it lives here because
  * `@archon/paths` is the one package every consumer of these helpers already depends on.
  */
-import { afterEach } from 'bun:test';
+import { afterEach, beforeEach, spyOn } from 'bun:test';
 import { rm } from 'node:fs/promises';
 import pino from 'pino';
-import { rootLogger } from './logger';
+import { rootLogger, setLogSink } from './logger';
+
+/**
+ * The default per-test budget on every platform: `bun test` runs there with `--timeout` set to this
+ * instead of Bun's 5 s default (see `scripts/bun-test-command.ts`).
+ *
+ * This is an attributed runner-floor residual, not headroom for slow tests: on the 4-vCPU
+ * `windows-latest` VM a child that touches the OS disk while it is saturated (Windows' own
+ * background maintenance reads it too) can take seconds regardless of which test issued it
+ * (coleam00/Archon#3294). The Windows leg keeps test temp on the runner's local disk for that
+ * reason (`.github/workflows/test.yml`). A wait inside a test should be bounded by this
+ * budget, not by a shorter timer of its own.
+ */
+export const DEFAULT_TEST_TIMEOUT_MS = 20_000;
+
+/**
+ * An explicit per-test budget that never undercuts the runner default.
+ *
+ * `--timeout` only sets the default, so a raw `it(name, fn, 10_000)` replaces the 20 s
+ * default with 10 s and reopens the stalls the floor absorbs. Pass a budget at
+ * or below the floor through here; a budget above it is safe as a plain number.
+ */
+export function testTimeout(ms: number): number {
+  return Math.max(ms, DEFAULT_TEST_TIMEOUT_MS);
+}
 
 /** Attempts before a stuck tree is reported as a leak rather than retried again. */
 const MAX_ATTEMPTS = 10;
@@ -132,4 +156,87 @@ export function captureLogLines(): { lines: Record<string, unknown>[]; restore()
       stream.write = write;
     },
   };
+}
+
+const STUB_LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace'] as const;
+
+/**
+ * Route a stub logger's calls through a real Pino logger at `trace` and record each
+ * emitted line. A secret check must read these lines rather than the stub's call
+ * arguments: `JSON.stringify` drops an `Error`'s message and stack, while the
+ * production `err` serializer emits both.
+ */
+export function captureStubLogOutput(
+  logger: Record<(typeof STUB_LOG_LEVELS)[number], (...args: never[]) => unknown>
+): { output(): string; restore(): void } {
+  const lines: string[] = [];
+  setLogSink(line => lines.push(line));
+  const realLog = rootLogger.child({}, { level: 'trace' });
+  const spies = STUB_LOG_LEVELS.map(level =>
+    spyOn(logger, level).mockImplementation(((...args: unknown[]) => {
+      (realLog[level] as (...logArgs: unknown[]) => void)(...args);
+    }) as never)
+  );
+  return {
+    output: (): string => lines.join(''),
+    restore: (): void => {
+      for (const spy of spies) spy.mockRestore();
+      setLogSink(undefined);
+    },
+  };
+}
+
+let compiledBinarySkipAnnounced = false;
+
+/**
+ * Whether tests that build a fresh executable with `bun build --compile` skip on this host.
+ *
+ * They skip on macOS unless `ARCHON_TEST_COMPILED_BINARIES=1`: running them locally has
+ * preceded a stuck `syspolicyd`, after which every new process on the machine queues behind
+ * the daemon until a reboot. CI runs on Linux and Windows, so it always runs them. Bun
+ * reports a skipped test only as a count, so the first skip in a process says why on stderr.
+ */
+export function skipCompiledBinaryTests(): boolean {
+  const skip = process.platform === 'darwin' && process.env.ARCHON_TEST_COMPILED_BINARIES !== '1';
+  if (skip && !compiledBinarySkipAnnounced) {
+    compiledBinarySkipAnnounced = true;
+    console.warn(
+      'Skipping tests that compile a binary with `bun build --compile` on macOS; set ARCHON_TEST_COMPILED_BINARIES=1 to run them.'
+    );
+  }
+  return skip;
+}
+
+/** Environment variables the `@archon/paths` path functions read. */
+const PATH_ENV_VARS = [
+  'WORKSPACE_PATH',
+  'WORKTREE_BASE',
+  'ARCHON_HOME',
+  'ARCHON_DOCKER',
+  'HOME',
+  'WSL_DISTRO_NAME',
+] as const;
+
+/**
+ * Save the path environment variables before each test and restore them after it,
+ * deleting any that were unset. Call at the top of a describe block.
+ */
+export function usePathEnvSnapshot(): void {
+  const snapshot: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of PATH_ENV_VARS) {
+      snapshot[key] = process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of PATH_ENV_VARS) {
+      if (snapshot[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = snapshot[key];
+      }
+    }
+  });
 }

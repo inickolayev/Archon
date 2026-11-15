@@ -49,9 +49,14 @@ mock.module('@archon/core', () => ({
   getDatabaseType: () => 'sqlite',
   loadConfig: mock(async () => ({})),
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
-  getCommandFolderSearchPaths: mock(() => ['.archon/commands', '.archon/commands/defaults']),
-  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
-  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
+  getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
+  getBundledWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows'),
+  ProjectRegistrationError: class ProjectRegistrationError extends Error {},
+  inspectProjectBaseBranch: mock(async () => ({
+    kind: 'repo',
+    defaultBranch: 'dev',
+    reason: null,
+  })),
   cloneRepository: mock(async () => {}),
   registerRepository: mock(async () => ({ success: true })),
   removeWorktree: mock(async () => ({ success: true })),
@@ -61,7 +66,7 @@ mock.module('@archon/core', () => ({
       this.name = 'ConversationNotFoundError';
     }
   },
-  generateAndSetTitle: mockGenerateAndSetTitle,
+  generateTitleForUser: mockGenerateAndSetTitle,
   resolveTitleRequest: mockResolveTitleRequest,
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   createLogger: () => ({
@@ -100,7 +105,11 @@ mock.module('@archon/core/db/conversations', () => ({
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({}));
-mock.module('@archon/core/db/workflows', () => ({}));
+mock.module('@archon/core/db/workflows', () => ({
+  getRunIdsByIsolationEnvId: mock(async (): Promise<string[]> => []),
+  getWorkflowRunsByIds: mock(async () => []),
+  getWorkflowRunForAttention: mock(async () => null),
+}));
 mock.module('@archon/core/db/workflow-events', () => ({}));
 const mockAddMessage = mock(async (_convId: string, _role: string, _content: string) => ({
   id: 'msg-uuid-1',
@@ -435,9 +444,7 @@ describe('POST /api/conversations with message (atomic create+send)', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
 
     const lastCall = mockGenerateAndSetTitle.mock.calls.at(-1);
-    expect(lastCall?.[2]).toBe('codex'); // resolved provider, not the raw assistant type
-    expect(lastCall?.[5]).toEqual(titleOptions.assistantConfig);
-    expect(lastCall?.[6]).toEqual(titleOptions);
+    expect(lastCall?.[2]).toEqual({ provider: 'codex', options: titleOptions });
   });
 
   test('skips title generation for slash commands', async () => {
@@ -738,6 +745,9 @@ describe('POST /api/conversations/:id/message — fan-out to Telegram', () => {
       mockWebAdapter,
       mockLockManager,
       undefined,
+      undefined,
+      {},
+      undefined,
       () => telegram.adapter as never
     );
 
@@ -769,6 +779,9 @@ describe('POST /api/conversations/:id/message — fan-out to Telegram', () => {
       mockWebAdapter,
       mockLockManager,
       undefined,
+      undefined,
+      {},
+      undefined,
       () => telegram.adapter as never
     );
 
@@ -799,6 +812,9 @@ describe('POST /api/conversations/:id/message — fan-out to Telegram', () => {
       app,
       mockWebAdapter,
       mockLockManager,
+      undefined,
+      undefined,
+      {},
       undefined,
       () => telegram.adapter as never
     );

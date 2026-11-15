@@ -1,6 +1,6 @@
-@import 'tailwindcss';
-@import 'highlight.js/styles/github-dark-dimmed.min.css';
-@import '@xyflow/react/dist/style.css';
+@import "tailwindcss";
+@import "highlight.js/styles/github-dark-dimmed.min.css";
+@import "@xyflow/react/dist/style.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -43,6 +43,30 @@
 }
 
 @theme inline {
+  /* Console dimensions; font tokens deliberately inherit line-height. */
+  --text-console-9: 9px;
+  --text-console-10: 10px;
+  --text-console-11: 11px;
+  --text-console-12: 12px;
+  --text-console-13: 13px;
+  --text-console-14: 14px;
+  --text-console-15: 15px;
+  --text-console-17: 17px;
+  --text-console-18: 18px;
+  --text-console-22: 22px;
+  --text-console-34: 34px;
+  --radius-console-12: 12px;
+  --radius-console-16: 16px;
+  --tracking-console-label: 0.14em;
+  --tracking-console-label-wide: 0.16em;
+  --tracking-console-display: 0.2em;
+  --tracking-console-tight: -0.2px;
+  --tracking-console-tighter: -0.4px;
+  --tracking-console-detail: 0.3px;
+  --tracking-console-badge: 0.6px;
+  --tracking-console-body: -0.005em;
+  --tracking-console-heading: -0.028em;
+
   /* App-specific theme colors */
   --color-background: var(--background);
   --color-surface: var(--surface);
@@ -67,8 +91,8 @@
   --color-node-loop: var(--node-loop);
   --color-node-approval: var(--node-approval);
   --color-node-wait: var(--node-wait);
-  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
 
   /* Shared theme mappings used outside the console */
   --color-foreground: var(--foreground);

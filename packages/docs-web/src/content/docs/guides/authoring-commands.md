@@ -28,9 +28,9 @@ A command is a **markdown file** that serves as a detailed instruction set for a
 
 Shared commands live in `.archon/commands/` relative to the working directory. Ordinary command nodes load them at runtime. When a workflow is composed through `include:`, Archon resolves and snapshots its command bodies during load-time composition so references and declared inputs can be validated before the nodes join the parent's DAG. A packaged workflow keeps its commands beside the YAML in `<workflow>/commands/`; those references resolve only inside the owning package and do not fall back to shared commands.
 
-> **`defaults/` is maintainer-territory:** `.archon/commands/defaults/` is reserved for commands shipped with Archon itself (embedded into the binary at build time). For your own commands use an owning workflow package's `commands/`, `.archon/commands/` (project-scoped), or `~/.archon/commands/` (home-scoped). Every file under `defaults/` must be committed in git — `bun run validate` will error if untracked files are found there.
+> **Bundled commands live inside their workflow packages:** Commands shipped with Archon sit beside the workflow that uses them, under `.archon/workflows/<pack>/<workflow>/commands/`, and are embedded into the binary at build time. There is no shared bundled command directory. For your own commands use an owning workflow package's `commands/`, `.archon/commands/` (project-scoped), or `~/.archon/commands/` (home-scoped).
 
-> **CLI vs Server:** The CLI reads commands from wherever you run it (sees uncommitted changes). The server reads from `~/.archon/workspaces/owner/repo/`, which only syncs from the remote before worktree creation — so changes must be committed and pushed for the server to pick them up.
+> **CLI vs Server:** The CLI reads commands from wherever you run it, including uncommitted changes. The server uses the registered project's saved checkout path. An existing local registration can point to your checkout or a subdirectory of it, so the server reads local files there. A new webhook registration creates a managed clone at `~/.archon/workspaces/owner/repo/source/`, or at a suffixed path such as `owner/repo-2/source/` when that project name is taken; commit and push changes from another checkout so that clone can receive them when it syncs. Worktree runs use files in their worktree.
 
 Commands use this structure:
 
@@ -229,12 +229,12 @@ Archon replaces variables in command text before sending to the AI. The most com
 |----------|-------|
 | `$ARGUMENTS` / `$USER_MESSAGE` | User's whole input message (positional `$1`/`$2`/`$3` are not supported) |
 | `$ARTIFACTS_DIR` | Pre-created artifacts directory for this workflow run |
-| `$BASE_BRANCH` | Base branch (auto-detected or configured) |
+| `$BASE_BRANCH` | The run's resolved or recorded base branch; see [resolution and child inheritance rules](/reference/variables/#workflow-variables) |
 | `$DOCS_DIR` | Documentation directory path (default: `docs/`) |
 | `$WORKFLOW_ID` | Unique workflow run ID |
 | `$CONTEXT` | GitHub issue/PR context (if available) |
 
-See the [Variable Reference](/reference/variables/) for the complete list, including `$LOOP_USER_INPUT`, `$REJECTION_REASON`, node output references, substitution order, and context variable behavior.
+See the [Variable Reference](/reference/variables/) for the complete list, including the deprecated `$LOOP_USER_INPUT` and `$REJECTION_REASON`, node output references, substitution order, and context variable behavior.
 
 ### Usage Pattern
 

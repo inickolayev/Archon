@@ -4,6 +4,9 @@
  * production API; we only care about id + dependencies + kind + status.
  */
 
+import type { components } from '@/lib/api.generated';
+import type { RunNodeState } from './event';
+
 export type WorkflowNodeKind =
   | 'prompt'
   | 'command'
@@ -14,7 +17,7 @@ export type WorkflowNodeKind =
   | 'loop'
   | 'cancel';
 
-export type WorkflowNodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+export type WorkflowNodeStatus = RunNodeState['state'];
 
 export interface WorkflowGraphNode {
   id: string;
@@ -24,41 +27,60 @@ export interface WorkflowGraphNode {
 
 export interface WorkflowGraphNodeWithStatus extends WorkflowGraphNode {
   status: WorkflowNodeStatus;
-  durationMs: number | null;
 }
 
-import type { RunEvent } from './event';
-
 /**
- * Derive each node's current status by walking run events in order.
- * Later events override earlier ones for the same node. Nodes with no
- * events stay `pending`.
+ * Attach the engine's state to each graph node. A node the engine has not
+ * listed has not been reached, which the engine itself reports as `pending`.
  */
 export function deriveNodeStatuses(
-  nodes: WorkflowGraphNode[],
-  events: RunEvent[]
+  graphNodes: WorkflowGraphNode[],
+  nodes: readonly RunNodeState[]
 ): WorkflowGraphNodeWithStatus[] {
-  const byNode = new Map<string, { status: WorkflowNodeStatus; durationMs: number | null }>();
-  for (const e of events) {
-    if (e.kind !== 'node_transition') continue;
-    const name = e.nodeName;
-    if (name.length === 0) continue;
-    const status: WorkflowNodeStatus =
-      e.transition === 'started'
-        ? 'running'
-        : e.transition === 'completed'
-          ? 'completed'
-          : e.transition === 'failed'
-            ? 'failed'
-            : 'skipped';
-    byNode.set(name, { status, durationMs: e.durationMs });
+  const stateById = new Map(nodes.map(n => [n.node_id, n.state]));
+  return graphNodes.map(n => ({ ...n, status: stateById.get(n.id) ?? 'pending' }));
+}
+
+/**
+ * A node as the workflow LIST endpoint serves it: the engine's transform has already rewritten
+ * what the author wrote (`command:` → `kind: 'agent'` + `source`, `bash:` → an exec node whose
+ * runtime is the shell). The generated `DagNode` schema describes only the authoring form, so
+ * the transformed fields are added here (`runtime` widens: a transformed bash node carries `sh`,
+ * which the authored script runtime does not admit); a definition that has not been through the
+ * transform still carries the authoring fields.
+ */
+export type ServedDagNode = Omit<components['schemas']['DagNode'], 'runtime'> & {
+  kind?: string;
+  source?: { kind?: string };
+  runtime?: string;
+};
+
+export function nodeKind(n: ServedDagNode): WorkflowNodeKind {
+  // The transformed form first: it is what the endpoint actually serves, and reading the
+  // authoring fields alone made every command node in the graph render as a prompt.
+  switch (n.kind) {
+    case 'agent':
+      return n.source?.kind === 'command' ? 'command' : 'prompt';
+    case 'exec':
+      return n.runtime === 'sh' ? 'bash' : 'script';
+    case 'gate':
+      return 'approval';
+    case 'wait':
+      return 'wait';
+    case 'halt':
+      return 'cancel';
+    case 'loop':
+    case 'loop_group':
+      return 'loop';
+    default:
+      break;
   }
-  return nodes.map(n => {
-    const current = byNode.get(n.id);
-    return {
-      ...n,
-      status: current?.status ?? 'pending',
-      durationMs: current?.durationMs ?? null,
-    };
-  });
+  if (n.loop !== undefined) return 'loop';
+  if (n.approval !== undefined) return 'approval';
+  if (n.wait !== undefined) return 'wait';
+  if (n.cancel !== undefined) return 'cancel';
+  if (n.bash !== undefined) return 'bash';
+  if (n.command !== undefined) return 'command';
+  if (n.script !== undefined) return 'script';
+  return 'prompt';
 }

@@ -1,4 +1,6 @@
 import { requestJson } from '../lib/http';
+import { authClient } from '@/lib/auth-client';
+import type { components } from '@/lib/api.generated';
 import type { Directory } from '../primitives/author';
 
 /**
@@ -8,40 +10,36 @@ import type { Directory } from '../primitives/author';
  * directory, so both are called from here.
  */
 
-export interface LinkedIdentity {
-  platform: string;
-  platformUserId: string;
-  displayName: string | null;
-  linkedAt: string | null;
-}
-
-export interface Account {
-  userId: string;
-  role: string;
-  name: string | null;
-  email: string | null;
-  identities: LinkedIdentity[];
-}
+export type LinkedIdentity = components['schemas']['LinkedIdentity'];
+export type Account = components['schemas']['AccountMeResponse'];
 
 export async function getAccount(): Promise<Account> {
-  return requestJson<Account>('/api/auth/me');
+  return requestJson('/api/auth/me', 'get');
 }
 
 /** Everyone who has written here, plus which of them is me. */
 export async function getDirectory(): Promise<Directory> {
-  const raw = await requestJson<{
-    me: string;
-    users: { id: string; displayName: string | null; email: string | null }[];
-  }>('/api/users/directory');
+  const raw = await requestJson('/api/users/directory', 'get');
   return { me: raw.me, users: raw.users };
+}
+
+/**
+ * Better Auth's client answers `{ data, error }` instead of throwing. Its
+ * endpoints are not Archon's, so they are not in the generated API either;
+ * this turns a refusal into the thrown error every caller here already handles.
+ */
+function throwOnAuthError(
+  result: { error: { message?: string; statusText: string } | null },
+  fallback: string
+): void {
+  if (result.error === null) return;
+  const message = result.error.message?.trim() ?? '';
+  throw new Error(message.length > 0 ? message : `${fallback} (${result.error.statusText})`);
 }
 
 /** Better Auth's own profile update — the name shown next to "you". */
 export async function updateName(name: string): Promise<void> {
-  await requestJson('/api/auth/update-user', {
-    method: 'POST',
-    body: JSON.stringify({ name }),
-  });
+  throwOnAuthError(await authClient.updateUser({ name }), 'Could not save the name');
 }
 
 /**
@@ -50,10 +48,10 @@ export async function updateName(name: string): Promise<void> {
  * are typing in.
  */
 export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
-  await requestJson('/api/auth/change-password', {
-    method: 'POST',
-    body: JSON.stringify({ currentPassword, newPassword, revokeOtherSessions: false }),
-  });
+  throwOnAuthError(
+    await authClient.changePassword({ currentPassword, newPassword, revokeOtherSessions: false }),
+    'Could not change the password'
+  );
 }
 
 /**
@@ -61,27 +59,24 @@ export async function changePassword(currentPassword: string, newPassword: strin
  * Auth's, because signing out also drops every pending one-time link token.
  */
 export async function signOut(): Promise<void> {
-  await requestJson('/api/auth/me/sign-out', { method: 'POST' });
+  await requestJson('/api/auth/me/sign-out', 'post');
 }
 
 /** What a one-time Telegram link would connect, before anything is changed. */
-export interface LinkPreview {
-  telegram: { displayName: string | null };
-  account: { name: string | null; email: string | null };
-  alreadyLinkedToThisAccount: boolean;
-  expiresAt: string;
-}
+export type LinkPreview = components['schemas']['TelegramLinkPreview'];
 
 export async function previewTelegramLink(token: string): Promise<LinkPreview> {
-  return requestJson<LinkPreview>(`/api/auth/telegram/link/${encodeURIComponent(token)}`);
+  return requestJson('/api/auth/telegram/link/{token}', 'get', { params: { token } });
 }
 
 export async function confirmTelegramLink(
   token: string
-): Promise<{ linked: boolean; alreadyLinked: boolean; movedRows: number; email: string | null }> {
-  return requestJson(`/api/auth/telegram/link/${encodeURIComponent(token)}`, { method: 'POST' });
+): Promise<components['schemas']['TelegramLinkResult']> {
+  return requestJson('/api/auth/telegram/link/{token}', 'post', { params: { token } });
 }
 
-export async function unlinkTelegram(): Promise<{ removed: number }> {
-  return requestJson('/api/auth/me/identities/telegram', { method: 'DELETE' });
+export async function unlinkTelegram(): Promise<components['schemas']['UnlinkIdentityResponse']> {
+  return requestJson('/api/auth/me/identities/{platform}', 'delete', {
+    params: { platform: 'telegram' },
+  });
 }

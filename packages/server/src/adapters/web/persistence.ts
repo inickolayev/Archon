@@ -16,7 +16,7 @@ interface BufferedToolCall {
   /** The provider's id for the call; its result is matched on it. Not persisted. */
   toolCallId: string;
   name: string;
-  input: Record<string, unknown>;
+  input: Extract<PlatformStructuredEvent, { type: 'tool_call' }>['rawInput'];
   startedAt: number;
   duration?: number;
   output?: string;
@@ -107,7 +107,11 @@ export class MessagePersistence {
    */
   appendToolCall(
     conversationId: string,
-    tool: { toolCallId: string; name: string; input: Record<string, unknown> }
+    tool: {
+      toolCallId: string;
+      name: string;
+      input: Extract<PlatformStructuredEvent, { type: 'tool_call' }>['rawInput'];
+    }
   ): void {
     const buf = this.assistantBuffer.get(conversationId) ?? { segments: [] };
     if (buf.segments.length === 0) {
@@ -184,54 +188,8 @@ export class MessagePersistence {
    * structure as the live streaming view (text+tools interleaving).
    */
   async flush(conversationId: string): Promise<void> {
-    // Snapshot and clear the buffer synchronously before any async work.
-    // This prevents a race where concurrent appendText calls push segments
-    // onto the same buf reference that is mid-flush: once the map entry is
-    // cleared here, new appendText calls create a fresh buffer entry and
-    // those segments won't be dropped when this flush completes.
-    const buf = this.assistantBuffer.get(conversationId);
-    if (!buf || buf.segments.length === 0) {
-      this.assistantBuffer.delete(conversationId);
-      return;
-    }
-
-    // Pre-set `duration` on the last tool in each segment so terminal tool calls
-    // (those that never receive an appendToolResult) don't satisfy the
-    // `output === undefined && duration === undefined` in-flight condition below.
-    const preNow = Date.now();
-    for (const seg of buf.segments) {
-      const lastTool = seg.toolCalls[seg.toolCalls.length - 1];
-      if (lastTool && lastTool.duration === undefined) {
-        lastTool.duration = preNow - lastTool.startedAt;
-      }
-    }
-
-    // Split: keep segments with in-flight tools (output pending) in the buffer
-    // so appendToolResult can still find them. Only flush completed segments.
-    const ready: BufferedSegment[] = [];
-    const pending: BufferedSegment[] = [];
-    for (const seg of buf.segments) {
-      const hasInflightTool = seg.toolCalls.some(
-        tc => tc.output === undefined && tc.duration === undefined
-      );
-      if (hasInflightTool) {
-        pending.push(seg);
-      } else {
-        ready.push(seg);
-      }
-    }
-
-    if (ready.length === 0) {
-      // All segments have in-flight tools — nothing to flush yet
-      return;
-    }
-
-    if (pending.length > 0) {
-      // Keep pending segments in the buffer for appendToolResult to find
-      buf.segments = pending;
-    } else {
-      this.assistantBuffer.delete(conversationId);
-    }
+    const ready = this.takeReadySegments(conversationId);
+    if (ready.length === 0) return;
 
     const dbId = this.dbIdMap.get(conversationId);
     if (!dbId) {
@@ -246,15 +204,6 @@ export class MessagePersistence {
         this.assistantBuffer.set(conversationId, { segments: [...ready] });
       }
       return;
-    }
-
-    // Finalize any remaining tool durations (last tool in each segment)
-    const now = Date.now();
-    for (const seg of ready) {
-      const lastTool = seg.toolCalls[seg.toolCalls.length - 1];
-      if (lastTool && lastTool.duration === undefined) {
-        lastTool.duration = now - lastTool.startedAt;
-      }
     }
 
     try {
@@ -286,6 +235,53 @@ export class MessagePersistence {
         })
       );
     }
+  }
+
+  private takeReadySegments(conversationId: string): BufferedSegment[] {
+    // Snapshot and clear the buffer synchronously before any async work.
+    // This prevents a race where concurrent appendText calls push segments
+    // onto the same buf reference that is mid-flush: once the map entry is
+    // cleared here, new appendText calls create a fresh buffer entry and
+    // those segments won't be dropped when this flush completes.
+    const buf = this.assistantBuffer.get(conversationId);
+    if (!buf || buf.segments.length === 0) {
+      this.assistantBuffer.delete(conversationId);
+      return [];
+    }
+
+    // Pre-set `duration` on the last tool in each segment so terminal tool calls
+    // (those that never receive an appendToolResult) don't satisfy the
+    // `output === undefined && duration === undefined` in-flight condition below.
+    this.finalizeRunningTools(conversationId);
+
+    // Split: keep segments with in-flight tools (output pending) in the buffer
+    // so appendToolResult can still find them. Only flush completed segments.
+    const ready: BufferedSegment[] = [];
+    const pending: BufferedSegment[] = [];
+    for (const seg of buf.segments) {
+      const hasInflightTool = seg.toolCalls.some(
+        tc => tc.output === undefined && tc.duration === undefined
+      );
+      if (hasInflightTool) {
+        pending.push(seg);
+      } else {
+        ready.push(seg);
+      }
+    }
+
+    if (ready.length === 0) {
+      // All segments have in-flight tools — nothing to flush yet
+      return [];
+    }
+
+    if (pending.length > 0) {
+      // Keep pending segments in the buffer for appendToolResult to find
+      buf.segments = pending;
+    } else {
+      this.assistantBuffer.delete(conversationId);
+    }
+
+    return ready;
   }
 
   /**

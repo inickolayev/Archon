@@ -9,6 +9,7 @@ function raw(over: Partial<Raw> & { id: string }, metadata: Record<string, unkno
     content: 'hello',
     created_at: '2026-06-05T10:00:00Z',
     metadata: JSON.stringify(metadata),
+    user_id: null,
     ...over,
   };
 }
@@ -76,6 +77,7 @@ describe('toMessage — malformed metadata', () => {
       content: 'hi',
       metadata: '{ not valid json',
       created_at: '2026-06-05T10:00:00Z',
+      user_id: null,
     });
     expect(m.category).toBeNull();
     expect(m.workflowResult).toBeNull();

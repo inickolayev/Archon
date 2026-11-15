@@ -3,20 +3,49 @@ import { z } from 'zod';
 import { checkChangedEventSchema, type CheckResult } from './events';
 import { gitObjectIdSchema, prRefSchema, repoRefSchema } from './identity';
 import {
+  mergeConditionSchema,
+  prReviewsSchema,
+  prThreadsSchema,
+  reviewThreadCommentSchema,
+  reviewThreadSchema,
   lifecycleReadRequestSchemas,
   lifecycleReadResultSchemas,
   mutationFailureSchema,
   mutationOperationSchema,
   mutationRequestSchemas,
   mutationResultSchemas,
+  repoLabelsListRequestSchema,
+  repoLabelsListSchema,
   prViewRequestSchema,
   prViewSchema,
+  workItemListRequestSchema,
+  workItemListSchema,
+  workItemSearchItemSchema,
+  workItemSearchRequestSchema,
+  workItemSearchSchema,
   workItemViewRequestSchema,
   workItemViewSchema,
+  workItemCommentsRequestSchema,
+  workItemCommentsSchema,
+  workItemCommentSchema,
+  prMergeStateRequestSchema,
+  prMergeStateSchema,
+  prFileSchema,
+  prFilesRequestSchema,
+  prFilesSchema,
+  repoFileRequestSchema,
+  repoFileSchema,
   type ForgeMutationRequest,
 } from './lifecycle';
 
 export * from './lifecycle';
+export * from './checks';
+import {
+  checkLogSchema,
+  checksLogsRequestSchema,
+  checksLogsSchema,
+  rerunGroupSchema,
+} from './checks';
 
 export const checksStateSchema = z.enum(['none', 'pending', 'green', 'red', 'gated', 'unknown']);
 export type ChecksState = z.infer<typeof checksStateSchema>;
@@ -47,7 +76,10 @@ export const checkObservationSchema = checkChangedEventSchema
     nativeResult: true,
     result: true,
   })
-  .extend({ state: checksStateSchema.exclude(['none']) });
+  .extend({
+    state: checksStateSchema.exclude(['none']),
+    rerun: rerunGroupSchema.nullable().optional(),
+  });
 export type CheckObservation = z.infer<typeof checkObservationSchema>;
 export const checksSummarySchema = z.object({
   state: checksStateSchema,
@@ -81,13 +113,22 @@ export const checksObservationSchema = checkSetSchema.safeExtend({
   ref: prRefSchema,
   revision: gitObjectIdSchema,
   required: checkSetSchema.nullable(),
+  approvalPending: z.boolean().nullable().optional(),
 });
 export type ChecksObservation = z.infer<typeof checksObservationSchema>;
+/** Checks on one commit; `branch` names the default branch when that is how the commit was chosen. */
+export const commitChecksObservationSchema = checkSetSchema.safeExtend({
+  repo: repoRefSchema,
+  branch: z.string().min(1).nullable(),
+  revision: gitObjectIdSchema,
+  approvalPending: z.boolean().nullable().optional(),
+});
 export const pluginIdentitySchema = z.object({
   name: z.string().regex(/^[a-z0-9-]+$/),
   version: z.string().min(1),
 });
 export const pluginMetadataSchema = pluginIdentitySchema.extend({
+  mutationConditions: z.object({ 'pr.merge': z.array(mergeConditionSchema).optional() }).optional(),
   protocol: z.literal(1),
   forge: z.string().min(1),
   hosts: z.array(z.string().min(1)),
@@ -95,6 +136,13 @@ export const pluginMetadataSchema = pluginIdentitySchema.extend({
   token_env: z.array(z.string().min(1)).default([]),
 });
 export type PluginMetadata = z.infer<typeof pluginMetadataSchema>;
+/**
+ * The capability a plugin advertises when `resolve` with `web: true` reads the
+ * forge's web URL of an issue or a pull request. URL shapes belong to the forge, so a
+ * caller never parses one. An older plugin would answer for the repository alone, or
+ * not at all, so the host refuses the request without it.
+ */
+export const RESOLVE_SUBJECT = 'resolve:subject';
 export const resolveResultSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('none'), forge: z.literal('none') }),
   z.object({
@@ -102,27 +150,53 @@ export const resolveResultSchema = z.discriminatedUnion('kind', [
     forge: z.string().min(1),
     repo: repoRefSchema,
     plugin: pluginIdentitySchema,
+    // The issue or pull request the URL names, in `repo`: only on a `web` request, and
+    // required there; the host refuses a resolved `web` answer without it.
+    subject: z
+      .object({ kind: z.enum(['issue', 'pr']), number: z.number().int().positive() })
+      .optional(),
   }),
 ]);
 export const resolveRequestSchema = z.object({
   operationId: z.string().min(1),
   op: z.literal('resolve'),
+  // A git remote URL, or with `web` the forge's web URL of an issue or a pull request.
   remote: z.string().nullable(),
+  web: z.literal(true).optional(),
 });
 export const checksRequestSchema = z.object({
   operationId: z.string().min(1),
   op: z.literal('checks.state'),
   ref: prRefSchema,
 });
+export const checksCommitRequestSchema = z.object({
+  operationId: z.string().min(1),
+  op: z.literal('checks.commit'),
+  repo: repoRefSchema,
+  at: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('revision'), revision: gitObjectIdSchema }),
+    z.object({ kind: z.literal('default_branch') }),
+  ]),
+});
 export const forgeRequestSchema = z.discriminatedUnion('op', [
   resolveRequestSchema,
   checksRequestSchema,
+  checksCommitRequestSchema,
+  checksLogsRequestSchema,
   ...lifecycleReadRequestSchemas,
   ...mutationRequestSchemas,
 ]);
 export type ForgeRequest = z.infer<typeof forgeRequestSchema>;
+/**
+ * The failures that say nothing about the request itself: the forge did not answer or
+ * answered that it is failing (`unavailable`), or it is limiting the caller
+ * (`rate_limited`). The host repeats a read that fails with one of them. A plugin sets
+ * them from a status, a documented header or an error code, never from message text.
+ */
+export const temporaryErrorKinds = ['unavailable', 'rate_limited'] as const;
 export const forgeErrorSchema = z.object({
   kind: z.enum([
+    ...temporaryErrorKinds,
     'unsupported_op',
     'conflict',
     'authorization',
@@ -148,6 +222,8 @@ export const forgeResponseSchema = z.discriminatedUnion('ok', [
     result: z.discriminatedUnion('op', [
       z.object({ op: z.literal('resolve'), value: resolveResultSchema }),
       z.object({ op: z.literal('checks.state'), value: checksObservationSchema }),
+      z.object({ op: z.literal('checks.commit'), value: commitChecksObservationSchema }),
+      z.object({ op: checksLogsRequestSchema.shape.op, value: checksLogsSchema }),
       ...lifecycleReadResultSchemas,
       ...mutationResultSchemas,
     ]),
@@ -186,6 +262,16 @@ const auditResponseSchema = z.discriminatedUnion('ok', [
     result: z.discriminatedUnion('op', [
       z.object({ op: resolveRequestSchema.shape.op, value: resolveResultSchema }),
       z.object({ op: checksRequestSchema.shape.op, value: checksObservationSchema }),
+      z.object({ op: checksCommitRequestSchema.shape.op, value: commitChecksObservationSchema }),
+      z.object({ op: prMergeStateRequestSchema.shape.op, value: prMergeStateSchema }),
+      z.object({
+        op: workItemCommentsRequestSchema.shape.op,
+        value: workItemCommentsSchema.extend({
+          comments: z.array(
+            workItemCommentSchema.omit({ body: true }).extend({ content: contentAuditSchema })
+          ),
+        }),
+      }),
       z.object({
         op: workItemViewRequestSchema.shape.op,
         value: workItemViewSchema
@@ -199,6 +285,62 @@ const auditResponseSchema = z.discriminatedUnion('ok', [
           .extend({ content: contentAuditSchema })
           .nullable(),
       }),
+      z.object({ op: repoLabelsListRequestSchema.shape.op, value: repoLabelsListSchema }),
+      z.object({ op: workItemListRequestSchema.shape.op, value: workItemListSchema }),
+      z.object({
+        op: workItemSearchRequestSchema.shape.op,
+        value: workItemSearchSchema.omit({ text: true }).extend({
+          query: contentAuditSchema,
+          items: z.array(
+            workItemSearchItemSchema.omit({ title: true }).extend({ content: contentAuditSchema })
+          ),
+        }),
+      }),
+      z.object({
+        op: checksLogsRequestSchema.shape.op,
+        value: checksLogsSchema.extend({
+          log: z.discriminatedUnion('kind', [
+            checkLogSchema.options[0].omit({ text: true }).extend({ content: contentAuditSchema }),
+            checkLogSchema.options[1],
+          ]),
+        }),
+      }),
+      z.object({
+        op: prFilesRequestSchema.shape.op,
+        value: prFilesSchema.extend({
+          files: z.array(
+            prFileSchema.omit({ patch: true }).extend({ patch: contentAuditSchema.nullable() })
+          ),
+        }),
+      }),
+      z.object({
+        op: repoFileRequestSchema.shape.op,
+        value: repoFileSchema.omit({ text: true }).extend({ content: contentAuditSchema }),
+      }),
+      z.object({
+        op: z.literal('pr.reviews'),
+        value: prReviewsSchema.extend({
+          items: z.array(
+            prReviewsSchema.shape.items.element
+              .omit({ body: true })
+              .extend({ content: contentAuditSchema })
+          ),
+        }),
+      }),
+      z.object({
+        op: z.literal('pr.threads'),
+        value: prThreadsSchema.extend({
+          threads: z.array(
+            reviewThreadSchema.extend({
+              comments: z.array(
+                reviewThreadCommentSchema
+                  .omit({ body: true })
+                  .extend({ content: contentAuditSchema })
+              ),
+            })
+          ),
+        }),
+      }),
       ...mutationResultSchemas,
     ]),
   }),
@@ -206,9 +348,106 @@ const auditResponseSchema = z.discriminatedUnion('ok', [
 ]);
 export type ForgeAuditResponse = z.infer<typeof auditResponseSchema>;
 
+function bodyAudit(body: string): z.infer<typeof contentAuditSchema> {
+  return { digest: contentDigest(body), bytes: Buffer.byteLength(body) };
+}
+
+type ForgeResult = Extract<ForgeResponse, { ok: true }>['result'];
+type ForgeAuditResult = Extract<ForgeAuditResponse, { ok: true }>['result'];
+
+/** A search's words and titles and a check's log are authored text: digests only. */
+function searchAudit(result: Extract<ForgeResult, { op: 'workitem.search' }>): ForgeAuditResult {
+  const { text, ...facts } = result.value;
+  return {
+    op: result.op,
+    value: {
+      ...facts,
+      query: bodyAudit(text),
+      items: facts.items.map(({ title, ...item }) => ({ ...item, content: bodyAudit(title) })),
+    },
+  };
+}
+function logAudit(result: Extract<ForgeResult, { op: 'checks.logs' }>): ForgeAuditResult {
+  const log = result.value.log;
+  if (log.kind === 'none') return { op: result.op, value: { ...result.value, log } };
+  const { text, ...facts } = log;
+  return {
+    op: result.op,
+    value: { ...result.value, log: { ...facts, content: bodyAudit(text) } },
+  };
+}
+
 export function forgeAuditResponse(response: ForgeResponse): ForgeAuditResponse {
   if (!response.ok) return response;
   const result = response.result;
+  if (result.op === 'workitem.search') return { ...response, result: searchAudit(result) };
+  if (result.op === 'checks.logs') return { ...response, result: logAudit(result) };
+  if (result.op === 'pr.reviews')
+    return {
+      ...response,
+      result: {
+        op: result.op,
+        value: {
+          ...result.value,
+          items: result.value.items.map(({ body, ...facts }) => ({
+            ...facts,
+            content: bodyAudit(body),
+          })),
+        },
+      },
+    };
+  if (result.op === 'pr.files')
+    return {
+      ...response,
+      result: {
+        op: result.op,
+        value: {
+          ...result.value,
+          files: result.value.files.map(({ patch, ...facts }) => ({
+            ...facts,
+            patch: patch === null ? null : bodyAudit(patch),
+          })),
+        },
+      },
+    };
+  if (result.op === 'repo.file') {
+    const { text, ...facts } = result.value;
+    return {
+      ...response,
+      result: { op: result.op, value: { ...facts, content: bodyAudit(text) } },
+    };
+  }
+  if (result.op === 'workitem.comments')
+    return {
+      ...response,
+      result: {
+        op: result.op,
+        value: {
+          ...result.value,
+          comments: result.value.comments.map(({ body, ...facts }) => ({
+            ...facts,
+            content: bodyAudit(body),
+          })),
+        },
+      },
+    };
+  if (result.op === 'pr.threads')
+    return {
+      ...response,
+      result: {
+        op: result.op,
+        value: {
+          ...result.value,
+          threads: result.value.threads.map(thread => ({
+            ...thread,
+            comments: thread.comments.map(({ body, ...facts }) => ({
+              ...facts,
+              content: bodyAudit(body),
+            })),
+          })),
+        },
+      },
+    };
   if (result.op !== 'workitem.view' && result.op !== 'pr.view') return { ...response, result };
   if (result.value === null) return { ...response, result: { op: 'pr.view', value: null } };
   const { title, body, ...facts } = result.value;
@@ -230,6 +469,8 @@ export const forgeOperationAuditSchema = z.object({
   target: z.union([prRefSchema, repoRefSchema]).nullable(),
   plugin: pluginIdentitySchema.nullable(),
   result: auditResponseSchema,
+  // How many times the host repeated a read that failed temporarily before `result`.
+  retries: z.number().int().nonnegative(),
   durationMs: z.number().nonnegative(),
 });
 

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { appendFileSync, readFileSync } from 'node:fs';
 
 interface PluginRef {
   repo: { host: string; path: string };
@@ -15,12 +16,34 @@ const OPS = [
   'resolve',
   'checks.state',
   'workitem.view',
+  'workitem.create',
+  'workitem.labels.set',
+  'workitem.label.add',
+  'workitem.comment.upsert',
+  'workitem.close',
+  'workitem.label.remove',
+  'workitem.list',
+  'repo.labels.list',
+  'repo.label.ensure',
   'pr.view',
   'pr.create',
   'pr.edit-body',
   'pr.ready',
+  'pr.draft',
   'comment.upsert',
-];
+  'pr.merge',
+  'checks.rerun',
+  'pr.reviews',
+  'pr.threads',
+  'pr.thread.reply',
+  'pr.thread.resolve',
+  'workitem.edit-body',
+  'workitem.comments',
+  'checks.commit',
+  'pr.merge-state',
+  'pr.files',
+  'repo.file',
+] as const;
 
 if (command === 'metadata') {
   process.stdout.write(
@@ -30,7 +53,8 @@ if (command === 'metadata') {
       version: '1.0.0',
       forge: 'test',
       hosts: ['forge.example'],
-      capabilities: OPS,
+      capabilities: mode === 'no-any-state' ? OPS : [...OPS, 'pr.view:any-state'],
+      mutationConditions: mode === 'no-conditions' ? undefined : { 'pr.merge': ['head'] },
       token_env: [],
     })
   );
@@ -43,6 +67,10 @@ else {
     operationId: string;
     op: string;
     ref?: PluginRef;
+    subject?: { kind: 'issue' | 'pr'; ref: PluginRef };
+    label?: string;
+    reason?: string;
+    thread?: string;
     selector?: { kind: string; ref?: PluginRef };
     repo?: PluginRef['repo'];
     headRepo?: PluginRef['repo'];
@@ -51,8 +79,24 @@ else {
     base?: string;
     draft?: boolean;
     body?: string;
+    marker?: string;
+    title?: string;
+    labels?: string[];
+    name?: string;
+    color?: string;
+    description?: string;
+    method?: 'merge' | 'squash';
+    conditions?: { head?: string };
+    revision?: string;
+    path?: string;
+    at?: { kind: 'revision'; revision: string } | { kind: 'default_branch' };
+    units?: {
+      unit: { kind: string; id: string; name: string };
+      rerun: { id: string; attempt: number } | null;
+    }[];
   };
   const ref = input.ref ??
+    input.subject?.ref ??
     input.selector?.ref ?? { repo: { host: 'forge.example', path: 'a/b' }, number: 1 };
   const repo = input.repo ?? ref.repo;
   // A create answers with the pull request the request asked for; every other
@@ -64,8 +108,8 @@ else {
     url: `https://forge.example/${repo.path}/pull/${String(ref.number)}`,
     head: input.head ?? 'feature',
     base: input.base ?? 'dev',
-    is_draft: input.op === 'pr.create' ? (input.draft ?? false) : false,
-    state: 'open',
+    is_draft: input.op === 'pr.create' ? (input.draft ?? false) : input.op === 'pr.draft',
+    state: mode === 'not-open' ? 'closed' : 'open',
     head_repo: input.headRepo ?? repo,
     head_revision: input.headRevision ?? 'headsha',
     base_revision: 'basesha',
@@ -79,30 +123,305 @@ else {
     bodyDigest: digest(input.body ?? ''),
   };
 
+  // A plugin released before review-thread creation times answers without them.
+  const created = (createdAt: string, commit: string | null) =>
+    mode === 'older-plugin' ? {} : { createdAt, commit };
+
   const answer = (target: unknown, value: object): unknown => ({
     operationId: input.operationId,
     ok: true,
-    result: { op: input.op, value: { target, outcome: 'applied', changed: true, ...value } },
+    result: {
+      op: input.op,
+      value: { target, outcome: 'applied', changed: mode !== 'unchanged', ...value },
+    },
   });
+
+  const subject = {
+    ref,
+    kind: input.subject?.kind ?? 'issue',
+    url: `https://forge.example/${repo.path}/issues/${String(ref.number)}`,
+    state: 'open',
+  };
+  const listed = (items: unknown[]): unknown => ({
+    operationId: input.operationId,
+    ok: true,
+    result: { op: input.op, value: { repo, label: input.label, items } },
+  });
+
+  const read = (value: object): unknown => ({
+    operationId: input.operationId,
+    ok: true,
+    result: { op: input.op, value },
+  });
+  const mergeState = (number: number): unknown =>
+    read({
+      ref: { ...ref, number },
+      head_revision: 'headsha',
+      default_branch: 'dev',
+      default_revision: 'devsha',
+      behind: 2,
+      mergeable: 'clean',
+      merge_commit: null,
+    });
+  const commitChecks = (revision: string): unknown =>
+    read({
+      repo,
+      branch: input.at?.kind === 'default_branch' ? 'dev' : null,
+      revision,
+      units: [],
+      summary: {
+        state: 'none',
+        counts: { total: 0, green: 0, red: 0, pending: 0, gated: 0, unknown: 0 },
+      },
+    });
 
   /** An applied answer that does not answer the request it was sent. */
   const mismatched = (): unknown => {
+    if (input.op === 'workitem.label.add') return answer(ref, { workitem: subject, labels: [] });
+    if (input.op === 'workitem.label.remove')
+      return answer(ref, { workitem: subject, labels: [input.name] });
+    if (input.op === 'workitem.list') return listed([{ ...subject, state: 'closed' }]);
+    if (input.op === 'pr.merge')
+      return answer(ref, {
+        ...mergeValue(),
+        pr: { ...pr, state: 'merged', head_revision: 'wrong' },
+      });
+    if (input.op === 'checks.rerun')
+      return answer(ref, { ref, revision: input.revision, units: input.units });
     if (input.op === 'pr.create')
       return answer(repo, { pr: { ...pr, head_revision: 'another-revision' } });
-    if (input.op === 'pr.ready') return answer(ref, { pr: { ...pr, is_draft: true } });
+    if (input.op === 'pr.ready' || input.op === 'pr.draft')
+      return answer(ref, { pr: { ...pr, is_draft: !pr.is_draft } });
     if (input.op === 'comment.upsert')
       return answer(ref, { comment: { ...comment, bodyDigest: digest('something else') } });
+    if (input.op === 'workitem.comment.upsert')
+      return answer(ref, {
+        workitem: subject,
+        comment: { ...comment, bodyDigest: digest('something else') },
+      });
+    if (input.op === 'workitem.close')
+      return answer(ref, { workitem: { ...subject, state: 'closed' }, reason: 'not_planned' });
+    if (input.op === 'pr.thread.reply')
+      return answer(ref, {
+        thread: input.thread,
+        comment: { ...comment, bodyDigest: digest('something else') },
+      });
+    if (input.op === 'pr.thread.resolve')
+      return answer(ref, { thread: 'another-thread', resolved: true });
+    if (input.op === 'workitem.edit-body')
+      return answer(ref, {
+        workitem: { ...subject, kind: 'issue' },
+        bodyDigest: digest('something else'),
+      });
     return answer(ref, { pr, bodyDigest: digest('something else') });
   };
 
-  const applied = (): unknown => {
-    if (input.op === 'pr.create') return answer(repo, { pr });
-    if (input.op === 'pr.ready') return answer(ref, { pr });
-    if (input.op === 'comment.upsert') return answer(ref, { comment });
-    return answer(ref, { pr, bodyDigest: digest(input.body ?? '') });
+  const mergeValue = (): Record<string, unknown> => ({
+    pr: { ...pr, state: 'merged', head_revision: input.conditions?.head },
+    method: mode === 'wrong-method' ? 'merge' : input.method,
+    conditions: mode === 'wrong-condition' ? { head: 'wrong' } : input.conditions,
+    enforcedConditions: mode === 'unenforced' ? [] : ['head'],
+    landed: { commit: 'landed', tree: 'tree', parents: ['base', 'head'] },
+  });
+  const editReply = (): unknown => answer(ref, { pr, bodyDigest: digest(input.body ?? '') });
+  const readHandlers = {
+    'checks.commit': () =>
+      commitChecks(
+        mode === 'mismatch'
+          ? 'another-revision'
+          : input.at?.kind === 'revision'
+            ? input.at.revision
+            : 'devsha'
+      ),
+    'pr.merge-state': () => mergeState(mode === 'mismatch' ? ref.number + 1 : ref.number),
+    'pr.files': () =>
+      read({
+        ref,
+        head_revision: 'headsha',
+        files: [
+          {
+            path: 'src/a.test.ts',
+            previous_path: null,
+            status: 'added',
+            patch: 'private patch',
+          },
+          { path: 'logo.png', previous_path: null, status: 'modified', patch: null },
+        ],
+      }),
+    'repo.file': () =>
+      read({
+        repo,
+        path: input.path,
+        revision: mode === 'mismatch' ? 'another-revision' : input.revision,
+        text: 'private file text',
+      }),
+    'workitem.comments': () =>
+      read({
+        workitem: subject,
+        comments: [
+          {
+            id: '7',
+            author: { host: 'forge.example', id: '1', login: 'maintainer' },
+            url: `${subject.url}#issuecomment-7`,
+            body: 'private conversation comment',
+          },
+        ],
+      }),
   };
+  const replies = {
+    ...readHandlers,
+    'workitem.create': () =>
+      answer(repo, {
+        changed: mode !== 'recovery',
+        workitem: {
+          ref: { repo, number: ref.number },
+          kind: 'issue',
+          url: `https://forge.example/${repo.path}/issues/${String(ref.number)}`,
+          state: mode === 'recovery' ? 'closed' : 'open',
+        },
+        markerDigest: digest(input.marker ?? ''),
+        titleDigest: digest(mode === 'recovery' ? 'edited' : (input.title ?? '')),
+        bodyDigest: digest(mode === 'recovery' ? 'edited' : (input.body ?? '')),
+      }),
+    'workitem.labels.set': () =>
+      answer(ref, {
+        workitem: {
+          ref,
+          kind: 'issue',
+          url: `https://forge.example/${repo.path}/issues/${String(ref.number)}`,
+          state: 'open',
+        },
+        labels: input.labels,
+      }),
+    'workitem.label.add': () => answer(ref, { workitem: subject, labels: ['other', input.name] }),
+    'workitem.label.remove': () => answer(ref, { workitem: subject, labels: ['other'] }),
+    'workitem.list': () =>
+      listed([subject, { ...subject, ref: { ...ref, number: ref.number + 1 }, kind: 'pr' }]),
+    'repo.label.ensure': () =>
+      answer(repo, {
+        label: {
+          name: input.name,
+          color: input.color,
+          descriptionDigest: digest(input.description ?? ''),
+        },
+      }),
+    'repo.labels.list': () => ({
+      operationId: input.operationId,
+      ok: true,
+      result: { op: input.op, value: { repo, labels: [{ name: 'a' }] } },
+    }),
+    'pr.merge': () => answer(ref, mergeValue()),
+    'checks.rerun': () =>
+      answer(ref, {
+        ref,
+        revision: input.revision,
+        units: (mode === 'subset' ? input.units?.slice(0, 1) : input.units)?.map(selected => ({
+          ...selected,
+          rerun: selected.rerun ? { ...selected.rerun, attempt: selected.rerun.attempt + 1 } : null,
+        })),
+      }),
+    'pr.reviews': () => ({
+      operationId: input.operationId,
+      ok: true,
+      result: {
+        op: input.op,
+        value: {
+          ref,
+          items: [
+            {
+              kind: 'review_comment',
+              id: '1',
+              author: null,
+              commit: 'head',
+              state: null,
+              createdAt: null,
+              url: pr.url,
+              body: 'private review body',
+            },
+          ],
+        },
+      },
+    }),
+    'pr.create': () => answer(repo, { pr }),
+    'pr.ready': () => answer(ref, { pr }),
+    'pr.draft': () => answer(ref, { pr }),
+    'comment.upsert': () => answer(ref, { comment }),
+    'workitem.comment.upsert': () => answer(ref, { workitem: subject, comment }),
+    'workitem.close': () =>
+      answer(ref, { workitem: { ...subject, state: 'closed' }, reason: input.reason }),
+    'pr.threads': () => ({
+      operationId: input.operationId,
+      ok: true,
+      result: {
+        op: input.op,
+        value: {
+          ref,
+          threads: [
+            {
+              id: 'thread-1',
+              ...created('2026-11-11T09:00:00Z', 'a'.repeat(40)),
+              resolved: false,
+              outdated: false,
+              path: 'src/a.ts',
+              line: 3,
+              comments: [
+                {
+                  id: 'c1',
+                  author: null,
+                  ...created('2026-11-11T09:00:00Z', 'a'.repeat(40)),
+                  body: 'private thread body',
+                  url: pr.url,
+                },
+                {
+                  id: 'c2',
+                  author: null,
+                  ...created('2026-11-11T13:00:00+02:00', null),
+                  body: 'a later reply',
+                  url: pr.url,
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+    'pr.thread.reply': () => answer(ref, { thread: input.thread, comment }),
+    'pr.thread.resolve': () => answer(ref, { thread: input.thread, resolved: true }),
+    'workitem.edit-body': () =>
+      answer(ref, {
+        workitem: { ...subject, kind: 'issue' },
+        bodyDigest: digest(input.body ?? ''),
+      }),
+    'pr.edit-body': editReply,
+    resolve: editReply,
+    'checks.state': editReply,
+    'workitem.view': editReply,
+    'pr.view': editReply,
+  } satisfies Record<(typeof OPS)[number], () => unknown>;
+  const readReplies: Record<string, () => unknown> = readHandlers;
+  const appliedReplies: Record<string, () => unknown> = replies;
+  const applied = (): unknown =>
+    Object.hasOwn(appliedReplies, input.op) ? appliedReplies[input.op]() : editReply();
 
-  if (mode === 'view-content' || mode === 'closed') {
+  // `temporary`: each call adds a line to `--calls`; the first `--fail` of them fail.
+  const callsFile = args[args.indexOf('--calls') + 1];
+  if (mode === 'temporary') appendFileSync(callsFile, '\n');
+  if (
+    mode === 'temporary' &&
+    readFileSync(callsFile, 'utf8').length <= Number(args[args.indexOf('--fail') + 1])
+  ) {
+    process.stdout.write(
+      JSON.stringify({
+        operationId: input.operationId,
+        ok: false,
+        error: { kind: args[args.indexOf('--kind') + 1], message: 'the forge is down' },
+        ...(input.op === 'pr.view'
+          ? {}
+          : { mutation: { op: input.op, target: ref, outcome: 'outcome_unknown' } }),
+      })
+    );
+    process.exit(1);
+  } else if (mode === 'view-content' || mode === 'closed' || mode === 'temporary') {
     process.stdout.write(
       JSON.stringify({
         operationId: input.operationId,
@@ -117,6 +436,17 @@ else {
         },
       })
     );
+  } else if (mode === 'wrong-kind') {
+    process.stdout.write(
+      JSON.stringify(
+        answer(ref, {
+          workitem: { ...subject, kind: subject.kind === 'pr' ? 'issue' : 'pr' },
+          ...(input.op === 'workitem.comment.upsert'
+            ? { comment }
+            : { labels: input.op === 'workitem.label.add' ? [input.name] : [] }),
+        })
+      )
+    );
   } else if (mode === 'wrong-target') {
     process.stdout.write(
       JSON.stringify(
@@ -124,7 +454,9 @@ else {
       )
     );
   } else if (mode === 'mismatch') {
-    process.stdout.write(JSON.stringify(mismatched()));
+    process.stdout.write(
+      JSON.stringify(Object.hasOwn(readReplies, input.op) ? readReplies[input.op]() : mismatched())
+    );
   } else if (mode === 'registered-case') {
     // The forge answers in the case it has registered, whatever case was asked with.
     const registered = { host: repo.host.toUpperCase(), path: repo.path.toUpperCase() };
@@ -146,7 +478,7 @@ else {
         operationId: input.operationId,
         ok: false,
         error: { kind: 'conflict', message: 'the forge said no' },
-        mutation: { op: input.op, target: ref, outcome: 'refused' },
+        mutation: { op: input.op, target: input.repo ?? ref, outcome: 'refused' },
       })
     );
     process.exit(1);

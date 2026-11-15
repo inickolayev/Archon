@@ -8,7 +8,8 @@
  *   Named inputs:     "$INPUTS.mode == 'fast'"  (#2470 inputs, supplied by a caller's
  *                     `with:` — see `resolveInputRef`)
  *   Numeric ops:      "$nodeId.output > '80'"  / ">=" / "<" / "<="
- *                     (both sides must parse as finite numbers; fail-closed otherwise)
+ *                     (the parser rejects a non-numeric RHS; a non-numeric output
+ *                     makes that atom false at run time)
  *   Unquoted RHS:     "$nodeId.exit_code == 0"  / "$nodeId.passed == true"
  *                     (numbers and booleans may be written without surrounding quotes)
  *   Compound AND/OR:  "$a.output == 'X' && $b.output != 'Y'"
@@ -41,12 +42,14 @@ import {
   OutputRefError,
   similarNodeIds,
   canonicalValueText,
+  outputRefText,
   type JsonValue,
 } from './output-ref';
 import {
-  parseLoopPrevWhenAtom,
-  parseWhenAtom,
-  splitOutsideQuotes,
+  findUnsupportedNestedWhenRef,
+  assertSupportedWhenOutputRefs,
+  parseWhenExpression,
+  type WhenAtom,
   type WhenAtomRef,
 } from './when-atom';
 
@@ -75,22 +78,20 @@ function resolveOutputRef(
   nodeId: string,
   field: string | undefined,
   nodeOutputs: ReadonlyMap<string, NodeOutput>,
-  exprSnippet: string
+  reference: string
 ): string {
   const nodeOutput = nodeOutputs.get(nodeId);
   if (!nodeOutput) {
     // A `.field` ref that resolves to no output (a typo, or a real node that hasn't
     // run before this reference) fails the consuming node loudly, matching
     // `resolveNodeOutputField`'s strict no-silent-drop posture (and
-    // `substituteNodeOutputRefs` in dag-executor). A whole-text `$id.output` stays
+    // `substituteNodeOutputRefs` in dag/references). A whole-text `$id.output` stays
     // lenient ('').
     if (field) {
-      throw new OutputRefError(
-        nodeId,
-        field,
-        'unknown-node',
-        similarNodeIds(nodeId, nodeOutputs.keys())
-      );
+      throw new OutputRefError(nodeId, field, 'unknown-node', {
+        reference,
+        candidates: similarNodeIds(nodeId, nodeOutputs.keys()),
+      });
     }
     getLog().warn({ nodeId }, 'condition_output_ref_unknown_node');
     return '';
@@ -113,16 +114,15 @@ function resolveOutputRef(
     return nodeOutput.output;
   }
 
-  const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
+  const resolution = resolveNodeOutputField(nodeOutput, nodeId, field, reference);
   if (resolution.kind === 'empty') return '';
   if (
     Array.isArray(resolution.value) ||
     (resolution.value !== null && typeof resolution.value === 'object')
   ) {
     const actualType = Array.isArray(resolution.value) ? 'array' : 'object';
-    getLog().error({ nodeId, field, actualType, exprSnippet }, 'dag.condition_field_not_primitive');
     throw new Error(
-      `Condition reference '$${nodeId}.output.${field}' resolved to an ${actualType}. ` +
+      `Condition reference '${reference}' resolved to an ${actualType}. ` +
         "A 'when:' field must be a string, number, boolean, or null; emit a scalar routing field " +
         'or inspect structured data in a script node.'
     );
@@ -141,7 +141,7 @@ function resolveOutputRef(
  * Loud, never `''`: a typo'd input that silently emptied would make the condition
  * quietly false and skip the node — the exact silent-branch failure #2566 removes
  * from the whole-output case. The prompt surface already throws for the same
- * reference (`substituteWorkflowVariables` in executor-shared.ts); this is the
+ * reference (`substituteWorkflowVariables` in workflow-variables.ts); this is the
  * `when:` twin of it, worded the same way so an author sees one message for one
  * mistake regardless of where they made it.
  */
@@ -177,18 +177,13 @@ export class InputRefError extends Error {
  * or array THROWS — under the no-silent-drop contract, comparing structured data
  * as a scalar fails loudly with diagnostic evidence rather than silently stringify-comparing.
  */
-function resolveInputRef(
-  name: string,
-  inputs: Record<string, JsonValue> | undefined,
-  exprSnippet: string
-): string {
+function resolveInputRef(name: string, inputs: Record<string, JsonValue> | undefined): string {
   // Canonical text (#2637): a typed input compares as its deterministic text —
   // `$INPUTS.flag == true` matches a boolean `true` via the unquoted-RHS grammar.
   if (inputs && Object.hasOwn(inputs, name)) {
     const value = inputs[name];
     if (Array.isArray(value) || (value !== null && typeof value === 'object')) {
       const actualType = Array.isArray(value) ? 'array' : 'object';
-      getLog().error({ input: name, actualType, exprSnippet }, 'dag.condition_field_not_primitive');
       throw new Error(
         `Condition reference '$INPUTS.${name}' resolved to an ${actualType}. ` +
           "A 'when:' input must be a string, number, boolean, or null; emit a scalar routing field " +
@@ -205,10 +200,9 @@ function resolveAtomRef(
   ref: WhenAtomRef,
   nodeOutputs: Map<string, NodeOutput>,
   inputs: Record<string, JsonValue> | undefined,
-  loopPrevOutputs: ReadonlyMap<string, NodeOutput> | undefined,
-  exprSnippet: string
+  loopPrevOutputs: ReadonlyMap<string, NodeOutput> | undefined
 ): string {
-  if (ref.kind === 'input') return resolveInputRef(ref.name, inputs, exprSnippet);
+  if (ref.kind === 'input') return resolveInputRef(ref.name, inputs);
   // No prior iteration is an ordinary first-iteration condition, not an unknown-node
   // authoring error. Once a prior body node exists, retain normal output-field checks.
   if (ref.kind === 'loop_prev' && !loopPrevOutputs?.has(ref.nodeId)) return '';
@@ -216,7 +210,7 @@ function resolveAtomRef(
     ref.nodeId,
     ref.field,
     ref.kind === 'loop_prev' ? (loopPrevOutputs ?? new Map()) : nodeOutputs,
-    exprSnippet
+    outputRefText(ref.nodeId, ref.field, ref.kind === 'loop_prev' ? 'prior' : 'current')
   );
 }
 
@@ -224,37 +218,29 @@ function resolveAtomRef(
  * Evaluate a single atomic condition expression against upstream node outputs.
  */
 function evaluateAtom(
+  atom: WhenAtom,
   expr: string,
   nodeOutputs: Map<string, NodeOutput>,
   inputs: Record<string, JsonValue> | undefined,
   loopPrevOutputs: ReadonlyMap<string, NodeOutput> | undefined
-): { result: boolean; parsed: boolean } {
-  const atom = loopPrevOutputs !== undefined ? parseLoopPrevWhenAtom(expr) : parseWhenAtom(expr);
-
-  if (!atom) {
-    getLog().debug({ expr }, 'condition_parse_failed');
-    return { result: false, parsed: false };
-  }
-
+): boolean {
   const { ref, operator, expected } = atom;
 
-  // Reference resolution may throw — OutputRefError for an unresolvable `.field` ref
-  // (typo / schemaless non-JSON / missing key), InputRefError for an undeclared
-  // `$INPUTS.<name>`. Deliberately NOT caught here: under the no-silent-drop contract
-  // it must propagate to fail the node, not fail-closed to a silent skip. (Pure-syntax
-  // parse failures still return {parsed:false} via the parse miss above.)
-  const actual = resolveAtomRef(ref, nodeOutputs, inputs, loopPrevOutputs, expr);
+  // Reference errors fail ordinary nodes and include entries; include descendants
+  // retain boundary skips so the block's work cannot run past the failed gate.
+  const actual = resolveAtomRef(ref, nodeOutputs, inputs, loopPrevOutputs);
 
   let result: boolean;
   if (operator === '==' || operator === '!=') {
     result = operator === '==' ? actual === expected : actual !== expected;
   } else {
-    // Numeric comparison
+    // Numeric comparison. `parseWhenExpression` only admits a finite-number RHS here,
+    // so only the runtime output can fail to parse.
     const actualNum = parseFloat(actual);
     const expectedNum = parseFloat(expected);
-    if (!Number.isFinite(actualNum) || !Number.isFinite(expectedNum)) {
+    if (!Number.isFinite(actualNum)) {
       getLog().debug({ expr, actual, expected }, 'condition_numeric_parse_failed');
-      return { result: false, parsed: false };
+      return false;
     }
     if (operator === '<') result = actualNum < expectedNum;
     else if (operator === '>') result = actualNum > expectedNum;
@@ -276,7 +262,7 @@ function evaluateAtom(
         },
     'condition_evaluated'
   );
-  return { result, parsed: true };
+  return result;
 }
 
 /**
@@ -296,18 +282,24 @@ export function evaluateCondition(
   options?: { loopPrevOutputs?: ReadonlyMap<string, NodeOutput> }
 ): { result: boolean; parsed: boolean } {
   const trimmed = expr.trim();
+  assertSupportedWhenOutputRefs(trimmed);
+  const nestedRef = findUnsupportedNestedWhenRef(trimmed);
+  if (nestedRef)
+    throw new Error(
+      `Reference '${nestedRef.reference}' uses nested shorthand; use canonical '.output' spelling for nested paths.`
+    );
 
-  // Split on || — OR has lower precedence
-  const orClauses = splitOutsideQuotes(trimmed, '||');
+  const orClauses = parseWhenExpression(trimmed, options?.loopPrevOutputs !== undefined);
+  if (orClauses === null) {
+    getLog().debug({ expr }, 'condition_parse_failed');
+    return { result: false, parsed: false };
+  }
 
   for (const orClause of orClauses) {
-    // Split each OR clause on && — AND has higher precedence
-    const andAtoms = splitOutsideQuotes(orClause, '&&');
     let orClauseResult = true;
 
-    for (const atom of andAtoms) {
-      const { result, parsed } = evaluateAtom(atom, nodeOutputs, inputs, options?.loopPrevOutputs);
-      if (!parsed) return { result: false, parsed: false }; // fail-closed on any parse error
+    for (const atom of orClause) {
+      const result = evaluateAtom(atom, trimmed, nodeOutputs, inputs, options?.loopPrevOutputs);
       if (!result) {
         orClauseResult = false;
         break; // short-circuit AND

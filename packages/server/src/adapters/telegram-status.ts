@@ -96,6 +96,14 @@ export function createTurnStatus(
  * wrap must be the outermost of the Telegram chain — an inner proxy asked for
  * `sendStructuredEvent` would answer for the bare adapter, which has none.
  */
+/** A tool call's input as the describer reads it: an object, or nothing. */
+function toolInput(
+  event: Extract<PlatformStructuredEvent, { type: 'tool_call' }>
+): Record<string, unknown> | undefined {
+  const input = event.rawInput;
+  return input !== null && typeof input === 'object' && !Array.isArray(input) ? input : undefined;
+}
+
 export function withTurnStatus<T extends IPlatformAdapter>(
   primary: T,
   status: TurnStatus | null
@@ -107,7 +115,7 @@ export function withTurnStatus<T extends IPlatformAdapter>(
         return async (conversationId: string, event: PlatformStructuredEvent): Promise<void> => {
           // Synchronous and self-guarding: `step` only records what to say
           // next, so nothing here can delay or fail the turn's own work.
-          if (event.type === 'tool_call') status.step(describeTool(event.name, event.rawInput));
+          if (event.type === 'tool_call') status.step(describeTool(event.name, toolInput(event)));
           // Forwarded when the wrapped adapter has one of its own, so this
           // stays a decoration on the chain rather than a hole in it.
           const forward = Reflect.get(target, prop, target) as unknown;

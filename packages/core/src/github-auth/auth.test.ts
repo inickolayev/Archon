@@ -1,18 +1,18 @@
+// @archon-test-isolated
 /**
  * Tests for the GitHub App auth module.
  *
  * Strictly mocked at the @octokit/rest boundary — no live api.github.com calls
- * in CI (PRD Q7). `mock.module` is process-global; this file is the ONLY place
- * in @archon/core that mocks @octokit/rest, and it's slotted as its own
- * `bun test` invocation in package.json's test script for isolation.
+ * in CI (PRD Q7). `mock.module` is process-global; the file directive requests
+ * a fresh process.
  */
 import { mock, spyOn, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// Capture the constructor arg + request fn so each test can inspect calls.
-const lastOctokitInit = { current: undefined as unknown };
+// Every constructor arg, in construction order, so tests can assert client config.
+const octokitInits: unknown[] = [];
 
 // One mockRequest used by every Octokit instance. Tests use mockResolvedValueOnce
 // to queue responses in call order. The 'GET /repos/.../installation' and
@@ -26,7 +26,7 @@ const mockRequest = mock(async (..._args: unknown[]) => ({
 class FakeOctokit {
   // The constructor records its init payload so tests can assert auth config.
   constructor(init: unknown) {
-    lastOctokitInit.current = init;
+    octokitInits.push(init);
   }
   request = mockRequest;
 }
@@ -49,12 +49,13 @@ import { AppNotInstalledError, AppPrivateKeyError } from './errors';
 const REAL_PEM =
   '-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----';
 
-function makeProvider(opts: { defaultInstallationId?: number } = {}) {
+function makeProvider(opts: { defaultInstallationId?: number; apiBaseUrl?: string } = {}) {
   return createGitHubAppAuthProvider({
     appId: '12345',
     privateKey: REAL_PEM,
     slug: 'archon-test',
     defaultInstallationId: opts.defaultInstallationId,
+    apiBaseUrl: opts.apiBaseUrl ?? 'https://api.github.com',
   });
 }
 
@@ -70,6 +71,7 @@ function tokenResponse(token: string, expiresInSec: number) {
 
 beforeEach(() => {
   mockRequest.mockReset();
+  octokitInits.length = 0;
 });
 
 describe('loadAppPrivateKey', () => {
@@ -183,16 +185,17 @@ describe('getInstallationToken', () => {
     expect(mockRequest).toHaveBeenCalledTimes(3);
   });
 
-  test('skips lookup when defaultInstallationId is set', async () => {
+  test('repository tokens verify installation access even with a default installation', async () => {
     const provider = makeProvider({ defaultInstallationId: 555 });
-    mockRequest.mockResolvedValueOnce(tokenResponse('ghs_direct', 3600));
-
-    const token = await provider.getInstallationToken('whatever', 'repo');
-    expect(token).toBe('ghs_direct');
-    // Exactly one call — the token-issuance, no install lookup.
-    expect(mockRequest).toHaveBeenCalledTimes(1);
-    const firstCallArgs = mockRequest.mock.calls[0];
-    expect(firstCallArgs?.[0]).toBe('POST /app/installations/{installation_id}/access_tokens');
+    mockRequest
+      .mockResolvedValueOnce({ status: 200, data: { id: 99 } })
+      .mockResolvedValueOnce(tokenResponse('ghs_repository', 3600));
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_repository');
+    expect(mockRequest.mock.calls[0]).toEqual([
+      'GET /repos/{owner}/{repo}/installation',
+      { owner: 'owner', repo: 'repo' },
+    ]);
+    expect(mockRequest.mock.calls[1]?.[1]).toEqual({ installation_id: 99 });
   });
 });
 
@@ -326,12 +329,23 @@ describe('token issuance retry', () => {
       .mockRejectedValueOnce(Object.assign(new Error('Server Error'), { status: 503 }))
       .mockResolvedValueOnce(tokenResponse('ghs_retry', 3600));
 
-    expect(await provider.getInstallationToken('o', 'r')).toBe('ghs_retry');
+    expect(await provider.getInstallationTokenById(9)).toBe('ghs_retry');
     expect(mockRequest).toHaveBeenCalledTimes(2);
   });
 });
 
 describe('primeInstallationLookup', () => {
+  test('fixed-install mode uses the webhook installation for repository tokens', async () => {
+    const provider = makeProvider({ defaultInstallationId: 555 });
+    provider.primeInstallationLookup('Owner', 'Repo', 99);
+    mockRequest.mockResolvedValueOnce(tokenResponse('ghs_webhook', 3600));
+
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_webhook');
+    expect(mockRequest.mock.calls).toEqual([
+      ['POST /app/installations/{installation_id}/access_tokens', { installation_id: 99 }],
+    ]);
+  });
+
   test('priming from webhook payload skips the lookup HTTP call', async () => {
     const provider = makeProvider();
     provider.primeInstallationLookup('o', 'r', 1234);
@@ -351,12 +365,12 @@ describe('invalidateToken', () => {
       .mockResolvedValueOnce(tokenResponse('ghs_first', 3600))
       .mockResolvedValueOnce(tokenResponse('ghs_second', 3600));
 
-    const first = await provider.getInstallationToken('o', 'r');
+    const first = await provider.getInstallationTokenById(1);
     expect(first).toBe('ghs_first');
 
     provider.invalidateToken(1);
 
-    const second = await provider.getInstallationToken('o', 'r');
+    const second = await provider.getInstallationTokenById(1);
     expect(second).toBe('ghs_second');
     expect(mockRequest).toHaveBeenCalledTimes(2);
   });
@@ -388,6 +402,32 @@ describe('invalidateToken', () => {
 });
 
 describe('invalidateRepo', () => {
+  test('evicts repository and fixed-install caches', async () => {
+    const provider = makeProvider({ defaultInstallationId: 555 });
+    mockRequest
+      .mockResolvedValueOnce(tokenResponse('ghs_fixed_before', 3600))
+      .mockResolvedValueOnce({ status: 200, data: { id: 99 } })
+      .mockResolvedValueOnce(tokenResponse('ghs_repo_before', 3600));
+    expect(await provider.getInstallationTokenById(555)).toBe('ghs_fixed_before');
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_repo_before');
+    expect(mockRequest.mock.calls.at(-1)?.[1]).toEqual({ installation_id: 99 });
+    const fixedClient = await provider.getOctokitForInstallation('owner', 'repo');
+
+    provider.invalidateRepo('owner', 'repo');
+
+    expect(await provider.getOctokitForInstallation('owner', 'repo')).not.toBe(fixedClient);
+    mockRequest
+      .mockResolvedValueOnce(tokenResponse('ghs_fixed_after', 3600))
+      .mockResolvedValueOnce({ status: 200, data: { id: 100 } })
+      .mockResolvedValueOnce(tokenResponse('ghs_repo_after', 3600))
+      .mockResolvedValueOnce(tokenResponse('ghs_old_repo_after', 3600));
+    expect(await provider.getInstallationTokenById(555)).toBe('ghs_fixed_after');
+    expect(await provider.getInstallationToken('owner', 'repo')).toBe('ghs_repo_after');
+    expect(mockRequest.mock.calls.at(-1)?.[1]).toEqual({ installation_id: 100 });
+    expect(await provider.getInstallationTokenById(99)).toBe('ghs_old_repo_after');
+    expect(mockRequest).toHaveBeenCalledTimes(7);
+  });
+
   test('evicts both lookup and token caches for the repo', async () => {
     const provider = makeProvider();
     mockRequest
@@ -411,12 +451,12 @@ describe('invalidateRepo', () => {
     mockRequest
       .mockResolvedValueOnce(tokenResponse('ghs_one', 3600))
       .mockResolvedValueOnce(tokenResponse('ghs_two', 3600));
-    const first = await provider.getInstallationToken('o', 'r');
+    const first = await provider.getInstallationTokenById(123);
     expect(first).toBe('ghs_one');
 
     provider.invalidateRepo('o', 'r');
 
-    const second = await provider.getInstallationToken('o', 'r');
+    const second = await provider.getInstallationTokenById(123);
     expect(second).toBe('ghs_two');
   });
 });
@@ -426,8 +466,7 @@ describe('cache TTL boundaries', () => {
     const baseTime = 1_700_000_000_000;
     let mockedNow = baseTime;
     // spyOn restores cleanly in afterEach via mockRestore; avoids direct
-    // mutation of the Date.now reference (and the eslint-disable that came
-    // with it).
+    // mutation of the Date.now reference.
     const nowSpy = spyOn(Date, 'now').mockImplementation(() => mockedNow);
 
     try {
@@ -463,6 +502,18 @@ describe('cache TTL boundaries', () => {
 });
 
 describe('getOctokitForInstallation', () => {
+  test('app-level and installation clients both call the configured API root', async () => {
+    const provider = makeProvider({
+      defaultInstallationId: 9,
+      apiBaseUrl: 'https://ghe.example/api/v3',
+    });
+    await provider.getOctokitForInstallation('o', 'r');
+    expect(octokitInits).toHaveLength(2);
+    for (const init of octokitInits) {
+      expect(init).toMatchObject({ baseUrl: 'https://ghe.example/api/v3' });
+    }
+  });
+
   test('returns same instance for same installation (memoised)', async () => {
     const provider = makeProvider({ defaultInstallationId: 9 });
     const a = await provider.getOctokitForInstallation('o', 'r');

@@ -1,0 +1,377 @@
+import { describe, expect, it } from 'bun:test';
+import { foldDagResumeSnapshot, type DagResumeEvent } from './dag-resume-snapshot';
+import { finishNodeExecution, newNodeInvocation, startNodeExecution } from './node-execution';
+import { serializeNodeStateRecord, serializeDeferredNodeUsage } from './node-record-serialization';
+
+const valid: DagResumeEvent = {
+  step_name: 'valid',
+  event_type: 'node_completed',
+  data: { node_output: 'valid output', tokens: { input: 7, output: 3 }, cost_usd: 0.2 },
+};
+
+const invalidTokens = [
+  { input: 100 },
+  { output: 10 },
+  { input: 100, output: 'unreadable' },
+  { input: null, output: 10 },
+  { input: NaN, output: 10 },
+  { input: 100, output: Infinity },
+  null,
+];
+
+describe('historical token accounting', () => {
+  for (const eventType of ['node_completed', 'node_failed', 'node_deferred_usage']) {
+    it.each(invalidTokens)(
+      `${eventType} keeps malformed counted tokens unknown: %j`,
+      async tokens => {
+        const snapshot = await foldDagResumeSnapshot(
+          [
+            { step_name: 'old', event_type: 'node_completed', data: { node_output: 'kept' } },
+            {
+              step_name: 'old',
+              event_type: eventType,
+              data: { tokens, cost_usd: 0.1, node_output: 'updated', error: 'failed' },
+            },
+            valid,
+          ],
+          'run'
+        );
+        expect(snapshot.tokensUnknown).toBe(true);
+        expect(snapshot.tokens).toBeUndefined();
+        expect(snapshot.costUsd).toBeCloseTo(0.3);
+        expect(snapshot.completedNodeOutputs.get('old')?.output).toBe(
+          eventType === 'node_failed'
+            ? undefined
+            : eventType === 'node_completed'
+              ? 'updated'
+              : 'kept'
+        );
+        expect(snapshot.failedNodes.has('old')).toBe(eventType === 'node_failed');
+        expect(snapshot.unresolvedNodeStarts.size).toBe(0);
+      }
+    );
+
+    it(`${eventType} excludes malformed aggregate restatements`, async () => {
+      const snapshot = await foldDagResumeSnapshot(
+        [
+          {
+            step_name: 'aggregate',
+            event_type: eventType,
+            data: { aggregate: true, tokens: { input: 100 }, cost_usd: 99 },
+          },
+          valid,
+        ],
+        'run'
+      );
+      expect(snapshot.tokensUnknown).toBe(false);
+      expect(snapshot.tokens).toEqual({ input: 7, output: 3 });
+      expect(snapshot.costUsd).toBe(0.2);
+    });
+  }
+
+  it('excludes malformed leaves covered by an authoritative instance', async () => {
+    const snapshot = await foldDagResumeSnapshot(
+      [
+        {
+          step_name: 'fan__item__leaf',
+          event_type: 'node_deferred_usage',
+          data: { tokens: { input: 100 }, cost_usd: 99 },
+        },
+        {
+          step_name: 'fan__item',
+          event_type: 'node_completed',
+          data: {
+            type: 'compose_fan_out_instance',
+            aggregate: true,
+            tokens: { input: 100, output: 10 },
+            cost_usd: 0.1,
+          },
+        },
+        valid,
+      ],
+      'run'
+    );
+    expect(snapshot.tokensUnknown).toBe(false);
+    expect(snapshot.tokens).toEqual({ input: 107, output: 13 });
+    expect(snapshot.costUsd).toBeCloseTo(0.3);
+  });
+
+  it('preserves valid zeros, absent usage and cache partiality', async () => {
+    const snapshot = await foldDagResumeSnapshot(
+      [
+        { step_name: 'empty', event_type: 'node_completed', data: {} },
+        {
+          step_name: 'old',
+          event_type: 'node_failed',
+          data: {
+            tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cachePartial: true },
+          },
+        },
+        valid,
+      ],
+      'run'
+    );
+    expect(snapshot.tokensUnknown).toBe(false);
+    expect(snapshot.tokens).toEqual({
+      input: 7,
+      output: 3,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cachePartial: true,
+    });
+  });
+});
+
+describe('historical cost floor', () => {
+  it.each([
+    { costUsd: 0.02, partial: true },
+    { costUsd: 0, partial: true },
+    { costUsd: undefined, partial: true },
+    { costUsd: 0.02, partial: false },
+    { costUsd: 0, partial: false },
+  ])('retains metadata-free loop completion cost proof: %j', async ({ costUsd, partial }) => {
+    const snapshot = await foldDagResumeSnapshot(
+      [
+        {
+          step_name: 'fan__item__loop',
+          event_type: 'node_completed',
+          data: {
+            node_output: 'approved',
+            ...(costUsd !== undefined ? { cost_usd: costUsd } : {}),
+            ...(partial ? { cost_partial: true } : {}),
+          },
+        },
+      ],
+      'run'
+    );
+    expect(snapshot.costUsd).toBe(costUsd);
+    expect(snapshot.costPartial).toBe(partial);
+    expect(snapshot.unfinishedInvocations?.size ?? 0).toBe(0);
+  });
+
+  const attempt = (path: string, costUsd?: number) => {
+    const start = startNodeExecution({
+      runId: 'run',
+      path,
+      node: { id: path, kind: 'agent', source: { kind: 'inline', prompt: 'p' } },
+      invocation: newNodeInvocation(),
+      provider: 'claude',
+    });
+    return [
+      serializeNodeStateRecord(start),
+      serializeNodeStateRecord(
+        finishNodeExecution(start, { status: 'completed' }, { output: { text: path }, costUsd })
+      ),
+    ];
+  };
+
+  it.each([
+    ['absent', { tokens: { input: 1, output: 1 } }],
+    ['a string', { cost_usd: 'NaN' }],
+    ['non-finite', { cost_usd: Infinity }],
+  ])(
+    'a metadata-free contribution with %s cost keeps later priced work as the floor',
+    async (_, data) => {
+      const snapshot = await foldDagResumeSnapshot(
+        [
+          { step_name: 'old', event_type: 'node_completed', data: { node_output: 'o', ...data } },
+          ...attempt('later', 0.2),
+        ],
+        'run'
+      );
+      expect(snapshot.costUsd).toBeCloseTo(0.2);
+    }
+  );
+
+  it('keeps reported zero distinct from absence', async () => {
+    expect((await foldDagResumeSnapshot(attempt('a', 0), 'run')).costUsd).toBe(0);
+    expect((await foldDagResumeSnapshot(attempt('a'), 'run')).costUsd).toBeUndefined();
+  });
+
+  it('uses modern spend proof over a conflicting flat legacy marker', async () => {
+    const rows = attempt('loop', 0.02);
+    const completion = rows[1];
+    const snapshot = await foldDagResumeSnapshot(
+      [rows[0], { ...completion, data: { ...completion.data, cost_partial: true } }],
+      'run'
+    );
+    expect(snapshot.costUsd).toBe(0.02);
+    expect(snapshot.costPartial).toBe(false);
+  });
+});
+
+describe('composed instance accounting segments', () => {
+  it.each(
+    ['node_completed', 'node_failed', 'node_deferred_usage'].flatMap(eventType =>
+      ['fan__item__leaf', 'fan__item__nested__item__leaf'].map(path => ({ eventType, path }))
+    )
+  )('keeps later own spend after an instance terminal: %j', async ({ eventType, path }) => {
+    const terminalData = {
+      type: 'compose_fan_out_instance',
+      aggregate: true,
+      cost_usd: 0.01,
+      tokens: { input: 7, output: 3 },
+    };
+    const terminal: DagResumeEvent = {
+      step_name: 'fan__item',
+      event_type: 'node_failed',
+      data: terminalData,
+    };
+    const leaf = startNodeExecution({
+      runId: 'run',
+      path,
+      provider: 'claude',
+      invocation: newNodeInvocation(),
+      node: {
+        id: 'leaf',
+        kind: 'loop',
+        loop: { prompt: 'Work', until: 'DONE', max_iterations: 1, fresh_context: false },
+      },
+    });
+    const rows: DagResumeEvent[] = [
+      {
+        step_name: path,
+        event_type: 'node_failed',
+        data: { cost_usd: 0.01, tokens: { input: 7, output: 3 } },
+      },
+      terminal,
+      serializeNodeStateRecord(
+        finishNodeExecution(leaf, { status: 'completed' }, { costUsd: 0, costPartial: true })
+      ),
+      {
+        step_name: path,
+        event_type: eventType,
+        data: { cost_usd: 0.02, tokens: { input: 14, output: 6 } },
+      },
+    ];
+    const open = await foldDagResumeSnapshot(rows, 'run');
+    expect(open.costUsd).toBeCloseTo(0.03);
+    expect(open.costPartial).toBe(true);
+    expect(open.tokens).toEqual({ input: 21, output: 9 });
+    const closed = await foldDagResumeSnapshot(
+      [
+        ...rows,
+        {
+          ...terminal,
+          event_type: 'node_completed',
+          data: { ...terminalData, cost_usd: 0.02, tokens: { input: 14, output: 6 } },
+        },
+      ],
+      'run'
+    );
+    expect(closed.costUsd).toBeCloseTo(0.03);
+    expect(closed.costPartial).toBe(false);
+    expect(closed.tokens).toEqual(open.tokens);
+  });
+});
+
+describe('interrupted loop accounting', () => {
+  it('counts carried gate spend once across repeated interrupted continuations', async () => {
+    const start = startNodeExecution({
+      runId: 'run',
+      path: 'loop',
+      provider: 'claude',
+      invocation: newNodeInvocation(),
+      node: {
+        id: 'loop',
+        kind: 'loop',
+        loop: { prompt: 'Work', until: 'DONE', max_iterations: 2, fresh_context: false },
+      },
+    });
+    const baseline = finishNodeExecution(
+      start,
+      { status: 'suspended', point: 'interactive_loop' },
+      {
+        costUsd: 0.04,
+        tokens: { input: 40, output: 4, cacheRead: 4, cacheWrite: 2 },
+      }
+    ).spend;
+    const rows = [
+      { costUsd: 0.02, tokens: { input: 20, output: 2, cacheRead: 2, cacheWrite: 1 } },
+      { costUsd: 0.04, tokens: { input: 40, output: 4, cacheRead: 4, cacheWrite: 2 } },
+    ].map(usage => {
+      const event = serializeDeferredNodeUsage(
+        finishNodeExecution(start, { status: 'suspended', point: 'interactive_loop' }, usage),
+        baseline
+      );
+      return { ...event, data: JSON.stringify(event.data) };
+    });
+
+    const snapshot = await foldDagResumeSnapshot(rows, 'run');
+
+    expect(snapshot.costUsd).toBeCloseTo(0.1);
+    expect(snapshot.costPartial).toBe(false);
+    expect(snapshot.tokens).toEqual({ input: 100, output: 10, cacheRead: 10, cacheWrite: 5 });
+    expect(snapshot.loopUsageBaselines).toEqual(new Map([[start.invocation.id, baseline]]));
+  });
+});
+
+describe('loop configuration failure accounting', () => {
+  for (const exit of ['completed', 'skipped', 'suspended'] as const) {
+    it.each([
+      { failureKind: 'config', sameInvocation: true, expected: 0.07 },
+      { failureKind: 'config', sameInvocation: false, expected: 0.11 },
+      { failureKind: 'unknown', sameInvocation: true, expected: 0.11 },
+    ] as const)(
+      `reconciles only the same invocation configuration restatement (exit=${exit}): %j`,
+      async ({ failureKind, sameInvocation, expected }) => {
+        const first = startNodeExecution({
+          runId: 'run',
+          path: 'loop',
+          provider: 'claude',
+          invocation: newNodeInvocation(),
+          node: {
+            id: 'loop',
+            kind: 'loop',
+            loop: { prompt: 'Work', until: 'DONE', max_iterations: 2, fresh_context: false },
+          },
+        });
+        const failed = serializeNodeStateRecord(
+          finishNodeExecution(
+            first,
+            { status: 'failed', error: 'failed', failureKind },
+            { costUsd: 0.04, costPartial: true, tokens: { input: 40, output: 4 } }
+          )
+        );
+        const next = {
+          ...first,
+          invocation: sameInvocation ? first.invocation : newNodeInvocation(),
+        };
+        const continuation = finishNodeExecution(
+          next,
+          exit === 'skipped'
+            ? {
+                status: 'skipped',
+                reason: 'trigger_rule',
+                cause: { kind: 'upstream_failed', origin: 'peer' },
+              }
+            : exit === 'suspended'
+              ? { status: 'suspended', point: 'interactive_loop' }
+              : { status: 'completed' },
+          { costUsd: 0.07, tokens: { input: 70, output: 7 } }
+        );
+        const completed =
+          exit !== 'completed'
+            ? serializeDeferredNodeUsage(continuation)
+            : serializeNodeStateRecord(continuation);
+        const snapshot = await foldDagResumeSnapshot([failed, completed], 'run');
+        expect(snapshot.tokens).toEqual(
+          expected === 0.07 ? { input: 70, output: 7 } : { input: 110, output: 11 }
+        );
+        if (failureKind === 'config' && sameInvocation)
+          expect(snapshot.loopUsageBaselines?.size).toBe(0);
+        expect(snapshot.costUsd).toBeCloseTo(expected, 5);
+        expect(snapshot.costPartial).toBe(!(failureKind === 'config' && sameInvocation));
+        if (failureKind === 'config' && sameInvocation) {
+          expect((await foldDagResumeSnapshot([failed, failed], 'run')).costUsd).toBeCloseTo(
+            0.04,
+            5
+          );
+          expect(
+            (await foldDagResumeSnapshot([failed, failed, completed], 'run')).costUsd
+          ).toBeCloseTo(0.07, 5);
+        }
+      }
+    );
+  }
+});

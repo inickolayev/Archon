@@ -1,7 +1,8 @@
-import { describe, expect, mock, test } from 'bun:test';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { describe, expect, mock, spyOn, test } from 'bun:test';
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as git from '@archon/git';
 import { createRecordingGitFixture } from '@archon/git/test-utils';
 import { trackTempRoots } from '@archon/paths/test-utils';
 
@@ -43,7 +44,7 @@ mock.module('@archon/core/db/conversations', () => ({
 
 mock.module('@archon/core/db/codebases', () => ({
   findCodebaseByRepoUrl: mock(async () => null),
-  createCodebase: mock(async () => undefined),
+  createManagedCodebase: mock(async () => undefined),
   getCodebaseCommands: mock(async () => ({})),
   updateCodebaseCommands: mock(async () => undefined),
   updateCodebase: mock(async () => undefined),
@@ -53,35 +54,87 @@ mock.module('@archon/core/db/users', () => ({
   findOrCreateUserByPlatformIdentity: mock(async () => undefined),
 }));
 
-mock.module('@archon/core/config/resolve-assistant', () => ({
-  resolveDefaultAssistant: mock(async () => 'claude'),
-}));
-
-const { GitLabAdapter } = await import('./adapter');
+const readiness = await import('./repository-readiness');
 const trackTempRoot = trackTempRoots();
 
-function createAdapter(token: string, gitlabUrl: string): InstanceType<typeof GitLabAdapter> {
-  return new GitLabAdapter(token, 'webhook-secret', {} as never, gitlabUrl, 'archon');
-}
-
 function ensureRepoReady(
-  adapter: InstanceType<typeof GitLabAdapter>,
+  client: { gitlabUrl: string; token: string },
   projectPath: string,
   repoPath: string
 ): Promise<void> {
-  return (
-    adapter as unknown as {
-      ensureRepoReady(
-        projectPath: string,
-        defaultBranch: string,
-        repoPath: string,
-        shouldSync: boolean
-      ): Promise<void>;
-    }
-  ).ensureRepoReady(projectPath, 'main', repoPath, false);
+  return readiness.ensureRepoReady(
+    client,
+    projectPath,
+    'main',
+    { name: projectPath, default_cwd: repoPath },
+    false
+  );
 }
 
 describe('GitLab clone child security boundary', () => {
+  test.skipIf(process.platform === 'win32')(
+    'trusts the destination before a real checkout hook runs',
+    async () => {
+      const root = trackTempRoot(
+        await realpath(await mkdtemp(join(tmpdir(), 'forge-checkout-trust-')))
+      );
+      const source = join(root, 'source');
+      const target = join(root, 'clone');
+      const hooks = join(root, 'hooks');
+      const config = join(root, 'gitconfig');
+      const saved = {
+        GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+        GIT_TEST_ASSUME_DIFFERENT_OWNER: process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER,
+      };
+      const realExec = git.execFileAsync;
+      let execSpy: ReturnType<typeof spyOn> | undefined;
+      try {
+        process.env.GIT_CONFIG_GLOBAL = config;
+        await mkdir(hooks);
+        await realExec('git', ['init', source]);
+        await realExec('git', [
+          '-C',
+          source,
+          '-c',
+          'user.name=Test',
+          '-c',
+          'user.email=test@example.com',
+          'commit',
+          '--allow-empty',
+          '-m',
+          'Initial',
+        ]);
+        await realExec('git', ['config', '--global', 'core.hooksPath', hooks]);
+        await git.addSafeDirectory(git.toRepoPath(source));
+        await git.addSafeDirectory(git.toRepoPath(join(source, '.git')));
+        await writeFile(
+          join(hooks, 'post-checkout'),
+          '#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE\ngit status --porcelain > hook-ran\n',
+          { mode: 0o755 }
+        );
+        process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = '1';
+        execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (file, args, options) => {
+          const clone = args.indexOf('clone');
+          const localArgs = [...args];
+          if (clone !== -1) localArgs[clone + 1] = source;
+          return realExec(file, localArgs, options);
+        });
+        await ensureRepoReady(
+          { gitlabUrl: 'https://gitlab.example.test', token: 'token' },
+          'group/project',
+          target
+        );
+        expect(await Bun.file(join(target, 'hook-ran')).exists()).toBe(true);
+      } finally {
+        execSpy?.mockRestore();
+        for (const [key, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    }
+  );
+
   test.skipIf(process.platform === 'win32')(
     'passes request-scoped oauth2 credentials outside argv for an explicit HTTPS port',
     async () => {
@@ -89,9 +142,9 @@ describe('GitLab clone child security boundary', () => {
       const targetPath = join(root, 'clone');
       const fixture = await createRecordingGitFixture(root);
       const token = 'gitlab-adapter-token-789';
-      const adapter = createAdapter(token, 'https://gitlab.example.test:8443');
+      const client = { gitlabUrl: 'https://gitlab.example.test:8443', token };
 
-      await fixture.run(() => ensureRepoReady(adapter, 'group/project', targetPath));
+      await fixture.run(() => ensureRepoReady(client, 'group/project', targetPath));
 
       const invocations = await fixture.readInvocations();
       const clone = invocations.find(invocation => invocation.argv.includes('clone'));
@@ -114,11 +167,11 @@ describe('GitLab clone child security boundary', () => {
       const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-gitlab-clone-403-')));
       const fixture = await createRecordingGitFixture(root);
       const token = 'gitlab-rejected-token-987';
-      const adapter = createAdapter(token, 'https://gitlab.example.test:8443');
+      const client = { gitlabUrl: 'https://gitlab.example.test:8443', token };
       const failure = `fatal: credential ${token} rejected: The requested URL returned error: 403\n`;
 
       const clone = fixture.run(
-        () => ensureRepoReady(adapter, 'group/project', join(root, 'clone')),
+        () => ensureRepoReady(client, 'group/project', join(root, 'clone')),
         failure
       );
 

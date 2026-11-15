@@ -21,11 +21,11 @@ export function ProfilePage(): ReactElement {
   const { data: account, error, loading } = useEntity<Account>(K.account, () => skill.getAccount());
 
   if (loading) {
-    return <div className="p-6 text-[12px] text-text-tertiary">Loading your account…</div>;
+    return <div className="p-6 text-console-12 text-text-tertiary">Loading your account…</div>;
   }
   if (error !== undefined || account === undefined) {
     return (
-      <div className="p-6 font-mono text-[12px] text-error">
+      <div className="p-6 font-mono text-console-12 text-error">
         Could not load your account: {error?.message ?? 'unknown error'}
       </div>
     );
@@ -33,11 +33,13 @@ export function ProfilePage(): ReactElement {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <header className="px-10 pt-[22px]">
-        <h1 className="text-[22px] font-extrabold tracking-[-0.4px] text-text-primary">Profile</h1>
+      <header className="px-10 pt-5.5">
+        <h1 className="text-console-22 font-extrabold tracking-console-tighter text-text-primary">
+          Profile
+        </h1>
       </header>
       <div className="flex-1 overflow-y-auto px-10 pb-14 pt-5">
-        <div className="mx-auto flex max-w-[680px] flex-col gap-[22px]">
+        <div className="mx-auto flex max-w-170 flex-col gap-5.5">
           <IdentityCard account={account} />
           <PasswordCard />
           <LinkedSourcesCard account={account} />
@@ -75,9 +77,7 @@ function Card({
   return (
     <SettingsSection title={title}>
       {hint !== undefined ? (
-        <p className="-mt-[10px] mb-[14px] text-[12.5px] leading-[1.5] text-text-secondary">
-          {hint}
-        </p>
+        <p className="-mt-2.5 mb-3.5 text-console-13 leading-[1.5] text-text-secondary">{hint}</p>
       ) : null}
       {children}
     </SettingsSection>
@@ -86,10 +86,10 @@ function Card({
 
 /** The action that changes something (design v5 brand bar). */
 const BUTTON_CLASS =
-  'brand-bar rounded-[7px] px-3.5 py-[7px] text-[12px] font-medium text-white transition-all hover:brightness-110 disabled:opacity-40';
+  'brand-bar rounded-md px-3.5 py-1.75 text-console-12 font-medium text-white transition-all hover:brightness-110 disabled:opacity-40';
 /** The quieter action next to it (Unlink, Sign out). */
 const BUTTON_QUIET_CLASS =
-  'rounded-[7px] border border-border px-3 py-[6px] text-[12px] text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary disabled:opacity-40';
+  'rounded-md border border-border px-3 py-1.5 text-console-12 text-text-secondary transition-colors hover:border-border-bright hover:text-text-primary disabled:opacity-40';
 
 export function IdentityCard({ account }: { account: Account }): ReactElement {
   const [name, setName] = useState(account.name ?? '');
@@ -118,15 +118,15 @@ export function IdentityCard({ account }: { account: Account }): ReactElement {
     <Card title="You" hint="The name is what other people see next to your messages.">
       <form onSubmit={save} className="flex flex-col gap-3">
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[10px] uppercase tracking-wider text-text-tertiary">
+          <span className="font-mono text-console-10 uppercase tracking-wider text-text-tertiary">
             Email
           </span>
-          <span className="font-mono text-[12px] text-text-secondary">
+          <span className="font-mono text-console-12 text-text-secondary">
             {account.email ?? 'not set'}
           </span>
         </label>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[10px] uppercase tracking-wider text-text-tertiary">
+          <span className="font-mono text-console-10 uppercase tracking-wider text-text-tertiary">
             Name
           </span>
           <input
@@ -147,8 +147,8 @@ export function IdentityCard({ account }: { account: Account }): ReactElement {
           >
             {state === 'saving' ? 'Saving…' : 'Save name'}
           </button>
-          {state === 'saved' ? <span className="text-[11px] text-success">Saved</span> : null}
-          {message !== null ? <span className="text-[11px] text-error">{message}</span> : null}
+          {state === 'saved' ? <span className="text-console-11 text-success">Saved</span> : null}
+          {message !== null ? <span className="text-console-11 text-error">{message}</span> : null}
         </div>
       </form>
     </Card>
@@ -215,8 +215,8 @@ export function PasswordCard(): ReactElement {
           >
             {state === 'saving' ? 'Changing…' : 'Change password'}
           </button>
-          {state === 'saved' ? <span className="text-[11px] text-success">Changed</span> : null}
-          {message !== null ? <span className="text-[11px] text-error">{message}</span> : null}
+          {state === 'saved' ? <span className="text-console-11 text-success">Changed</span> : null}
+          {message !== null ? <span className="text-console-11 text-error">{message}</span> : null}
         </div>
       </form>
     </Card>
@@ -256,7 +256,7 @@ export function LinkedSourcesCard({ account }: { account: Account }): ReactEleme
       hint="Chat accounts that write as you. Ask the bot for a link from its menu: ☰ Menu → Link this chat to my account."
     >
       {external.length === 0 ? (
-        <p className="text-[12px] text-text-tertiary">
+        <p className="text-console-12 text-text-tertiary">
           Nothing linked yet. In Telegram: ☰ Menu → “Link this chat to my account”, then open the
           link it sends while signed in here.
         </p>
@@ -270,11 +270,11 @@ export function LinkedSourcesCard({ account }: { account: Account }): ReactEleme
             >
               <span className="flex min-w-0 items-center gap-2">
                 <PlatformBadge platformType={identity.platform} />
-                <span className="truncate text-[12px] text-text-secondary">
+                <span className="truncate text-console-12 text-text-secondary">
                   {identity.displayName ?? identity.platformUserId}
                 </span>
                 {identity.linkedAt !== null ? (
-                  <span className="shrink-0 font-mono text-[10px] text-text-tertiary">
+                  <span className="shrink-0 font-mono text-console-10 text-text-tertiary">
                     linked {relativeTime(identity.linkedAt)}
                   </span>
                 ) : null}
@@ -295,7 +295,7 @@ export function LinkedSourcesCard({ account }: { account: Account }): ReactEleme
           ))}
         </ul>
       )}
-      {message !== null ? <p className="mt-2 text-[11px] text-error">{message}</p> : null}
+      {message !== null ? <p className="mt-2 text-console-11 text-error">{message}</p> : null}
     </Card>
   );
 }
@@ -321,7 +321,7 @@ export function SignOutCard({ signOut }: { signOut: () => Promise<void> }): Reac
       >
         {busy ? 'Signing out…' : 'Sign out'}
       </button>
-      {message !== null ? <p className="mt-2 text-[11px] text-error">{message}</p> : null}
+      {message !== null ? <p className="mt-2 text-console-11 text-error">{message}</p> : null}
     </Card>
   );
 }

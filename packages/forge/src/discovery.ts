@@ -17,6 +17,11 @@ export interface PluginCandidate extends PluginArgv {
   expectedName?: string;
 }
 
+/** A plugin the host runs from its own source tree instead of an installed executable. */
+export interface SourcePlugin extends PluginArgv {
+  name: string;
+}
+
 export interface DiscoveredPlugin extends PluginCandidate {
   metadata: PluginMetadata;
 }
@@ -32,11 +37,31 @@ export interface PluginDiscovery {
 export class PluginDiscoveryError extends Error {
   constructor(
     readonly kind: 'duplicate_host' | 'process_failed' | 'invalid_response',
-    message: string
+    message: string,
+    options?: ErrorOptions
   ) {
-    super(message);
+    super(message, options);
     this.name = 'PluginDiscoveryError';
   }
+}
+
+type CandidateInspection =
+  | { kind: 'ready'; candidate: PluginCandidate }
+  | { kind: 'unavailable'; candidate: PluginCandidate; error: PluginDiscoveryError };
+
+function inspectionFailure(
+  candidate: PluginCandidate,
+  operation: 'stat' | 'access',
+  error: unknown
+): PluginDiscoveryError {
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  return new PluginDiscoveryError(
+    'process_failed',
+    `${candidate.source}: ${operation} failed for ${candidate.command}${code ? ` (${code})` : ''}: ${message}`,
+    { cause: error }
+  );
 }
 
 function executableName(entry: string): string | undefined {
@@ -46,7 +71,7 @@ function executableName(entry: string): string | undefined {
   return match[1].toLowerCase();
 }
 
-async function scanDirectory(directory: string, source: string): Promise<PluginCandidate[]> {
+async function scanDirectory(directory: string, source: string): Promise<CandidateInspection[]> {
   let entries: string[];
   try {
     entries = await readdir(directory);
@@ -54,49 +79,63 @@ async function scanDirectory(directory: string, source: string): Promise<PluginC
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
   }
-  const candidates: PluginCandidate[] = [];
+  const candidates: CandidateInspection[] = [];
   for (const entry of entries.sort()) {
-    const name = executableName(entry);
-    if (!name) {
-      if (/^archon-forge-/i.test(entry)) {
-        process.stderr.write(`Skipping forge plugin ${entry}: unsupported executable format\n`);
-      }
-      continue;
-    }
-    const command = resolve(directory, entry);
-    try {
-      const details = await stat(command);
-      if (!details.isFile()) continue;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      // Retain a broken link as an unavailable candidate, so selecting it
-      // cannot silently turn into an unclaimed (no-forge) result.
-      candidates.push({
-        source: `${source}:${name}`,
-        configured: false,
-        command,
-        args: [],
-        expectedName: name,
-      });
-      continue;
-    }
-    if (process.platform !== 'win32') {
-      try {
-        await access(command, constants.X_OK);
-      } catch {
-        process.stderr.write(`Skipping forge plugin ${entry}: file is not executable\n`);
-        continue;
-      }
-    }
-    candidates.push({
-      source: `${source}:${name}`,
-      configured: false,
-      command,
-      args: [],
-      expectedName: name,
-    });
+    const candidate = await scannedCandidate(directory, source, entry);
+    if (candidate) candidates.push(candidate);
   }
   return candidates;
+}
+
+async function scannedCandidate(
+  directory: string,
+  source: string,
+  entry: string
+): Promise<CandidateInspection | undefined> {
+  const name = executableName(entry);
+  if (!name) {
+    if (/^archon-forge-/i.test(entry)) {
+      process.stderr.write(`Skipping forge plugin ${entry}: unsupported executable format\n`);
+    }
+    return undefined;
+  }
+  const command = resolve(directory, entry);
+  const candidate: PluginCandidate = {
+    source: `${source}:${name}`,
+    configured: false,
+    command,
+    args: [],
+    expectedName: name,
+  };
+  let mode: number;
+  try {
+    const details = await stat(command);
+    mode = details.mode;
+    if (!details.isFile()) return undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      return { kind: 'unavailable', candidate, error: inspectionFailure(candidate, 'stat', error) };
+    }
+    // Retain a broken link as an unavailable candidate, so selecting it
+    // cannot silently turn into an unclaimed (no-forge) result.
+    return { kind: 'ready', candidate };
+  }
+  if (process.platform !== 'win32') {
+    try {
+      await access(command, constants.X_OK);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EACCES' || (mode & 0o111) !== 0) {
+        return {
+          kind: 'unavailable',
+          candidate,
+          error: inspectionFailure(candidate, 'access', error),
+        };
+      }
+      process.stderr.write(`Skipping forge plugin ${entry}: file is not executable\n`);
+      return undefined;
+    }
+  }
+  return { kind: 'ready', candidate };
 }
 
 function configuredCandidates(
@@ -124,10 +163,12 @@ function configuredCandidates(
 }
 
 async function readMetadata(
-  candidate: PluginCandidate,
+  inspection: CandidateInspection,
   env: NodeJS.ProcessEnv,
   options: { timeoutMs?: number; maxOutputBytes?: number }
 ): Promise<PluginMetadata> {
+  if (inspection.kind === 'unavailable') throw inspection.error;
+  const { candidate } = inspection;
   const outcome = await runPluginProcess(candidate, ['metadata'], {
     env,
     timeoutMs: options.timeoutMs ?? 10_000,
@@ -168,16 +209,46 @@ export async function discoverPlugins(
     timeoutMs?: number;
     maxOutputBytes?: number;
     /**
-     * The installed plugins directory to scan, the one `archon plugin install` writes.
+     * The installed plugins directory to scan, the one `archon plugin add` writes.
      * The host owns where that is (the CLI passes `getPluginsPath()` from
      * `@archon/paths`); forge stays a leaf package and has no rule of its own for it.
      * Omitted, only configured plugins, `pluginDirs` and PATH are scanned.
      */
     pluginsDir?: string;
+    /**
+     * Plugins a source checkout runs from its own tree. Each one replaces every scanned
+     * executable of the same name, so an installed copy older than the host never runs.
+     * A release binary passes none.
+     */
+    sourcePlugins?: readonly SourcePlugin[];
   } = {}
 ): Promise<PluginDiscovery> {
   const config = forgePluginConfigSchema.parse(options.config ?? {});
   const env = options.env ?? process.env;
+  const candidates = await discoverCandidates(config, env, options);
+  const { plugins, unavailable } = await discoverCandidateMetadata(
+    candidates,
+    config,
+    env,
+    options
+  );
+  const { byHost, hostConfig } = bindPluginHosts(plugins, config);
+  const pluginTokenEnv = new Map(
+    config.plugins.flatMap(plugin =>
+      plugin.token_env ? ([[plugin.plugin, plugin.token_env]] as const) : []
+    )
+  );
+  return { plugins, unavailable, byHost, hostConfig, pluginTokenEnv };
+}
+
+type DiscoveryOptions = NonNullable<Parameters<typeof discoverPlugins>[0]>;
+type ParsedPluginConfig = ReturnType<typeof forgePluginConfigSchema.parse>;
+
+async function discoverCandidates(
+  config: ParsedPluginConfig,
+  env: NodeJS.ProcessEnv,
+  options: DiscoveryOptions
+): Promise<CandidateInspection[]> {
   const dirs = [
     ...(options.pluginsDir !== undefined ? [options.pluginsDir] : []),
     ...config.pluginDirs,
@@ -191,14 +262,69 @@ export async function discoverPlugins(
       )
     )
   ).flat();
-  const candidates = [...configuredCandidates(config), ...scanned].filter(
-    (candidate, index, all) =>
-      all.findIndex(
-        other =>
-          other.command === candidate.command &&
-          JSON.stringify(other.args) === JSON.stringify(candidate.args)
-      ) === index
-  );
+  const configured: CandidateInspection[] = configuredCandidates(config).map(candidate => ({
+    kind: 'ready',
+    candidate,
+  }));
+  return mergeCandidates([...configured, ...withSourcePlugins(options, configured, scanned)]);
+}
+
+function withSourcePlugins(
+  options: DiscoveryOptions,
+  configured: readonly CandidateInspection[],
+  scanned: readonly CandidateInspection[]
+): CandidateInspection[] {
+  // A plugin the operator configured by name is their explicit choice of executable, so
+  // it runs instead of the source plugin. A scanned one was only found by its file name.
+  const configuredNames = new Set(configured.map(({ candidate }) => candidate.expectedName));
+  const source = (options.sourcePlugins ?? []).filter(plugin => !configuredNames.has(plugin.name));
+  const sourceNames = new Set(source.map(plugin => plugin.name));
+  const kept = scanned.filter(({ candidate }) => {
+    if (!sourceNames.has(candidate.expectedName ?? '')) return true;
+    process.stderr.write(
+      `Skipping forge plugin ${candidate.command}: this checkout runs ${candidate.expectedName} from source\n`
+    );
+    return false;
+  });
+  return [
+    // Marked configured so a source plugin that fails its handshake fails discovery
+    // instead of being skipped.
+    ...source.map(
+      (plugin): CandidateInspection => ({
+        kind: 'ready',
+        candidate: {
+          source: `source:${plugin.name}`,
+          configured: true,
+          command: plugin.command,
+          args: plugin.args,
+          expectedName: plugin.name,
+        },
+      })
+    ),
+    ...kept,
+  ];
+}
+
+function mergeCandidates(inspections: readonly CandidateInspection[]): CandidateInspection[] {
+  const unique = new Map<string, CandidateInspection>();
+  for (const inspection of inspections) {
+    const { candidate } = inspection;
+    const key = JSON.stringify([candidate.command, candidate.args]);
+    const existing = unique.get(key);
+    if (!existing) unique.set(key, inspection);
+    else if (inspection.kind === 'unavailable') {
+      unique.set(key, { ...inspection, candidate: existing.candidate });
+    }
+  }
+  return [...unique.values()];
+}
+
+async function discoverCandidateMetadata(
+  candidates: readonly CandidateInspection[],
+  config: ParsedPluginConfig,
+  env: NodeJS.ProcessEnv,
+  options: DiscoveryOptions
+): Promise<Pick<PluginDiscovery, 'plugins' | 'unavailable'>> {
   const plugins: DiscoveredPlugin[] = [];
   const names = new Set<string>();
   const unavailable: PluginDiscoveryError[] = [];
@@ -206,10 +332,11 @@ export async function discoverPlugins(
   const selectedNames = new Set(
     Object.values(config.hosts).map(value => (typeof value === 'string' ? value : value.plugin))
   );
-  for (const candidate of candidates) {
+  for (const inspection of candidates) {
+    const { candidate } = inspection;
     let metadata: PluginMetadata;
     try {
-      metadata = await readMetadata(candidate, env, options);
+      metadata = await readMetadata(inspection, env, options);
     } catch (error) {
       if (
         !(error instanceof PluginDiscoveryError) ||
@@ -232,13 +359,19 @@ export async function discoverPlugins(
     plugins.push({ ...candidate, metadata });
   }
 
-  for (const name of unavailableNames) {
-    if (names.has(name))
-      throw new PluginDiscoveryError(
-        'duplicate_host',
-        `forge plugin ${name} has both available and failed candidates`
-      );
-  }
+  const failedDuplicate = [...unavailableNames].find(name => names.has(name));
+  if (failedDuplicate !== undefined)
+    throw new PluginDiscoveryError(
+      'duplicate_host',
+      `forge plugin ${failedDuplicate} has both available and failed candidates`
+    );
+  return { plugins, unavailable };
+}
+
+function bindPluginHosts(
+  plugins: readonly DiscoveredPlugin[],
+  config: ParsedPluginConfig
+): Pick<PluginDiscovery, 'byHost' | 'hostConfig'> {
   const byName = new Map(plugins.map(plugin => [plugin.metadata.name, plugin]));
   const byHost = new Map<string, DiscoveredPlugin>();
   const claim = (host: string, plugin: DiscoveredPlugin): void => {
@@ -254,11 +387,6 @@ export async function discoverPlugins(
   for (const plugin of plugins) for (const host of plugin.metadata.hosts) claim(host, plugin);
 
   const hostConfig = new Map<string, Exclude<ForgeHostPlugin, string>>();
-  const pluginTokenEnv = new Map(
-    config.plugins.flatMap(plugin =>
-      plugin.token_env ? ([[plugin.plugin, plugin.token_env]] as const) : []
-    )
-  );
   for (const [host, raw] of Object.entries(config.hosts)) {
     const value = typeof raw === 'string' ? { plugin: raw, args: [] } : raw;
     const plugin = byName.get(value.plugin);
@@ -270,5 +398,5 @@ export async function discoverPlugins(
     claim(host, plugin);
     hostConfig.set(normalizeHost(host), value);
   }
-  return { plugins, unavailable, byHost, hostConfig, pluginTokenEnv };
+  return { byHost, hostConfig };
 }

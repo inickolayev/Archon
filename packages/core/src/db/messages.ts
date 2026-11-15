@@ -1,9 +1,10 @@
 /**
  * Database operations for conversation messages (Web UI history and orchestrator prompt enrichment)
  */
-import { pool, getDatabaseType } from './connection';
+import { pool, getDialect, getDatabaseType } from './connection';
 import type { MessageRow } from '../schemas/message';
 import { formatSqliteTimestamp } from './timestamps';
+import { assertPublicConversation } from './workflow-origin-anchor';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -76,12 +77,13 @@ export interface AddMessageOptions {
  */
 export async function addMessage(
   conversationId: string,
-  role: 'user' | 'assistant',
+  role: MessageRow['role'],
   content: string,
   metadata?: Record<string, unknown>,
   userId?: string,
   options?: AddMessageOptions
 ): Promise<MessageRow> {
+  assertPublicConversation(conversationId);
   const createdAt = createdAtSql(nextCreatedAtMs(options?.sentAtMs), 6);
   const result = await pool.query<MessageRow>(
     `INSERT INTO remote_agent_messages (conversation_id, role, content, metadata, user_id, created_at)
@@ -103,22 +105,24 @@ export async function addMessage(
  * List messages for a conversation, oldest first.
  * Fetches the newest `limit` messages so that the most recent history is always
  * returned, then reverses to preserve chronological (oldest-first) order.
- * `id DESC` breaks ties between rows sharing a created_at so the LIMIT window
- * is stable across refetches. `addMessage` no longer produces ties — it writes
- * milliseconds and keeps them strictly increasing — but the tie-breaker still
- * earns its place: every row written before that change was stamped at SQLite's
- * one-second granularity, and a random uuid is a stable order, just not a
- * meaningful one. It decides which rows the window holds, never which turn came
- * first. conversationId is the database UUID (not platform_conversation_id).
+ * The tie-breaker after created_at keeps the LIMIT window stable across
+ * refetches: SQLite ties follow insertion order, PostgreSQL retains ID order.
+ * `addMessage` no longer produces ties for "now" rows — it writes milliseconds
+ * and keeps them strictly increasing — but rows written before that change were
+ * stamped at SQLite's one-second granularity, and a reported send time may
+ * coincide with another row's.
+ * conversationId is the database UUID (not platform_conversation_id).
  */
 export async function listMessages(
   conversationId: string,
   limit = 200
 ): Promise<readonly MessageRow[]> {
+  assertPublicConversation(conversationId);
+  const dialect = getDialect();
   const result = await pool.query<MessageRow>(
     `SELECT * FROM remote_agent_messages
      WHERE conversation_id = $1
-     ORDER BY created_at DESC, id DESC
+     ORDER BY created_at DESC, ${dialect.messageOrderTieBreaker} DESC
      LIMIT $2`,
     [conversationId, limit]
   );
@@ -134,18 +138,15 @@ export async function getRecentWorkflowResultMessages(
   conversationId: string,
   limit = 3
 ): Promise<readonly MessageRow[]> {
-  const dbType = getDatabaseType();
-  const metadataFilter =
-    dbType === 'postgresql'
-      ? "(metadata->>'workflowResult') IS NOT NULL"
-      : "json_extract(metadata, '$.workflowResult') IS NOT NULL";
+  assertPublicConversation(conversationId);
+  const dialect = getDialect();
+  const metadataFilter = `${dialect.jsonText('metadata', 'workflowResult')} IS NOT NULL`;
   try {
     const result = await pool.query<Pick<MessageRow, 'id' | 'content' | 'metadata'>>(
       `SELECT id, content, metadata FROM remote_agent_messages
        WHERE conversation_id = $1
        AND ${metadataFilter}
-       -- id DESC tie-breaker: see listMessages() above for why.
-       ORDER BY created_at DESC, id DESC
+       ORDER BY created_at DESC, ${dialect.messageOrderTieBreaker} DESC
        LIMIT $2`,
       [conversationId, limit]
     );

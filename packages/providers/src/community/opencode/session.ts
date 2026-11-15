@@ -1,6 +1,12 @@
+import type { SessionPromptAsyncData } from '@opencode-ai/sdk/v2';
 import { createLogger } from '@archon/paths';
 
-import { truncateToolOutput, type ProviderStopReason } from '@archon/provider-contract';
+import {
+  sessionPreview,
+  toolCallSchema,
+  truncateToolOutput,
+  type ProviderStopReason,
+} from '@archon/provider-contract';
 
 import type { MessageChunk, ResultChunk, SendQueryOptions } from '../../types';
 
@@ -12,7 +18,7 @@ import {
 } from './agent-config';
 import { errorMessage, pendingPermissionError } from './errors';
 import type { OpencodeClientLike } from './runtime';
-import { normalizeTokens } from './tokens';
+import { sumAssistantUsage } from './tokens';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 
@@ -80,7 +86,7 @@ export function toolPartEvents(
       toolCallId,
       name: typeof part.tool === 'string' ? part.tool : 'unknown',
     };
-    if (isRecord(state?.input)) call.rawInput = state.input;
+    if (isRecord(state?.input)) call.rawInput = toolCallSchema.shape.rawInput.parse(state.input);
     events.push(call);
   }
   if (!closed.has(toolCallId)) {
@@ -130,7 +136,10 @@ export async function resolveSessionId(
         return { sessionId, resumed: true };
       }
     } catch (error) {
-      getLog().warn({ err: error, resumeSessionId, cwd }, 'opencode.session_resume_failed');
+      getLog().warn(
+        { err: error, resumeSessionIdPreview: sessionPreview(resumeSessionId), cwd },
+        'opencode.session_resume_failed'
+      );
     }
   }
 
@@ -148,16 +157,21 @@ export function createSessionPromptBody(
   model: { providerID: string; modelID: string },
   requestOptions: SendQueryOptions | undefined,
   agentOverride?: NamedAgentConfig
-): Record<string, unknown> {
+): NonNullable<SessionPromptAsyncData['body']> {
   const singleAgent = agentOverride ?? selectSingleAgent(requestOptions?.nodeConfig?.agents);
   const adaptedAgentConfig = singleAgent ? adaptNamedAgentForOpencode(singleAgent) : undefined;
   const effectivePrompt = resolvePromptForAgent(singleAgent, prompt);
-  const promptBody: Record<string, unknown> = {
+  const selectedSystem =
+    requestOptions?.systemPrompt ??
+    requestOptions?.nodeConfig?.systemPrompt ??
+    requestOptions?.appendSystemPrompt;
+  const system = Array.isArray(selectedSystem) ? selectedSystem.join('\n') : selectedSystem;
+  const promptBody: NonNullable<SessionPromptAsyncData['body']> = {
     parts: [{ type: 'text', text: effectivePrompt }],
     model: adaptedAgentConfig?.model ?? model,
     ...(adaptedAgentConfig?.agent ? { agent: adaptedAgentConfig.agent } : {}),
     ...(adaptedAgentConfig?.tools ? { tools: adaptedAgentConfig.tools } : {}),
-    ...(requestOptions?.systemPrompt ? { system: requestOptions.systemPrompt } : {}),
+    ...(system ? { system } : {}),
   };
 
   if (requestOptions?.outputFormat?.type === 'json_schema') {
@@ -174,7 +188,7 @@ export async function promptSession(
   client: OpencodeClientLike,
   cwd: string,
   sessionId: string,
-  promptBody: Record<string, unknown>
+  promptBody: NonNullable<SessionPromptAsyncData['body']>
 ): Promise<void> {
   await client.session.promptAsync({
     path: { id: sessionId },
@@ -201,7 +215,10 @@ async function readStructuredOutput(
       return info.structured_output;
     }
   } catch (error) {
-    getLog().warn({ err: error, sessionId, messageId }, 'opencode.structured_output_lookup_failed');
+    getLog().warn(
+      { err: error, sessionIdPreview: sessionPreview(sessionId), messageId },
+      'opencode.structured_output_lookup_failed'
+    );
   }
 
   return undefined;
@@ -215,12 +232,16 @@ export async function* streamOpencodeSession(
   model: { providerID: string; modelID: string },
   requestOptions: SendQueryOptions | undefined
 ): AsyncGenerator<MessageChunk> {
+  requestOptions?.abortSignal?.throwIfAborted();
   const events = await client.event.subscribe({ query: { directory: cwd } });
+  requestOptions?.abortSignal?.throwIfAborted();
   const streamController = new AbortController();
   const seenToolCalls = new Set<string>();
   const completedToolCalls = new Set<string>();
   const textBlocks = new TextPartBlocks();
   let latestAssistantInfo: Record<string, unknown> | undefined;
+  // Latest update of each assistant message, keyed by message id.
+  const assistantInfos = new Map<string, Record<string, unknown>>();
   let lastAssistantMessageId: string | undefined;
   let aborted = requestOptions?.abortSignal?.aborted === true;
 
@@ -229,7 +250,10 @@ export async function* streamOpencodeSession(
     void client.session
       .abort({ path: { id: sessionId }, query: { directory: cwd } })
       .catch((error): void => {
-        getLog().debug({ err: error, sessionId }, 'opencode.session_abort_failed');
+        getLog().debug(
+          { err: error, sessionIdPreview: sessionPreview(sessionId) },
+          'opencode.session_abort_failed'
+        );
       });
     streamController.abort();
   };
@@ -255,6 +279,7 @@ export async function* streamOpencodeSession(
           latestAssistantInfo = info;
           if (typeof info.id === 'string') {
             lastAssistantMessageId = info.id;
+            assistantInfos.set(info.id, info);
           }
         }
         continue;
@@ -320,14 +345,14 @@ export async function* streamOpencodeSession(
           sessionId,
           lastAssistantMessageId
         );
-        const tokens = normalizeTokens(latestAssistantInfo);
+        const { tokens, cost } = sumAssistantUsage([...assistantInfos.values()]);
 
         yield* textBlocks.drain();
         // Built by assignment on a typed value so a misspelled key fails to compile.
         const result: ResultChunk = { type: 'result', sessionId };
         if (tokens) result.tokens = tokens;
         if (structuredOutput !== undefined) result.structuredOutput = structuredOutput;
-        if (typeof latestAssistantInfo?.cost === 'number') result.cost = latestAssistantInfo.cost;
+        if (cost !== undefined) result.cost = cost;
         const stopReason = opencodeStopReason(latestAssistantInfo?.finish);
         if (stopReason !== undefined) result.stopReason = stopReason;
         if (typeof latestAssistantInfo?.modelID === 'string' && latestAssistantInfo.modelID) {
@@ -341,14 +366,16 @@ export async function* streamOpencodeSession(
     if (aborted) {
       const abortReason = requestOptions?.abortSignal?.reason;
       throw new Error(
-        `OpenCode query aborted (session: ${sessionId}, cwd: ${cwd})` +
+        `OpenCode query aborted (session: ${sessionPreview(sessionId)}, cwd: ${cwd})` +
           (abortReason ? `: ${String(abortReason)}` : '')
       );
     }
     // Only `session.idle` reports the turn's outcome. A stream that closed before it
     // (the embedded server died or dropped the connection) is a failed turn, not an
     // empty success.
-    throw new Error(`OpenCode event stream ended before session.idle (session: ${sessionId})`);
+    throw new Error(
+      `OpenCode event stream ended before session.idle (session: ${sessionPreview(sessionId)})`
+    );
   } catch (error) {
     // Preserve partial output: a part still open when the turn fails reaches the user.
     yield* textBlocks.drain();

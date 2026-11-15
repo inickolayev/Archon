@@ -1,3 +1,6 @@
+import { diagnoseOpencode } from './diagnostics';
+import { probeOpencodeRuntime } from './runtime';
+import type { CredentialStatus } from '@archon/provider-contract';
 import { join } from 'node:path';
 
 import { createLogger } from '@archon/paths';
@@ -36,6 +39,18 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 export class OpencodeProvider implements IAgentProvider {
+  constructor(private readonly diagnosticProbe = probeOpencodeRuntime) {}
+  diagnose(
+    request: Parameters<NonNullable<IAgentProvider['diagnose']>>[0]
+  ): ReturnType<typeof diagnoseOpencode> {
+    request.signal.throwIfAborted();
+    return diagnoseOpencode(request.signal, this.diagnosticProbe);
+  }
+
+  async checkCredential(): Promise<CredentialStatus> {
+    return { state: 'not_checked', source: 'native' };
+  }
+
   /**
    * One call is one attempt; the engine owns retry. A failure, including one thrown
    * while setting the turn up, ends in a `result` carrying a typed `failure`, then
@@ -99,18 +114,7 @@ export class OpencodeProvider implements IAgentProvider {
     const orderedAgents = getOrderedAgents(requestOptions?.nodeConfig);
     const hasAgentConfig = orderedAgents.length > 0;
     const isMultiAgent = orderedAgents.length > 1;
-    const usingExternalBaseUrl = Boolean(assistantConfig.baseUrl);
-    if (usingExternalBaseUrl) {
-      throw new Error(
-        'OpenCode external baseUrl mode is no longer supported. ' +
-          'Archon now requires managed embedded OpenCode runtime for fully controlled agent lifecycle.'
-      );
-    }
-
-    const sessionCwd =
-      hasAgentConfig && nodeId && !usingExternalBaseUrl
-        ? join(cwd, '.archon-opencode', nodeId)
-        : cwd;
+    const sessionCwd = hasAgentConfig && nodeId ? join(cwd, '.archon-opencode', nodeId) : cwd;
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('OpenCode query aborted');

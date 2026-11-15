@@ -1,15 +1,21 @@
 /**
  * SQLite adapter using bun:sqlite
  */
-import { Database, type SQLQueryBindings } from 'bun:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { Database, SQLiteError, type SQLQueryBindings } from 'bun:sqlite';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import type { IDatabase, QueryResult, SqlDialect } from './types';
 import { createLogger } from '@archon/paths';
 import { APP_VERSION } from '../schema-version';
-
-/** bun:sqlite's get() returns null (not undefined) when the query has no row. */
-type Maybe<T> = T | null;
+import {
+  isSqliteSchemaCurrent,
+  recordSqliteSchemaFingerprint,
+  sqliteStartupDigest,
+} from './sqlite-schema-state';
+import { migrateColumns } from './sqlite-migrations';
+import { prepareAll, prepareGet } from './sqlite-statements';
+import { isSqliteBusy, retryWhileBusy, retryWhileBusySync } from './sqlite-busy';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -23,7 +29,7 @@ function getLog(): ReturnType<typeof createLogger> {
  * one-time rebuild that widens a dev database's narrow holder-kind CHECK.
  * `owner_*` name the process that owns an 'attempt' holder and are NULL for 'run'.
  */
-function resourceSlotHoldersTable(name: string): string {
+export function resourceSlotHoldersTable(name: string): string {
   return `CREATE TABLE IF NOT EXISTS ${name} (
         resource_key TEXT NOT NULL REFERENCES remote_agent_resource_slots(resource_key),
         holder_kind TEXT NOT NULL CHECK (holder_kind IN ('run', 'attempt')),
@@ -41,14 +47,21 @@ export class SqliteAdapter implements IDatabase {
   readonly dialect = 'sqlite' as const;
   readonly sql: SqlDialect = sqliteDialect;
   /**
-   * Tail of the transaction queue. bun:sqlite is a single connection, so two
+   * Tail of the connection queue. bun:sqlite is a single connection, so two
    * overlapping `withTransaction` blocks would interleave their BEGINs and throw
-   * "cannot start a transaction within a transaction." Chaining each transaction
-   * onto this tail serializes them: the second waits for the first to COMMIT,
+   * "cannot start a transaction within a transaction", and a plain `query()` would
+   * run inside whichever transaction is open. Chaining every transaction and every
+   * plain statement onto this tail serializes them: the second waits for the first to COMMIT,
    * then sees its committed state — exactly what the approval-gate CAS needs so a
    * concurrent second resolver cleanly loses (rowCount 0) instead of erroring.
    */
   private txTail: Promise<unknown> = Promise.resolve();
+
+  /** Identifies what this build's convergence applies; see sqliteStartupDigest(). */
+  static readonly schemaDigest = sqliteStartupDigest([
+    resourceSlotHoldersTable,
+    SqliteAdapter.prototype.createSchema,
+  ]);
 
   constructor(dbPath: string) {
     // Ensure directory exists
@@ -64,16 +77,44 @@ export class SqliteAdapter implements IDatabase {
     this.db.run('PRAGMA busy_timeout = 5000');
 
     // Enable WAL mode for better concurrent performance
-    this.db.run('PRAGMA journal_mode = WAL');
+    retryWhileBusySync(() => this.db.run('PRAGMA journal_mode = WAL'));
 
     // Enable foreign keys
     this.db.run('PRAGMA foreign_keys = ON');
 
     // Initialize schema if needed
-    this.initSchema();
+    try {
+      this.initSchema();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  /**
+   * Marks code running inside one of this adapter's transaction blocks. The public
+   * query() and withTransaction() queue behind that open transaction, so calling them
+   * from inside it would wait forever; they throw instead.
+   */
+  private readonly transactionScope = new AsyncLocalStorage<SqliteAdapter>();
+
+  private assertNotInOwnTransaction(): void {
+    if (this.transactionScope.getStore() === this) {
+      throw new Error(
+        "SQLite query() or withTransaction() was called inside withTransaction; use the transaction's query instead"
+      );
+    }
   }
 
   async query<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
+    this.assertNotInOwnTransaction();
+    // bun:sqlite is one connection shared by every caller. Queue each attempt behind
+    // open transactions, or the statement would join another caller's transaction
+    // and vanish if that transaction rolls back.
+    return retryWhileBusy('statement', () => this.serialize(() => this.execute<T>(sql, params)));
+  }
+
+  private async execute<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
     // Convert $1, $2, etc. to ? placeholders and reorder params to match
     const { sql: convertedSql, params: reorderedParams } = this.convertPlaceholders(
       sql,
@@ -89,36 +130,48 @@ export class SqliteAdapter implements IDatabase {
       const sqliteParams = reorderedParams as SQLQueryBindings[];
 
       if (isSelect) {
-        const rows = this.prepareAll<T>(convertedSql, sqliteParams);
+        const rows = prepareAll<T>(this.db, convertedSql, sqliteParams);
         return { rows, rowCount: rows.length };
-      } else {
-        const upperSql = sql.toUpperCase();
-
-        // Handle INSERT with RETURNING using native SQLite RETURNING (3.35+)
-        // We must use .all() instead of .run() because .run() discards
-        // RETURNING results, and its lastInsertRowid is unreliable when
-        // ON CONFLICT DO UPDATE fires.
-        if (upperSql.includes('RETURNING') && upperSql.includes('INSERT')) {
-          const rows = this.prepareAll<T>(convertedSql, sqliteParams);
-          return { rows, rowCount: rows.length };
-        }
-
-        // UPDATE/DELETE with RETURNING not supported
-        if (upperSql.includes('RETURNING')) {
-          throw new Error(
-            'SQLite adapter does not support RETURNING clause on UPDATE/DELETE statements. ' +
-              `Query: ${convertedSql.substring(0, 100)}... ` +
-              'Hint: Use a SELECT before the mutation if you need the row data.'
-          );
-        }
-
-        // Standard INSERT/UPDATE/DELETE without RETURNING
-        const rowCount = this.prepareRun(convertedSql, sqliteParams);
-        return { rows: [], rowCount };
       }
+      const upperSql = sql.toUpperCase();
+
+      // Handle INSERT with RETURNING using native SQLite RETURNING (3.35+)
+      // We must use .all() instead of .run() because .run() discards
+      // RETURNING results, and its lastInsertRowid is unreliable when
+      // ON CONFLICT DO UPDATE fires.
+      if (upperSql.includes('RETURNING') && upperSql.includes('INSERT')) {
+        const rows = prepareAll<T>(this.db, convertedSql, sqliteParams);
+        return { rows, rowCount: rows.length };
+      }
+
+      // UPDATE/DELETE with RETURNING not supported
+      if (upperSql.includes('RETURNING')) {
+        throw new Error(
+          'SQLite adapter does not support RETURNING clause on UPDATE/DELETE statements. ' +
+            `Query: ${convertedSql.substring(0, 100)}... ` +
+            'Hint: Use a SELECT before the mutation if you need the row data.'
+        );
+      }
+
+      // Standard INSERT/UPDATE/DELETE without RETURNING
+      const rowCount = this.prepareRun(convertedSql, sqliteParams);
+      return { rows: [], rowCount };
     } catch (error) {
-      const err = error as Error;
-      getLog().error({ err, sql: convertedSql, params }, 'db.sqlite_query_failed');
+      // A busy statement is retried by query() or withTransaction(), which log the wait.
+      if (!isSqliteBusy(error)) {
+        // Driver messages and stacks can echo bound values (e.g. invalid JSON paths).
+        getLog().error(
+          {
+            err: {
+              message: 'Query failed (error details withheld to protect bound values)',
+              ...(error instanceof SQLiteError ? { code: error.code, errno: error.errno } : {}),
+            },
+            sql,
+            paramCount: params?.length ?? 0,
+          },
+          'db.sqlite_query_failed'
+        );
+      }
       throw error;
     }
   }
@@ -126,24 +179,46 @@ export class SqliteAdapter implements IDatabase {
   async withTransaction<T>(
     fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>
   ): Promise<T> {
-    const run = async (): Promise<T> => {
-      await this.query('BEGIN');
+    this.assertNotInOwnTransaction();
+    // A busy snapshot requires replaying the whole transaction, never a single statement.
+    const execute = this.execute.bind(this);
+    const runOnce = async (): Promise<T> => {
+      // Remember busy errors even when the callback catches or wraps them.
+      let busy: SQLiteError | undefined;
+      const blockQuery = async <U>(sql: string, params?: unknown[]): Promise<QueryResult<U>> => {
+        try {
+          return await execute<U>(sql, params);
+        } catch (error) {
+          if (isSqliteBusy(error)) busy = error;
+          throw error;
+        }
+      };
+      await execute('BEGIN');
       try {
-        const result = await fn(this.query.bind(this));
-        await this.query('COMMIT');
+        const result = await this.transactionScope.run(this, () => fn(blockQuery));
+        if (busy) throw busy;
+        await execute('COMMIT');
         return result;
       } catch (e) {
         try {
-          await this.query('ROLLBACK');
+          await execute('ROLLBACK');
         } catch (rollbackError) {
           getLog().error({ err: rollbackError as Error }, 'db.sqlite_transaction_rollback_failed');
         }
-        throw e;
+        throw busy ?? e;
       }
     };
-    // Serialize against any in-flight transaction (see `txTail`). The stored tail
-    // is made non-rejecting so one transaction's failure never blocks the next.
-    const result = this.txTail.then(run, run);
+    // A busy failure anywhere in the block, COMMIT included, has already rolled back,
+    // so the block reruns from BEGIN against fresh state.
+    return this.serialize(() => retryWhileBusy('transaction', runOnce));
+  }
+
+  /**
+   * Run `work` after every queued transaction and statement (see `txTail`). The stored tail is
+   * made non-rejecting so one failure never blocks the next.
+   */
+  private serialize<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.txTail.then(work, work);
     this.txTail = result.then(
       () => undefined,
       () => undefined
@@ -155,35 +230,15 @@ export class SqliteAdapter implements IDatabase {
     this.db.close();
   }
 
-  /**
-   * bun:sqlite does not finalize statements automatically when the connection
-   * closes: one unfinalized statement keeps the database file pinned until GC
-   * (delete-after-close fails with EBUSY on Windows). So every prepare() in
-   * this class must funnel through these wrappers, which finalize the
-   * statement within the operation's scope (#2875).
-   */
-  private prepareAll<T>(sql: string, params: SQLQueryBindings[] = []): T[] {
-    const stmt = this.db.prepare(sql);
-    try {
-      return stmt.all(...params) as T[];
-    } finally {
-      stmt.finalize();
-    }
-  }
-
-  private prepareGet<T>(sql: string, params: SQLQueryBindings[] = []): Maybe<T> {
-    const stmt = this.db.prepare(sql);
-    try {
-      return stmt.get(...params) as Maybe<T>;
-    } finally {
-      stmt.finalize();
-    }
-  }
-
   private prepareRun(sql: string, params: SQLQueryBindings[] = []): number {
     const stmt = this.db.prepare(sql);
     try {
-      return stmt.run(...params).changes;
+      const changes = stmt.run(...params).changes;
+      // Bun includes foreign-key actions in .changes; rowCount must describe only
+      // the statement's rows, as PostgreSQL does (not children updated by SET NULL).
+      return changes === 0
+        ? 0
+        : (prepareGet<{ count: number }>(this.db, 'SELECT changes() AS count')?.count ?? 0);
     } finally {
       stmt.finalize();
     }
@@ -218,23 +273,27 @@ export class SqliteAdapter implements IDatabase {
     return { sql: convertedSql, params: reordered };
   }
 
-  /**
-   * Initialize database schema.
-   * Always runs createSchema() since all statements use IF NOT EXISTS,
-   * ensuring new tables from migrations are created in existing databases.
-   */
   private initSchema(): void {
-    // Probe BEFORE createSchema(): once CREATE TABLE IF NOT EXISTS has run there is
-    // no way left to tell a fresh database from one that predates version tracking.
-    const preExisting = this.hasAnyArchonTable();
-    this.createSchema();
-    const allApplied = this.migrateColumns();
-    this.recordSchemaVersion(preExisting, allApplied);
+    retryWhileBusySync(() => {
+      const digest = SqliteAdapter.schemaDigest;
+      if (this.db.transaction(() => isSqliteSchemaCurrent(this.db, digest)).deferred()) return;
+      this.db
+        .transaction(() => {
+          if (isSqliteSchemaCurrent(this.db, digest)) return;
+          const preExisting = this.hasAnyArchonTable();
+          this.createSchema();
+          const allApplied = migrateColumns(this.db, resourceSlotHoldersTable);
+          const recorded = this.recordSchemaVersion(preExisting, allApplied);
+          recordSqliteSchemaFingerprint(this.db, digest, allApplied && recorded);
+        })
+        .immediate();
+    });
   }
 
   /** True when core Archon tables already exist — i.e. this is not a fresh database. */
   private hasAnyArchonTable(): boolean {
-    const row = this.prepareGet(
+    const row = prepareGet(
+      this.db,
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
       ['remote_agent_codebases']
     );
@@ -255,16 +314,17 @@ export class SqliteAdapter implements IDatabase {
    * than the "not recorded" / stale-version state a reader can act on. The next
    * successful open records it.
    */
-  private recordSchemaVersion(preExisting: boolean, allApplied: boolean): void {
+  private recordSchemaVersion(preExisting: boolean, allApplied: boolean): boolean {
     if (!allApplied) {
       getLog().warn(
         { appVersion: APP_VERSION },
         'db.sqlite_schema_version_skipped_incomplete_migration'
       );
-      return;
+      return false;
     }
     try {
-      const existing = this.prepareGet<{ app_version: string }>(
+      const existing = prepareGet<{ app_version: string }>(
+        this.db,
         'SELECT app_version FROM remote_agent_schema_version WHERE id = 1'
       );
 
@@ -281,355 +341,14 @@ export class SqliteAdapter implements IDatabase {
           [APP_VERSION]
         );
       }
+      return true;
     } catch (e: unknown) {
+      if (isSqliteBusy(e)) throw e;
       // Deliberate, logged fallback: the vintage row is diagnostic metadata and must
       // never be able to stop the database from opening (e.g. a read-only DB file).
       getLog().warn({ err: e as Error }, 'db.sqlite_schema_version_record_failed');
+      return false;
     }
-  }
-
-  /**
-   * Add columns to existing tables that predate newer schema additions.
-   * SQLite's CREATE TABLE IF NOT EXISTS skips entirely for existing tables,
-   * so new columns must be added via ALTER TABLE for databases created before
-   * the columns were added to createSchema().
-   */
-  private migrateColumns(): boolean {
-    // Each block below suppresses its own failure so one bad table cannot abort
-    // schema init. This flag carries that outcome to recordSchemaVersion(): a
-    // database missing a failed migration must NOT be stamped as fully applied
-    // by this build, or the vintage becomes a wrong answer that gets believed.
-    let allApplied = true;
-    // Users columns. `role` is the web-auth identity seam (default 'admin').
-    // Better Auth's own tables are PostgreSQL-only — web auth is never enabled
-    // on SQLite — so only the role column is backfilled here.
-    try {
-      const userCols = this.prepareAll<{ name: string }>("PRAGMA table_info('remote_agent_users')");
-      const userColNames = new Set(userCols.map(c => c.name));
-      if (!userColNames.has('role')) {
-        this.db.run("ALTER TABLE remote_agent_users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'");
-      }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_users_columns_failed');
-      allApplied = false;
-    }
-
-    // Codebases columns
-    try {
-      const codebaseCols = this.prepareAll<{ name: string }>(
-        "PRAGMA table_info('remote_agent_codebases')"
-      );
-      const codebaseColNames = new Set(codebaseCols.map(c => c.name));
-
-      if (!codebaseColNames.has('default_branch')) {
-        this.db.run('ALTER TABLE remote_agent_codebases ADD COLUMN default_branch TEXT');
-      }
-      if (!codebaseColNames.has('kind')) {
-        this.db.run(
-          "ALTER TABLE remote_agent_codebases ADD COLUMN kind TEXT NOT NULL DEFAULT 'repo'"
-        );
-      }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_codebases_columns_failed');
-      allApplied = false;
-    }
-
-    // Conversations columns
-    try {
-      const cols = this.prepareAll<{ name: string }>(
-        "PRAGMA table_info('remote_agent_conversations')"
-      );
-      const colNames = new Set(cols.map(c => c.name));
-
-      if (!colNames.has('title')) {
-        this.db.run('ALTER TABLE remote_agent_conversations ADD COLUMN title TEXT');
-      }
-      if (!colNames.has('deleted_at')) {
-        this.db.run('ALTER TABLE remote_agent_conversations ADD COLUMN deleted_at TEXT');
-      }
-      if (!colNames.has('hidden')) {
-        this.db.run('ALTER TABLE remote_agent_conversations ADD COLUMN hidden INTEGER DEFAULT 0');
-      }
-      if (!colNames.has('user_id')) {
-        this.db.run(
-          'ALTER TABLE remote_agent_conversations ADD COLUMN user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL'
-        );
-      }
-      // Indexes must be created here, not in createSchema(): these columns don't
-      // exist on older databases until the ALTER TABLE statements above run, and
-      // CREATE INDEX on a missing column aborts the entire createSchema()
-      // exec block. Idempotent so they're safe to run unconditionally.
-      this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON remote_agent_conversations(user_id) WHERE user_id IS NOT NULL'
-      );
-      this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON remote_agent_conversations(hidden)'
-      );
-      // idx_conversations_codebase was originally non-partial. Replace it once,
-      // not on every open: an unconditional DROP + CREATE rebuilds the index
-      // each time the adapter is constructed, and leaves a window where the
-      // index is gone if the re-create fails.
-      const existingCodebaseIdx = this.prepareGet<{ sql: string | null }>(
-        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_codebase'"
-      );
-      if (existingCodebaseIdx && !(existingCodebaseIdx.sql ?? '').includes('deleted_at IS NULL')) {
-        this.db.run('DROP INDEX idx_conversations_codebase');
-      }
-      this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_conversations_codebase ON remote_agent_conversations(codebase_id) WHERE deleted_at IS NULL'
-      );
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_conversations_columns_failed');
-      allApplied = false;
-    }
-
-    // Workflow runs columns
-    try {
-      const wfCols = this.prepareAll<{ name: string }>(
-        "PRAGMA table_info('remote_agent_workflow_runs')"
-      );
-      const wfColNames = new Set(wfCols.map(c => c.name));
-
-      if (!wfColNames.has('parent_conversation_id')) {
-        this.db.run(
-          'ALTER TABLE remote_agent_workflow_runs ADD COLUMN parent_conversation_id TEXT'
-        );
-      }
-
-      if (!wfColNames.has('working_path')) {
-        this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN working_path TEXT');
-      }
-
-      if (!wfColNames.has('user_id')) {
-        this.db.run(
-          'ALTER TABLE remote_agent_workflow_runs ADD COLUMN user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL'
-        );
-      }
-      // Run-tree parent (#2121 Phase 2). Self-referential FK — a `workflow:` sub-run
-      // links back to its spawning parent. ON DELETE SET NULL so deleting a parent
-      // orphans children rather than cascade-deleting their audit trail.
-      if (!wfColNames.has('parent_run_id')) {
-        this.db.run(
-          'ALTER TABLE remote_agent_workflow_runs ADD COLUMN parent_run_id TEXT REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL'
-        );
-      }
-      // Between-run continuation (#2747). Self-referential FK mirroring
-      // parent_run_id — written once at run creation, never on resume.
-      if (!wfColNames.has('adopted_from_run_id')) {
-        this.db.run(
-          'ALTER TABLE remote_agent_workflow_runs ADD COLUMN adopted_from_run_id TEXT REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL'
-        );
-      }
-      // Durable output root (#2200). The resolved ~/.archon/workspaces/<project>/
-      // directory this run's artifacts, logs, and state live under, written once
-      // at run start so historical artifacts survive a codebase rename (#1192).
-      if (!wfColNames.has('output_root')) {
-        this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN output_root TEXT');
-      }
-      // Run checkout baseline (#3305): JSON checkout observation written once when the
-      // run wins its execution claim. NULL means not recorded.
-      if (!wfColNames.has('checkout_baseline')) {
-        this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN checkout_baseline TEXT');
-      }
-      if (!wfColNames.has('outcome')) {
-        this.db.run(
-          "ALTER TABLE remote_agent_workflow_runs ADD COLUMN outcome TEXT CHECK (outcome IN ('succeeded', 'failed'))"
-        );
-      }
-      // Same rationale as idx_conversations_user_id above.
-      this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_workflow_runs_user_id ON remote_agent_workflow_runs(user_id) WHERE user_id IS NOT NULL'
-      );
-      this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_run ON remote_agent_workflow_runs(parent_run_id) WHERE parent_run_id IS NOT NULL'
-      );
-      this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_workflow_runs_adopted_from ON remote_agent_workflow_runs(adopted_from_run_id) WHERE adopted_from_run_id IS NOT NULL'
-      );
-      this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv ON remote_agent_workflow_runs(parent_conversation_id)'
-      );
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_workflow_runs_columns_failed');
-      allApplied = false;
-    }
-
-    // Sessions columns
-    try {
-      const sessCols = this.prepareAll<{ name: string }>(
-        "PRAGMA table_info('remote_agent_sessions')"
-      );
-      const sessColNames = new Set(sessCols.map(c => c.name));
-
-      if (!sessColNames.has('ended_reason')) {
-        this.db.run('ALTER TABLE remote_agent_sessions ADD COLUMN ended_reason TEXT');
-      }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_session_columns_failed');
-      allApplied = false;
-    }
-
-    // Messages columns
-    try {
-      const cols = this.prepareAll<{ name: string }>("PRAGMA table_info('remote_agent_messages')");
-      const colNames = new Set(cols.map(c => c.name));
-      if (!colNames.has('user_id')) {
-        this.db.run(
-          'ALTER TABLE remote_agent_messages ADD COLUMN user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL'
-        );
-      }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_messages_columns_failed');
-      allApplied = false;
-    }
-
-    // Isolation environments columns
-    try {
-      const cols = this.prepareAll<{ name: string }>(
-        "PRAGMA table_info('remote_agent_isolation_environments')"
-      );
-      const colNames = new Set(cols.map(c => c.name));
-      if (!colNames.has('created_by_user_id')) {
-        this.db.run(
-          'ALTER TABLE remote_agent_isolation_environments ADD COLUMN created_by_user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL'
-        );
-      }
-    } catch (e: unknown) {
-      getLog().warn(
-        { err: e as Error },
-        'db.sqlite_migration_isolation_environments_columns_failed'
-      );
-      allApplied = false;
-    }
-
-    // User AI prefs columns. #1998: default_model is the per-user default
-    // CHAT model, written atomically with default_provider. The table itself
-    // shipped with Phase 3 (#1948), so pre-existing installs need this ALTER —
-    // CREATE TABLE IF NOT EXISTS in createSchema() is a no-op for them.
-    try {
-      const cols = this.prepareAll<{ name: string }>(
-        "PRAGMA table_info('remote_agent_user_ai_prefs')"
-      );
-      const colNames = new Set(cols.map(c => c.name));
-      if (!colNames.has('default_model')) {
-        this.db.run('ALTER TABLE remote_agent_user_ai_prefs ADD COLUMN default_model TEXT');
-      }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_user_ai_prefs_columns_failed');
-      allApplied = false;
-    }
-
-    // Lifecycle ordering: SQLite timestamps have one-second precision. A trigger
-    // assigns a durable, monotonically increasing value for each inserted event.
-    try {
-      const cols = this.prepareAll<{ name: string }>(
-        "PRAGMA table_info('remote_agent_workflow_events')"
-      );
-      if (!new Set(cols.map(c => c.name)).has('event_order')) {
-        this.db.run('ALTER TABLE remote_agent_workflow_events ADD COLUMN event_order INTEGER');
-      }
-      this.db.run(
-        `CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_run_order
-           ON remote_agent_workflow_events(workflow_run_id, event_order)
-           WHERE event_order IS NOT NULL`
-      );
-      this.db.run(
-        `CREATE TRIGGER IF NOT EXISTS remote_agent_workflow_events_assign_order
-           AFTER INSERT ON remote_agent_workflow_events
-           WHEN NEW.event_order IS NULL
-           BEGIN
-             UPDATE remote_agent_workflow_events
-             SET event_order = (
-               SELECT COALESCE(MAX(event_order), 0) + 1
-               FROM remote_agent_workflow_events
-             )
-             WHERE rowid = NEW.rowid;
-           END`
-      );
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_workflow_events_columns_failed');
-      allApplied = false;
-    }
-
-    // #1955: credential rows are vendor-keyed (claude→anthropic, codex→openai,
-    // copilot→github-copilot). Idempotent data fix mirroring
-    // migrations/000_combined.sql: where both a legacy and a vendor row exist
-    // for the same user, the vendor row wins; then legacy rows are renamed.
-    // Transactional so a mid-sequence failure can't leave partial renames
-    // (matches the Postgres path, which runs inside the schema-apply txn);
-    // a failed run is also survivable — reads normalize legacy ids.
-    try {
-      this.db.run('BEGIN');
-      try {
-        this.db.run(
-          `DELETE FROM remote_agent_user_provider_keys
-           WHERE provider IN ('claude', 'codex', 'copilot')
-             AND EXISTS (
-               SELECT 1 FROM remote_agent_user_provider_keys v
-               WHERE v.user_id = remote_agent_user_provider_keys.user_id
-                 AND v.provider = CASE remote_agent_user_provider_keys.provider
-                   WHEN 'claude' THEN 'anthropic'
-                   WHEN 'codex' THEN 'openai'
-                   WHEN 'copilot' THEN 'github-copilot'
-                 END
-             )`
-        );
-        this.db.run(
-          "UPDATE remote_agent_user_provider_keys SET provider = 'anthropic' WHERE provider = 'claude'"
-        );
-        this.db.run(
-          "UPDATE remote_agent_user_provider_keys SET provider = 'openai' WHERE provider = 'codex'"
-        );
-        this.db.run(
-          "UPDATE remote_agent_user_provider_keys SET provider = 'github-copilot' WHERE provider = 'copilot'"
-        );
-        this.db.run('COMMIT');
-      } catch (inner: unknown) {
-        this.db.run('ROLLBACK');
-        throw inner;
-      }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_provider_key_vendor_ids_failed');
-      allApplied = false;
-    }
-
-    // Resource slot holders gained the 'attempt' kind and its owner columns (#2816).
-    // SQLite cannot alter a CHECK, so a table created with the narrow ('run') CHECK is
-    // rebuilt once. Only unreleased dev builds created that shape. BEGIN IMMEDIATE and
-    // the re-check make a concurrent opener skip instead of rebuilding twice.
-    try {
-      const holdersSql = (): string =>
-        this.prepareGet<{ sql: string }>(
-          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'remote_agent_resource_slot_holders'"
-        )?.sql ?? '';
-      if (!holdersSql().includes("'attempt'")) {
-        this.db.run('BEGIN IMMEDIATE');
-        try {
-          if (!holdersSql().includes("'attempt'")) {
-            this.db.run(resourceSlotHoldersTable('remote_agent_resource_slot_holders_next'));
-            this.db.run(
-              `INSERT INTO remote_agent_resource_slot_holders_next
-                 (resource_key, holder_kind, holder_id, acquired_at)
-               SELECT resource_key, holder_kind, holder_id, acquired_at
-                 FROM remote_agent_resource_slot_holders`
-            );
-            this.db.run('DROP TABLE remote_agent_resource_slot_holders');
-            this.db.run(
-              'ALTER TABLE remote_agent_resource_slot_holders_next RENAME TO remote_agent_resource_slot_holders'
-            );
-          }
-          this.db.run('COMMIT');
-        } catch (inner: unknown) {
-          this.db.run('ROLLBACK');
-          throw inner;
-        }
-      }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_resource_slot_holders_failed');
-      allApplied = false;
-    }
-
-    return allApplied;
   }
 
   /**
@@ -644,7 +363,8 @@ export class SqliteAdapter implements IDatabase {
   private createSchema(): void {
     this.db.run(`
       -- Schema vintage (#2316): which Archon build created this database, and which
-      -- last applied schema to it. Diagnostic only — nothing gates on these values.
+      -- last applied schema to it. Vintage fields are diagnostic; schema_fingerprint
+      -- separately records successful convergence for the startup skip check.
       -- Single row (id = 1); written by recordSchemaVersion() from APP_VERSION so the
       -- version string has exactly one source of truth.
       CREATE TABLE IF NOT EXISTS remote_agent_schema_version (
@@ -652,7 +372,8 @@ export class SqliteAdapter implements IDatabase {
         created_app_version TEXT,
         app_version TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+        schema_fingerprint TEXT
       );
 
       -- Users table (Archon identity, platform-agnostic)
@@ -807,13 +528,13 @@ export class SqliteAdapter implements IDatabase {
         ON remote_agent_isolation_environments (codebase_id, workflow_type, workflow_id)
         WHERE status = 'active';
 
-      -- Workflow runs table
       -- conversation_id's ON DELETE CASCADE would erase run rows (and with them
       -- the live-run cleanup pin for isolation environments, #2868) on a hard
       -- conversation delete; soft delete is the only supported path. Mirrors
       -- the COMMENT ON COLUMN in migrations/000_combined.sql.
       CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        origin TEXT,
         conversation_id TEXT NOT NULL REFERENCES remote_agent_conversations(id) ON DELETE CASCADE,
         codebase_id TEXT REFERENCES remote_agent_codebases(id) ON DELETE SET NULL,
         workflow_name TEXT NOT NULL,
@@ -827,11 +548,40 @@ export class SqliteAdapter implements IDatabase {
         parent_run_id TEXT REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL,
         adopted_from_run_id TEXT REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL,
         started_at TEXT DEFAULT (datetime('now')),
+        active_phase_started_at TEXT,
         completed_at TEXT,
         last_activity_at TEXT DEFAULT (datetime('now')),
         working_path TEXT,
         output_root TEXT,
-        checkout_baseline TEXT
+        checkout_baseline TEXT,
+        item_id TEXT REFERENCES remote_agent_items(id)
+      );
+
+      -- The durable thing runs are about; see migrations/000_combined.sql.
+      CREATE TABLE IF NOT EXISTS remote_agent_items (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        project_key TEXT NOT NULL,
+        key TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(project_key, key)
+      );
+
+      CREATE TABLE IF NOT EXISTS remote_agent_state_revisions (
+        project_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        value TEXT,
+        operation TEXT NOT NULL,
+        writer_kind TEXT NOT NULL CHECK (writer_kind IN ('run', 'operator')),
+        writer_run_id TEXT,
+        writer_node_path TEXT,
+        writer_identity TEXT,
+        writer_via TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        lease_run_id TEXT,
+        lease_node_path TEXT,
+        lease_taken_at TEXT,
+        PRIMARY KEY (project_key, name, revision)
       );
 
       CREATE TABLE IF NOT EXISTS remote_agent_start_receipts (
@@ -845,6 +595,7 @@ export class SqliteAdapter implements IDatabase {
         outcome TEXT NOT NULL CHECK (outcome IN ('matched', 'unmatched', 'unsupported', 'malformed')),
         reason TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        item_key TEXT,
         UNIQUE(source_instance_id, delivery_id)
       );
 
@@ -854,6 +605,7 @@ export class SqliteAdapter implements IDatabase {
         binding_revision TEXT,
         host_id TEXT,
         intent TEXT,
+        event_input_names TEXT,
         preparation_status TEXT NOT NULL CHECK (preparation_status IN ('pending', 'preparing', 'failed', 'rejected', 'unmatched', 'complete')),
         preparation_owner TEXT,
         preparation_error TEXT,
@@ -884,8 +636,11 @@ export class SqliteAdapter implements IDatabase {
         binding_id TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         admitted_at TEXT,
+        item_id TEXT REFERENCES remote_agent_items(id),
         FOREIGN KEY (receipt_id, binding_id) REFERENCES remote_agent_start_receipt_bindings(receipt_id, binding_id) ON DELETE SET NULL
       );
+
+      CREATE INDEX IF NOT EXISTS idx_state_revisions_created_at ON remote_agent_state_revisions(created_at);
 
       CREATE INDEX IF NOT EXISTS idx_resource_start_queue
         ON remote_agent_resource_start_requests(resource_key, status, queue_position);
@@ -893,6 +648,15 @@ export class SqliteAdapter implements IDatabase {
         ON remote_agent_resource_start_requests(host_id, status, resource_key, queue_position);
       CREATE INDEX IF NOT EXISTS idx_start_binding_preparation
         ON remote_agent_start_receipt_bindings(host_id, preparation_status, created_at);
+
+      CREATE TABLE IF NOT EXISTS remote_agent_web_push_subscriptions (
+        id TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
 
       -- Workflow events table
       CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
@@ -957,7 +721,11 @@ export class SqliteAdapter implements IDatabase {
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON remote_agent_workflow_runs(status);
       CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id ON remote_agent_workflow_events(workflow_run_id);
       CREATE INDEX IF NOT EXISTS idx_workflow_events_type ON remote_agent_workflow_events(event_type);
+      CREATE INDEX IF NOT EXISTS idx_workflow_events_run_type ON remote_agent_workflow_events(workflow_run_id, event_type);
       CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at ON remote_agent_workflow_events(created_at);
+      -- Metric completions (listMetricRecords). Its predicate must equal the query's.
+      CREATE INDEX IF NOT EXISTS idx_workflow_events_metrics ON remote_agent_workflow_events(created_at)
+        WHERE event_type = 'node_completed' AND json_extract(data, '$.structured_output.metrics') IS NOT NULL;
       -- NOTE: the idx_workflow_events_run_order index and the assign_order trigger
       -- are deliberately NOT created here. Both reference event_order, which does
       -- not exist on databases created before it was introduced — and CREATE INDEX
@@ -1004,6 +772,7 @@ export class SqliteAdapter implements IDatabase {
  * SQLite SQL dialect helpers
  */
 export const sqliteDialect: SqlDialect = {
+  messageOrderTieBreaker: 'rowid',
   generateUuid(): string {
     return crypto.randomUUID();
   },
@@ -1013,15 +782,8 @@ export const sqliteDialect: SqlDialect = {
   },
 
   jsonMerge(column: string, paramIndex: number): string {
-    // SQLite json_patch: merges two JSON objects
     // Use $N placeholder (not raw ?) so convertPlaceholders can reorder params correctly
     return `json_patch(${column}, $${String(paramIndex)})`;
-  },
-
-  jsonArrayContains(column: string, path: string, paramIndex: number): string {
-    // SQLite: check if JSON array contains value using instr
-    // Use $N placeholder for consistent param ordering
-    return `instr(json_extract(${column}, '$.${path}'), $${String(paramIndex)}) > 0`;
   },
 
   nowMinusDays(paramIndex: number): string {
@@ -1030,5 +792,21 @@ export const sqliteDialect: SqlDialect = {
 
   daysSince(column: string): string {
     return `(julianday('now') - julianday(${column}))`;
+  },
+
+  jsonText(column: string, path: string): string {
+    return `json_extract(${column}, '$.${path}')`;
+  },
+
+  jsonRemove(column: string, ...keys: string[]): string {
+    return `json_remove(${[column, ...keys.map(key => `'$.${key}'`)].join(', ')})`;
+  },
+
+  rowLock(): string {
+    return '';
+  },
+
+  indexedBy(index: string): string {
+    return ` INDEXED BY ${index}`;
   },
 };

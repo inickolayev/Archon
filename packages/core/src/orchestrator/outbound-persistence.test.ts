@@ -22,6 +22,7 @@ function fakeAdapter(): IPlatformAdapter & { delivered: string[] } {
   const delivered: string[] = [];
   return {
     delivered,
+    capabilities: { messagePersistence: 'core', defaultWorkflowDispatch: 'foreground' },
     sendMessage: async (_id, message) => {
       delivered.push(message);
     },

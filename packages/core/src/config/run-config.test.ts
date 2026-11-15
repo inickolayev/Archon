@@ -1,5 +1,6 @@
+// @archon-test-isolated
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
-import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers/in-process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +9,10 @@ import {
   parseWorkflowRunConfig,
   sealWorkflowRunConfig,
   unsealWorkflowRunConfig,
+  workflowRunConfigFromRun,
+  workflowRunConfigKeys,
 } from './run-config';
+import { workflowRunConfigLayerSchema } from '@archon/workflows/schemas/run-config';
 import { decodeWorkflowRunConfigHandoff } from './run-config-handoff';
 
 const TEST_KEY = 'ab'.repeat(32);
@@ -37,7 +41,7 @@ describe('workflow run config', () => {
         assistants: { pi: { model: 'minimax/MiniMax-M3', enableExtensions: false } },
         tiers: { large: { provider: 'codex', model: 'gpt-5.6-sol' } },
         aliases: { '@planner': { provider: 'claude', model: 'opus' } },
-        workflows: { quotaMaxAttempts: 3 },
+        workflows: { quotaMaxAttempts: 3, toolCallAttentionMs: 60000 },
         docs: { path: 'handbook' },
         env: { BENCH_TOKEN: 'top-secret' },
       },
@@ -51,11 +55,69 @@ describe('workflow run config', () => {
         assistants: { pi: { model: 'minimax/MiniMax-M3', enableExtensions: false } },
         tiers: { large: { provider: 'codex', model: 'gpt-5.6-sol' } },
         aliases: { '@planner': { provider: 'claude', model: 'opus' } },
-        workflows: { quotaMaxAttempts: 3 },
+        workflows: { quotaMaxAttempts: 3, toolCallAttentionMs: 60000 },
         docsPath: 'handbook',
         envVars: { BENCH_TOKEN: 'top-secret' },
       },
     });
+  });
+
+  it('projects every accepted runtime key to its layer field and sealed key paths', () => {
+    const projections = {
+      assistant: { value: 'pi', layer: { assistant: 'pi' }, paths: ['assistant'] },
+      defaultAssistant: { value: 'pi', layer: { assistant: 'pi' }, paths: ['assistant'] },
+      assistants: {
+        value: { pi: { enableExtensions: false, extensionFlags: { auth: 'secret' } }, codex: {} },
+        layer: {
+          assistants: {
+            pi: { enableExtensions: false, extensionFlags: { auth: 'secret' } },
+            codex: {},
+          },
+        },
+        paths: [
+          'assistants.codex',
+          'assistants.pi.enableExtensions',
+          'assistants.pi.extensionFlags',
+        ],
+      },
+      aliases: {
+        value: { '@planner': { provider: 'claude', model: 'opus' } },
+        layer: { aliases: { '@planner': { provider: 'claude', model: 'opus' } } },
+        paths: ['aliases.@planner'],
+      },
+      tiers: {
+        value: { large: { provider: 'codex', model: 'gpt-5.6-sol' } },
+        layer: { tiers: { large: { provider: 'codex', model: 'gpt-5.6-sol' } } },
+        paths: ['tiers.large'],
+      },
+      workflows: {
+        value: { toolCallAttentionMs: 60000 },
+        layer: { workflows: { toolCallAttentionMs: 60000 } },
+        paths: ['workflows.toolCallAttentionMs'],
+      },
+      docs: { value: { path: 'handbook' }, layer: { docsPath: 'handbook' }, paths: ['docs.path'] },
+      env: {
+        value: { BENCH_TOKEN: 'test-value' },
+        layer: { envVars: { BENCH_TOKEN: 'test-value' } },
+        paths: ['env.BENCH_TOKEN'],
+      },
+    };
+    expect(Object.keys(projections).sort()).toEqual([...workflowRunConfigKeys].sort());
+    const entries = Object.values(projections);
+    expect([...new Set(entries.flatMap(entry => Object.keys(entry.layer)))].sort()).toEqual(
+      [...workflowRunConfigLayerSchema.keyof().options].sort()
+    );
+    for (const [key, { value, layer, paths }] of Object.entries(projections)) {
+      const parsed = parseWorkflowRunConfig({ [key]: value }, { kind: 'http', label: key });
+      expect(parsed.layer).toEqual(layer);
+      expect(sealWorkflowRunConfig(parsed.layer, parsed.source).keys).toEqual(paths);
+    }
+    const combined = workflowRunConfigLayerSchema.parse(
+      Object.assign({}, ...entries.map(entry => entry.layer))
+    );
+    expect(sealWorkflowRunConfig(combined, { kind: 'http', label: 'inline' }).keys).toEqual(
+      [...new Set(entries.flatMap(entry => entry.paths))].sort()
+    );
   });
 
   it('rejects unknown, ambiguous, and every unavailable top-level key with its name', () => {
@@ -85,7 +147,6 @@ describe('workflow run config', () => {
       'container',
       'botName',
       'streaming',
-      'paths',
       'concurrency',
       'recommendedWorkflows',
     ]) {
@@ -98,7 +159,7 @@ describe('workflow run config', () => {
   it('rejects model settings that cannot execute or survive resume', () => {
     expect(() =>
       parseWorkflowRunConfig({ assistant: 'not-registered' }, { kind: 'http', label: 'inline' })
-    ).toThrow("Invalid run config at 'assistant': unknown provider 'not-registered'");
+    ).toThrow("Invalid run config at 'assistant': Unknown provider: 'not-registered'");
     expect(() =>
       parseWorkflowRunConfig(
         { aliases: { planner: { provider: 'claude', model: 'opus' } } },
@@ -229,7 +290,7 @@ describe('workflow run config', () => {
       { kind: 'http', label: 'inline' }
     );
 
-    expect(parsed.layer.assistants?.copilot).toEqual({ modelReasoningEffort: 'xhigh' });
+    expect(parsed.layer.assistants?.copilot).toEqual({ modelReasoningEffort: 'max' });
     expect(
       parseWorkflowRunConfig(
         { assistants: { opencode: { model: ' anthropic / claude-sonnet-4-5 ' } } },
@@ -275,6 +336,19 @@ describe('workflow run config', () => {
     expect(serialized).not.toContain('env-secret');
     expect(metadata.keys).toEqual(['assistants.pi.extensionFlags', 'env.TOKEN']);
     expect(unsealWorkflowRunConfig(metadata)).toEqual(input.layer);
+  });
+
+  it('reads the run config another run started with, naming that run as the source', () => {
+    const run_config = sealWorkflowRunConfig(
+      { assistant: 'codex' },
+      { kind: 'cli', label: 'config.claude.yaml' }
+    );
+    expect(workflowRunConfigFromRun({ id: 'r1', metadata: { run_config } })).toEqual({
+      layer: { assistant: 'codex' },
+      source: { kind: 'cli', label: 'run r1 (config.claude.yaml)' },
+    });
+    // A run started without --config ran on the install's config alone.
+    expect(workflowRunConfigFromRun({ id: 'r2', metadata: {} })).toBeUndefined();
   });
 
   it('fails explicitly when persisted ciphertext is tampered with', () => {

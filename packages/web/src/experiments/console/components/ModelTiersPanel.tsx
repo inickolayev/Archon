@@ -4,7 +4,7 @@ import type {
   PiModelInfo,
   ProviderInfo,
   ProviderKeyList,
-  SafeConfigTiers,
+  SafeConfig,
   TiersForm,
   TierName,
   TierRowForm,
@@ -19,12 +19,12 @@ import { effortOptionsForAgent, normalizeEffortForAgent } from '../lib/model-opt
 import { useCancelledRef } from '../lib/use-cancelled-ref';
 import { errorDetail } from '../lib/http';
 import { SettingsSection } from './SettingsSection';
-import { ScopeToggle } from './ScopeToggle';
+import { UserScopeSlot, userScopeStatus } from './ScopeToggle';
 import { SELECT_CLASS, SelectShell } from './SettingsFormPrimitives';
 import { ModelPickerField } from './ModelPickerField';
 
 /** Seed the editable tier form from a tier map (configured tiers only). */
-function seedTiers(tiers: SafeConfigTiers['tiers']): TiersForm {
+function seedTiers(tiers: SafeConfig['tiers']): TiersForm {
   const row = (t: TierName): TierRowForm => {
     const set = tiers?.[t];
     return { provider: set?.provider ?? '', model: set?.model ?? '', effort: set?.effort ?? '' };
@@ -39,7 +39,7 @@ function seedTiers(tiers: SafeConfigTiers['tiers']): TiersForm {
  * claude and codex ship built-ins — for any other provider an unset tier
  * resolves to nothing, and the hint must say so instead of implying a fallback.
  */
-function defaultHint(cfg: SafeConfigTiers, t: TierName, scope: SettingsScope): string {
+function defaultHint(cfg: SafeConfig, t: TierName, scope: SettingsScope): string {
   if (scope === 'user') {
     const installSet = cfg.tiers?.[t];
     if (installSet) return `${installSet.provider}/${installSet.model}`;
@@ -54,7 +54,8 @@ function defaultHint(cfg: SafeConfigTiers, t: TierName, scope: SettingsScope): s
  * (ungated; works on solo installs), "Just me" writes the caller's per-user
  * prefs row via PATCH /api/auth/me/ai-prefs/tiers (highest precedence at run
  * time). The "Just me" scope is hidden when GET /api/auth/me/ai-prefs 401s (no
- * web identity — solo-PAT or logged out), mirroring AgentsPanel.
+ * web identity — solo-PAT or logged out), mirroring AgentsPanel; any other
+ * failure of that read is shown in its place.
  * A row left on "Default" is sent as an unset and falls back to the next layer.
  */
 export function ModelTiersPanel(): ReactElement {
@@ -78,20 +79,18 @@ export function ModelTiersPanel(): ReactElement {
     skill.listProviderKeys
   );
 
-  // No web identity (401) or any other prefs read failure → install scope only,
-  // so the editor never mislabels install values as "Just me".
-  const userScopeAvailable = userPrefsError === undefined;
-  const [scope, setScope] = useState<SettingsScope>('install');
+  const userScope = userScopeStatus(userPrefsError);
+  const [selectedScope, setScope] = useState<SettingsScope>('install');
+  // Without per-user prefs the editor is install-only, so it never labels
+  // install values as "Just me".
+  const scope: SettingsScope = userScope.kind === 'available' ? selectedScope : 'install';
 
   const [form, setForm] = useState<TiersForm | null>(null);
   const baselineRef = useRef('');
   useEffect(() => {
     if (config === undefined) return;
     if (scope === 'user' && userPrefs === undefined) return;
-    const seeded =
-      scope === 'user'
-        ? seedTiers(userPrefs?.tiers)
-        : seedTiers((config.config as SafeConfigTiers).tiers);
+    const seeded = scope === 'user' ? seedTiers(userPrefs?.tiers) : seedTiers(config.config.tiers);
     setForm(seeded);
     baselineRef.current = JSON.stringify(seeded);
   }, [config, userPrefs, scope]);
@@ -106,19 +105,19 @@ export function ModelTiersPanel(): ReactElement {
   if (loadError !== undefined) {
     return (
       <SettingsSection title="Model Tiers">
-        <p className="font-mono text-[11px] text-error">{loadError.message}</p>
+        <p className="font-mono text-console-11 text-error">{loadError.message}</p>
       </SettingsSection>
     );
   }
   if (form === null || providers === undefined || config === undefined) {
     return (
       <SettingsSection title="Model Tiers">
-        <p className="font-mono text-[11px] text-text-tertiary">Loading…</p>
+        <p className="font-mono text-console-11 text-text-tertiary">Loading…</p>
       </SettingsSection>
     );
   }
 
-  const cfg = config.config as SafeConfigTiers;
+  const cfg = config.config;
   const dirty = JSON.stringify(form) !== baselineRef.current;
 
   const setRow = (t: TierName, partial: Partial<TierRowForm>): void => {
@@ -149,16 +148,16 @@ export function ModelTiersPanel(): ReactElement {
   return (
     <SettingsSection title="Model Tiers">
       <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-        <p className="min-w-[260px] flex-1 text-[12.5px] leading-relaxed text-text-tertiary">
+        <p className="min-w-65 flex-1 text-console-13 leading-relaxed text-text-tertiary">
           Bundled workflows resolve <code className="font-mono">small</code> /{' '}
           <code className="font-mono">medium</code> / <code className="font-mono">large</code> to
           these models. Leave a row on “Default” to use the next layer’s preset.
           {scope === 'user' ? ' Your rows override the install rows for runs you start.' : ''}
         </p>
-        {userScopeAvailable ? <ScopeToggle scope={scope} onChange={setScope} /> : null}
+        <UserScopeSlot status={userScope} scope={scope} onChange={setScope} />
       </div>
 
-      <div className="flex flex-col gap-[11px]">
+      <div className="flex flex-col gap-2.75">
         {TIER_ORDER.map(tier => {
           const row = form[tier];
           const unset = row.provider === '';
@@ -166,12 +165,12 @@ export function ModelTiersPanel(): ReactElement {
           return (
             <div
               key={tier}
-              className="flex flex-wrap items-center gap-[14px] rounded-xl border border-border bg-surface-elevated p-4"
+              className="flex flex-wrap items-center gap-3.5 rounded-xl border border-border bg-surface-elevated p-4"
             >
-              <div className="w-[78px] shrink-0 text-[13.5px] font-bold capitalize text-text-primary">
+              <div className="w-19.5 shrink-0 text-console-14 font-bold capitalize text-text-primary">
                 {tier}
               </div>
-              <SelectShell className="w-[160px] shrink-0">
+              <SelectShell className="w-40 shrink-0">
                 <select
                   value={row.provider}
                   onChange={e => {
@@ -208,15 +207,15 @@ export function ModelTiersPanel(): ReactElement {
                 placeholder={
                   unset
                     ? `default: ${defaultHint(cfg, tier, scope)}`
-                    : 'model (e.g. opus, gpt-5.6-terra)'
+                    : 'model (e.g. opus, gpt-6.1-terra)'
                 }
                 ariaLabel={`${tier} model`}
-                className="min-w-[160px] flex-1"
+                className="min-w-40 flex-1"
                 agents={keyData?.agents}
                 piModels={piModels}
               />
               {effortOptions !== null ? (
-                <SelectShell className="w-[110px] shrink-0">
+                <SelectShell className="w-27.5 shrink-0">
                   <select
                     value={row.effort}
                     onChange={e => {
@@ -247,21 +246,21 @@ export function ModelTiersPanel(): ReactElement {
       </div>
 
       {TIER_ORDER.filter(t => form[t].provider !== '').length === 1 ? (
-        <p className="mt-3 font-mono text-[11px] text-text-tertiary">
+        <p className="mt-3 font-mono text-console-11 text-text-tertiary">
           Heads up: only one tier is set{scope === 'user' ? ' for you' : ''} — runs asking for the
           other tiers fall back to the nearest configured preset.
         </p>
       ) : null}
 
-      <div className="mt-[18px] flex items-center justify-end gap-3">
+      <div className="mt-4.5 flex items-center justify-end gap-3">
         {saveError !== null ? (
-          <span className="font-mono text-[11px] text-error">{saveError}</span>
+          <span className="font-mono text-console-11 text-error">{saveError}</span>
         ) : null}
         <button
           type="button"
           onClick={() => void onSave()}
           disabled={!dirty || saving}
-          className="brand-bar rounded-[10px] px-[18px] py-2.5 text-[13px] font-bold text-white shadow-[0_8px_22px_-10px_color-mix(in_oklch,var(--brand-magenta),transparent_20%)] transition-all hover:-translate-y-px hover:brightness-110 disabled:translate-y-0 disabled:opacity-40 disabled:shadow-none"
+          className="brand-bar rounded-lg px-4.5 py-2.5 text-console-13 font-bold text-white shadow-[0_8px_22px_-10px_color-mix(in_oklch,var(--brand-magenta),transparent_20%)] transition-all hover:-translate-y-px hover:brightness-110 disabled:translate-y-0 disabled:opacity-40 disabled:shadow-none"
         >
           {saving ? 'Saving…' : 'Save changes'}
         </button>

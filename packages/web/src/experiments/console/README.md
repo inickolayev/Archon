@@ -6,6 +6,8 @@ name remains in place to avoid a mechanical move while the builder is changing.
 ## Routes
 
 - `/console` → all runs
+- `/console/metrics` → overview cards declared by packs, over `?window=7d|30d|90d`
+- `/console/metrics/details` → one row per metric, with calibration boxes
 - `/console/settings` → assistant, provider, system, and identity settings
 - `/console/profile` → the signed-in account: display name, linked Telegram,
   sign out (clears this console's cache, not only the session)
@@ -20,6 +22,8 @@ name remains in place to avoid a mechanical move while the builder is changing.
 - `/console/p/:projectId/chat/:conversationId` → one chat of that project;
   `new` is an unsent chat, created on the first send. A project holds as many
   chats as the operator starts
+- `/console/p/:projectId/metrics` → the project's overview cards
+- `/console/p/:projectId/metrics/details` → the project's metric details
 - `/console/p/:projectId/r/:runId` → project-scoped run detail
 
 ## Ownership
@@ -61,14 +65,32 @@ installations operate without an identity.
 
 ## Persisted view preferences
 
-| Key | Default | Purpose |
-| --- | --- | --- |
-| `archon.console.detailView` | `log` | Run-detail tab |
-| `archon.console.showToolCalls` | `1` | Show tool calls in the stream |
-| `archon.console.showSystem` | `0` | Show system events |
-| `archon.console.runNodeFilter` | `all` | Filter the run stream by node |
-| `archon.console.railWidth` | unset | Project rail width |
-| `archon.console.lastWorkflow` | unset | Last selected workflow |
-| `archon.console.builderProject` | unset | Builder project selection |
+| Key                              | Default | Purpose                                |
+| -------------------------------- | ------- | -------------------------------------- |
+| `archon.console.detailView`      | `log`   | Run-detail tab                         |
+| `archon.console.showToolCalls`   | `1`     | Show tool calls in the stream          |
+| `archon.console.showSystem`      | `0`     | Show system events                     |
+| `archon.console.runNodeSelection` | empty   | Filter the run stream by node ID       |
+| `archon.console.railWidth`       | unset   | Project rail width                     |
+| `archon.console.lastWorkflow`    | unset   | Last selected workflow                 |
+| `archon.console.builderProject`  | unset   | Builder project selection              |
+| `archon.console.attentionAlerts` | `0`     | Alert when a run needs you or finishes |
 
-Local storage reads are guarded and fall back to these defaults.
+Local storage reads are guarded and fall back to these defaults. The node selection
+uses an empty value for all nodes.
+
+### Closed-console notifications
+
+Settings → Alerts has a separate opt-in for Web Push. It requires an authenticated web identity, HTTPS or localhost, notification permission, and a browser with Push API support. Every opted-in browser receives run attention notices for this install. Notification clicks open `/runs/<id>`. On iOS, install the site as a home-screen web app first.
+
+The first subscription quietly baselines existing pauses. Delivery is recorded per destination, after sending. A crash or a partial delivery failure can re-send to browsers that already received the notice; notifications use `tag: runId` so duplicates replace each other. Turning the toggle off deletes the subscription and unsubscribes the browser. The in-tab alert toggle stays independent.
+
+## Design tokens
+
+Use the [console scale in the brand guide](https://archon.diy/brand/#console-design-tokens)
+and Tailwind's default spacing scale, including decimal multipliers.
+`src/index.css` owns the scale; console font tokens inherit line height.
+`bun run lint` checks arbitrary lengths and the generated guide. After editing
+the theme, run `bun run scripts/check-console-tokens.ts --write-docs` from the
+repository root. The guide documents the narrow adjacent-comment syntax for
+one-off layout exceptions.

@@ -1,5 +1,14 @@
+import type { AssistantConfigForm, TiersForm, AliasRowForm } from '../primitives/settings';
+export type {
+  AssistantConfigForm,
+  TierRowForm,
+  TiersForm,
+  SettingsScope,
+  AliasRowForm,
+} from '../primitives/settings';
 import { requestJson } from '../lib/http';
 import type { components } from '@/lib/api.generated';
+import { TIER_ORDER, type TierName } from '../lib/tiers';
 
 /**
  * Installation-wide settings skills: assistant config + system health/version.
@@ -18,35 +27,19 @@ export type HealthResponse = components['schemas']['HealthResponse'];
 export type UpdateCheckResponse = components['schemas']['UpdateCheckResponse'];
 
 export function getConfig(): Promise<ConfigResponse> {
-  return requestJson<ConfigResponse>('/api/config');
+  return requestJson('/api/config', 'get');
 }
 
 export function updateAssistantConfig(body: UpdateAssistantConfigBody): Promise<ConfigResponse> {
-  return requestJson<ConfigResponse>('/api/config/assistants', {
-    method: 'PATCH',
-    body: JSON.stringify(body),
-  });
+  return requestJson('/api/config/assistants', 'patch', { body });
 }
 
 export function getHealth(): Promise<HealthResponse> {
-  return requestJson<HealthResponse>('/api/health');
+  return requestJson('/api/health', 'get');
 }
 
 export function getUpdateCheck(): Promise<UpdateCheckResponse> {
-  return requestJson<UpdateCheckResponse>('/api/update-check');
-}
-
-/**
- * Editable assistant form state. `models` is providerId → free-text model (model
- * strings are intentionally unvalidated — the SDK ships models faster than Archon
- * can enumerate them). The codex-only reasoning/web-search fields are flat here
- * and only attached to the codex entry by `buildAssistantUpdate`.
- */
-export interface AssistantConfigForm {
-  assistant: string;
-  models: Record<string, string>;
-  modelReasoningEffort: string;
-  webSearchMode: string;
+  return requestJson('/api/update-check', 'get');
 }
 
 /**
@@ -73,50 +66,25 @@ export function buildAssistantUpdate(form: AssistantConfigForm): UpdateAssistant
     if (Object.keys(entry).length > 0) assistants[providerId] = entry;
   }
 
-  const body: UpdateAssistantConfigBody = { assistant: form.assistant };
+  const body: UpdateAssistantConfigBody =
+    form.assistant === '' ? {} : { assistant: form.assistant };
   if (Object.keys(assistants).length > 0) body.assistants = assistants;
   return body;
 }
 
 // ---------------------------------------------------------------------------
-// Model tiers. Types inlined (mirroring server/.../config.schemas.ts) until a
-// regen lands TiersConfig / UpdateTiersBody / SafeConfig.tiers in
-// @/lib/api.generated — same convention as skills/github.ts. Migrate to
-// `components['schemas']['TiersConfig']` etc. once the spec is regenerated.
+// Model tiers.
 // ---------------------------------------------------------------------------
 
 export type TierEntry = components['schemas']['TierEntry'];
+export type TiersMap = components['schemas']['TiersConfig'];
+export { TIER_ORDER, type TierName };
 
-export interface TiersMap {
-  small?: TierEntry;
-  medium?: TierEntry;
-  large?: TierEntry;
-}
-
-/** `SafeConfig` + the tier fields not yet in the generated spec. */
-export type SafeConfigTiers = SafeConfig & { tiers?: TiersMap; tierDefaults?: TiersMap };
-
-export interface UpdateTiersBody {
-  tiers: { small?: TierEntry | null; medium?: TierEntry | null; large?: TierEntry | null };
-}
+export type UpdateTiersBody = components['schemas']['UpdateTiersBody'];
 
 export function updateTiers(body: UpdateTiersBody): Promise<ConfigResponse> {
-  return requestJson<ConfigResponse>('/api/config/tiers', {
-    method: 'PATCH',
-    body: JSON.stringify(body),
-  });
+  return requestJson('/api/config/tiers', 'patch', { body });
 }
-
-export type TierName = 'small' | 'medium' | 'large';
-export const TIER_ORDER: readonly TierName[] = ['small', 'medium', 'large'];
-
-export interface TierRowForm {
-  provider: string; // '' = unset (falls back to the built-in default)
-  model: string;
-  effort: NonNullable<TierEntry['effort']> | '';
-}
-
-export type TiersForm = Record<TierName, TierRowForm>;
 
 /**
  * Pure form → PATCH body. A row whose provider OR model is blank is sent as
@@ -141,25 +109,14 @@ export function buildTiersUpdate(form: TiersForm): UpdateTiersBody {
   return { tiers };
 }
 
-// ---------------------------------------------------------------------------
-// @custom aliases (install scope) + per-user AI prefs (Phase 3). Types inlined
-// until a regen lands UserAiPrefs / UpdateAliasesBody in @/lib/api.generated —
-// same convention as the tiers block above.
-// ---------------------------------------------------------------------------
-
-/** `SafeConfig` + the alias field not yet in the generated spec. */
-export type SafeConfigAliases = SafeConfig & { aliases?: Record<string, TierEntry> };
-
-export interface UpdateAliasesBody {
-  aliases: Record<string, TierEntry | null>;
-}
+export type SafeConfigAliases = SafeConfig;
+export type UpdateAliasesBody = components['schemas']['UpdateAliasesBody'];
+export type UpdateUserTiersBody = components['schemas']['UpdateUserTiersBody'];
+export type UpdateUserAliasesBody = components['schemas']['UpdateUserAliasesBody'];
 
 /** Install-wide @custom aliases — writes `aliases:` to ~/.archon/config.yaml. */
 export function updateAliases(body: UpdateAliasesBody): Promise<ConfigResponse> {
-  return requestJson<ConfigResponse>('/api/config/aliases', {
-    method: 'PATCH',
-    body: JSON.stringify(body),
-  });
+  return requestJson('/api/config/aliases', 'patch', { body });
 }
 
 /**
@@ -167,30 +124,18 @@ export function updateAliases(body: UpdateAliasesBody): Promise<ConfigResponse> 
  * with config). Reads 401 when no web identity resolves — panels use that to
  * hide the "Just me" scope.
  */
-export interface UserAiPrefs {
-  tiers?: TiersMap;
-  aliases?: Record<string, TierEntry>;
-  defaultProvider?: string;
-  /** Per-user default CHAT model (#1998) — only meaningful with defaultProvider. */
-  defaultModel?: string;
-}
+export type UserAiPrefs = components['schemas']['UserAiPrefs'];
 
 export function getUserAiPrefs(): Promise<UserAiPrefs> {
-  return requestJson<UserAiPrefs>('/api/auth/me/ai-prefs');
+  return requestJson('/api/auth/me/ai-prefs', 'get');
 }
 
-export function updateUserTiers(body: UpdateTiersBody): Promise<UserAiPrefs> {
-  return requestJson<UserAiPrefs>('/api/auth/me/ai-prefs/tiers', {
-    method: 'PATCH',
-    body: JSON.stringify(body),
-  });
+export function updateUserTiers(body: UpdateUserTiersBody): Promise<UserAiPrefs> {
+  return requestJson('/api/auth/me/ai-prefs/tiers', 'patch', { body });
 }
 
-export function updateUserAliases(body: UpdateAliasesBody): Promise<UserAiPrefs> {
-  return requestJson<UserAiPrefs>('/api/auth/me/ai-prefs/aliases', {
-    method: 'PATCH',
-    body: JSON.stringify(body),
-  });
+export function updateUserAliases(body: UpdateUserAliasesBody): Promise<UserAiPrefs> {
+  return requestJson('/api/auth/me/ai-prefs/aliases', 'patch', { body });
 }
 
 /**
@@ -202,21 +147,7 @@ export function updateUserDefault(
   provider: string | null,
   model: string | null
 ): Promise<UserAiPrefs> {
-  return requestJson<UserAiPrefs>('/api/auth/me/ai-prefs/default', {
-    method: 'PATCH',
-    body: JSON.stringify({ provider, model }),
-  });
-}
-
-/** The editable scope of a settings panel: install-wide config vs per-user DB prefs. */
-export type SettingsScope = 'install' | 'user';
-
-/** One editable alias row in the AliasesPanel. */
-export interface AliasRowForm {
-  name: string;
-  provider: string;
-  model: string;
-  effort: NonNullable<TierEntry['effort']> | '';
+  return requestJson('/api/auth/me/ai-prefs/default', 'patch', { body: { provider, model } });
 }
 
 /** Seed editable alias rows from a saved alias map (sorted by name). */
@@ -227,9 +158,25 @@ export function seedAliasRows(map: Record<string, TierEntry> | undefined): Alias
 }
 
 /**
+ * The server's alias-name rule (`validateAliasName` in @archon/server), run in
+ * the form so a bad name never costs a round trip. `scripts/alias-name-parity.test.ts`
+ * keeps this copy identical — the web bundle cannot import the server's.
+ */
+export function aliasNameError(name: string): string | null {
+  if ((TIER_ORDER as readonly string[]).includes(name)) {
+    return `Alias name '${name}' is reserved (small/medium/large are tier keywords). Use a different name.`;
+  }
+  if (!name.startsWith('@')) {
+    return `Alias name '${name}' must start with '@' (e.g. '@${name}').`;
+  }
+  return null;
+}
+
+/**
  * Pure form → PATCH body. Baseline names that no longer appear in the rows are
  * sent as `null` (unset — covers both deletion and rename), complete rows are
  * sent as entries, and incomplete rows (blank name/provider/model) are dropped.
+ * Throws on a complete row whose name the server would reject.
  */
 export function buildAliasesUpdate(
   rows: AliasRowForm[],
@@ -245,6 +192,8 @@ export function buildAliasesUpdate(
     const provider = row.provider.trim();
     const model = row.model.trim();
     if (!name || !provider || !model) continue;
+    const nameError = aliasNameError(name);
+    if (nameError !== null) throw new Error(nameError);
     const entry: TierEntry = { provider, model };
     if (row.effort) entry.effort = row.effort;
     aliases[name] = entry;

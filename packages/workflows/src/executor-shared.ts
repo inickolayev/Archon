@@ -1,135 +1,147 @@
 /**
- * Shared helpers for executor.ts and dag-executor.ts.
- *
- * Extracted here once the Rule of Three was met — both files had
- * identical copies of these error-classification and prompt-building
- * utilities. Single source of truth; no logic changes from either copy.
+ * Retry classification, subprocess failure formatting and completion-signal detection
+ * shared by the executors.
  */
-import { readFile } from 'fs/promises';
-import { AsyncLocalStorage } from 'node:async_hooks';
-import { join } from 'path';
-import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
-import * as archonPaths from '@archon/paths';
-import {
-  liveSourceRoots,
-  packagedWorkflowDirectory,
-  workflowSourceConfigForRoots,
-  type WorkflowSourceRoots,
-} from './workflow-source';
-import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
-import { bundledDefaultCommandPath, bundlesPackagedResources } from './defaults/bundle-inventory';
-import { createLogger } from '@archon/paths';
-import { isValidCommandName } from './command-validation';
-import type { LoadCommandResult } from './schemas';
+import { escapeRegExp } from '@archon/paths/regexp';
+import type { ExecNode, DagNode, NodeOutput, WorkflowExecutionResult } from './schemas';
 import type { ProviderFailure } from '@archon/provider-contract';
-import type { NodeFailureKind } from './schemas/node-execution';
-import { substituteInputRefs, type JsonValue } from './output-ref';
-import { parsePackagedResourceReference } from './packaged-workflow';
+import type { ExecutionOutput, NodeFailureKind } from './schemas/node-execution';
+import { transitiveDepsLookup } from './depends-on';
+import type { hostSpawnFailure, RawSubprocessRejection } from './subprocess';
 
-/** Lazy-initialized logger */
-let cachedLog: ReturnType<typeof createLogger> | undefined;
-function getLog(): ReturnType<typeof createLogger> {
-  if (!cachedLog) cachedLog = createLogger('workflow.executor-shared');
-  return cachedLog;
-}
-
-// ─── Error Classification ────────────────────────────────────────────────────
-
-/** Result of error classification */
-export type ErrorType = 'TRANSIENT' | 'FATAL' | 'UNKNOWN';
-
-const QUOTA_EXHAUSTION_PATTERNS = [
-  'session limit',
-  'usage limit reached',
-  'credit exhaustion',
-  'credit balance',
-] as const;
-
-/** Fatal errors: authentication/authorization failures plus quota exhaustion. */
-export const FATAL_PATTERNS = [
-  'unauthorized',
-  'forbidden',
-  'invalid token',
-  'authentication failed',
-  'permission denied',
-  '401',
-  '403',
-  ...QUOTA_EXHAUSTION_PATTERNS,
-];
-
-/** Ambiguous fatal patterns that yield to concrete transient evidence. */
-const FALLBACK_FATAL_PATTERNS = ['auth error'];
-
-/**
- * Rate/concurrency pressure (429, provider overload) — a subset of TRANSIENT that
- * sheds load on a minutes-scale window, so it earns its own patient backoff policy
- * (see {@link getRetryDelayMs}) instead of the generic short exponential one (#2706).
- * Defined first so {@link TRANSIENT_PATTERNS} derives from it: a pattern can never
- * widen the rate-limit budget while classifyError treats it as non-transient.
- */
-export const RATE_LIMIT_PATTERNS = [
-  '429',
-  'rate limit',
-  'too many requests',
-  'overloaded', // Anthropic/Minimax overload message text
-  'at capacity', // Codex/OpenAI model-level saturation
-] as const;
-
-/** Transient error patterns - temporary issues that may resolve with retry */
-export const TRANSIENT_PATTERNS = [
-  'timeout',
-  'econnrefused',
-  'econnreset',
-  'etimedout',
-  ...RATE_LIMIT_PATTERNS,
-  '503',
-  '502',
-  '529', // Anthropic HTTP 529 = service overloaded
-  'network error',
-  'stream closed without yielding content', // empty provider stream (#2706): silent rejection or interruption, not a node defect
-  'socket hang up',
-  'exited with code',
-  'claude code crash',
-];
-
-/**
- * Check if error message matches any pattern in the list.
- */
-export function matchesPattern(message: string, patterns: string[]): boolean {
-  return patterns.some(pattern => message.includes(pattern));
-}
-
-/**
- * Classify an error to determine if it's transient (can retry) or fatal (should fail).
- * Decisive FATAL patterns take priority over TRANSIENT patterns to prevent an error
- * containing both (e.g. "unauthorized: process exited with code 1") from being retried.
- * Ambiguous provider wrapper text such as "auth error" is fatal only when no concrete
- * transient signal matches.
- */
-export function classifyError(error: Error): ErrorType {
-  const message = error.message.toLowerCase();
-
-  if (matchesPattern(message, FATAL_PATTERNS)) {
-    return 'FATAL';
-  }
-  if (matchesPattern(message, TRANSIENT_PATTERNS)) {
-    return 'TRANSIENT';
-  }
-  if (matchesPattern(message, FALLBACK_FATAL_PATTERNS)) {
-    return 'FATAL';
-  }
-  return 'UNKNOWN';
-}
+// ─── Retry Classification ────────────────────────────────────────────────────
 
 /** Retry budget for rate-limited failures, replacing the node's own maxRetries when one is seen. */
 export const RATE_LIMIT_MAX_RETRIES = 5;
 
+export const OVERLOAD_MAX_RETRIES = 5;
+const OVERLOAD_RETRY_DELAY_MS = 45_000;
+const OVERLOAD_MAX_DELAY_MS = 300_000;
+
 /** Flat delay center for rate-limit retries; jitter widens it to ±50% in {@link getRetryDelayMs}. */
 export const RATE_LIMIT_RETRY_DELAY_MS = 45_000;
 
-export function isRateLimitError(error: string): boolean {
-  const message = error.toLowerCase();
-  return RATE_LIMIT_PATTERNS.some(pattern => message.includes(pattern));
+/**
+ * Center of the wait after a rate limit outlasts its retries and the provider gave no reset;
+ * jitter widens it to ±50% in {@link rateLimitResumeAt}.
+ */
+export const RATE_LIMIT_PAUSE_DELAY_MS = 10 * 60_000;
+
+/**
+ * When a run paused by a rate limit that outlasted its retries tries again, in epoch ms:
+ * the provider's reported reset while it is still ahead, otherwise a jittered backoff so
+ * runs limited together do not wake in lockstep. A seconds-scale `retryAfterMs` hint is
+ * deliberately not a deadline here: it would wake the run straight into another full retry
+ * cycle.
+ */
+export function rateLimitResumeAt(failure: ProviderFailure, now: number): number {
+  const reportedReset = failure.resetAt === undefined ? Number.NaN : Date.parse(failure.resetAt);
+  if (reportedReset > now) return reportedReset;
+  return now + Math.round(RATE_LIMIT_PAUSE_DELAY_MS * (0.5 + Math.random()));
+}
+
+/** A provider failure the provider-limit wait can pause a run on: a rate or usage limit. */
+export type ProviderLimitFailure = ProviderFailure & { class: 'rate_limited' | 'quota_exhausted' };
+
+export function isProviderLimit(
+  failure: ProviderFailure | undefined
+): failure is ProviderLimitFailure {
+  return failure?.class === 'rate_limited' || failure?.class === 'quota_exhausted';
+}
+
+/**
+ * When the provider-limit wait would try a failed limit again, in epoch ms: a rate limit's
+ * {@link rateLimitResumeAt}, a usage limit's reported reset. Undefined for a usage limit
+ * without a reported reset, which the run cannot wait on.
+ */
+export function providerLimitResumeAt(
+  failure: ProviderLimitFailure,
+  now: number
+): number | undefined {
+  if (failure.class === 'rate_limited') return rateLimitResumeAt(failure, now);
+  return failure.resetAt === undefined ? undefined : Date.parse(failure.resetAt);
+}
+
+/**
+ * Aggregates forward the original failure object. Share this resolver across one execution
+ * pass so each selected deadline survives enclosing aggregates and the final wait.
+ */
+export function createProviderLimitDeadlineResolver(): (
+  failure: ProviderLimitFailure,
+  now: number
+) => number | undefined {
+  const deadlines = new WeakMap<ProviderLimitFailure, number>();
+  return (failure, now) => {
+    const cached = deadlines.get(failure);
+    if (cached !== undefined) return cached;
+    const deadline = providerLimitResumeAt(failure, now);
+    if (deadline !== undefined) deadlines.set(failure, deadline);
+    return deadline;
+  };
+}
+
+/**
+ * The failed nodes of one scope that no failure lies upstream of: none of the nodes they
+ * transitively depend on failed, whatever state lies between. A failure downstream of
+ * another is deferred, whatever caused it: the node may have failed only on its upstream's
+ * poisoned output, and nothing typed tells that from a failure of its own. Continuation runs
+ * it again with its upstream, so it cannot hold a run in a provider-limit wait: once the
+ * upstream succeeds, a failure of its own fails the run.
+ */
+export function rootFailures(
+  nodes: readonly Pick<DagNode, 'id' | 'depends_on'>[],
+  outputs: ReadonlyMap<string, NodeOutput>
+): { nodeId: string; output: Extract<NodeOutput, { state: 'failed' }> }[] {
+  const depsOf = transitiveDepsLookup(nodes);
+  const inScope = new Set(nodes.map(node => node.id));
+  const failed = (id: string): boolean => inScope.has(id) && outputs.get(id)?.state === 'failed';
+  return nodes.flatMap(node => {
+    const output = outputs.get(node.id);
+    return output?.state === 'failed' && ![...depsOf(node.id)].some(failed)
+      ? [{ nodeId: node.id, output }]
+      : [];
+  });
+}
+
+/**
+ * The typed provider failure an aggregate node (a loop group, a composed fan-out instance,
+ * the fan-out itself) reports for its failed descendants; the provider-limit wait reads only
+ * the aggregate's. Callers pass the {@link rootFailures} of a scope, or the fan-out's sibling
+ * instances. A lone failure is the aggregate's, unchanged. Several are reported only when
+ * every one is a provider limit, so the wait never pauses a run beside an unrelated root
+ * failure that each continuation would repeat. Among limits, a usage limit without a reported
+ * reset wins because the run cannot wait on it; otherwise the latest
+ * deadline wins. The pass-owned resolver preserves that sample for enclosing aggregates
+ * and the final wait.
+ */
+export function aggregateProviderFailure(
+  failures: readonly (ProviderFailure | undefined)[],
+  now: number,
+  providerLimitDeadline: ReturnType<typeof createProviderLimitDeadlineResolver>
+): ProviderFailure | undefined {
+  if (failures.length <= 1) return failures[0];
+  const limits: { failure: ProviderLimitFailure; resumeAt: number | undefined }[] = [];
+  for (const failure of failures) {
+    if (!isProviderLimit(failure)) return undefined;
+    limits.push({ failure, resumeAt: providerLimitDeadline(failure, now) });
+  }
+  const unwaitable = limits.find(limit => limit.resumeAt === undefined);
+  if (unwaitable !== undefined) return unwaitable.failure;
+  return limits.reduce((latest, limit) =>
+    (limit.resumeAt ?? 0) > (latest.resumeAt ?? 0) ? limit : latest
+  ).failure;
+}
+
+export function effectiveRetryMaxRetries(
+  configuredMaxRetries: number,
+  retryClass: RetryClass | undefined,
+  sawRateLimit: boolean
+): number {
+  return Math.max(
+    configuredMaxRetries,
+    sawRateLimit ? RATE_LIMIT_MAX_RETRIES : 0,
+    retryClass === 'overloaded' ? OVERLOAD_MAX_RETRIES : 0
+  );
 }
 
 /**
@@ -139,7 +151,7 @@ export function isRateLimitError(error: string): boolean {
  * recover on a minutes-scale window with no retry-after signal (#2706), so exponential
  * from 3s either exhausts before the window opens or over-waits once it does; flat +
  * jitter spreads concurrent nodes apart without thundering-herd re-synchronization.
- * Everything else keeps the caller's base × 2^attempt exponential shape.
+ * Ordinary failures keep the caller's base × 2^attempt exponential shape.
  */
 export function getRetryDelayMs(
   retryClass: RetryClass,
@@ -149,35 +161,20 @@ export function getRetryDelayMs(
   if (retryClass === 'rate_limited') {
     return Math.round(RATE_LIMIT_RETRY_DELAY_MS * (0.5 + Math.random()));
   }
+  if (retryClass === 'overloaded') {
+    return Math.round(
+      Math.min(OVERLOAD_RETRY_DELAY_MS * 2 ** attempt, OVERLOAD_MAX_DELAY_MS) *
+        (0.5 + Math.random())
+    );
+  }
   return baseDelayMs * Math.pow(2, attempt);
 }
 
-/** The failure kinds a provider error can have. Each one decides retry by itself. */
+/** How retry treats a failure; also the failure kinds a provider error can have. */
 export type RetryClass = Extract<
   NodeFailureKind,
-  'fatal' | 'transient' | 'rate_limited' | 'unknown'
+  'fatal' | 'transient' | 'rate_limited' | 'overloaded' | 'unknown'
 >;
-
-/**
- * Failure kind of an untyped provider error, classified once from its text. This is the
- * fallback for providers that do not report a typed `ProviderFailure` yet; a typed failure
- * goes through {@link nodeFailureKindOf} instead.
- */
-export function providerFailureKind(error: Error): RetryClass {
-  const errorType = classifyError(error);
-  switch (errorType) {
-    case 'FATAL':
-      return 'fatal';
-    case 'TRANSIENT':
-      return isRateLimitError(error.message) ? 'rate_limited' : 'transient';
-    case 'UNKNOWN':
-      return 'unknown';
-    default: {
-      const exhaustive: never = errorType;
-      return exhaustive;
-    }
-  }
-}
 
 /** The node failure kind a provider's typed failure class maps to. */
 export function nodeFailureKindOf(failure: ProviderFailure): RetryClass {
@@ -187,6 +184,7 @@ export function nodeFailureKindOf(failure: ProviderFailure): RetryClass {
     case 'budget_exceeded':
     case 'misconfigured':
       return 'fatal';
+    case 'overloaded':
     case 'rate_limited':
     case 'transient':
     case 'unknown':
@@ -199,24 +197,38 @@ export function nodeFailureKindOf(failure: ProviderFailure): RetryClass {
 }
 
 /**
- * How retry treats a failed attempt. A provider-error kind recorded at the failure site is
- * the answer. Engine-detected kinds (timeout, exec_failed, config and the rest) and records
- * without a kind still classify their error text, as they did before provider failures were
- * typed: giving each engine kind its own retry rule is a separate decision.
+ * The retry class of every failure kind. Retry reads only the kind recorded where the
+ * failure happened, never the error text: for an exec node that text is the script's own
+ * output, so matching it would let whatever a script prints decide whether it re-runs.
  */
-export function retryClassOf(failure: {
-  failureKind?: NodeFailureKind;
-  error: string;
-}): RetryClass {
-  switch (failure.failureKind) {
-    case 'fatal':
-    case 'transient':
-    case 'rate_limited':
-    case 'unknown':
-      return failure.failureKind;
-    default:
-      return providerFailureKind(new Error(failure.error));
-  }
+const RETRY_CLASS = {
+  fatal: 'fatal',
+  transient: 'transient',
+  rate_limited: 'rate_limited',
+  overloaded: 'overloaded',
+  unknown: 'unknown',
+  // A silent provider stream or a hung subprocess; a fresh attempt is the remedy. Each
+  // retry of a hung AI node can wait another full idle_timeout.
+  timeout: 'transient',
+  // A script's exit is no evidence a re-run helps; `on_error: all` opts in.
+  exec_failed: 'unknown',
+  // A fresh AI attempt can produce valid output under `on_error: all`. An exec contract
+  // failure is never retried: it records `retryable: false`.
+  output_contract: 'unknown',
+  // `fatal` is the class retry never re-runs, even under `on_error: all`.
+  config: 'fatal',
+  cancelled: 'fatal',
+  // Loop and child failures never reach a retry decision; listed for totality.
+  max_iterations: 'unknown',
+  child_failed: 'unknown',
+} as const satisfies Record<NodeFailureKind, RetryClass>;
+
+/**
+ * How retry treats a failed attempt of this kind. A record without a kind (written before
+ * `failureKind` existed) is `unknown`: retried only under `on_error: all`.
+ */
+export function retryClassOf(kind: NodeFailureKind | undefined): RetryClass {
+  return RETRY_CLASS[kind ?? 'unknown'];
 }
 
 // ─── Subprocess Failure Formatting ───────────────────────────────────────────
@@ -250,21 +262,34 @@ export function retainStreamTail(text: string | undefined): string | undefined {
   )}`;
 }
 
-/**
- * Raw ExecFileException shape from Node's `child_process.execFile`. For inline
- * scripts via `bash -c <body>` / `bun -e <body>` the entire script body is
- * embedded in `err.message`, `err.cmd`, and the first line of `err.stack` —
- * which is why `formatSubprocessFailure` strips the prefix and exposes a
- * controlled `logFields` subset rather than the raw error.
- */
-interface RawSubprocessError {
-  message?: string;
-  stderr?: string;
-  stdout?: string;
-  // Numeric exit code OR errno symbol (e.g. 'ENOENT') — mirrors ExecFileException.
-  code?: number | string | null;
-  killed?: boolean;
-  cmd?: string;
+export function formatHostSpawnFailure(
+  failure: ReturnType<typeof hostSpawnFailure>,
+  runtime: ExecNode['runtime'],
+  command: string,
+  label: string
+): string | undefined {
+  if (runtime === 'sh' && (failure === 'ENOENT' || failure === 'ENOTDIR')) {
+    return (
+      `${label} failed: bash executable not found at '${command}'. ` +
+      'Set ARCHON_BASH_PATH if Git Bash is installed elsewhere ' +
+      '(e.g. user-scope installer at %LOCALAPPDATA%\\Programs\\Git\\bin\\bash.exe).'
+    );
+  }
+  if (failure === 'ENOENT') return `${label} failed: '${command}' executable not found in PATH`;
+  if (failure === 'EACCES') return `${label} failed: permission denied (check cwd permissions)`;
+  return undefined;
+}
+
+const STDERR_LABEL = '[stderr]\n';
+const STDOUT_LABEL = '\n[stdout]\n';
+
+function subprocessDiagnostic(
+  stderrTail: string | undefined,
+  stdoutTail: string | undefined,
+  fallback: string
+): string {
+  if (stderrTail && stdoutTail) return `${STDERR_LABEL}${stderrTail}${STDOUT_LABEL}${stdoutTail}`;
+  return stderrTail || stdoutTail || fallback;
 }
 
 /**
@@ -279,27 +304,92 @@ interface RawSubprocessError {
  * of the script body (`err.message`, `err.stack`, `err.cmd`).
  */
 export function formatSubprocessFailure(
-  err: RawSubprocessError,
+  err: Partial<
+    Pick<
+      RawSubprocessRejection,
+      'message' | 'stderr' | 'stdout' | 'code' | 'killed' | 'commandFailed'
+    >
+  >,
   label: string
-): { userMessage: string; logFields: Record<string, unknown> } {
+): SubprocessFailure {
   const stderr = (err.stderr ?? '').trim();
   const stdout = (err.stdout ?? '').trim();
   const rawMessage = (err.message ?? '').trim();
 
-  // The first line of Node's ExecFileException.message is `Command failed: <cmd>`,
-  // and for `bash -c <body>` / `bun -e <body>` that line embeds the full script
-  // body. Strip it so user-facing output never re-leaks the body.
-  const hasCommandFailedPrefix = rawMessage.startsWith('Command failed:');
-  const bodyAfterPrefix = hasCommandFailedPrefix
-    ? rawMessage.split('\n').slice(1).join('\n').trim()
-    : rawMessage;
+  // Node embeds multiline argv in this message, so none of it is safe as a
+  // fallback diagnostic. Actual process output belongs to stdout and stderr.
+  const hasCommandFailedPrefix = err.commandFailed || rawMessage.startsWith('Command failed:');
 
+  const { stderrTail, stdoutTail } = subprocessStreamTails(stderr, stdout);
+
+  const diagnostic = subprocessDiagnostic(
+    stderrTail,
+    stdoutTail,
+    hasCommandFailedPrefix ? 'no diagnostic output' : rawMessage || 'unknown error'
+  );
+
+  const truncated =
+    diagnostic.length > SUBPROCESS_ERROR_MAX_CHARS
+      ? diagnostic.slice(-SUBPROCESS_ERROR_MAX_CHARS) + '\n…[truncated]'
+      : diagnostic;
+
+  const errorCode = typeof err.code === 'string' ? err.code : undefined;
+  const codeSuffix =
+    typeof err.code === 'number'
+      ? ` [exit ${String(err.code)}]`
+      : errorCode
+        ? ` [error ${errorCode}]`
+        : '';
+
+  const exitCode = typeof err.code === 'number' ? err.code : undefined;
+  return {
+    userMessage: `${label} failed${codeSuffix}: ${truncated}`,
+    logFields: {
+      exitCode,
+      errorCode,
+      killed: err.killed === true,
+      stderrTail,
+      stdoutTail,
+    },
+    exitCode,
+    capturedOutput: capturedStdout(err.stdout ?? ''),
+  };
+}
+
+/**
+ * A subprocess failure, split by consumer: `userMessage` and `logFields` are diagnostics
+ * (trimmed, one budget shared by both streams); `exitCode` and `capturedOutput` are the
+ * structured values a failed exec node persists.
+ */
+interface SubprocessFailure {
+  userMessage: string;
+  logFields: Record<string, unknown>;
+  /** The process's numeric exit status. Absent when it never produced one (spawn error). */
+  exitCode: number | undefined;
+  /** Stdout as the node's output, or undefined when the process wrote none. */
+  capturedOutput: ExecutionOutput | undefined;
+}
+
+/**
+ * Stdout kept as the failed node's output: untrimmed, so what a consumer reads is what
+ * the process wrote, and cut to its last `SUBPROCESS_ERROR_MAX_CHARS` characters. A cut
+ * is reported through `persisted.truncated`, because the head is gone.
+ */
+function capturedStdout(stdout: string): ExecutionOutput | undefined {
+  if (stdout.length === 0) return undefined;
+  if (stdout.length <= SUBPROCESS_ERROR_MAX_CHARS) return { text: stdout };
+  const tail = stdout.slice(-SUBPROCESS_ERROR_MAX_CHARS);
+  return {
+    text: tail,
+    persisted: { text: tail, truncated: true, originalBytes: Buffer.byteLength(stdout, 'utf8') },
+  };
+}
+
+function subprocessStreamTails(stderr: string, stdout: string) {
   // Well-behaved scripts print failure context to stdout, so both streams share
   // the cap. stderr keeps budget priority; the leftover goes to stdout, and each
   // stream is labelled only when both are present. The budget accounts for the
   // label overhead so the joined diagnostic never truncates away a label.
-  const STDERR_LABEL = '[stderr]\n';
-  const STDOUT_LABEL = '\n[stdout]\n';
   const bothPresent = stderr.length > 0 && stdout.length > 0;
   const labelsOverhead = bothPresent ? STDERR_LABEL.length + STDOUT_LABEL.length : 0;
   const halfCap = Math.floor(SUBPROCESS_ERROR_MAX_CHARS / 2);
@@ -309,600 +399,10 @@ export function formatSubprocessFailure(
     SUBPROCESS_ERROR_MAX_CHARS - labelsOverhead - (stderrTail?.length ?? 0)
   );
 
-  let diagnostic: string;
-  if (stderrTail && stdoutTail) {
-    diagnostic = `${STDERR_LABEL}${stderrTail}${STDOUT_LABEL}${stdoutTail}`;
-  } else if (stderrTail || stdoutTail) {
-    diagnostic = (stderrTail ?? '') + (stdoutTail ?? '');
-  } else if (bodyAfterPrefix) {
-    diagnostic = bodyAfterPrefix;
-  } else if (hasCommandFailedPrefix) {
-    // Prefix was the entire message — exit code in the suffix is the only signal.
-    diagnostic = 'no diagnostic output';
-  } else {
-    diagnostic = 'unknown error';
-  }
-
-  const truncated =
-    diagnostic.length > SUBPROCESS_ERROR_MAX_CHARS
-      ? diagnostic.slice(-SUBPROCESS_ERROR_MAX_CHARS) + '\n…[truncated]'
-      : diagnostic;
-
-  const exitSuffix = err.code != null ? ` [exit ${String(err.code)}]` : '';
-
-  return {
-    userMessage: `${label} failed${exitSuffix}: ${truncated}`,
-    logFields: {
-      exitCode: err.code ?? undefined,
-      killed: err.killed === true,
-      stderrTail,
-      stdoutTail,
-    },
-  };
-}
-
-// ─── Credit/Limit Exhaustion Detection ──────────────────────────────────────
-
-/** Patterns that indicate a subscription session limit in streamed assistant output */
-const SESSION_LIMIT_OUTPUT_PATTERNS = [
-  'hit your session limit',
-  'session limit reached',
-  'session limit has been reached',
-];
-
-/** Patterns that indicate pay-per-token credit exhaustion in streamed assistant output */
-const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
-  "you're out of extra usage",
-  'out of credits',
-  'credit balance',
-  'insufficient credit',
-];
-
-/** Extract a reset-time clause from a session-limit message, e.g. "resets 3am (America/Mexico_City)". */
-function extractResetTime(text: string): string | null {
-  const match = /resets\s+([^\n·.!]+)/i.exec(text);
-  return match ? match[1].trim() : null;
-}
-
-/**
- * Detect credit/session-limit exhaustion in streamed node output text.
- *
- * The Claude SDK surfaces both subscription session limits and pay-per-token
- * credit exhaustion as normal assistant text messages rather than thrown errors.
- * This function checks the accumulated output for known phrases and returns an
- * actionable error string, or null if no limit is detected.
- *
- * @returns null if no limit detected; a session-limit string (instructs user to
- * abandon and retry after reset) or a credit-exhaustion string (instructs user
- * to resume when credits refill).
- */
-export function detectCreditExhaustion(text: string): string | null {
-  const lower = text.toLowerCase();
-
-  if (SESSION_LIMIT_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
-    const resetTime = extractResetTime(text);
-    return resetTime
-      ? `Claude session limit reached — resets ${resetTime}. Abandon this run and retry after reset.`
-      : 'Claude session limit reached — abandon this run and retry when the session resets.';
-  }
-
-  if (CREDIT_EXHAUSTION_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
-    return 'Credit exhaustion detected — resume when credits reset';
-  }
-
-  return null;
-}
-
-// ─── Command Loading ─────────────────────────────────────────────────────────
-
-/**
- * Load command prompt from file.
- *
- * Two directories are in play and they are not interchangeable. `cwd` is the workspace
- * the run acts on: it owns config, and it is where a `commands.folder` setting is read
- * from. `sourceRoots` is where the command TEXT lives — the authoring checkout, or a
- * run's frozen capture of it. They describe the same place for an ordinary in-place run
- * and differ whenever a workflow authored in one checkout executes against another.
- * Passing `cwd` for both is what made a workflow's own commands invisible inside its
- * isolated worktree.
- *
- * @param deps - Workflow dependencies (for config loading)
- * @param cwd - Target workspace; owns config only
- * @param commandName - Name of the command (without .md extension)
- * @param configuredFolder - Optional additional folder from config to search
- * @param sourceRoots - Roots to resolve command files under; defaults to reading `cwd` live
- * @returns On success: `{ success: true, content }`. On failure: `{ success: false, reason, message }`.
- */
-export async function loadCommandPrompt(
-  deps: Pick<WorkflowDeps, 'loadConfig'>,
-  cwd: string,
-  commandName: string,
-  configuredFolder?: string,
-  sourceRoots?: WorkflowSourceRoots
-): Promise<LoadCommandResult> {
-  const roots = sourceRoots ?? liveSourceRoots(cwd);
-  const sourceConfig = sourceRoots && workflowSourceConfigForRoots(sourceRoots);
-  // Validate command name first
-  if (!isValidCommandName(commandName)) {
-    getLog().error({ commandName }, 'invalid_command_name');
-    return {
-      success: false,
-      reason: 'invalid_name',
-      message: `Invalid command name (potential path traversal): ${commandName}`,
-    };
-  }
-
-  // Opt-out comes from the SOURCE when there is one — a capture carries the settings that
-  // were in force when it was taken, so a resume cannot let the target's `defaults:`
-  // decide whether the bundled scope counts. Falls back to reading `cwd` live.
-  let loadDefaultCommands = sourceConfig?.load_default_commands;
-  if (loadDefaultCommands === undefined) {
-    try {
-      loadDefaultCommands = (await deps.loadConfig(cwd)).defaults?.loadDefaultCommands ?? true;
-    } catch (error) {
-      const err = error as Error;
-      getLog().warn(
-        {
-          err,
-          cwd,
-          note: 'Default commands will be loaded. Check your .archon/config.yaml if this is unexpected.',
-        },
-        'config_load_failed_using_defaults'
-      );
-      loadDefaultCommands = true;
-    }
-  }
-
-  const packaged = parsePackagedResourceReference(commandName);
-  if (packaged !== null) {
-    if (packaged.owner.source === 'bundled') {
-      if (
-        !loadDefaultCommands ||
-        (roots.kind === 'live' &&
-          !isBinaryBuild() &&
-          !(await bundlesPackagedResources(packaged.owner.pack)))
-      ) {
-        return {
-          success: false,
-          reason: 'not_found',
-          message: `Packaged command not found: ${packaged.name}.md`,
-        };
-      }
-      // A captured run reads the bundled bytes IT froze, even in a binary: the capture
-      // materialized the constants to files, and those are what its digest covers.
-      if (isBinaryBuild() && roots.kind === 'live') {
-        const content = BUNDLED_COMMANDS[commandName];
-        if (content === undefined) {
-          return {
-            success: false,
-            reason: 'not_found',
-            message: `Packaged command not found: ${packaged.name}.md`,
-          };
-        }
-        if (!content.trim()) {
-          return {
-            success: false,
-            reason: 'empty_file',
-            message: `Command file is empty: ${packaged.name}.md`,
-          };
-        }
-        return { success: true, content };
-      }
-    }
-
-    const workflowDir = await packagedWorkflowDirectory(roots, packaged.owner);
-    if (workflowDir === null) {
-      return {
-        success: false,
-        reason: 'not_found',
-        message: `Packaged command not found (no ${packaged.owner.source} source): ${packaged.name}.md`,
-      };
-    }
-    const filePath = join(workflowDir, 'commands', `${packaged.name}.md`);
-    try {
-      const content = await readFile(filePath, 'utf-8');
-      if (!content.trim()) {
-        return {
-          success: false,
-          reason: 'empty_file',
-          message: `Command file is empty: ${filePath}`,
-        };
-      }
-      return { success: true, content };
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      let reason: 'permission_denied' | 'not_found' | 'read_error';
-      if (err.code === 'EACCES') {
-        reason = 'permission_denied';
-      } else if (err.code === 'ENOENT') {
-        reason = 'not_found';
-      } else {
-        reason = 'read_error';
-      }
-      if (err.code !== 'ENOENT') {
-        getLog().error({ err, commandName, filePath }, 'packaged_command_file_read_error');
-      }
-      return {
-        success: false,
-        reason,
-        message:
-          err.code === 'ENOENT'
-            ? `Packaged command not found: ${filePath}`
-            : `Error reading packaged command ${filePath}: ${err.message}`,
-      };
-    }
-  }
-
-  // Use command folder paths with optional configured folder.
-  // Each scope is walked 1 subfolder deep so `triage/review.md` resolves as
-  // `review` — matching the workflows/scripts convention. Resolution
-  // precedence: repo > home (~/.archon/commands/) > bundled/app defaults.
-  // The SOURCE's command folder, when a capture supplied one. `configuredFolder` is the
-  // target's, which is the right answer only for an in-place run — for a captured run it
-  // would search folders the frozen source never used.
-  const searchPaths = archonPaths.getCommandFolderSearchPaths(
-    sourceConfig?.command_folder ?? configuredFolder
-  );
-  const projectRoot = roots.project;
-  const resolvedSearchPaths: string[] = [
-    ...(projectRoot !== null ? searchPaths.map(folder => join(projectRoot, folder)) : []),
-    roots.globalCommands,
-  ];
-
-  for (const dir of resolvedSearchPaths) {
-    const entries = await archonPaths.findCommandFiles(dir);
-    const match = entries.find(e => e.commandName === commandName);
-    if (!match) continue;
-
-    const filePath = join(dir, match.relativePath);
-    try {
-      const content = await readFile(filePath, 'utf-8');
-      if (!content.trim()) {
-        getLog().error({ commandName }, 'command_file_empty');
-        return {
-          success: false,
-          reason: 'empty_file',
-          message: `Command file is empty: ${commandName}.md`,
-        };
-      }
-      getLog().debug({ commandName, filePath }, 'command_loaded');
-      return { success: true, content };
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      if (err.code === 'EACCES') {
-        getLog().error({ commandName, filePath }, 'command_file_permission_denied');
-        return {
-          success: false,
-          reason: 'permission_denied',
-          message: `Permission denied reading command: ${commandName}.md`,
-        };
-      }
-      // Other unexpected errors (ENOENT shouldn't happen since the walk just found it,
-      // but if the file was deleted between walk and read we fall through to 'not found'
-      // with a log.)
-      getLog().error({ err, commandName, filePath }, 'command_file_read_error');
-      return {
-        success: false,
-        reason: 'read_error',
-        message: `Error reading command ${commandName}.md: ${err.message}`,
-      };
-    }
-  }
-
-  // If not found in repo/home and app defaults enabled, search app defaults
-  if (loadDefaultCommands) {
-    // A captured run reads the bundled command bytes IT froze; see the note above.
-    if (isBinaryBuild() && roots.kind === 'live') {
-      // Binary: check bundled commands
-      const bundledContent = BUNDLED_COMMANDS[commandName];
-      if (bundledContent) {
-        getLog().debug({ commandName }, 'command_loaded_bundled');
-        return { success: true, content: bundledContent };
-      }
-      getLog().debug({ commandName }, 'command_bundled_not_found');
-    } else {
-      // Live defaults are the flat files the index selects, so they resolve by direct
-      // path. Old captures retain whatever command layout they froze — subfolders
-      // included — so they keep the basename walk, independently of the current index.
-      const appDefaultsPath = roots.bundledCommands;
-      let filePath: string | null;
-      if (roots.kind === 'captured') {
-        const entries = await archonPaths.findCommandFiles(appDefaultsPath);
-        const match = entries.find(e => e.commandName === commandName);
-        filePath = match ? join(appDefaultsPath, match.relativePath) : null;
-      } else {
-        filePath = await bundledDefaultCommandPath(appDefaultsPath, commandName);
-      }
-      if (filePath !== null) {
-        try {
-          const content = await readFile(filePath, 'utf-8');
-          if (!content.trim()) {
-            getLog().error({ commandName }, 'command_app_default_empty');
-            return {
-              success: false,
-              reason: 'empty_file',
-              message: `App default command file is empty: ${commandName}.md`,
-            };
-          }
-          getLog().debug({ commandName }, 'command_loaded_app_defaults');
-          return { success: true, content };
-        } catch (error) {
-          const err = error as NodeJS.ErrnoException;
-          if (err.code !== 'ENOENT') {
-            getLog().warn({ err, commandName }, 'command_app_default_read_error');
-          } else {
-            getLog().debug({ commandName }, 'command_app_default_not_found');
-          }
-          // Fall through to not found
-        }
-      } else {
-        getLog().debug({ commandName }, 'command_app_default_not_found');
-      }
-    }
-  }
-
-  // Not found anywhere
-  const allSearchPaths = loadDefaultCommands ? [...searchPaths, 'app defaults'] : searchPaths;
-  getLog().error({ commandName, searchPaths: allSearchPaths }, 'command_not_found');
-  return {
-    success: false,
-    reason: 'not_found',
-    message: `Command prompt not found: ${commandName}.md (searched: ${allSearchPaths.join(', ')})`,
-  };
-}
-
-// ─── Variable Substitution ───────────────────────────────────────────────────
-
-/**
- * Scope holding the current run's adopted artifact directory (#2747), entered by
- * the executor around DAG execution. A scoped context rather than another
- * positional parameter because the value is RUN-level (like `artifactsDir`) but
- * is consumed at every substitution site several layers down; a child sub-run's
- * `executeWorkflow` re-enters with its own (absent) scope, correctly shadowing
- * the parent's adoption.
- */
-const adoptedRunDirContext = new AsyncLocalStorage<string | undefined>();
-
-export function runWithAdoptedRunDir<T>(
-  adoptedRunDir: string | undefined,
-  fn: () => Promise<T>
-): Promise<T> {
-  return adoptedRunDirContext.run(adoptedRunDir, fn);
-}
-
-export function currentAdoptedRunDir(): string | undefined {
-  return adoptedRunDirContext.getStore();
-}
-
-/** Pattern string for context variables - used to create fresh regex instances */
-export const CONTEXT_VAR_PATTERN_STR =
-  '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';
-
-/**
- * Substitute workflow variables in a prompt.
- *
- * Supported variables:
- * - $WORKFLOW_ID - The workflow run ID
- * - $USER_MESSAGE, $ARGUMENTS - The user's trigger message
- * - $ARTIFACTS_DIR - External artifacts directory for this workflow run
- * - $STATE_DIR - External per-PROJECT cross-run state directory (shared by every
- *   workflow in the project; pre-created by the executor). Throws if referenced
- *   without a resolved value.
- * - $ADOPTED_RUN_DIR (#2747) - The adopted run's artifact directory, resolved
- *   through its persisted `output_root`. Read-only by contract; throws if
- *   referenced without an adoption active.
- * - $TYPED_ARTIFACTS_FILE - This invocation's typed-artifact listing (JSON). Throws
- *   if referenced by a context that never materialized one (see below).
- * - $BASE_BRANCH - The base branch (from config or auto-detected)
- * - $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT - GitHub issue/PR context (if available)
- * - $DOCS_DIR - Documentation directory path (configured or default 'docs/')
- * - $LOOP_USER_INPUT - User feedback from interactive loop approval. Only populated on the
- *   first iteration of a resumed interactive loop; empty string on all other iterations.
- * - $REJECTION_REASON - Reviewer feedback from approval node rejection (on_reject prompts only).
- * - $LOOP_PREV_OUTPUT - Cleaned output of the previous loop iteration. Empty string on the
- *   first iteration (no prior output exists). Useful for fresh_context loops that need
- *   to reference what the previous pass produced or why it failed.
- * - $INPUTS.<name> - Named sub-run inputs (#2470), supplied by a caller's `with:` on a
- *   `workflow:` node. Resolved from `options.inputs` in the non-shell branch only; an
- *   unknown name THROWS. Shell (bash/script) nodes read `INPUTS_<UPPER_SNAKE>` env vars.
- *
- * When issueContext is undefined, context variables are replaced with empty string
- * to avoid sending literal "$CONTEXT" to the AI.
- */
-export function substituteWorkflowVariables(
-  prompt: string,
-  workflowId: string,
-  userMessage: string,
-  artifactsDir: string,
-  baseBranch: string,
-  docsDir: string,
-  issueContext?: string,
-  loopUserInput?: string,
-  rejectionReason?: string,
-  loopPrevOutput?: string,
-  options?: {
-    shellSafe?: boolean;
-    stateDir?: string;
-    inputs?: Record<string, JsonValue>;
-    /** Adopted run's artifact directory (#2747). Undefined = no adoption active. */
-    adoptedRunDir?: string;
-    /**
-     * This invocation's typed-artifact listing path. Undefined means the caller never
-     * supplied one (a coordination node, or a wiring bug) and a prompt that references
-     * `$TYPED_ARTIFACTS_FILE` throws. An explicit `''` is a caller stating it has no
-     * listing — the dry-run preview — and substitutes empty without throwing.
-     */
-    typedArtifactsFile?: string;
-  }
-): { prompt: string; contextSubstituted: boolean } {
-  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
-  if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
-    throw new Error(
-      'No base branch could be resolved. Auto-detection failed and `worktree.baseBranch` is not set in .archon/config.yaml. ' +
-        'Set the config value or use the --from flag to select a branch (e.g., --from dev).'
-    );
-  }
-
-  // Same fail-fast for $STATE_DIR. The state directory is threaded from the
-  // executor to every substitution site; a site that forgot to pass it would
-  // otherwise leave the variable literal (AI nodes) or empty (shell nodes),
-  // silently writing state to the wrong place. Loud beats silent.
-  if (!options?.stateDir && prompt.includes('$STATE_DIR')) {
-    throw new Error(
-      '$STATE_DIR is referenced but no state directory was resolved for this run. ' +
-        '$STATE_DIR is only available inside a workflow run; if you are seeing this from a workflow node, ' +
-        'please report it as a bug.'
-    );
-  }
-
-  // $ADOPTED_RUN_DIR (#2747) resolves only under an explicit adoption. A run
-  // that references it without one throws — mirroring $BASE_BRANCH/$STATE_DIR —
-  // because a literal or empty substitution would silently point work at
-  // nothing instead of telling the author the run was never started with --adopt.
-  if (!options?.adoptedRunDir && !currentAdoptedRunDir() && prompt.includes('$ADOPTED_RUN_DIR')) {
-    throw new Error(
-      '$ADOPTED_RUN_DIR is referenced but this run did not adopt a prior run. ' +
-        'Start it with `workflow run <name> --adopt <run-id>` (or adopt_run_id on the API) ' +
-        "to read an earlier run's artifacts by reference."
-    );
-  }
-
-  // $TYPED_ARTIFACTS_FILE is delivered by every executable invocation context (bash,
-  // script, agent prompt, loop attempt). A context that never supplied one must fail
-  // loudly: substituting '' would read as "no typed artifacts", which is the exact
-  // silent-empty lookup this contract exists to remove. An explicit empty string is
-  // different — a caller that knows it has no listing (the dry-run preview) says so.
-  if (options?.typedArtifactsFile === undefined && prompt.includes('$TYPED_ARTIFACTS_FILE')) {
-    throw new Error(
-      '$TYPED_ARTIFACTS_FILE is referenced but this invocation has no typed-artifact listing. ' +
-        'It is available inside bash, script, agent, loop, and approval-rework nodes; ' +
-        'if you are seeing this from one of those, please report it as a bug.'
-    );
-  }
-
-  // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
-  const resolvedDocsDir = docsDir || 'docs/';
-
-  // Substitute basic variables
-  // When shellSafe is true, skip user-controlled variables — they will be passed
-  // via subprocess environment variables instead to prevent shell injection.
-  let result = prompt
-    .replace(/\$WORKFLOW_ID/g, workflowId)
-    .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
-    // Engine-controlled like $ARTIFACTS_DIR — substituted even under shellSafe,
-    // or `bash:`/`script:` bodies would never see it.
-    .replace(/\$STATE_DIR/g, options?.stateDir ?? '')
-    .replace(/\$ADOPTED_RUN_DIR/g, options?.adoptedRunDir ?? currentAdoptedRunDir() ?? '')
-    // Also engine-controlled; the same path is delivered as TYPED_ARTIFACTS_FILE to
-    // exec subprocesses, so a shell body resolves it either way.
-    .replace(/\$TYPED_ARTIFACTS_FILE/g, options?.typedArtifactsFile ?? '')
-    .replace(/\$BASE_BRANCH/g, baseBranch)
-    .replace(/\$DOCS_DIR/g, resolvedDocsDir);
-
-  if (!options?.shellSafe) {
-    result = result
-      .replace(/\$USER_MESSAGE/g, userMessage)
-      .replace(/\$ARGUMENTS/g, userMessage)
-      .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
-      .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
-      .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
-
-    // $INPUTS.<name> — named sub-run inputs (#2470). Substituted ONLY in the non-shell
-    // branch: a sub-run's input value can derive from AI output (e.g. `with: {plan:
-    // $plan.output}`), the exact user-controlled class shellSafe keeps out of shell
-    // source (#2115). Bash/script bodies read INPUTS_<UPPER_SNAKE> env vars instead.
-    // An unknown name THROWS (mirrors $node.output.field strictness) rather than
-    // substituting '' — a typo'd input silently emptying is worse than a load-visible error.
-    result = substituteInputRefs(result, options?.inputs);
-  }
-
-  // Check if context variables exist (use fresh regex to avoid lastIndex issues)
-  const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
-
-  // Substitute or clear context variables (use fresh global regex for replace)
-  if (!options?.shellSafe) {
-    if (!issueContext && hasContextVariables) {
-      getLog().debug(
-        {
-          action: 'clearing variables',
-          variables: ['$CONTEXT', '$EXTERNAL_CONTEXT', '$ISSUE_CONTEXT'],
-        },
-        'context_variables_cleared'
-      );
-    }
-    result = result.replace(new RegExp(CONTEXT_VAR_PATTERN_STR, 'g'), issueContext ?? '');
-  }
-
-  return {
-    prompt: result,
-    contextSubstituted: hasContextVariables && !!issueContext,
-  };
-}
-
-/**
- * Apply variable substitution and optionally append issue context.
- * Appends context only if it wasn't already substituted via $CONTEXT variables.
- * This prevents duplicate context being sent to the AI.
- *
- * @param template - The command prompt template with variable placeholders
- * @param workflowId - The workflow run ID for variable substitution
- * @param userMessage - The user's trigger message for variable substitution
- * @param artifactsDir - The external artifacts directory for $ARTIFACTS_DIR substitution
- * @param baseBranch - The resolved base branch for $BASE_BRANCH substitution
- * @param docsDir - The resolved docs directory for $DOCS_DIR substitution
- * @param issueContext - Optional GitHub issue/PR context to substitute or append
- * @param logLabel - Human-readable label for logging (e.g., 'workflow step prompt')
- * @param options - Forwarded to {@link substituteWorkflowVariables}; carries `stateDir`
- *   for `$STATE_DIR` and `typedArtifactsFile` for `$TYPED_ARTIFACTS_FILE`, each of
- *   which throws when referenced without one.
- * @returns The final prompt with variables substituted and context optionally appended
- */
-export function buildPromptWithContext(
-  template: string,
-  workflowId: string,
-  userMessage: string,
-  artifactsDir: string,
-  baseBranch: string,
-  docsDir: string,
-  issueContext: string | undefined,
-  logLabel: string,
-  options?: {
-    shellSafe?: boolean;
-    stateDir?: string;
-    inputs?: Record<string, JsonValue>;
-    typedArtifactsFile?: string;
-  }
-): string {
-  const { prompt, contextSubstituted } = substituteWorkflowVariables(
-    template,
-    workflowId,
-    userMessage,
-    artifactsDir,
-    baseBranch,
-    docsDir,
-    issueContext,
-    undefined,
-    undefined,
-    undefined,
-    options
-  );
-
-  if (issueContext && !contextSubstituted) {
-    getLog().debug({ logLabel }, 'issue_context_appended');
-    return prompt + '\n\n---\n\n' + issueContext;
-  }
-
-  return prompt;
+  return { stderrTail, stdoutTail };
 }
 
 // ─── Completion Signal Detection ────────────────────────────────────────────
-
-/**
- * Escape special regex characters in string
- */
-function escapeRegExp(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 /**
  * Detect whether the AI output contains a completion signal.
@@ -994,81 +494,7 @@ export function isInlineScript(script: string): boolean {
   return script.includes('\n') || /[;(){}&|<>$`"' ]/.test(script);
 }
 
-// ─── Platform Message Sending ────────────────────────────────────────────────
-
-/** Context for platform message sending */
-export interface SendMessageContext {
-  workflowId?: string;
-  nodeName?: string;
-}
-
-/** Threshold for consecutive UNKNOWN errors before aborting */
-const UNKNOWN_ERROR_THRESHOLD = 3;
-
-/** Mutable counter for tracking consecutive unknown errors across calls */
-export interface UnknownErrorTracker {
-  count: number;
-}
-
-/**
- * Safely send a message to the platform without crashing on failure.
- * Returns true if message was sent successfully, false otherwise.
- * Only suppresses transient/unknown errors; fatal errors are rethrown.
- * When unknownErrorTracker is provided, consecutive UNKNOWN errors are tracked
- * and the workflow is aborted after UNKNOWN_ERROR_THRESHOLD consecutive failures.
- */
-export async function safeSendMessage(
-  platform: IWorkflowPlatform,
-  conversationId: string,
-  message: string,
-  context?: SendMessageContext,
-  metadata?: WorkflowMessageMetadata,
-  unknownErrorTracker?: UnknownErrorTracker
-): Promise<boolean> {
-  try {
-    await platform.sendMessage(conversationId, message, metadata);
-    if (unknownErrorTracker) unknownErrorTracker.count = 0;
-    return true;
-  } catch (error) {
-    const err = error as Error;
-    const errorType = classifyError(err);
-
-    getLog().error(
-      {
-        err,
-        conversationId,
-        messageLength: message.length,
-        errorType,
-        platformType: platform.getPlatformType(),
-        ...context,
-        stack: err.stack,
-      },
-      'platform_message_send_failed'
-    );
-
-    // Reset tracker on any non-UNKNOWN outcome — only *consecutive* UNKNOWN
-    // errors should trip the threshold (e.g. UNKNOWN→TRANSIENT→UNKNOWN→UNKNOWN
-    // is two separate runs, not three in a row).
-    if (unknownErrorTracker && errorType !== 'UNKNOWN') {
-      unknownErrorTracker.count = 0;
-    }
-
-    // Fatal errors should not be suppressed - they indicate configuration issues
-    if (errorType === 'FATAL') {
-      throw new Error(`Platform authentication/permission error: ${err.message}`);
-    }
-
-    // Track consecutive UNKNOWN errors - abort if threshold exceeded
-    if (errorType === 'UNKNOWN' && unknownErrorTracker) {
-      unknownErrorTracker.count++;
-      if (unknownErrorTracker.count >= UNKNOWN_ERROR_THRESHOLD) {
-        throw new Error(
-          `${String(UNKNOWN_ERROR_THRESHOLD)} consecutive unrecognized errors - aborting workflow: ${err.message}`
-        );
-      }
-    }
-
-    // Transient errors (and below-threshold unknown errors) suppressed to allow workflow to continue
-    return false;
-  }
-}
+/** A phase of `executeWorkflow` either hands its value on or ends the execution with a result. */
+export type RunPhase<T> =
+  | { stopped: false; value: T }
+  | { stopped: true; result: WorkflowExecutionResult };

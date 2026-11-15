@@ -1,0 +1,1928 @@
+// @archon-test-isolated
+/**
+ * Real Git and a real SQLite database: abandonment removes the worktree a run
+ * created, with force, and keeps its branch unless it never left its start point. Runs in its own `bun test`
+ * invocation (declared by @archon-test-isolated) because it mock.module's the DB connection.
+ */
+import { setPlatformPolicies } from '../../platforms/registry';
+import * as gitModule from '@archon/git';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import {
+  chmod,
+  symlink,
+  mkdtemp,
+  mkdir,
+  realpath,
+  writeFile,
+  readFile,
+  rm,
+} from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { trackTempRoots } from '@archon/paths/test-utils';
+import { getGitCheckoutIdentity, readWorktreeLock, toRepoPath, toBranchName } from '@archon/git';
+import {
+  IsolationResolver,
+  WorktreeProvider,
+  WorktreeRegistrationChangedError,
+  WorktreeRemovalInProgressError,
+  classifyIsolationError,
+  configureIsolation,
+  getIsolationProvider,
+  worktreeRegistrationMetadata,
+} from '@archon/isolation';
+import type { IsolationEnvironmentRow, IIsolationStore } from '@archon/isolation';
+import * as isolationModule from '@archon/isolation';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import { setLogLevel } from '@archon/paths';
+
+setLogLevel('silent');
+const { SqliteAdapter, sqliteDialect } = await import('../../db/adapters/sqlite');
+const db = new SqliteAdapter(':memory:');
+mock.module('../../db/connection', () => ({
+  pool: db,
+  getDatabase: () => db,
+  getDialect: () => sqliteDialect,
+  getDatabaseType: () => 'sqlite',
+}));
+const isolationDb = await import('../../db/isolation-environments');
+const { claimPendingWorkflowRun } = await import('../../db/workflows');
+const { cleanupStaleWorktrees, onConversationClosed, runScheduledCleanup } = await import(
+  '../cleanup-service'
+);
+const { cleanupMergedWorktrees } = await import('./merged-sweep');
+const { removeEnvironment } = await import('./remove-environment');
+const { assessCompletedRunWorktree, reclaimRunWorktree, releaseCompletedRunWorktree } =
+  await import('./run-worktree');
+const codebaseDb = await import('../../db/codebases');
+
+function ghJsonOutput(command: string, payload: unknown): string {
+  if (command === 'api' && Array.isArray(payload)) {
+    return payload.map(page => JSON.stringify(page)).join('\n');
+  }
+  return JSON.stringify(payload);
+}
+
+function ghCommitObject(oid: string | null): string {
+  return JSON.stringify({
+    data: { repository: { object: oid === null ? null : { __typename: 'Commit', oid } } },
+  });
+}
+
+async function git(path: string, ...args: string[]): Promise<string> {
+  const proc = Bun.spawn(['git', '-C', path, ...args], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: { ...process.env },
+  });
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code) throw new Error(err);
+  return out.trim();
+}
+
+async function initRepo(path: string): Promise<void> {
+  await mkdir(path);
+  await git(path, 'init', '-q', '-b', 'main');
+  await git(path, 'config', 'user.name', 'Test');
+  await git(path, 'config', 'user.email', 'test@example.com');
+  await git(path, 'config', 'commit.gpgsign', 'false');
+}
+
+/** Insert a run that uses `path`, as a run reusing the checkout would. */
+async function seedRunAt(path: string | null, status: string): Promise<string> {
+  const id = randomUUID();
+  await db.query(
+    `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id)
+     VALUES ($1, 'cli', $1)`,
+    [id]
+  );
+  await db.query(
+    `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, workflow_name, user_message, status, metadata, codebase_id, working_path)
+     VALUES ($1, $1, 'test-wf', 'test', $2, '{}', $3, $4)`,
+    [id, status, codebaseId, path]
+  );
+  return id;
+}
+
+const track = trackTempRoots();
+const originalGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+let root: string;
+let repo: string;
+let codebaseId: string;
+let env: IsolationEnvironmentRow;
+let run: WorkflowRun;
+let store: IIsolationStore;
+let provider: WorktreeProvider;
+/** The commit the fixture's branch was cut from. */
+let cutFrom: string;
+/** Record on the run the start point the isolation step records for a branch it cut. */
+const recordStartPoint = (): void => {
+  run.checkout_baseline = {
+    kind: 'git',
+    sampledAt: new Date().toISOString(),
+    commit: cutFrom,
+    tree: null,
+    worktree: { status: 'clean' },
+    cutFromCommit: cutFrom,
+  };
+};
+const branchExists = async (name: string): Promise<boolean> =>
+  (await git(repo, 'branch', '--list', name)) !== '';
+const request = () => ({
+  canonicalRepoPath: toRepoPath(repo),
+  codebaseId,
+  codebaseName: 'test/repo',
+  workflowType: 'task' as const,
+  identifier: 'release',
+});
+const status = async () => (await isolationDb.getById(env.id))?.status;
+
+test.each(['replacement', 'partial', 'dirty'] as const)(
+  'conversation close retains references and reports %s cleanup failure',
+  async mode => {
+    const conversationId = randomUUID();
+    await db.query(
+      `INSERT INTO remote_agent_conversations
+        (id, platform_type, platform_conversation_id, codebase_id, isolation_env_id, cwd)
+       VALUES ($1, 'github', $1, $2, $3, $4)`,
+      [conversationId, codebaseId, env.id, env.working_path]
+    );
+    if (mode === 'replacement') {
+      await git(repo, 'worktree', 'remove', env.working_path);
+      await git(root, 'clone', '-q', repo, env.working_path);
+    } else if (mode === 'dirty') {
+      await writeFile(join(env.working_path, 'file'), 'operator edits');
+    }
+    const partial =
+      mode === 'partial'
+        ? spyOn(getIsolationProvider(), 'destroy').mockResolvedValue({
+            worktreeRemoved: true,
+            directoryClean: false,
+            branchDeleted: null,
+            remoteBranchDeleted: null,
+            warnings: ['Retained directory'],
+          })
+        : undefined;
+    try {
+      await expect(onConversationClosed('github', conversationId)).rejects.toThrow();
+    } finally {
+      partial?.mockRestore();
+    }
+    const { rows } = await db.query<{ isolation_env_id: string; cwd: string }>(
+      'SELECT isolation_env_id, cwd FROM remote_agent_conversations WHERE id = $1',
+      [conversationId]
+    );
+    expect(rows[0]).toEqual({ isolation_env_id: env.id, cwd: env.working_path });
+    expect(await status()).toBe('active');
+    expect(await readFile(join(env.working_path, 'file'), 'utf8')).toBe(
+      mode === 'dirty' ? 'operator edits' : 'original'
+    );
+  }
+);
+
+test.each(['active', 'destroyed'] as const)(
+  'conversation close clears references after cleanup of a %s environment',
+  async initialStatus => {
+    const conversationId = randomUUID();
+    await db.query(
+      `INSERT INTO remote_agent_conversations
+        (id, platform_type, platform_conversation_id, codebase_id, isolation_env_id, cwd)
+       VALUES ($1, 'github', $1, $2, $3, $4)`,
+      [conversationId, codebaseId, env.id, env.working_path]
+    );
+    if (initialStatus === 'destroyed') await removeEnvironment(env);
+
+    await onConversationClosed('github', conversationId);
+
+    const { rows } = await db.query<{ isolation_env_id: string | null; cwd: string | null }>(
+      'SELECT isolation_env_id, cwd FROM remote_agent_conversations WHERE id = $1',
+      [conversationId]
+    );
+    expect(rows[0]).toEqual({ isolation_env_id: null, cwd: null });
+    expect(await status()).toBe('destroyed');
+    expect(existsSync(env.working_path)).toBe(false);
+  }
+);
+
+beforeEach(async () => {
+  setPlatformPolicies([]);
+  root = track(await realpath(await mkdtemp(join(tmpdir(), 'archon-release-'))));
+  process.env.GIT_CONFIG_GLOBAL = join(root, '.gitconfig');
+  repo = join(root, 'repo');
+  await initRepo(repo);
+  await writeFile(join(repo, '.gitignore'), '*.secret\n');
+  await writeFile(join(repo, 'file'), 'original');
+  await writeFile(join(repo, 'flagged'), 'original');
+  await git(repo, 'add', '.');
+  await git(repo, 'commit', '-qm', 'initial');
+  const remote = join(root, 'remote.git');
+  await mkdir(remote);
+  await git(remote, 'init', '--bare', '-q');
+  await git(repo, 'remote', 'add', 'upstream', remote);
+  await git(repo, 'push', '-q', 'upstream', 'main');
+  const config = async () => ({
+    baseBranch: toBranchName('main'),
+    remote: 'upstream',
+    path: '.worktrees',
+  });
+  configureIsolation(config);
+  provider = new WorktreeProvider(config);
+  codebaseId = randomUUID();
+  await db.query(
+    `INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES ($1, 'test/repo', $2)`,
+    [codebaseId, repo]
+  );
+  const created = await provider.create(request());
+  if (created.metadata.provenance !== 'created') throw new Error('Expected fresh creation');
+  if (created.metadata.cutFromCommit === undefined) throw new Error('Expected a cut branch');
+  cutFrom = created.metadata.cutFromCommit;
+  env = await isolationDb.create({
+    codebase_id: codebaseId,
+    workflow_type: 'task',
+    workflow_id: 'release',
+    working_path: created.workingPath,
+    branch_name: created.branchName,
+    metadata: { ...worktreeRegistrationMetadata(created.metadata) },
+  });
+  run = {
+    id: 'run',
+    workflow_name: 'test',
+    conversation_id: 'conv',
+    parent_conversation_id: null,
+    codebase_id: codebaseId,
+    status: 'cancelled',
+    outcome: null,
+    user_message: '',
+    metadata: { owned_worktree: { envId: env.id, creationId: created.metadata.creationId } },
+    active_phase_started_at: null,
+    started_at: new Date(),
+    completed_at: null,
+    last_activity_at: null,
+    working_path: created.workingPath,
+    user_id: null,
+    parent_run_id: null,
+    adopted_from_run_id: null,
+    output_root: null,
+    checkout_baseline: null,
+    item_id: null,
+    origin: null,
+  };
+  store = isolationDb.createIsolationStore();
+});
+
+// A test may leave a read-only directory behind; make it removable for cleanup.
+afterEach(async () => {
+  if (originalGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+  else process.env.GIT_CONFIG_GLOBAL = originalGlobalConfig;
+  if (existsSync(root)) await Bun.spawn(['chmod', '-R', 'u+w', root]).exited;
+});
+
+/**
+ * Recreate the run's worktree under a symlinked base. Git lists it by its
+ * symlink-resolved path while Archon records the path it asked for.
+ */
+async function useSymlinkedBase(): Promise<void> {
+  await mkdir(join(root, 'real-base'));
+  await symlink(join(root, 'real-base'), join(repo, '.wt-link'));
+  const config = async () => ({
+    baseBranch: toBranchName('main'),
+    remote: 'upstream',
+    path: '.wt-link',
+  });
+  configureIsolation(config);
+  const created = await new WorktreeProvider(config).create({ ...request(), identifier: 'linked' });
+  if (created.metadata.provenance !== 'created') throw new Error('Expected fresh creation');
+  expect(created.workingPath).toContain('.wt-link');
+  env = await isolationDb.create({
+    codebase_id: codebaseId,
+    workflow_type: 'task',
+    workflow_id: 'linked',
+    working_path: created.workingPath,
+    branch_name: created.branchName,
+    metadata: { ...worktreeRegistrationMetadata(created.metadata) },
+  });
+  run.working_path = created.workingPath;
+  run.metadata = { owned_worktree: { envId: env.id, creationId: created.metadata.creationId } };
+}
+
+for (const persistence of ['sql', 'file'] as const) {
+  test(`${persistence}: reclaim failure rolls back retirement and preserves its evidence`, async () => {
+    const target =
+      persistence === 'sql'
+        ? store
+        : (
+            await (
+              await import('../../workflows/file-host')
+            ).createFileWorkflowHost(join(root, 'store'))
+          ).records.isolation;
+    if (persistence === 'file') {
+      env = await target.create({
+        ...env,
+        branch_name: toBranchName(env.branch_name),
+        created_by_platform: undefined,
+        created_by_user_id: undefined,
+      });
+      run.metadata = {
+        owned_worktree: { envId: env.id, creationId: env.metadata.worktree_creation_id },
+      };
+    }
+    await expect(
+      reclaimRunWorktree(run, {
+        ...target,
+        withWorktreeRegistration: (observed, remove) =>
+          target.withWorktreeRegistration(observed, () =>
+            remove(async () => {
+              throw new Error('retirement write failed');
+            })
+          ),
+      })
+    ).rejects.toThrow('retirement write failed');
+    expect((await target.getById(env.id))?.status).toBe('active');
+    expect(existsSync(env.working_path)).toBe(true);
+  });
+}
+
+describe('owned worktree release', () => {
+  test('a removal Git abandons halfway is finished, not left unretryable', async () => {
+    const locked = join(env.working_path, 'locked');
+    await mkdir(locked);
+    await writeFile(join(locked, 'file'), 'cannot unlink');
+    await chmod(locked, 0o555);
+
+    const result = await reclaimRunWorktree(run, store);
+
+    expect(result.released?.path).toBe(env.working_path);
+    expect(existsSync(env.working_path)).toBe(false);
+    expect(await status()).toBe('destroyed');
+    expect(await git(repo, 'rev-parse', '--verify', env.branch_name)).toBeTruthy();
+  });
+
+  test('under a symlinked base, a failed removal Git still tracks keeps the checkout', async () => {
+    await useSymlinkedBase();
+    const originalExec = gitModule.execFileAsync;
+    const failing = spyOn(gitModule, 'execFileAsync').mockImplementation(
+      async (file, args, options) => {
+        if (file === 'git' && args.includes('worktree') && args.includes('remove'))
+          throw new Error('simulated remove failure');
+        return originalExec(file, args, options);
+      }
+    );
+    try {
+      await expect(reclaimRunWorktree(run, store)).rejects.toThrow('simulated remove failure');
+    } finally {
+      failing.mockRestore();
+    }
+    expect(existsSync(join(env.working_path, 'file'))).toBe(true);
+    expect(await status()).toBe('active');
+    expect(await readWorktreeLock(gitModule.toWorktreePath(env.working_path))).toBeNull();
+  });
+
+  test('under a symlinked base, a vanished but registered checkout is retained', async () => {
+    await useSymlinkedBase();
+    await git(env.working_path, 'checkout', '--detach', '-q');
+    await rm(env.working_path, { recursive: true });
+    await expect(reclaimRunWorktree(run, store)).rejects.toThrow('still registered');
+    expect(await status()).toBe('active');
+  });
+
+  test.each(['sql', 'file'] as const)(
+    '%s: a removal that fails while still registered can be retried',
+    async persistence => {
+      const target =
+        persistence === 'sql'
+          ? store
+          : (
+              await (
+                await import('../../workflows/file-host')
+              ).createFileWorkflowHost(join(root, 'store'))
+            ).records.isolation;
+      if (persistence === 'file') {
+        env = await target.create({
+          codebase_id: codebaseId,
+          workflow_type: 'task',
+          workflow_id: 'release',
+          working_path: env.working_path,
+          branch_name: toBranchName(env.branch_name),
+          metadata: env.metadata,
+        });
+        run.metadata = {
+          owned_worktree: { envId: env.id, creationId: env.metadata.worktree_creation_id },
+        };
+      }
+      const originalExec = gitModule.execFileAsync;
+      const failing = spyOn(gitModule, 'execFileAsync').mockImplementation(
+        async (file, args, options) => {
+          if (file === 'git' && args.includes('worktree') && args.includes('remove'))
+            throw new Error('simulated remove failure');
+          return originalExec(file, args, options);
+        }
+      );
+      try {
+        await expect(reclaimRunWorktree(run, target)).rejects.toThrow('simulated remove failure');
+      } finally {
+        failing.mockRestore();
+      }
+      expect(existsSync(join(env.working_path, 'file'))).toBe(true);
+      expect((await target.getById(env.id))?.status).toBe('active');
+      expect(await readWorktreeLock(gitModule.toWorktreePath(env.working_path))).toBeNull();
+
+      const result = await reclaimRunWorktree(run, target);
+      expect(result.released?.path).toBe(env.working_path);
+      expect(existsSync(env.working_path)).toBe(false);
+      expect((await target.getById(env.id))?.status).toBe('destroyed');
+    }
+  );
+
+  test('discards uncommitted work, hidden index flags, and unpushed commits; keeps the branch', async () => {
+    const wt = env.working_path;
+    await writeFile(join(wt, 'file'), 'unstaged');
+    await writeFile(join(wt, 'staged'), 'staged');
+    await git(wt, 'add', 'staged');
+    await writeFile(join(wt, 'untracked'), 'untracked');
+    await writeFile(join(wt, 'operator.secret'), 'ignored');
+    await git(wt, 'update-index', '--assume-unchanged', 'flagged');
+    await git(wt, 'update-index', '--skip-worktree', '.gitignore');
+    await writeFile(join(wt, 'flagged'), 'hidden edit');
+    await git(wt, 'commit', '-qm', 'unpushed', '--', 'staged');
+    const head = await git(wt, 'rev-parse', 'HEAD');
+
+    const result = await reclaimRunWorktree(run, store);
+
+    expect(result).toEqual({
+      released: { path: wt, branch: env.branch_name, branchDeleted: false },
+      warnings: [],
+    });
+    expect(existsSync(wt)).toBe(false);
+    expect(await status()).toBe('destroyed');
+    expect(await git(repo, 'rev-parse', '--verify', env.branch_name)).toBe(head);
+    await expect(reclaimRunWorktree(run, store)).resolves.toEqual({ warnings: [] });
+  });
+
+  test('a generated branch still at its start point goes with the worktree', async () => {
+    recordStartPoint();
+    const result = await reclaimRunWorktree(run, store);
+    expect(result.released?.branchDeleted).toBe(true);
+    expect(result.warnings).toEqual([]);
+    expect(existsSync(env.working_path)).toBe(false);
+    expect(await branchExists(env.branch_name)).toBe(false);
+  });
+
+  test('a generated branch with an unpushed commit is kept', async () => {
+    recordStartPoint();
+    await writeFile(join(env.working_path, 'work'), 'work');
+    await git(env.working_path, 'add', 'work');
+    await git(env.working_path, 'commit', '-qm', 'work');
+    const result = await reclaimRunWorktree(run, store);
+    expect(result.released?.branchDeleted).toBe(false);
+    expect(await branchExists(env.branch_name)).toBe(true);
+  });
+
+  test('a generated branch checked out in another checkout is kept', async () => {
+    recordStartPoint();
+    await git(repo, 'checkout', '-q', '--ignore-other-worktrees', env.branch_name);
+    const result = await reclaimRunWorktree(run, store);
+    expect(result.released?.branchDeleted).toBe(false);
+    expect(existsSync(env.working_path)).toBe(false);
+    expect(await branchExists(env.branch_name)).toBe(true);
+  });
+
+  test('a branch the launch named is kept even at its start point', async () => {
+    const named = await provider.create({
+      ...request(),
+      identifier: 'build/8-y',
+      taskBranch: { kind: 'new', branch: toBranchName('build/8-y') },
+    });
+    if (named.metadata.provenance !== 'created') throw new Error('Expected fresh creation');
+    const namedEnv = await isolationDb.create({
+      codebase_id: codebaseId,
+      workflow_type: 'task',
+      workflow_id: 'build/8-y',
+      working_path: named.workingPath,
+      branch_name: named.branchName,
+      metadata: { ...worktreeRegistrationMetadata(named.metadata) },
+    });
+    recordStartPoint();
+    const result = await reclaimRunWorktree(
+      {
+        ...run,
+        working_path: named.workingPath,
+        metadata: { owned_worktree: { envId: namedEnv.id, creationId: named.metadata.creationId } },
+      },
+      store
+    );
+    expect(result.released?.branchDeleted).toBe(false);
+    expect(existsSync(named.workingPath)).toBe(false);
+    expect(await branchExists('build/8-y')).toBe(true);
+  });
+
+  test('removes a worktree with an initialized submodule', async () => {
+    const lib = join(root, 'lib');
+    await initRepo(lib);
+    await writeFile(join(lib, 'lib'), 'lib');
+    await git(lib, 'add', '.');
+    await git(lib, 'commit', '-qm', 'lib');
+    await git(
+      env.working_path,
+      '-c',
+      'protocol.file.allow=always',
+      'submodule',
+      'add',
+      '-q',
+      lib,
+      'lib'
+    );
+    await git(env.working_path, 'commit', '-qm', 'add submodule');
+    expect(existsSync(join(env.working_path, 'lib', 'lib'))).toBe(true);
+
+    await reclaimRunWorktree(run, store);
+
+    expect(existsSync(env.working_path)).toBe(false);
+    expect(await status()).toBe('destroyed');
+  });
+
+  test('a claimable run on the checkout refuses release and leaves it usable', async () => {
+    recordStartPoint();
+    const other = await seedRunAt(env.working_path, 'paused');
+    await expect(reclaimRunWorktree(run, store)).rejects.toThrow(`claimable run ${other}`);
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await branchExists(env.branch_name)).toBe(true);
+    expect(await status()).toBe('active');
+    expect(await readWorktreeLock(gitModule.toWorktreePath(env.working_path))).toBeNull();
+  });
+
+  test('a detached adoption row without a path cannot claim the checkout once release begins', async () => {
+    const adopter = await seedRunAt(null, 'pending');
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const originalExec = gitModule.execFileAsync;
+    const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(
+      async (file, args, options) => {
+        if (file === 'git' && args.includes('worktree') && args.includes('remove')) {
+          entered.resolve();
+          await finish.promise;
+        }
+        return originalExec(file, args, options);
+      }
+    );
+    const release = reclaimRunWorktree(run, store);
+    try {
+      await entered.promise;
+      const claim = claimPendingWorkflowRun(adopter, env.working_path);
+      finish.resolve();
+      await release;
+      expect(await claim).toBeNull();
+    } finally {
+      finish.resolve();
+      await release.catch(() => {});
+      exec.mockRestore();
+    }
+    expect(existsSync(env.working_path)).toBe(false);
+  });
+
+  test('a run that reuses the checkout during removal can neither start nor adopt it', async () => {
+    const originalExec = gitModule.execFileAsync;
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(
+      async (file, args, options) => {
+        if (file === 'git' && args.includes('worktree') && args.includes('remove')) {
+          entered.resolve();
+          await finish.promise;
+        }
+        return originalExec(file, args, options);
+      }
+    );
+    const release = reclaimRunWorktree(run, store);
+    try {
+      await entered.promise;
+      const lateRun = seedRunAt(env.working_path, 'pending');
+      const adoption = await provider.create(request()).catch((err: unknown) => err);
+      expect(String(adoption)).toContain('an abandoned run is removing it');
+      if (!(adoption instanceof Error)) throw new Error('expected adoption refusal');
+      expect(classifyIsolationError(adoption)).toBe(
+        '**Error:** Refused to adopt an existing directory at the worktree path. ' +
+          'Remove it or choose a different branch/codebase registration.'
+      );
+      finish.resolve();
+      await release;
+      expect(await claimPendingWorkflowRun(await lateRun)).toBeNull();
+    } finally {
+      finish.resolve();
+      await release.catch(() => {});
+      exec.mockRestore();
+    }
+    expect(existsSync(env.working_path)).toBe(false);
+
+    // Once a fresh checkout is registered at the path again, runs there start normally.
+    const fresh = await provider.create(request());
+    await isolationDb.create({
+      codebase_id: codebaseId,
+      workflow_type: 'task',
+      workflow_id: 'release',
+      working_path: fresh.workingPath,
+      branch_name: fresh.branchName,
+    });
+    expect(
+      await claimPendingWorkflowRun(await seedRunAt(fresh.workingPath, 'pending'))
+    ).not.toBeNull();
+  });
+
+  test("an operator's lock refuses release", async () => {
+    await git(repo, 'worktree', 'lock', '--reason', 'operator', env.working_path);
+    await expect(reclaimRunWorktree(run, store)).rejects.toThrow('Could not release worktree');
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await status()).toBe('active');
+    expect(await readWorktreeLock(gitModule.toWorktreePath(env.working_path))).toEqual({
+      reason: 'operator',
+    });
+  });
+
+  test('mismatched marker refuses replacement estate', async () => {
+    const { gitDir } = await getGitCheckoutIdentity(env.working_path);
+    await writeFile(join(gitDir, 'archon-creation-id'), 'replacement');
+    await expect(reclaimRunWorktree(run, store)).rejects.toThrow('identity changed');
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await status()).toBe('active');
+  });
+
+  test('a vanished but registered detached checkout is retained, not falsely finalized', async () => {
+    await git(env.working_path, 'checkout', '--detach', '-q');
+    await rm(env.working_path, { recursive: true });
+    await expect(reclaimRunWorktree(run, store)).rejects.toThrow('still registered');
+    expect(await status()).toBe('active');
+  });
+
+  test('a residual directory survives removal and keeps the row active', async () => {
+    const originalExec = gitModule.execFileAsync;
+    const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(
+      async (file, args, options) => {
+        const result = await originalExec(file, args, options);
+        if (file === 'git' && args.includes('worktree') && args.includes('remove')) {
+          await mkdir(env.working_path);
+          await writeFile(join(env.working_path, 'late.secret'), 'late residue');
+        }
+        return result;
+      }
+    );
+    try {
+      await expect(reclaimRunWorktree(run, store)).rejects.toThrow('filesystem removal incomplete');
+      expect(await readFile(join(env.working_path, 'late.secret'), 'utf8')).toBe('late residue');
+      expect(await status()).toBe('active');
+    } finally {
+      exec.mockRestore();
+    }
+  });
+});
+
+describe('completed run worktree release', () => {
+  const readers = () => ({
+    getCodebase: codebaseDb.getCodebase,
+    getLiveRunOwningEnv: isolationDb.getLiveRunOwningEnv,
+  });
+  const assess = () =>
+    assessCompletedRunWorktree({ ...run, status: 'completed' }, store, readers());
+  const commitInWorktree = async (): Promise<void> => {
+    await writeFile(join(env.working_path, 'work'), 'work');
+    await git(env.working_path, 'add', 'work');
+    await git(env.working_path, 'commit', '-qm', 'work');
+  };
+
+  beforeEach(async () => {
+    await git(join(root, 'remote.git'), 'symbolic-ref', 'HEAD', 'refs/heads/main');
+    await mkdir(join(repo, '.archon'));
+    await writeFile(join(repo, '.archon', 'config.yaml'), 'worktree:\n  remote: upstream\n');
+  });
+
+  test.each(
+    (['sql', 'file'] as const).flatMap(persistence =>
+      ([true, false] as const).map(recorded => ({ persistence, recorded }))
+    )
+  )(
+    '$persistence: a clean checkout with no commits of its own is removed; start point recorded: $recorded',
+    async ({ persistence, recorded }) => {
+      if (recorded) recordStartPoint();
+      const target =
+        persistence === 'sql'
+          ? store
+          : (
+              await (
+                await import('../../workflows/file-host')
+              ).createFileWorkflowHost(join(root, 'store'))
+            ).records.isolation;
+      if (persistence === 'file') {
+        env = await target.create({
+          codebase_id: codebaseId,
+          workflow_type: 'task',
+          workflow_id: 'release',
+          working_path: env.working_path,
+          branch_name: toBranchName(env.branch_name),
+          metadata: env.metadata,
+        });
+        run.metadata = {
+          owned_worktree: { envId: env.id, creationId: env.metadata.worktree_creation_id },
+        };
+      }
+      const completed = { ...run, status: 'completed' as const };
+
+      expect(await assessCompletedRunWorktree(completed, target, readers())).toEqual({
+        disposition: 'release',
+      });
+      await releaseCompletedRunWorktree(completed, target, readers());
+
+      expect(existsSync(env.working_path)).toBe(false);
+      expect((await target.getById(env.id))?.status).toBe('destroyed');
+      // Without a recorded start point the branch is kept: nothing proves it holds no work.
+      expect(await branchExists(env.branch_name)).toBe(!recorded);
+    }
+  );
+
+  test('a commit on no remote keeps the checkout', async () => {
+    await commitInWorktree();
+    expect(await assess()).toEqual({
+      disposition: 'retained',
+      reason: 'unpushed_commits',
+      detail: '1 commit(s) on no remote',
+    });
+  });
+
+  test('a commit made after a push that left tracking refs stale keeps the checkout', async () => {
+    await commitInWorktree();
+    await pushByUrl();
+    await writeFile(join(env.working_path, 'later'), 'later');
+    await git(env.working_path, 'add', 'later');
+    await git(env.working_path, 'commit', '-qm', 'later');
+    expect(await assess()).toEqual({
+      disposition: 'retained',
+      reason: 'unpushed_commits',
+      detail: '1 commit(s) on no remote',
+    });
+  });
+
+  test('uncommitted changes keep the checkout', async () => {
+    await writeFile(join(env.working_path, 'file'), 'edited');
+    expect(await assess()).toEqual({
+      disposition: 'retained',
+      reason: 'uncommitted_changes',
+    });
+  });
+
+  // A push by URL leaves no remote-tracking ref, so only the live remote proves it.
+  const pushByUrl = async (): Promise<void> => {
+    await git(
+      env.working_path,
+      'push',
+      '-q',
+      join(root, 'remote.git'),
+      `HEAD:refs/heads/${env.branch_name}`
+    );
+    // Git on Windows matches the path to the upstream URL and writes the tracking ref anyway.
+    await git(repo, 'update-ref', '-d', `refs/remotes/upstream/${env.branch_name}`);
+  };
+
+  test('a pushed run-named checkout is removed, keeping its local and remote branch', async () => {
+    recordStartPoint();
+    await commitInWorktree();
+    await pushByUrl();
+    expect(await git(repo, 'branch', '--remotes')).not.toContain(env.branch_name);
+    const completed = { ...run, status: 'completed' as const };
+    expect(await assessCompletedRunWorktree(completed, store, readers())).toEqual({
+      disposition: 'release',
+    });
+
+    let inClaim = false;
+    const registrationStore: IIsolationStore = {
+      ...store,
+      withWorktreeRegistration: async (observed, remove) => {
+        inClaim = true;
+        try {
+          return await store.withWorktreeRegistration(observed, remove);
+        } finally {
+          inClaim = false;
+        }
+      },
+    };
+    const networkClaims: boolean[] = [];
+    const originalExec = gitModule.execFileAsync;
+    const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(
+      async (file, args, options) => {
+        if (args.includes('ls-remote')) networkClaims.push(inClaim);
+        return originalExec(file, args, options);
+      }
+    );
+    try {
+      await releaseCompletedRunWorktree(completed, registrationStore, readers());
+      expect(networkClaims).toEqual([false]);
+    } finally {
+      exec.mockRestore();
+    }
+
+    expect(existsSync(env.working_path)).toBe(false);
+    expect(await status()).toBe('destroyed');
+    expect(await git(repo, 'branch', '--list', env.branch_name)).toContain(env.branch_name);
+    expect(await git(repo, 'ls-remote', 'upstream', `refs/heads/${env.branch_name}`)).not.toBe('');
+  });
+
+  test('a remote that cannot be read keeps a checkout with commits tracking refs miss', async () => {
+    await commitInWorktree();
+    await git(repo, 'remote', 'set-url', 'upstream', join(root, 'missing.git'));
+    expect(await assess()).toMatchObject({ disposition: 'retained', reason: 'check_failed' });
+    await expect(
+      releaseCompletedRunWorktree({ ...run, status: 'completed' }, store, readers())
+    ).rejects.toThrow();
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await status()).toBe('active');
+  });
+
+  test('a worktree created for a named branch is never released at run end', async () => {
+    const named = await provider.create({
+      ...request(),
+      identifier: 'build/7-x',
+      taskBranch: { kind: 'new', branch: toBranchName('build/7-x') },
+    });
+    if (named.metadata.provenance !== 'created') throw new Error('Expected fresh creation');
+    const namedEnv = await isolationDb.create({
+      codebase_id: codebaseId,
+      workflow_type: 'task',
+      workflow_id: 'build/7-x',
+      working_path: named.workingPath,
+      branch_name: named.branchName,
+      metadata: { ...worktreeRegistrationMetadata(named.metadata) },
+    });
+    // Clean and fully pushed, so only the named branch can keep it.
+    await git(named.workingPath, 'push', '-q', 'upstream', 'HEAD:refs/heads/build/7-x');
+    await git(repo, 'fetch', '-q', 'upstream');
+
+    expect(
+      await assessCompletedRunWorktree(
+        {
+          ...run,
+          status: 'completed',
+          working_path: named.workingPath,
+          metadata: {
+            owned_worktree: { envId: namedEnv.id, creationId: named.metadata.creationId },
+          },
+        },
+        store,
+        readers()
+      )
+    ).toBeNull();
+    expect(existsSync(named.workingPath)).toBe(true);
+  });
+
+  test('the completing run does not hold its own checkout', async () => {
+    run.id = await seedRunAt(env.working_path, 'running');
+    expect(await assess()).toEqual({ disposition: 'release' });
+  });
+
+  test.each(['running', 'paused'])('another %s run keeps the checkout', async otherStatus => {
+    const other = await seedRunAt(env.working_path, otherStatus);
+    expect(await assess()).toEqual({
+      disposition: 'retained',
+      reason: 'in_use',
+      detail: `run ${other} (${otherStatus})`,
+    });
+  });
+
+  test('a check that cannot run is reported, not thrown', async () => {
+    run.metadata = { owned_worktree: { envId: env.id, creationId: randomUUID() } };
+    expect(await assess()).toEqual({
+      disposition: 'retained',
+      reason: 'check_failed',
+      detail: 'creation proof does not match its isolation record',
+    });
+  });
+
+  test.each(['uncommitted_changes', 'unpushed_commits'] as const)(
+    'work arriving before the registration claim is checked under the worktree lock (%s)',
+    async reason => {
+      const real = store;
+      const racing: IIsolationStore = {
+        ...real,
+        withWorktreeRegistration: async (observed, remove) => {
+          await writeFile(join(env.working_path, 'late'), 'late work');
+          if (reason === 'unpushed_commits') {
+            await git(env.working_path, 'add', 'late');
+            await git(env.working_path, 'commit', '-qm', 'late work');
+          }
+          return real.withWorktreeRegistration(observed, remove);
+        },
+      };
+      await expect(
+        releaseCompletedRunWorktree({ ...run, status: 'completed' }, racing, readers())
+      ).rejects.toThrow(`no longer releasable: ${reason}`);
+      expect(await readFile(join(env.working_path, 'late'), 'utf8')).toBe('late work');
+      expect(await status()).toBe('active');
+      expect(await readWorktreeLock(gitModule.toWorktreePath(env.working_path))).toBeNull();
+    }
+  );
+
+  test('work that appears after the assessment refuses the release', async () => {
+    const completed = { ...run, status: 'completed' as const };
+    expect(await assessCompletedRunWorktree(completed, store, readers())).toEqual({
+      disposition: 'release',
+    });
+    await writeFile(join(env.working_path, 'late'), 'late work');
+
+    await expect(releaseCompletedRunWorktree(completed, store, readers())).rejects.toThrow(
+      'no longer releasable: uncommitted_changes'
+    );
+    expect(await readFile(join(env.working_path, 'late'), 'utf8')).toBe('late work');
+    expect(await status()).toBe('active');
+  });
+});
+
+describe('the age sweep keeps work that exists nowhere else', () => {
+  const age = (id: string): Promise<unknown> =>
+    db.query(
+      `UPDATE remote_agent_isolation_environments SET created_at = datetime('now', '-30 days') WHERE id = $1`,
+      [id]
+    );
+
+  test('a stale environment with no run keeps a commit on no remote', async () => {
+    await writeFile(join(env.working_path, 'work'), 'work');
+    await git(env.working_path, 'add', 'work');
+    await git(env.working_path, 'commit', '-qm', 'work');
+    await age(env.id);
+
+    const result = await cleanupStaleWorktrees(codebaseId, repo);
+
+    expect(result.removed).toEqual([]);
+    expect(result.skipped).toEqual([
+      {
+        branchName: env.branch_name,
+        reason: `1 unpushed commit(s); remove it explicitly with archon complete ${env.branch_name} --force`,
+      },
+    ]);
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await status()).toBe('active');
+  });
+
+  test('a stale environment with no run and nothing unpushed is still removed', async () => {
+    await age(env.id);
+    const result = await cleanupStaleWorktrees(codebaseId, repo);
+    expect(result.removed).toEqual([env.branch_name]);
+    expect(await status()).toBe('destroyed');
+  });
+
+  test('a missing checkout keeps the branch it created while it holds a commit on no remote', async () => {
+    await writeFile(join(env.working_path, 'work'), 'work');
+    await git(env.working_path, 'add', 'work');
+    await git(env.working_path, 'commit', '-qm', 'work');
+    const tip = await git(env.working_path, 'rev-parse', 'HEAD');
+    await git(repo, 'worktree', 'remove', env.working_path);
+
+    const report = await runScheduledCleanup();
+
+    expect(report.skipped).toContainEqual({
+      id: env.id,
+      reason: `path missing but 1 unpushed commit(s); remove it explicitly with archon complete ${env.branch_name} --force`,
+    });
+    expect(await status()).toBe('active');
+    expect(await git(repo, 'rev-parse', env.branch_name)).toBe(tip);
+  });
+});
+
+test('ordinary cleanup preserves a replacement clone and its active record', async () => {
+  await git(repo, 'worktree', 'remove', env.working_path);
+  await git(root, 'clone', '-q', repo, env.working_path);
+  await writeFile(join(env.working_path, 'operator-file'), 'keep me');
+
+  const error = await removeEnvironment(env, { force: true }).catch((error: unknown) => error);
+
+  expect(await readFile(join(env.working_path, 'operator-file'), 'utf8')).toBe('keep me');
+  expect(error).toBeInstanceOf(Error);
+  expect(String(error)).toContain('ownership');
+  expect(await status()).toBe('active');
+  expect(await git(repo, 'branch', '--list', env.branch_name)).toContain(env.branch_name);
+});
+
+test('ordinary cleanup removes a proven checkout and its branch', async () => {
+  const result = await removeEnvironment(env);
+  expect(result.worktreeRemoved).toBe(true);
+  expect(result.branchDeleted).toBe(true);
+  expect(existsSync(env.working_path)).toBe(false);
+  expect(await status()).toBe('destroyed');
+  expect(await git(repo, 'branch', '--list', env.branch_name)).toBe('');
+});
+
+test.each(['worktreeRemoved', 'directoryClean'] as const)(
+  'incomplete %s preserves the active registration and published remote ref',
+  async field => {
+    await git(repo, 'remote', 'rename', 'upstream', 'origin');
+    await git(repo, 'push', '-q', 'origin', env.branch_name);
+    const ref = `refs/heads/${env.branch_name}`;
+    const published = await git(repo, 'ls-remote', 'origin', ref);
+    expect(published).toContain(ref);
+    const partial = spyOn(getIsolationProvider(), 'destroy').mockResolvedValue({
+      worktreeRemoved: true,
+      directoryClean: true,
+      branchDeleted: null,
+      remoteBranchDeleted: null,
+      warnings: ['Retained directory'],
+      [field]: false,
+    });
+    try {
+      const result = await removeEnvironment(env, { deleteRemoteBranch: true });
+      expect(result.skippedReason).toContain('filesystem removal incomplete');
+      expect(await status()).toBe('active');
+      expect(await git(repo, 'ls-remote', 'origin', ref)).toBe(published);
+    } finally {
+      partial.mockRestore();
+    }
+  }
+);
+
+async function advanceUnpublishedTip(mode: string, prHead: string): Promise<void> {
+  if (mode !== 'head-ahead' && mode !== 'branch-ahead') return;
+  if (mode === 'head-ahead') await git(env.working_path, 'checkout', '--detach', prHead);
+  await writeFile(join(env.working_path, 'unpublished'), 'keep me');
+  await git(env.working_path, 'add', 'unpublished');
+  await git(env.working_path, 'commit', '-qm', 'unpublished');
+  if (mode === 'branch-ahead') await git(env.working_path, 'checkout', '--detach', prHead);
+}
+
+test.each(['both', 'head-only', 'branch-only'] as const)(
+  'cleanup retains unpublished merge resolution at local tip: %s',
+  async mode => {
+    await git(repo, 'remote', 'rename', 'upstream', 'origin');
+    await git(join(root, 'remote.git'), 'symbolic-ref', 'HEAD', 'refs/heads/main');
+    await writeFile(join(env.working_path, 'left'), 'left');
+    await git(env.working_path, 'add', 'left');
+    await git(env.working_path, 'commit', '-qm', 'left');
+    const left = await git(env.working_path, 'rev-parse', 'HEAD');
+    await writeFile(join(repo, 'right'), 'right');
+    await git(repo, 'add', 'right');
+    await git(repo, 'commit', '-qm', 'right');
+    await git(env.working_path, 'merge', '--no-ff', 'main', '-m', 'local merge');
+    await writeFile(join(env.working_path, 'resolution'), 'unpublished resolution');
+    await git(env.working_path, 'add', 'resolution');
+    await git(env.working_path, 'commit', '--amend', '--no-edit');
+    await git(repo, 'merge', '--no-ff', left, '-m', 'published merge');
+    await git(repo, 'push', '-q', 'origin', 'main');
+    expect(await git(repo, 'cherry', 'origin/main', env.branch_name)).toBe('');
+    if (mode === 'head-only') {
+      await git(env.working_path, 'checkout', '--detach', 'HEAD');
+      await git(repo, 'branch', '-f', env.branch_name, 'main');
+    }
+    if (mode === 'branch-only') await git(env.working_path, 'checkout', '--detach', 'main');
+    const branchTip = await git(repo, 'rev-parse', env.branch_name);
+    const headTip = await git(env.working_path, 'rev-parse', 'HEAD');
+    const branchPr = spyOn(isolationModule, 'getPrState').mockResolvedValue({ state: 'NONE' });
+    const commitPr = spyOn(isolationModule, 'getPrsForCommit').mockResolvedValue({ state: 'NONE' });
+    try {
+      const result = await cleanupMergedWorktrees(codebaseId, repo);
+      expect(result.errors).toEqual([]);
+      expect(result.removed).toEqual([]);
+      expect(result.skipped).toContainEqual({
+        branchName: env.branch_name,
+        reason: 'no cleanup evidence covers all local tips',
+      });
+      expect(await status()).toBe('active');
+      expect(await git(repo, 'rev-parse', env.branch_name)).toBe(branchTip);
+      expect(await git(env.working_path, 'rev-parse', 'HEAD')).toBe(headTip);
+    } finally {
+      branchPr.mockRestore();
+      commitPr.mockRestore();
+    }
+  }
+);
+
+test.each(
+  (['ancestry', 'patch', 'closed'] as const).flatMap(signal =>
+    (['covered', 'head-ahead', 'branch-ahead', 'dirty', 'paused'] as const).map(mode => ({
+      signal,
+      mode,
+    }))
+  )
+)(
+  'legacy $signal cleanup evidence with $mode work: every tip stays protected',
+  async ({ signal, mode }) => {
+    await git(repo, 'remote', 'rename', 'upstream', 'origin');
+    await git(join(root, 'remote.git'), 'symbolic-ref', 'HEAD', 'refs/heads/main');
+    await writeFile(join(env.working_path, 'feature'), 'published work');
+    await git(env.working_path, 'add', 'feature');
+    await git(env.working_path, 'commit', '-qm', 'feature');
+    const prHead = await git(env.working_path, 'rev-parse', 'HEAD');
+    await git(env.working_path, 'push', '-q', 'origin', 'HEAD:refs/heads/published-feature');
+    if (signal === 'ancestry') await git(repo, 'merge', '--ff-only', env.branch_name);
+    if (signal === 'patch') {
+      await writeFile(join(repo, 'main-only'), 'base work');
+      await git(repo, 'add', 'main-only');
+      await git(repo, 'commit', '-qm', 'advance base');
+      await git(repo, 'cherry-pick', prHead);
+      expect(await git(repo, 'rev-parse', 'HEAD')).not.toBe(prHead);
+    }
+    await git(repo, 'push', '-q', 'origin', 'main');
+    await advanceUnpublishedTip(mode, prHead);
+    if (mode === 'dirty') await writeFile(join(env.working_path, 'feature'), 'operator edits');
+    if (mode === 'paused') await seedRunAt(env.working_path, 'paused');
+    const failedRun = mode === 'covered' ? await seedRunAt(env.working_path, 'failed') : null;
+    const branchPr = spyOn(isolationModule, 'getPrState').mockResolvedValue(
+      signal === 'closed' ? { state: 'CLOSED', headSha: prHead } : { state: 'NONE' }
+    );
+    const commitPr = spyOn(isolationModule, 'getPrsForCommit').mockResolvedValue({ state: 'NONE' });
+    try {
+      if (signal === 'closed') {
+        const withoutOptIn = await cleanupMergedWorktrees(codebaseId, repo);
+        expect(withoutOptIn.removed).toEqual([]);
+        expect(await status()).toBe('active');
+      }
+      const result = await cleanupMergedWorktrees(codebaseId, repo, {
+        includeClosed: signal === 'closed',
+      });
+      const reclaimed = mode === 'covered';
+      expect(result.errors).toEqual([]);
+      expect(result.removed).toEqual(reclaimed ? [env.branch_name] : []);
+      expect(existsSync(env.working_path)).toBe(!reclaimed);
+      expect(await status()).toBe(reclaimed ? 'destroyed' : 'active');
+      expect(await git(repo, 'branch', '--list', env.branch_name)).toEqual(
+        reclaimed ? '' : expect.stringContaining(env.branch_name)
+      );
+      if (failedRun)
+        expect(result.releasedFailedRuns).toEqual([
+          {
+            branchName: env.branch_name,
+            runId: failedRun,
+            reason: signal === 'closed' ? 'PR closed' : 'merged',
+          },
+        ]);
+    } finally {
+      branchPr.mockRestore();
+      commitPr.mockRestore();
+    }
+  }
+);
+
+test.each([
+  'covered',
+  'head-base',
+  'branch-base',
+  'head-ahead',
+  'branch-ahead',
+  'dirty',
+  'paused',
+] as const)('commit-associated squash merge with a different published name: %s', async mode => {
+  await git(repo, 'remote', 'rename', 'upstream', 'origin');
+  await git(join(root, 'remote.git'), 'symbolic-ref', 'HEAD', 'refs/heads/main');
+  for (const value of ['first', 'second', 'third']) {
+    await writeFile(join(env.working_path, 'feature'), value);
+    await git(env.working_path, 'add', 'feature');
+    await git(env.working_path, 'commit', '-qm', value);
+  }
+  const prHead = await git(env.working_path, 'rev-parse', 'HEAD');
+  await git(env.working_path, 'push', '-q', 'origin', 'HEAD:refs/heads/published-feature');
+  await git(repo, 'merge', '--squash', env.branch_name);
+  await git(repo, 'commit', '-qm', 'squashed feature');
+  await git(repo, 'push', '-q', 'origin', 'main');
+  await git(env.working_path, 'reset', '--hard', 'HEAD~1');
+  if (mode === 'head-ahead' || mode === 'branch-ahead') {
+    await git(env.working_path, 'reset', '--hard', prHead);
+    if (mode === 'head-ahead') await git(env.working_path, 'checkout', '--detach', prHead);
+    await git(env.working_path, 'commit', '--allow-empty', '-qm', 'unpublished work');
+    if (mode === 'branch-ahead') await git(env.working_path, 'checkout', '--detach', prHead);
+  }
+  if (mode === 'head-base') await git(env.working_path, 'checkout', '--detach', `${prHead}~3`);
+  if (mode === 'branch-base') {
+    await git(env.working_path, 'checkout', '--detach', 'HEAD');
+    await git(repo, 'branch', '-f', env.branch_name, `${prHead}~3`);
+  }
+  const baseCommit = await git(repo, 'rev-parse', `${prHead}~3`);
+  const reclaimed = ['covered', 'head-base', 'branch-base'].includes(mode);
+  if (mode === 'dirty') await writeFile(join(env.working_path, 'feature'), 'operator edits');
+  if (mode === 'paused') await seedRunAt(env.working_path, 'paused');
+  expect(
+    await gitModule.isBranchMerged(
+      toRepoPath(repo),
+      toBranchName(env.branch_name),
+      toBranchName('origin/main')
+    )
+  ).toBe(mode === 'branch-base');
+  expect(
+    await gitModule.isPatchEquivalent(
+      toRepoPath(repo),
+      toBranchName(env.branch_name),
+      toBranchName('origin/main')
+    )
+  ).toBe(mode === 'branch-base');
+
+  const originalExec = gitModule.execFileAsync;
+  const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(async (file, args, options) => {
+    if (file === 'git' && args.includes('get-url'))
+      return { stdout: 'https://github.com/test/repo.git', stderr: '' };
+    if (file === 'gh') {
+      if (args.includes('graphql'))
+        return {
+          stdout: ghCommitObject(args.at(-1)?.slice(4) ?? ''),
+          stderr: '',
+        };
+      const payload =
+        args[0] === 'pr'
+          ? []
+          : args[0] === 'repo'
+            ? { nameWithOwner: 'test/repo' }
+            : args.some(arg => arg.includes(`/commits/${baseCommit}/`))
+              ? [[]]
+              : [
+                  [
+                    {
+                      state: 'closed',
+                      merged_at: '2026-01-01T00:00:00Z',
+                      head: { sha: prHead },
+                      base: { repo: { full_name: 'test/repo' } },
+                    },
+                  ],
+                ];
+      return {
+        stdout: ghJsonOutput(args[0], payload),
+        stderr: '',
+      };
+    }
+    return originalExec(file, args, options);
+  });
+  try {
+    const result = await cleanupMergedWorktrees(codebaseId, repo);
+    expect(result.errors).toEqual([]);
+    expect(result.removed).toEqual(reclaimed ? [env.branch_name] : []);
+    expect(existsSync(env.working_path)).toBe(!reclaimed);
+    expect(await status()).toBe(reclaimed ? 'destroyed' : 'active');
+    if (!reclaimed) expect(result.skipped).toHaveLength(1);
+  } finally {
+    exec.mockRestore();
+  }
+});
+
+test.each([
+  'remote',
+  'branch-response',
+  'missing-gh',
+  'commit-repository',
+  'commit-pulls',
+  'commit-pulls-null-object',
+  'malformed-pulls-null-object',
+  'commit-object',
+  'unknown-commit',
+] as const)('cleanup retains and reports PR inspection: %s', async failure => {
+  await git(repo, 'remote', 'rename', 'upstream', 'origin');
+  await git(join(root, 'remote.git'), 'symbolic-ref', 'HEAD', 'refs/heads/main');
+  await writeFile(join(env.working_path, 'feature'), 'unmerged work');
+  await git(env.working_path, 'add', 'feature');
+  await git(env.working_path, 'commit', '-qm', 'feature');
+  const tip = await git(env.working_path, 'rev-parse', 'HEAD');
+  await db.query(
+    "UPDATE remote_agent_isolation_environments SET created_at = '2020-01-01' WHERE id = $1",
+    [env.id]
+  );
+  const failedGhCommand = {
+    remote: undefined,
+    'branch-response': undefined,
+    'missing-gh': 'pr',
+    'commit-repository': 'repo',
+    'commit-pulls': 'pulls',
+    'commit-pulls-null-object': 'pulls',
+    'malformed-pulls-null-object': undefined,
+    'commit-object': 'graphql',
+    'unknown-commit': 'pulls',
+  }[failure];
+  const ghOutput: Record<string, string> = {
+    pr: failure === 'branch-response' ? '{}' : '[]',
+    repo: '{"nameWithOwner":"test/repo"}',
+    api: failure === 'malformed-pulls-null-object' ? '[{}]' : '[]',
+  };
+  const commitObjectOutput = ghCommitObject(
+    failure === 'unknown-commit' ||
+      failure === 'commit-pulls-null-object' ||
+      failure === 'malformed-pulls-null-object'
+      ? null
+      : tip
+  );
+  const ghFailure =
+    failure === 'unknown-commit'
+      ? Object.assign(new Error('association rejected'), {
+          code: 1,
+          stdout: JSON.stringify({ status: '422' }),
+        })
+      : Object.assign(new Error('missing gh'), { code: 'ENOENT' });
+  const originalExec = gitModule.execFileAsync;
+  const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(async (file, args, options) => {
+    if (file === 'git' && args.includes('get-url')) {
+      if (failure === 'remote') throw new Error('remote inspection failed');
+      return { stdout: 'https://github.com/test/repo.git', stderr: '' };
+    }
+    if (file === 'gh') {
+      if (
+        (args.includes('graphql') ? 'graphql' : args[0] === 'api' ? 'pulls' : args[0]) ===
+        failedGhCommand
+      )
+        throw ghFailure;
+      return {
+        stdout: args.includes('graphql') ? commitObjectOutput : ghOutput[args[0]],
+        stderr: '',
+      };
+    }
+    return originalExec(file, args, options);
+  });
+  const selected = (await isolationDb.listAllActiveWithCodebase()).filter(row => row.id === env.id);
+  const selection = spyOn(isolationDb, 'listAllActiveWithCodebase').mockResolvedValue(selected);
+  const lastCommit = spyOn(gitModule, 'getLastCommitDate');
+  const reason =
+    failure === 'unknown-commit'
+      ? 'no pull request covers all local work — a local commit was not found in the configured repository'
+      : 'PR state lookup failed — merge state unverifiable';
+  try {
+    const manual = await cleanupMergedWorktrees(codebaseId, repo);
+    expect(manual.errors).toEqual([]);
+    expect(manual.removed).toEqual([]);
+    expect(manual.skipped).toEqual([{ branchName: env.branch_name, reason }]);
+    const scheduled = await runScheduledCleanup();
+    expect(scheduled.errors).toEqual([]);
+    expect(scheduled.removed).toEqual([]);
+    expect(lastCommit).not.toHaveBeenCalled();
+    expect(scheduled.skipped).toContainEqual({
+      id: env.id,
+      reason,
+    });
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await status()).toBe('active');
+    expect(await git(repo, 'rev-parse', env.branch_name)).toBe(tip);
+  } finally {
+    exec.mockRestore();
+    selection.mockRestore();
+    lastCommit.mockRestore();
+  }
+});
+
+test.each([false, true])(
+  'merged cleanup uses the configured repository despite GH_REPO (configured PR merged=%s)',
+  async merged => {
+    await git(repo, 'remote', 'rename', 'upstream', 'origin');
+    await git(join(root, 'remote.git'), 'symbolic-ref', 'HEAD', 'refs/heads/main');
+    await writeFile(join(env.working_path, 'unmerged-feature'), 'not integrated');
+    await git(env.working_path, 'add', 'unmerged-feature');
+    await git(env.working_path, 'commit', '-qm', 'feature outside the base');
+    const sharedTip = await git(env.working_path, 'rev-parse', 'HEAD');
+    const remoteUrl = 'git@github.com:test/repo.git';
+    const originalGhRepo = process.env.GH_REPO;
+    process.env.GH_REPO = 'other/repo';
+    const originalExec = gitModule.execFileAsync;
+    const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(
+      async (file, args, options) => {
+        if (file === 'git' && args.includes('get-url')) return { stdout: remoteUrl, stderr: '' };
+        if (file !== 'gh') return originalExec(file, args, options);
+        if (args.includes('graphql'))
+          return {
+            stdout: ghCommitObject(args.at(-1)?.slice(4) ?? ''),
+            stderr: '',
+          };
+        const repoFlag = args.indexOf('--repo');
+        const selectedRepo = repoFlag === -1 ? process.env.GH_REPO : args[repoFlag + 1];
+        let payload: unknown = [[]];
+        if (args[0] === 'pr')
+          payload =
+            selectedRepo === remoteUrl && !merged
+              ? []
+              : [{ state: 'MERGED', headRefOid: sharedTip }];
+        if (args[0] === 'repo') payload = { nameWithOwner: 'test/repo' };
+        return {
+          stdout: ghJsonOutput(args[0], payload),
+          stderr: '',
+        };
+      }
+    );
+    try {
+      const result = await cleanupMergedWorktrees(codebaseId, repo);
+      expect(result.errors).toEqual([]);
+      expect(result.removed).toEqual(merged ? [env.branch_name] : []);
+      expect(existsSync(env.working_path)).toBe(!merged);
+      expect(await status()).toBe(merged ? 'destroyed' : 'active');
+      if (!merged) {
+        expect(result.skipped).toEqual([
+          { branchName: env.branch_name, reason: 'no cleanup evidence covers all local tips' },
+        ]);
+      }
+    } finally {
+      exec.mockRestore();
+      if (originalGhRepo === undefined) delete process.env.GH_REPO;
+      else process.env.GH_REPO = originalGhRepo;
+    }
+  }
+);
+
+test('merged cleanup retires locally and reports the retained published branch', async () => {
+  await git(repo, 'remote', 'rename', 'upstream', 'origin');
+  await git(join(root, 'remote.git'), 'symbolic-ref', 'HEAD', 'refs/heads/main');
+  await git(repo, 'push', '-q', 'origin', env.branch_name);
+  const ref = `refs/heads/${env.branch_name}`;
+  const published = await git(repo, 'ls-remote', 'origin', ref);
+  expect(published).toContain(ref);
+  const pr = spyOn(isolationModule, 'getPrState').mockResolvedValue({
+    state: 'MERGED',
+    headSha: await git(env.working_path, 'rev-parse', 'HEAD'),
+  });
+  try {
+    const result = await cleanupMergedWorktrees(codebaseId, repo);
+    expect(result.removed).toEqual([env.branch_name]);
+    expect(result.warnings).toEqual([
+      {
+        branchName: env.branch_name,
+        message: expect.stringContaining('Remote branch retained'),
+      },
+    ]);
+    expect(await status()).toBe('destroyed');
+    expect(existsSync(env.working_path)).toBe(false);
+    expect(await git(repo, 'ls-remote', 'origin', ref)).toBe(published);
+  } finally {
+    pr.mockRestore();
+  }
+});
+
+test.each([false, true].flatMap(force => [false, true].map(split => ({ force, split }))))(
+  'local cleanup retains an unchanged remote ref with a warning (force=$force, split=$split)',
+  async ({ force, split }) => {
+    const pushRemote = split ? join(root, 'push.git') : join(root, 'remote.git');
+    await git(repo, 'remote', 'add', 'origin', join(root, 'remote.git'));
+    if (split) {
+      await git(root, 'init', '--bare', '-q', pushRemote);
+      await git(repo, 'remote', 'set-url', '--push', 'origin', pushRemote);
+    }
+    await git(repo, 'push', '-q', 'origin', env.branch_name);
+    const ref = `refs/heads/${env.branch_name}`;
+    const published = await git(repo, 'ls-remote', pushRemote, ref);
+    expect(published).toContain(ref);
+    const result = await removeEnvironment(env, { force, deleteRemoteBranch: true });
+    expect(result.worktreeRemoved).toBe(true);
+    expect(result.branchDeleted).toBe(true);
+    expect(result.warnings.join(' ')).toContain('Remote branch retained');
+    expect(await status()).toBe('destroyed');
+    expect(await git(repo, 'ls-remote', pushRemote, ref)).toBe(published);
+  }
+);
+
+test.each(
+  [false, true].flatMap(force =>
+    [false, true].flatMap(split =>
+      ['same', 'advanced', 'absent'].map(tip => ({ force, split, tip }))
+    )
+  )
+)(
+  'remote cleanup retains a replacement published after commit (force=$force, split=$split, tip=$tip)',
+  async ({ force, split, tip }) => {
+    const published = tip !== 'absent';
+    await git(repo, 'remote', 'add', 'origin', join(root, 'remote.git'));
+    const pushRemote = split ? join(root, 'push.git') : join(root, 'remote.git');
+    if (split) {
+      await git(root, 'init', '--bare', '-q', pushRemote);
+      await git(repo, 'remote', 'set-url', '--push', 'origin', pushRemote);
+    }
+    if (published) await git(repo, 'push', '-q', 'origin', env.branch_name);
+    const originalOid = await git(repo, 'rev-parse', env.branch_name);
+    const acquire = isolationDb.withWorktreeRegistration;
+    let replacementOid = '';
+    let replacementId = '';
+    const claim = spyOn(isolationDb, 'withWorktreeRegistration').mockImplementation(
+      async (observed, remove) => {
+        const result = await acquire(observed, remove);
+        expect(await status()).toBe('destroyed');
+        const replacement = await provider.create(request());
+        const registered = await isolationDb.create({
+          codebase_id: codebaseId,
+          provider: 'worktree',
+          working_path: replacement.workingPath,
+          branch_name: replacement.branchName,
+          workflow_type: env.workflow_type,
+          workflow_id: env.workflow_id,
+          metadata: { ...worktreeRegistrationMetadata(replacement.metadata) },
+        });
+        replacementId = registered.id;
+        if (tip === 'advanced')
+          await git(replacement.workingPath, 'commit', '--allow-empty', '-qm', 'replacement');
+        replacementOid = await git(replacement.workingPath, 'rev-parse', 'HEAD');
+        await git(replacement.workingPath, 'push', '-q', 'origin', replacement.branchName);
+        return result;
+      }
+    );
+    try {
+      const result = await removeEnvironment(env, { force, deleteRemoteBranch: true });
+      if (tip === 'advanced') expect(replacementOid).not.toBe(originalOid);
+      else expect(replacementOid).toBe(originalOid);
+      expect(await git(repo, 'ls-remote', pushRemote, `refs/heads/${env.branch_name}`)).toBe(
+        `${replacementOid}\trefs/heads/${env.branch_name}`
+      );
+      expect((await isolationDb.getById(replacementId))?.status).toBe('active');
+      expect(existsSync(env.working_path)).toBe(true);
+      expect(result.worktreeRemoved).toBe(true);
+      expect(result.warnings.join(' ')).toContain('Remote branch retained');
+    } finally {
+      claim.mockRestore();
+    }
+  }
+);
+
+test('remote cleanup refuses network work without registration ownership proof', async () => {
+  const originalExec = gitModule.execFileAsync;
+  const network: string[] = [];
+  const exec = spyOn(gitModule, 'execFileAsync').mockImplementation(async (file, args, options) => {
+    if (args.includes('push') || args.includes('ls-remote')) network.push(args.join(' '));
+    return originalExec(file, args, options);
+  });
+  try {
+    const result = await removeEnvironment(env, { deleteRemoteBranch: true });
+    expect(network).toEqual([]);
+    expect(result.worktreeRemoved).toBe(true);
+    expect(result.branchDeleted).toBe(true);
+    expect(result.warnings.join(' ')).toContain('Remote branch retained');
+    expect(await status()).toBe('destroyed');
+  } finally {
+    exec.mockRestore();
+  }
+});
+
+test('ordinary cleanup accepts an unchanged legacy registration with joined codebase fields', async () => {
+  const { worktree_registration_id, ...metadata } = env.metadata;
+  await db.query('UPDATE remote_agent_isolation_environments SET metadata = $1 WHERE id = $2', [
+    JSON.stringify(metadata),
+    env.id,
+  ]);
+  const selected = (await isolationDb.listAllActiveWithCodebase()).find(row => row.id === env.id);
+  if (!selected) throw new Error('Missing joined environment fixture');
+
+  const result = await removeEnvironment(selected);
+
+  expect(result.worktreeRemoved).toBe(true);
+  expect(await status()).toBe('destroyed');
+  expect(existsSync(env.working_path)).toBe(false);
+});
+
+test('ordinary cleanup keeps an existing branch the environment checked out', async () => {
+  await git(repo, 'checkout', '-q', '-b', 'operator-work');
+  await writeFile(join(repo, 'unpushed'), 'only copy');
+  await git(repo, 'add', 'unpushed');
+  await git(repo, 'commit', '-qm', 'unpushed');
+  await git(repo, 'checkout', '-q', 'main');
+  const tip = await git(repo, 'rev-parse', 'operator-work');
+  const created = await provider.create({
+    ...request(),
+    identifier: 'operator-work',
+    taskBranch: { kind: 'new', branch: toBranchName('operator-work') },
+  });
+  if (created.metadata.provenance !== 'created') throw new Error('Expected fresh creation');
+  const existing = await isolationDb.create({
+    codebase_id: codebaseId,
+    workflow_type: 'task',
+    workflow_id: 'operator-work',
+    working_path: created.workingPath,
+    branch_name: created.branchName,
+    metadata: { ...worktreeRegistrationMetadata(created.metadata) },
+  });
+
+  const result = await removeEnvironment(existing);
+
+  expect(result.worktreeRemoved).toBe(true);
+  expect(result.branchDeleted).toBeNull();
+  expect(await git(repo, 'rev-parse', 'operator-work')).toBe(tip);
+});
+
+test('listing retains a replacement directory without a Git entry', async () => {
+  await git(repo, 'worktree', 'remove', env.working_path);
+  await mkdir(env.working_path);
+  await writeFile(join(env.working_path, 'operator-file'), 'keep me');
+  const { listEnvironments } = await import('../../operations/isolation-operations');
+  const result = await listEnvironments();
+  expect(result.codebases.flatMap(codebase => codebase.environments).map(env => env.id)).toContain(
+    env.id
+  );
+  expect(await status()).toBe('active');
+  await expect(removeEnvironment(env, { force: true })).rejects.toThrow('ownership');
+  expect(await readFile(join(env.working_path, 'operator-file'), 'utf8')).toBe('keep me');
+});
+
+test('ordinary cleanup removes a proven checkout under a symlinked base', async () => {
+  await useSymlinkedBase();
+  const result = await removeEnvironment(env);
+  expect(result.worktreeRemoved).toBe(true);
+  expect(existsSync(env.working_path)).toBe(false);
+  expect(await status()).toBe('destroyed');
+});
+
+test('worktree sweep keeps a missing-path container discoverable for container cleanup', async () => {
+  const container = await seedMissingPathContainer();
+  await runScheduledCleanup();
+  expect((await isolationDb.getById(container.id))?.status).toBe('active');
+  expect((await isolationDb.listActiveContainerEnvironments()).map(row => row.id)).toContain(
+    container.id
+  );
+});
+
+test('conversation close retains a container and its conversation reference', async () => {
+  const container = await seedMissingPathContainer();
+  const conversationId = randomUUID();
+  await db.query(
+    `INSERT INTO remote_agent_conversations
+      (id, platform_type, platform_conversation_id, codebase_id, isolation_env_id, cwd)
+     VALUES ($1, 'github', $1, $2, $3, $4)`,
+    [conversationId, codebaseId, container.id, container.working_path]
+  );
+  await expect(onConversationClosed('github', conversationId)).rejects.toThrow('not a worktree');
+  expect((await isolationDb.getById(container.id))?.status).toBe('active');
+  const { rows } = await db.query<{ isolation_env_id: string; cwd: string }>(
+    'SELECT isolation_env_id, cwd FROM remote_agent_conversations WHERE id = $1',
+    [conversationId]
+  );
+  expect(rows[0]).toEqual({ isolation_env_id: container.id, cwd: container.working_path });
+});
+
+async function seedMissingPathContainer(): Promise<IsolationEnvironmentRow> {
+  const id = randomUUID();
+  await db.query(
+    `INSERT INTO remote_agent_isolation_environments
+      (id, codebase_id, provider, workflow_type, workflow_id, working_path, branch_name)
+     VALUES ($1, $2, 'container', 'task', $1, $3, '')`,
+    [id, codebaseId, join(root, 'missing-host-folder')]
+  );
+  const row = await isolationDb.getById(id);
+  if (!row) throw new Error('Container fixture missing');
+  return row;
+}
+
+/**
+ * A worktree cleanup observes a registration, then retires it. These tests
+ * re-register the same workflow between the two (an upsert keeps the row id), and
+ * expect the replacement to stay active after the cleanup's retire write.
+ */
+describe('cleanup retires only the registration it observed', () => {
+  const reRegister = (): Promise<IsolationEnvironmentRow> =>
+    isolationDb.create({
+      codebase_id: env.codebase_id,
+      workflow_type: env.workflow_type,
+      workflow_id: env.workflow_id,
+      working_path: env.working_path,
+      branch_name: toBranchName(env.branch_name),
+      metadata: env.metadata,
+    });
+
+  /** Re-register at the claim or retirement boundary, using real conditional writes. */
+  function racingStore(): {
+    store: IIsolationStore;
+    afterRetire: () => IsolationEnvironmentRow | null | undefined;
+    replacement: () => IsolationEnvironmentRow | undefined;
+  } {
+    const real = isolationDb.createIsolationStore();
+    let replacement: IsolationEnvironmentRow | undefined;
+    let after: IsolationEnvironmentRow | null | undefined;
+    const race = async (write: () => Promise<void>): Promise<void> => {
+      if (replacement) return write();
+      replacement = await reRegister();
+      try {
+        await write();
+      } finally {
+        after = await isolationDb.getById(replacement.id);
+      }
+    };
+    return {
+      store: {
+        ...real,
+        withWorktreeRegistration: async (observed, remove) => {
+          if (!replacement) replacement = await reRegister();
+          try {
+            return await real.withWorktreeRegistration(observed, remove);
+          } finally {
+            after = await isolationDb.getById(replacement.id);
+          }
+        },
+        updateStatus: (id, next) =>
+          next === 'destroyed'
+            ? race(() => real.updateStatus(id, next))
+            : real.updateStatus(id, next),
+        markWorktreeDestroyed: observed => race(() => real.markWorktreeDestroyed(observed)),
+      },
+      afterRetire: () => after,
+      replacement: () => replacement,
+    };
+  }
+
+  function expectReplacementActive(
+    after: IsolationEnvironmentRow | null | undefined,
+    replacement: IsolationEnvironmentRow | undefined
+  ): void {
+    expect(replacement?.id).toBe(env.id);
+    expect(after?.status).toBe('active');
+    expect(after?.metadata.worktree_registration_id).toBe(
+      replacement?.metadata.worktree_registration_id
+    );
+  }
+
+  test('listing reconciles only the observed missing registration', async () => {
+    await git(repo, 'worktree', 'remove', '--force', env.working_path);
+    const { listEnvironments } = await import('../../operations/isolation-operations');
+    const mark = isolationDb.markWorktreeDestroyed;
+    const update = isolationDb.updateStatus;
+    let replacement: IsolationEnvironmentRow | undefined;
+    const racingMark = spyOn(isolationDb, 'markWorktreeDestroyed').mockImplementation(
+      async observed => {
+        if (observed.id === env.id) replacement = await reRegister();
+        await mark(observed);
+      }
+    );
+    const racingUpdate = spyOn(isolationDb, 'updateStatus').mockImplementation(async (id, next) => {
+      if (id === env.id && next === 'destroyed') replacement = await reRegister();
+      await update(id, next);
+    });
+    try {
+      await listEnvironments();
+    } finally {
+      racingMark.mockRestore();
+      racingUpdate.mockRestore();
+    }
+    expectReplacementActive(await isolationDb.getById(env.id), replacement);
+  });
+
+  test.each([false, true])('refuses post-reload replacement with force=%s', async force => {
+    const getCodebase = codebaseDb.getCodebase;
+    let replacement: IsolationEnvironmentRow | undefined;
+    const racing = spyOn(codebaseDb, 'getCodebase').mockImplementation(async id => {
+      replacement = await reRegister();
+      return getCodebase(id);
+    });
+    try {
+      await expect(removeEnvironment(env, { force })).rejects.toBeInstanceOf(
+        WorktreeRegistrationChangedError
+      );
+    } finally {
+      racing.mockRestore();
+    }
+    expectReplacementActive(await isolationDb.getById(env.id), replacement);
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await git(repo, 'branch', '--list', env.branch_name)).not.toBe('');
+  });
+
+  test('conversation close refuses a registration replaced after selection', async () => {
+    const conversationId = randomUUID();
+    await db.query(
+      `INSERT INTO remote_agent_conversations
+      (id, platform_type, platform_conversation_id, codebase_id, isolation_env_id, cwd)
+      VALUES ($1, 'github', $1, $2, $3, $4)`,
+      [conversationId, codebaseId, env.id, env.working_path]
+    );
+    const readLiveRun = isolationDb.getLiveRunOwningEnv;
+    let replacement: IsolationEnvironmentRow | undefined;
+    const racing = spyOn(isolationDb, 'getLiveRunOwningEnv').mockImplementation(async (...args) => {
+      replacement ??= await reRegister();
+      return readLiveRun(...args);
+    });
+    const destroy = spyOn(getIsolationProvider(), 'destroy');
+    try {
+      await expect(onConversationClosed('github', conversationId)).rejects.toThrow(
+        'changed during cleanup'
+      );
+      expect(destroy).not.toHaveBeenCalled();
+    } finally {
+      racing.mockRestore();
+      destroy.mockRestore();
+    }
+    expectReplacementActive(await isolationDb.getById(env.id), replacement);
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await git(repo, 'branch', '--list', env.branch_name)).not.toBe('');
+    const { rows } = await db.query<{ isolation_env_id: string; cwd: string }>(
+      'SELECT isolation_env_id, cwd FROM remote_agent_conversations WHERE id = $1',
+      [conversationId]
+    );
+    expect(rows[0]).toEqual({ isolation_env_id: env.id, cwd: env.working_path });
+  });
+
+  test('scheduled missing-path cleanup refuses a registration replaced after selection', async () => {
+    await git(repo, 'worktree', 'remove', env.working_path);
+    const getLiveRun = isolationDb.getLiveRunOwningEnv;
+    let replacement: IsolationEnvironmentRow | undefined;
+    const racing = spyOn(isolationDb, 'getLiveRunOwningEnv').mockImplementation(async id => {
+      replacement = await reRegister();
+      return getLiveRun(id);
+    });
+    const destroy = spyOn(getIsolationProvider(), 'destroy');
+    try {
+      const report = await runScheduledCleanup();
+      expect(report.removed).toEqual([]);
+      expect(report.errors).toContainEqual({
+        id: env.id,
+        error: expect.stringContaining('changed during cleanup'),
+      });
+      expect(destroy).not.toHaveBeenCalled();
+    } finally {
+      racing.mockRestore();
+      destroy.mockRestore();
+    }
+    expectReplacementActive(await isolationDb.getById(env.id), replacement);
+    expect(await git(repo, 'branch', '--list', env.branch_name)).not.toBe('');
+  });
+
+  test('registration replacement is refused while removal holds the claim', async () => {
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const destroy = spyOn(getIsolationProvider(), 'destroy').mockImplementation(async () => {
+      entered.resolve();
+      await finish.promise;
+      return {
+        worktreeRemoved: false,
+        directoryClean: false,
+        branchDeleted: null,
+        remoteBranchDeleted: null,
+        warnings: [],
+      };
+    });
+    const removal = removeEnvironment(env);
+    try {
+      await entered.promise;
+      await expect(reRegister()).rejects.toBeInstanceOf(WorktreeRemovalInProgressError);
+      expect((await isolationDb.getById(env.id))?.metadata.worktree_registration_id).toBe(
+        env.metadata.worktree_registration_id
+      );
+    } finally {
+      finish.resolve();
+      await removal;
+      destroy.mockRestore();
+    }
+    const replacement = await reRegister();
+    expectReplacementActive(await isolationDb.getById(env.id), replacement);
+    expect(existsSync(env.working_path)).toBe(true);
+  });
+
+  test('run reclaim of a vanished checkout', async () => {
+    await git(repo, 'worktree', 'remove', '--force', env.working_path);
+    const { store: racing, afterRetire, replacement } = racingStore();
+    await expect(reclaimRunWorktree(run, racing)).rejects.toThrow('changed during cleanup');
+    expectReplacementActive(afterRetire(), replacement());
+  });
+
+  test('guarded run reclaim keeps the checkout', async () => {
+    const { store: racing, afterRetire, replacement } = racingStore();
+    const destroy = spyOn(getIsolationProvider(), 'destroy');
+    try {
+      await expect(reclaimRunWorktree(run, racing)).rejects.toThrow('changed during cleanup');
+      expect(destroy).not.toHaveBeenCalled();
+    } finally {
+      destroy.mockRestore();
+    }
+    expectReplacementActive(afterRetire(), replacement());
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await git(repo, 'branch', '--list', env.branch_name)).not.toBe('');
+  });
+
+  for (const lookup of ['existing', 'workflow', 'linked'] as const) {
+    test(`resolver ${lookup} lookup of a vanished checkout`, async () => {
+      if (lookup === 'linked') {
+        env = await isolationDb.create({
+          ...env,
+          workflow_type: 'issue',
+          workflow_id: '42',
+          branch_name: toBranchName(env.branch_name),
+          created_by_platform: undefined,
+          created_by_user_id: undefined,
+        });
+      }
+      await git(repo, 'worktree', 'remove', '--force', env.working_path);
+      const { store: racing, afterRetire, replacement } = racingStore();
+      const resolver = new IsolationResolver({ store: racing, provider: getIsolationProvider() });
+      await expect(
+        resolver.resolve({
+          existingEnvId: lookup === 'existing' ? env.id : null,
+          codebase: { id: codebaseId, name: 'test/repo', defaultCwd: repo },
+          hints:
+            lookup === 'linked'
+              ? { workflowType: 'task', workflowId: 'linking', linkedIssues: [42] }
+              : { workflowType: env.workflow_type, workflowId: env.workflow_id },
+          platformType: 'cli',
+        })
+      ).rejects.toBeInstanceOf(WorktreeRegistrationChangedError);
+      expectReplacementActive(afterRetire(), replacement());
+      expect(await isolationDb.getById(env.id)).toEqual(replacement() ?? null);
+    });
+  }
+
+  test('resolver release of an unlinked creation', async () => {
+    const { store: racing, afterRetire, replacement } = racingStore();
+    const resolver = new IsolationResolver({ store: racing, provider: getIsolationProvider() });
+    const created = await resolver.resolve({
+      existingEnvId: null,
+      codebase: { id: codebaseId, name: 'test/repo', defaultCwd: repo },
+      hints: { workflowType: 'task', workflowId: 'unlinked' },
+      platformType: 'cli',
+    });
+    if (created.status !== 'resolved') throw new Error('Expected creation');
+    env = created.env;
+    const destroy = spyOn(getIsolationProvider(), 'destroy');
+    try {
+      await resolver.releaseUnlinked(created);
+      expect(destroy).not.toHaveBeenCalled();
+    } finally {
+      destroy.mockRestore();
+    }
+    expectReplacementActive(afterRetire(), replacement());
+    expect(existsSync(env.working_path)).toBe(true);
+    expect(await git(repo, 'branch', '--list', env.branch_name)).not.toBe('');
+  });
+});

@@ -80,7 +80,7 @@ export function NodeSourcePanel({
   if (data === undefined) {
     return (
       <Frame label="File">
-        <p className="font-mono text-[11.5px] text-text-tertiary">{pendingMessage(error)}</p>
+        <p className="font-mono text-console-12 text-text-tertiary">{pendingMessage(error)}</p>
       </Frame>
     );
   }
@@ -102,7 +102,7 @@ export function NodeSourcePanel({
             onClick={() => {
               setRaw(v => !v);
             }}
-            className="font-mono text-[10px] uppercase tracking-[0.1em] text-text-tertiary transition-colors hover:text-text-primary"
+            className="font-mono text-console-10 uppercase tracking-widest text-text-tertiary transition-colors hover:text-text-primary"
           >
             {raw ? 'rendered' : 'raw'}
           </button>
@@ -112,49 +112,49 @@ export function NodeSourcePanel({
       <div className="flex flex-col gap-1">
         {ref === null ? null : (
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-            <span className="font-mono text-[12px] text-text-primary">{ref.name}</span>
+            <span className="font-mono text-console-12 text-text-primary">{ref.name}</span>
             {ref.owner !== null ? (
-              <span className="font-mono text-[10px] text-text-tertiary">
+              <span className="font-mono text-console-10 text-text-tertiary">
                 pack {packLabel(ref.owner)}
               </span>
             ) : null}
             {data.scope === undefined ? null : (
-              <span className="font-mono text-[10px] text-text-tertiary">{data.scope}</span>
+              <span className="font-mono text-console-10 text-text-tertiary">{data.scope}</span>
             )}
             {data.runtime === undefined ? null : (
-              <span className="font-mono text-[10px] text-text-tertiary">{data.runtime}</span>
+              <span className="font-mono text-console-10 text-text-tertiary">{data.runtime}</span>
             )}
           </div>
         )}
         {data.path !== null ? (
-          <p title={data.path} className="break-all font-mono text-[10px] text-text-tertiary">
+          <p title={data.path} className="break-all font-mono text-console-10 text-text-tertiary">
             {data.path}
           </p>
         ) : ref !== null ? (
-          <p className="font-mono text-[10px] text-text-tertiary">
+          <p className="font-mono text-console-10 text-text-tertiary">
             embedded in this build — no file on disk
           </p>
         ) : (
-          <p className="font-mono text-[10px] text-text-tertiary">
+          <p className="font-mono text-console-10 text-text-tertiary">
             written into the workflow itself, not read from a file
           </p>
         )}
         {note === undefined ? null : (
-          <p className="font-mono text-[10px] text-text-tertiary">{note}</p>
+          <p className="font-mono text-console-10 text-text-tertiary">{note}</p>
         )}
       </div>
       <div
-        className="mt-2 max-h-[420px] overflow-y-auto rounded-[8px] border bg-surface-inset p-2"
+        className="mt-2 max-h-105 overflow-y-auto rounded-md border bg-surface-inset p-2"
         style={{ borderColor: 'var(--border)' }}
       >
         {showRendered ? (
-          <div className="chat-markdown text-[12.5px] leading-relaxed text-text-primary">
+          <div className="chat-markdown text-console-13 leading-relaxed text-text-primary">
             <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>
               {data.content}
             </ReactMarkdown>
           </div>
         ) : (
-          <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-text-primary">
+          <pre className="whitespace-pre-wrap break-words font-mono text-console-12 leading-relaxed text-text-primary">
             {data.content}
           </pre>
         )}
@@ -176,7 +176,7 @@ function Frame({
   return (
     <section className="flex flex-col gap-1">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-text-tertiary">
+        <span className="font-mono text-console-10 font-semibold uppercase tracking-widest text-text-tertiary">
           {label}
         </span>
         {action}

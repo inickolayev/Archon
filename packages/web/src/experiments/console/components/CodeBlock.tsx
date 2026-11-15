@@ -88,14 +88,14 @@ export function CodeBlock({ children }: CodeBlockProps): ReactElement {
     <div className="group relative my-2">
       <pre
         ref={preRef}
-        className="overflow-x-auto rounded border bg-surface-inset p-2 text-[12px] leading-relaxed [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[12px]"
+        className="overflow-x-auto rounded border bg-surface-inset p-2 text-console-12 leading-relaxed [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-console-12"
         style={{ borderColor: 'var(--border)' }}
       >
         {children}
       </pre>
-      <div className="pointer-events-none absolute right-[6px] top-[6px] flex items-center gap-[6px]">
+      <div className="pointer-events-none absolute right-1.5 top-1.5 flex items-center gap-1.5">
         {language !== null ? (
-          <span className="rounded px-[5px] py-[1px] font-mono text-[10px] uppercase tracking-[0.12em] text-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <span className="rounded px-1.25 py-px font-mono text-console-10 uppercase tracking-widest text-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             {language}
           </span>
         ) : null}
@@ -104,7 +104,7 @@ export function CodeBlock({ children }: CodeBlockProps): ReactElement {
           onClick={copy}
           aria-label={label}
           title={label}
-          className={`pointer-events-auto rounded border bg-[color:var(--surface-elevated)] px-[7px] py-[2px] font-mono text-[10.5px] transition-opacity hover:text-text-primary focus:opacity-100 focus-visible:outline focus-visible:outline-1 group-hover:opacity-100 group-focus-within:opacity-100 ${
+          className={`pointer-events-auto rounded border bg-[color:var(--surface-elevated)] px-1.75 py-0.5 font-mono text-console-11 transition-opacity hover:text-text-primary focus:opacity-100 focus-visible:outline focus-visible:outline-1 group-hover:opacity-100 group-focus-within:opacity-100 ${
             state === 'idle' ? 'opacity-0' : 'opacity-100'
           } ${state === 'failed' ? 'text-error' : 'text-text-secondary'}`}
           style={{

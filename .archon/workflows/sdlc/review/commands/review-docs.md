@@ -1,8 +1,8 @@
 # Docs Review — Documentation Impact
 
-Find one defect: **after this change, someone following the repository's documentation would form a materially wrong expectation or lack a required step.** Wrong documentation is worse than missing documentation; unnecessary documentation is maintenance debt. Read-only: never modify files, commit, or post anywhere.
+Find this class of defect: **after this change, someone following the repository's documentation would form a materially wrong expectation or lack a required step.** Wrong documentation is worse than missing documentation; unnecessary documentation is maintenance debt. Before you start, read `review-lens.md` (`.archon/sdlc/policy/`, over the default in `$PACK_DIR/.shared/policy/`): it says how a lens stays read-only, where scratch work goes, what counts as a finding, and how a discovery is recorded. Your scratch worktree is `git worktree add --detach "$(mkdir -p "$ARTIFACTS_DIR/.archon/scratch/docs" && mktemp -d "$ARTIFACTS_DIR/.archon/scratch/docs/XXXXXX")" HEAD`, and your scratch files go under `$ARTIFACTS_DIR`.
 
-Read `$ARTIFACTS_DIR/review/scope.md` first, and the project's `architecture.md` if it has one. Anchor the review on the accepted work order's stated invariants, and scale depth to what the change can destroy: irreversible or destructive paths, lifecycle ownership, persisted contracts and schemas, credentials and auth boundaries, integration boundaries, and concurrency over shared state each get an explicit attempt to refute the invariant they rest on; a prose-only change gets the minimum. In light mode, verify prior findings from this lens first, then examine only the delta.
+Read `$ARTIFACTS_DIR/review/scope.md` first. The project's own values are in its steering documents: open, where the project has one, its `engineering.md` — at the root, in a config directory such as `.archon/`, or wherever its steering files point — only when a finding depends on a value it states, and read the section you cite, not the whole file. A preference it states is a finding you cite, and one it does not state is taste you leave out. Anchor the review on the accepted work order's stated invariants, and apply the supplied full-review policy: **$mode.output.risks**. On a continuation, scope.md names the prior report and the correction delta, and you examine only the delta. Read the prior report so you do not raise a finding again. When it holds a blocking finding still open whose `sources` include `docs`, you run to verify it: read `$ARTIFACTS_DIR/implementation.md`, judge each such finding as resolved by the delta, validly declined (the implementer's evidence holds), or still open, and check whether the fix introduced a new defect or side effect in this lens's area. Otherwise you run because the delta reaches new ground in this lens's area.
 
 ## A finding needs all four
 
@@ -15,20 +15,20 @@ Read `$ARTIFACTS_DIR/review/scope.md` first, and the project's `architecture.md`
 
 A documented statement, option, default, or example made false; removed behavior still advertised; a required migration or destructive step omitted; a public change users cannot discover; stale generated docs whose generation step was missed. When workflows, prompts, skills, or plugins ARE the product, their shipped documentation counts the same as any reference page. Before reporting either kind: verify the existing text is actually contradicted, not merely worded differently than you would word it, and confirm the reader cannot already discover the requirement through existing help, schema, or reference output.
 
+A finding's correction covers every page that makes the same claim: search the documentation for the claim, not only the page the diff touched.
+
 ## Steering files
 
 `AGENTS.md` / `CLAUDE.md` are steering, not changelogs. Suggest a change only when a stated rule is now false, a pointer moved, or a new durable invariant must guide future work. Smallest rule, reference the code, never duplicate it.
 
-## Severity
+## What a finding costs
 
-- **Critical** — docs direct a user or operator toward data loss or a breaking action.
-- **Important** — a reader acts incorrectly or cannot complete a supported task.
-- **Suggestion** — worthwhile but non-blocking.
+State what each finding costs if it merges — the concrete consequence and who meets it — and never assign it a severity: synthesis labels every finding. Name what a reader does wrong or cannot do because of it, and say whether the text is false, missing for behavior this change adds, or only improvable.
 
 ## Output
 
-Write `$ARTIFACTS_DIR/review/docs.md`: each in-scope finding begins with `sources: [docs]`, followed by the four parts (quote the false text), then the examined-and-current list with confirming evidence. In light mode, a verdict per prior finding. No findings is a valid result.
+Write `$ARTIFACTS_DIR/review/docs.md`: each in-scope finding begins with `sources: [docs]`, followed by the four parts (quote the false text), then the examined-and-current list with confirming evidence. On a continuation, a verdict per prior `docs` finding you verified: still open, fixed at `<sha>`, or validly declined, with evidence. No findings is a valid result.
 
-If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-docs.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`docs`). Write no file for no discovery; never append to another lens's file or record suspicion.
+Your discoveries file is `$ARTIFACTS_DIR/discoveries/review-docs.json`, and your `source_node` is `docs`.
 
-Verify every cited path is real, then reply with one line pointing to it: `review findings: $ARTIFACTS_DIR/review/docs.md` and the findings count by severity.
+Verify every cited path is real, then reply with one line pointing to it: `review findings: $ARTIFACTS_DIR/review/docs.md` and the findings count.

@@ -18,7 +18,10 @@ packages/cli/
 ├── src/
 │   ├── cli.ts              # Entry point, argument parsing, routing
 │   ├── commands/
-│   │   ├── workflow.ts     # workflow list/run/runs/get (approve/reject/status/resume/abandon delegate to @archon/core/operations)
+│   │   ├── workflow.ts     # workflow route module: re-exports every subcommand; reset-sessions/cleanup/event
+│   │   ├── workflow-control.ts # workflow resume/abandon/cancel/answer/approve/reject/respond (delegate to @archon/core/operations)
+│   │   ├── workflow-query.ts # workflow list/test/status/get/runs/logs/wait
+│   │   ├── workflow-run-*.ts # workflow run: select, admit, launch, execute
 │   │   ├── isolation.ts    # isolation list/cleanup (list/merged-cleanup delegate to @archon/core/operations)
 │   │   ├── setup.ts        # setup command implementation
 │   │   ├── chat.ts         # chat command implementation
@@ -46,9 +49,9 @@ packages/cli/
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ loadArchonEnv(cwd)  — both loads use override: true             │
+│ loadCliEnv(cwd) — wraps loadArchonEnv with identity protection  │
 │   1. ~/.archon/.env        (home scope)                         │
-│   2. <cwd>/.archon/.env    (repo scope, wins over home)         │
+│   2. <cwd>/.archon/.env    (repo scope, exceptions below)       │
 │   Emits one [archon] loaded N keys from <path> line per file    │
 │   when N > 0 and ARCHON_VERBOSE_BOOT=1 or LOG_LEVEL=debug/trace.│
 └─────────────────────────────────┬───────────────────────────────┘
@@ -61,9 +64,9 @@ packages/cli/
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ cli.ts  Git repository check                                    │
-│                 Skip for version/help, validate and resolve to  │
-│                 repo root for workflow/isolation commands       │
+│ cli.ts  Project resolution                                      │
+│                 Honor folder selection and registered folders;  │
+│                 otherwise resolve the nearest Git checkout      │
 └─────────────────────────────────┬───────────────────────────────┘
                                   │
                                   ▼
@@ -80,11 +83,16 @@ packages/cli/
 
 **Code:** `packages/cli/src/cli.ts`
 
-**Git repository check:**
-- Commands `workflow`, `isolation`, and `complete` require running from a git repository
-- Commands `version`, `help`, `setup`, and `chat` bypass this check
-- When in a subdirectory, automatically resolves to repository root
-- Exit code 1 if not in a git repository
+Repository env normally overrides home env. The CLI preserves the user-scope `GH_CONFIG_DIR` (including its absence), so repository env cannot redirect the stored gh login. Inside a workflow, inherited GitHub identity values take precedence over both env files, including empty values that disable host credentials. See [forge plugin configuration](/reference/forge/#plugin-configuration).
+
+**Project resolution:**
+
+- `workflow run --folder` uses the supplied canonical directory, even inside Git, and explicitly registers it as a folder project.
+- A registered folder and its ordinary descendants resolve to the folder directory. Archon runs folder workflows in place without managing a worktree, branch or PR.
+- A Git repository nested inside a registered folder retains its own repository identity. Other Git paths resolve to the nearest repository root, preserving linked-checkout ownership.
+- Unregistered non-Git execution requires folder registration; first-use CLI execution uses `workflow run --folder`. Without registration or that flag, execution exits with code 1.
+- File-only dry runs and fixture tests can inspect local files without registration. On a readable registry they honor folder ownership; if lookup fails they use the proven Git root or supplied directory. `workflow list` and `validate` retain their Git-root fallback when the registry cannot open.
+- `version`, `help`, `setup`, and `chat` bypass project resolution.
 
 ---
 
@@ -97,13 +105,13 @@ packages/cli/
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ workflow.ts  workflowListCommand(cwd, { name, full, json })      │
+│ workflow-query.ts  workflowListCommand(cwd, { name, full, json })│
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ @archon/workflows/workflow-discovery                              │
-│ discoverWorkflowsWithConfig(cwd, config)                          │
+│ discoverWorkflowsWithConfig(cwd, loadConfig, providerRegistry)    │
 │ - Loads bundled defaults                                         │
 │ - Searches .archon/workflows/ recursively                        │
 │ - Merges (repo overrides defaults by name)                       │
@@ -126,7 +134,7 @@ packages/cli/
 └──────────────────────────┘   └───────────────────────────────────┘
 ```
 
-**Code:** `packages/cli/src/commands/workflow.ts`
+**Code:** `packages/cli/src/commands/workflow-query.ts`
 
 ---
 
@@ -134,64 +142,51 @@ packages/cli/
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ archon workflow run <name> [message] [--branch X] [--from X] [--no-worktree]│
+│ archon workflow run <name> [message] [--branch X] [--detach] …  │
 └─────────────────────────────────┬───────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ workflow.ts:78-92  Discover & find workflow by name             │
-│                    Error if not found (lists available)         │
+│ selectRunWorkflow()                                             │
+│ - Locate the run a continuation resumes                         │
+│ - Capture the workflow source, then discover from the capture   │
+│ - Find the workflow by name (error lists available)             │
 └─────────────────────────────────┬───────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ workflow.ts:99  Create CLIAdapter for stdout                    │
+│ admitRunExecution()   (--dry-run stops before this)             │
+│ - Flag, worktree policy, input and capability gates             │
 └─────────────────────────────────┬───────────────────────────────┘
                                   │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ workflow.ts:104-133  Database setup                             │
-│ - Create conversation: cli-{timestamp}-{random}                 │
-│ - Lookup codebase from directory (warn if fails)                │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
                     ┌─────────────┴─────────────┐
                     │                           │
-             no --branch                   --branch
+                --detach                    (default)
                     │                           │
                     ▼                           ▼
 ┌───────────────────────────┐   ┌───────────────────────────────────┐
-│ Use cwd as-is             │   │ workflow.ts:152-168                │
-│                           │   │ Auto-detect git repo               │
-│                           │   │ Auto-register codebase if needed   │
-└─────────────┬─────────────┘   └───────────────┬───────────────────┘
-              │                                 │
-              │                   ┌─────────────┴─────────────┐
-              │                   │                           │
-              │            --no-worktree               (default)
-              │                   │                           │
-              │                   ▼                           ▼
-              │   ┌─────────────────────────┐ ┌─────────────────────────┐
-              │   │ workflow.ts:171-175     │ │ workflow.ts:177-219     │
-              │   │ git.checkout(cwd, branch)│ │ Check existing worktree │
-              │   │                         │ │ If healthy → reuse      │
-              │   │                         │ │ Else → provider.create()│
-              │   │                         │ │ Track in DB             │
-              │   └────────────┬────────────┘ └────────────┬────────────┘
-              │                │                           │
-              └────────────────┴─────────────┬─────────────┘
-                                             │
-                                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ workflow.ts:235-243  executeWorkflow()                          │
-│ - Pass adapter, conversation, workflow, cwd, message            │
-│ - Stream AI responses to stdout                                 │
-│ - Return success/failure                                        │
-└─────────────────────────────────────────────────────────────────┘
+│ launchDetachedOwnedRun()  │   │ prepareForegroundLaunch()         │
+│ Pre-flight, write the run │   │ Destination, project, adoption    │
+│ row, fork the child       │   │ lane, --resume binding, AI config │
+└───────────────────────────┘   └───────────────┬───────────────────┘
+                                                │
+                                                ▼
+                                ┌───────────────────────────────────┐
+                                │ provisionWorkspace()              │
+                                │ Folder seam, reused --branch      │
+                                │ worktree, or a new worktree       │
+                                └───────────────┬───────────────────┘
+                                                │
+                                                ▼
+                                ┌───────────────────────────────────┐
+                                │ executeOwnedRun()                 │
+                                │ Signal guard, progress, engine    │
+                                │ submit or resume, wait, teardown, │
+                                │ result                            │
+                                └───────────────────────────────────┘
 ```
 
-**Code:** `packages/cli/src/commands/workflow.ts:72-251`
+**Code:** `workflowRunCommand` in `packages/cli/src/commands/workflow-run-owned.ts`, which owns the captured source and the durable-wait loop. The phases live in `workflow-run-admission.ts`, `workflow-run-launch.ts` and `workflow-run-execution.ts` beside it.
 
 **Worktree Provider:** `packages/isolation/src/providers/worktree.ts`
 
@@ -233,135 +228,115 @@ can fail before either write.
 
 ## `isolation list` Flow
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ archon isolation list                                           │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ isolation.ts:19-57  isolationListCommand()                      │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ @archon/core isolationDb.listAllActiveWithCodebase()            │
-│ - Joins isolation_environments with codebases                   │
-│ - Returns: path, branch, workflow_type, codebase_name,          │
-│            platform, days_since_activity                        │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ isolation.ts:30-55  Group by codebase, print table              │
-└─────────────────────────────────────────────────────────────────┘
+```text
+archon isolation list → isolationListCommand()
+  │
+  ├─ @archon/core listEnvironments()
+  │    ├─ isolationDb.listAllActiveWithCodebase()
+  │    ├─ For each codebase: isolationDb.listByCodebaseWithAge()
+  │    │    └─ Reconcile missing worktrees, preserving live-run ownership
+  │    └─ Return environments grouped by codebase and reconciliation totals
+  │
+  ├─ Print worktree details and totals (return early if no codebases)
+  │
+  ├─ @archon/core listContainerEnvironments()
+  │    ├─ isolationDb.listActiveContainerEnvironments()
+  │    ├─ getRunByIsolationEnvId() for each container
+  │    │    └─ Return matched run or null; throw on query/status errors
+  │    └─ Build summaries; catch lookup errors and set runStatus: lookup-failed
+  │
+  └─ Print container details and totals: run status, no run (orphan),
+     or run lookup failed
 ```
 
-**Code:** `packages/cli/src/commands/isolation.ts:19-57`
+**Code:** `packages/cli/src/commands/isolation.ts` (`isolationListCommand`),
+`packages/core/src/operations/isolation-operations.ts`
+(`listEnvironments`), `packages/core/src/services/cleanup/containers.ts`
+(`listContainerEnvironments`), `packages/core/src/db/workflow-run-reads.ts`
+(`getRunByIsolationEnvId`).
+
+The container listing matches `metadata.isolation_env_id`; no match does not
+establish that cleanup can remove the container. Cleanup checks wider live
+ownership. A failed lookup is logged and displayed as `run lookup failed`.
 
 ---
 
 ## `isolation cleanup` Flow
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ archon isolation cleanup [days]                                 │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ isolation.ts:62-99  isolationCleanupCommand(daysStale)          │
-│                     default: 7 days                             │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ @archon/core isolationDb.findStaleEnvironments(days)            │
-│ - WHERE last_activity_at < now - days                           │
-│ - Excludes telegram platform                                    │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ For each stale environment:                                     │
-│ 1. provider.destroy(path, options)                              │
-│ 2. Update DB status → 'destroyed'                               │
-│ 3. Log result                                                   │
-└─────────────────────────────────────────────────────────────────┘
+```text
+archon isolation cleanup [days] (default: 7)
+  │
+  ├─ Reconcile missing worktrees (preserve container rows)
+  │
+  ├─ findStaleEnvironments(days)
+  │    └─ Filter provider = 'worktree'
+  │         └─ For each stale worktree:
+  │              ├─ Skip environments owned by resumable runs
+  │              ├─ Skip any with a commit on no remote (getCleanupRunLock)
+  │              └─ provider.destroy(path, options)
+  │                   └─ Mark destroyed only after complete removal
+  │
+  └─ cleanupContainerEnvironments(days), even when no worktrees are stale
+       ├─ Skip containers owned by resumable runs
+       └─ Container backend removes container and volume
+            └─ Mark destroyed only after successful removal
 ```
 
-**Code:** `packages/cli/src/commands/isolation.ts:62-99`
+**Code:** `isolationCleanupCommand` in `packages/cli/src/commands/isolation.ts`
 
 ---
 
 ## `isolation cleanup --merged` Flow
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ archon isolation cleanup --merged [--include-closed]            │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ isolation.ts  isolationCleanupMergedCommand({ includeClosed })  │
-│ For each codebase → cleanupMergedWorktrees(codebaseId, path)    │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                     For each active environment
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ judgeBranchForRemoval() — three-signal union                    │
-│  localBranchExists()     gate: (a) and (b) need the local ref   │
-│  (a) isBranchMerged()    git ancestry (fast-forward/merge)      │
-│  (b) isPatchEquivalent() git cherry  (1-commit squash-merge)    │
-│  (c) getPrState()        gh CLI      (MERGED/CLOSED/OPEN/NONE/  │
-│                                      UNAVAILABLE)               │
-│                                                                 │
-│  any git signal          → 'reclaimable' if the worktree HEAD   │
-│                            also passes `git cherry <base> HEAD` │
-│  MERGED                  → 'reclaimable' if the worktree HEAD   │
-│                            and the branch ref (where each       │
-│                            exists) are at or behind the PR head │
-│  CLOSED                  → same, only if includeClosed          │
-│  OPEN                    → 'open-pr', always kept               │
-│  UNAVAILABLE             → 'pr-unavailable', kept and reported  │
-│  NONE and ref present    → 'unmerged', not reclaimed            │
-│  NONE and ref gone       → 'unjudgeable', kept and reported     │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │ 'reclaimable'
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Guard checks: no uncommitted changes, no run can still claim    │
-│ the env (getRemovalBlocker)                                     │
-│ provider.destroy() → remove worktree + delete remote branch     │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. `isolationCleanupMergedCommand` calls `cleanupMergedWorktrees` for each codebase.
+2. `judgeBranchForRemoval` first checks base ancestry and patch equivalence, requiring
+   coverage of both the branch ref and worktree HEAD. Otherwise it checks the branch-name PR. A merged PR authorizes
+   removal only if its head covers every existing local tip: worktree HEAD and
+   recorded branch ref (`isRevCoveredBy`). With neither tip left, its state suffices.
+3. If branch lookup cannot prove coverage, `getPrsForCommit` discovers candidates
+   from HEAD and then the branch tip, querying equal tips only once. A merged
+   candidate must cover both tips by itself. An open branch PR does not suppress
+   a covering merged candidate, and coverage is never combined across PR heads.
+4. Missing candidate heads are fetched from the configured remote. A comparison
+   failure immediately stops judgment for that environment, reports the error, and
+   retains the worktree without trying later candidates. Lookup failure produces
+   `pr-unavailable`; both failures keep the environment and prevent scheduled stale deletion.
+5. Commit association lookup first requests associated PRs. A nonempty result skips
+   commit inspection. If the lookup fails or returns no PRs, it queries GitHub's object
+   by OID in the configured repository. After an empty association or a structured HTTP 422 rejection, an
+   error-free response with an accessible repository and a null object produces
+   `UNKNOWN_COMMIT`; this proves absence only in that repository. It does not
+   establish absence across GitHub. Lookup errors and malformed responses stay
+   `UNAVAILABLE`, even if object inspection returns null, except for that confirmed
+   422 rejection. HTTP 422 alone does not prove absence. An unknown tip does not stop
+   inspection of other tips or covering candidates. Without eligible proof, an unknown
+   commit produces `unknown-commit`, reporting that no PR covers all local work because
+   a local commit was not found in the configured repository, and preventing scheduled
+   stale deletion. An open PR then produces `open-pr`; the
+   remaining verdicts are `unmerged`, or `unjudgeable` when the branch ref is gone
+   and no PR answers.
+   Manual merged cleanup reports all of these. Ordinary `unmerged` can still
+   proceed through the scheduled age policy and its unpushed-commit checks.
+6. A `merged` or explicitly included `pr-closed` verdict reaches `checkRemoval`: dirty worktrees and running, pending,
+   or paused owners stay. A failed run's lock may be released by this settlement.
+   `provider.destroy` removes the worktree and local branch, then retires the
+   registration. Remote branches are retained with a warning because ownership
+   cannot be proved after retirement.
 
-Signals are evaluated in order — the first positive match short-circuits to avoid
-unnecessary `gh` API calls. The `gh` CLI is a soft dependency: when it is not installed or
-the remote is not GitHub, only git signals are used (`NONE`). When `gh` is there but fails
-(auth, rate limit, unreadable output) the result is `UNAVAILABLE`, and the environment is
-kept and reported rather than passed to the staleness sweep.
+Manual `includeClosed` also authorizes closed PRs whose head covers every local tip,
+with a `pr-closed` verdict and `PR closed` release reason. Scheduled cleanup does not
+opt in. A base inspection failure immediately stops judgment for that environment,
+reports the error, and retains the worktree without trying PR evidence. The optional
+`gh` CLI currently provides GitHub evidence. An unsupported remote returns `NONE` (no PR proof).
+For a GitHub remote, missing `gh` or another lookup failure returns `UNAVAILABLE`,
+retaining and reporting the worktree and blocking scheduled stale deletion when
+Git has not already proved integration. A failed lookup is never an empty
+successful response. No pack branch naming is used.
 
-A multi-commit squash merge is invisible to both git signals, so PR state is the only
-one that sees it. Both git signals also need the local branch ref: once it is gone, the
-PR is the only judge, and a branch with no PR is reported as unverifiable instead of
-failing the check. A MERGED or CLOSED PR only covers the commits it carried. Run
-branch names are reused, and removal deletes both the worktree and the branch, so each
-local tip that still exists, the worktree's HEAD and the branch ref, must be the PR's head
-commit or an ancestor of it (`isRevCoveredBy`). A detached HEAD or a reused branch with
-commits past the PR head is unmerged work. The same holds when git proves the merge: the worktree's
-HEAD must also pass `git cherry <base> HEAD`, which answers for both git signals (an
-ancestor of the base lists nothing, a squash-merged commit lists as `-`). A HEAD it
-cannot answer for is reported as a failed merge check. A PR head pushed from elsewhere and never fetched here is
-fetched by SHA from the branch's remote first; if that fetch fails, the check fails and
-the worktree is kept, with the fetch error in the reason. The scheduled sweep (`runScheduledCleanup`) makes the same call, so
-both paths agree on what counts as merged.
-
-**Code:** `packages/core/src/services/cleanup-service.ts` — `judgeBranchForRemoval()`, `cleanupMergedWorktrees()`, `runScheduledCleanup()`, `getRemovalBlocker()`
-**Code:** `packages/isolation/src/pr-state.ts` — `getPrState()`
-**Code:** `packages/git/src/branch.ts` — `isPatchEquivalent()`, `localBranchExists()`
+**Code:** `packages/core/src/services/cleanup/` — `merge-verdict.ts`,
+`merged-sweep.ts`, `scheduled-sweep.ts`, `run-lock.ts` and `remove-environment.ts`.
+PR reads live in `packages/isolation/src/pr-state.ts`; ancestry and head fetching
+live in `packages/git/src/branch.ts`.
 
 ---
 
@@ -389,7 +364,7 @@ Implements `IPlatformAdapter` for terminal output.
 
 | Function | Package | Location | Purpose |
 |----------|---------|----------|---------|
-| `discoverWorkflowsWithConfig(cwd, config)` | `@archon/workflows/workflow-discovery` | `workflows/src/workflow-discovery.ts` | Find and parse workflow YAML |
+| `discoverWorkflowsWithConfig(cwd, loadConfig, providerRegistry)` | `@archon/workflows/workflow-discovery` | `workflows/src/workflow-discovery.ts` | Find and parse workflow YAML |
 | `executeWorkflow(...)` | `@archon/workflows/executor` | `workflows/src/executor.ts` | Run workflow steps |
 | `getIsolationProvider()` | `@archon/isolation` | `isolation/src/factory.ts` | Get WorktreeProvider singleton |
 | `conversationDb.*` | `@archon/core` | `core/src/db/conversations.ts` | Conversation CRUD |
@@ -404,9 +379,9 @@ Implements `IPlatformAdapter` for terminal output.
 
 CLI conversations use ID format: `cli-{timestamp}-{random}`
 
-Example: `cli-1705932847321-a7f3b2`
+The random suffix contains 16 cryptographically random bytes encoded as 32 hex characters.
 
-Generated at: `packages/cli/src/commands/workflow.ts`
+Generated at: `packages/cli/src/utils/conversation-id.ts`
 
 ---
 
@@ -416,15 +391,17 @@ When `--branch` is provided:
 
 1. **Lookup:** `isolationDb.findActiveByWorkflow(codebaseId, 'task', branchName)`
 2. **Health check:** `provider.healthCheck(path)` on existing
-3. **Reuse:** If found and healthy (warns if `--from` was specified but not applied)
-4. **Create:** If not found or unhealthy -- passes a `taskBranch: { kind: 'new', fromBranch }`
+3. **Branch verification:** Read the current local branch. Refuse a different branch or detached
+   HEAD, naming the requested branch, actual branch, and path without changing the checkout.
+4. **Reuse:** If found, healthy, and on the requested branch (warns if `--from` was specified but not applied)
+5. **Create:** If not found or unhealthy -- passes a `taskBranch: { kind: 'new', fromBranch }`
    selection to the provider when `--from` is specified. Adoption instead passes
    `taskBranch: { kind: 'existing', branch }`, which checks out that exact local branch
    without creating a child branch or syncing it to a remote.
 
 Worktrees stored at: `~/.archon/workspaces/<owner>/<repo>/worktrees/<branch-slug>/`
 
-**Code:** `packages/cli/src/commands/workflow.ts:177-219`
+**Code:** `provisionWorktree` in `packages/cli/src/commands/workflow-run-launch.ts`
 
 ---
 
@@ -432,8 +409,11 @@ Worktrees stored at: `~/.archon/workspaces/<owner>/<repo>/worktrees/<branch-slug
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 1 | Error (logged to stderr, including not in git repo) |
+| 0 | Success, except for the JSON control refusals noted below. |
+| 1 | Error. Answer commands (`answer`, `respond`, `approve`, `reject`) and `resume --detach` also return 1 on refusal. Human-mode diagnostics go to stderr; JSON refusals emit `ok: false` with the reason on stdout. |
+
+Non-detached JSON `resume`, `abandon`, and `cancel` can return 0 with `ok: false`.
+Check `ok` when consuming those acknowledgments.
 
 ---
 

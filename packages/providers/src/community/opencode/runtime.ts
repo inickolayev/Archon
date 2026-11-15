@@ -48,8 +48,7 @@ async function startEmbeddedOpencode(
   createOpencode: (
     options: Record<string, unknown>
   ) => Promise<{ client: unknown; server: { url: string; close(): void } }>,
-  startupPort: number,
-  signal?: AbortSignal
+  startupPort: number
 ): Promise<{ client: unknown; server: { url: string; close(): void } }> {
   // Clear any pre-existing OpenCode server credential env vars so the embedded
   // server uses the random password generated in buildEmbeddedServerConfig rather
@@ -62,11 +61,12 @@ async function startEmbeddedOpencode(
     delete process.env.OPENCODE_SERVER_USERNAME;
   }
 
+  // The SDK binds startup signals for the process lifetime; caller cancellation
+  // belongs to acquisition and sessions, while the final release owns shutdown.
   return await createOpencode({
     hostname: '127.0.0.1',
     port: startupPort,
     timeout: OPENCODE_START_TIMEOUT_MS,
-    signal,
     config: buildEmbeddedServerConfig(startupPort),
   });
 }
@@ -152,28 +152,13 @@ function killProcess(pid: number): void {
   }
 }
 
-function errorText(error: unknown): string {
-  if (error instanceof Error) return `${error.name} ${error.message}`.toLowerCase();
-  return String(error).toLowerCase();
-}
-
 function isPortBindConflict(error: unknown): boolean {
-  const message = errorText(error);
-
-  if (
+  return (
     typeof error === 'object' &&
     error !== null &&
     'code' in error &&
-    typeof (error as { code?: unknown }).code === 'string' &&
-    (error as { code: string }).code.toUpperCase() === 'EADDRINUSE'
-  ) {
-    return true;
-  }
-
-  return (
-    message.includes('eaddrinuse') ||
-    message.includes('address already in use') ||
-    message.includes('failed to start server on port')
+    typeof error.code === 'string' &&
+    error.code.toUpperCase() === 'EADDRINUSE'
   );
 }
 
@@ -205,14 +190,10 @@ export async function acquireEmbeddedRuntime(signal?: AbortSignal): Promise<Embe
         let lastError: unknown;
 
         for (let attempt = 0; attempt < OPENCODE_START_MAX_RETRIES; attempt += 1) {
-          if (signal?.aborted) {
-            throw new Error('OpenCode runtime startup aborted');
-          }
-
           const startupPort = pickRandomStartupPort();
 
           try {
-            runtime = await startEmbeddedOpencode(createOpencode, startupPort, signal);
+            runtime = await startEmbeddedOpencode(createOpencode, startupPort);
             break;
           } catch (error) {
             lastError = error;
@@ -251,9 +232,33 @@ export async function acquireEmbeddedRuntime(signal?: AbortSignal): Promise<Embe
     })();
   }
 
-  const runtime = await embeddedRuntimePromise;
-  runtime.refCount += 1;
-  return runtime;
+  const acquisition = embeddedRuntimePromise.then(runtime => {
+    runtime.refCount += 1;
+    return runtime;
+  });
+  if (!signal) return await acquisition;
+
+  return await new Promise<EmbeddedRuntime>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error('OpenCode runtime startup aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+
+    acquisition.then(
+      runtime => {
+        signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) {
+          releaseEmbeddedRuntime(runtime);
+          onAbort();
+        } else {
+          resolve(runtime);
+        }
+      },
+      error => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 
 export function releaseEmbeddedRuntime(runtime: EmbeddedRuntime): void {
@@ -304,18 +309,21 @@ export async function disposeInstanceForDirectory(
   }
 }
 
-/**
- * Cheap availability probe for `archon doctor` — resolves the embedded
- * OpenCode SDK module WITHOUT starting the server.
- *
- * `acquireEmbeddedRuntime` spawns a child process and binds a port, which is
- * far too heavy for a diagnostic. This only confirms the SDK is installed and
- * its `createOpencode` entrypoint is present, so doctor can report runtime
- * readiness without the boot. Throws if the module cannot be resolved.
- */
-export async function probeOpencodeRuntimeModule(): Promise<boolean> {
+/** Check SDK and executable availability without starting a server or binding a port. */
+export async function probeOpencodeRuntime(
+  signal: AbortSignal
+): Promise<'ready' | 'sdk-entrypoint-missing' | 'executable-missing'> {
+  signal.throwIfAborted();
   const mod = await import('@opencode-ai/sdk');
-  return typeof (mod as { createOpencode?: unknown }).createOpencode === 'function';
+  signal.throwIfAborted();
+  if (typeof mod.createOpencode !== 'function') return 'sdk-entrypoint-missing';
+
+  // Bun searches PATH (on Windows for .exe/.cmd/.bat/.com, not PATHEXT or cwd),
+  // so a custom-PATHEXT or cwd-only install reads as missing. Without the option
+  // it uses the PATH from process start, not the env the SDK spawn inherits.
+  return Bun.which('opencode', { PATH: process.env.PATH }) === null
+    ? 'executable-missing'
+    : 'ready';
 }
 
 /** Reset the embedded runtime state. For testing only. */
