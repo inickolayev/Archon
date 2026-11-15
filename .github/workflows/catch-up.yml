@@ -211,6 +211,13 @@ jobs:
         if: steps.need.outputs.merge == 'true'
         env:
           TARGET: ${{ steps.target.outputs.sha }}
+          # Repository variable, set by a person once the Factory's token can push workflow
+          # files. This check used to assume the token never could: when the scope was granted
+          # (2026-11-15) it kept labelling every night `needs-credential`, and the roll-forward
+          # kept refusing to send the repair agent, 42 nights in a row. The token lives on the
+          # Factory's machine and this job cannot look at it, so the person who grants or
+          # revokes the scope flips this variable too.
+          FACTORY_PUSHES_WORKFLOWS: ${{ vars.FACTORY_PUSHES_WORKFLOWS }}
         run: |
           set -euo pipefail
           # From the point we diverged, not from our HEAD: our own `test.yml` permanently
@@ -219,7 +226,14 @@ jobs:
           # The question is what THEY changed in the range we are about to take.
           base="$(git merge-base HEAD "${TARGET}")"
           touched="$(git diff --name-only "${base}" "${TARGET}" -- .github/workflows || true)"
-          if [ -n "${touched}" ]; then
+          if [ -n "${touched}" ] && [ "${FACTORY_PUSHES_WORKFLOWS:-false}" = true ]; then
+            echo 'blocked=false' >> "${GITHUB_OUTPUT}"
+            {
+              echo 'Диапазон трогает файлы воркфлоу; токен фабрики их отправить может'
+              echo '(переменная `FACTORY_PUSHES_WORKFLOWS=true`):'
+              printf '```\n%s\n```\n' "${touched}"
+            } | tee -a "${GITHUB_STEP_SUMMARY}"
+          elif [ -n "${touched}" ]; then
             echo 'blocked=true' >> "${GITHUB_OUTPUT}"
             {
               echo 'Этот диапазон трогает файлы воркфлоу, а наш токен их менять не может'
