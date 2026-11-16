@@ -329,6 +329,12 @@ jobs:
           # so don't leave it in the worktree's git config.
           persist-credentials: false
 
+      # Fork-only step: the release tags these checks read are upstream's, and this fork does
+      # not publish them — pushing a v* tag here would fire release.yml and publish.yml. Fetch
+      # them into this checkout instead, so the baselines match the committed vintage fixtures.
+      - name: Fetch upstream release tags
+        run: git fetch --no-tags https://github.com/coleam00/Archon.git '+refs/tags/v*:refs/tags/v*'
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:

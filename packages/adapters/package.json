@@ -44,7 +44,12 @@
       "src/forge/github/project-assistant.integration.test.ts"
     ],
     [
-      "src/chat/telegram/",
+      "src/chat/telegram/attachments.test.ts",
+      "src/chat/telegram/markdown.test.ts",
+      "src/chat/telegram/media-group.test.ts",
+      "src/chat/telegram/quotes.test.ts",
+      "src/chat/telegram/turn-status-text.test.ts",
+      "src/chat/telegram/turn-status.test.ts",
       "src/community/chat/",
       "src/community/forge/gitea/comment-delivery.test.ts",
       "src/community/forge/gitea/webhook-intake.test.ts",
@@ -56,6 +61,18 @@
       "src/forge/github/webhook-intake.test.ts",
       "src/test/no-archon-home-writes.test.ts",
       "src/utils/"
+    ],
+    [
+      "src/chat/telegram/turn-status-transport.test.ts"
+    ],
+    [
+      "src/chat/telegram/outbound-images.test.ts"
+    ],
+    [
+      "src/chat/telegram/adapter-quotes.test.ts"
+    ],
+    [
+      "src/chat/telegram/adapter.test.ts"
     ],
     [
       "src/forge/github/adapter.test.ts"

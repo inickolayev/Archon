@@ -1,3 +1,4 @@
+// @archon-test-isolated
 import { describe, expect, mock, test } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 
