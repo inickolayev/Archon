@@ -101,6 +101,14 @@ jobs:
             existing="$(gh issue list -R "${GITHUB_REPOSITORY}" --label needs-agent --state open \
                           --limit 20 --json number,title \
                           --jq '[.[] | select(.title | startswith("catch-up:"))] | first | .number // empty')"
+            # The listing lags behind a close by a few seconds. On 2026-11-16 "Close what is no
+            # longer true" closed #10 and two seconds later this still listed it, so the night's
+            # new conflict went into a closed issue and the roll-forward found nothing to repair.
+            # Ask the issue itself, which is consistent.
+            if [ -n "${existing}" ] && [ "$(gh issue view "${existing}" -R "${GITHUB_REPOSITORY}" \
+                                             --json state --jq '.state')" != OPEN ]; then
+              existing=''
+            fi
             if [ -n "${existing}" ]; then
               # The night is worth recording even when the problem is not new: "still stuck,
               # four nights running" is the fact a person acts on.
