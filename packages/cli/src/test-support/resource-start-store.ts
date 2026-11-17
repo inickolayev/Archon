@@ -37,7 +37,7 @@ export function createInMemoryResourceStartStore(
   listReusableCheckouts: () => Promise<readonly ReusableCheckout[]>,
   recordNotice: (notice: NonNullable<ReturnType<typeof skippedFireNotice>>) => Promise<void>
 ): IResourceStartStore & {
-  /** Take a slot for an admitted failed or paused run's resume, or say what blocks it. */
+  /** Take a slot for an admitted failed or paused run's resume, or say what blocks it. A running run keeps its own. */
   resume(run: WorkflowRun): Promise<ResourceBlocker | null>;
   /** Give back the slot of an admitted run; whether it held one. */
   release(id: string): Promise<boolean>;
@@ -121,7 +121,7 @@ export function createInMemoryResourceStartStore(
     const previous = requests.get(intent.launch.run.id);
     if (previous) return decision(previous);
     const launch = preparedWorkflowLaunchSchema.parse(intent.launch);
-    const blocker = resourceStartBlocker(await occupancy(intent.resource), launch);
+    const blocker = resourceStartBlocker(await occupancy(intent.resource), launch, intent.hostId);
     const request: ResourceStartRequestInspection = {
       id: launch.run.id,
       resource: intent.resource,
@@ -177,6 +177,8 @@ export function createInMemoryResourceStartStore(
     resume: async run => {
       const request = requests.get(run.id);
       if (request?.status !== 'admitted') return null;
+      // A running run resumed without its owner keeps the slot it holds, if it holds one.
+      if (run.status === 'running' && !released.has(run.id)) return null;
       if (run.status !== 'failed' && run.status !== 'paused')
         throw new WorkflowNotResumableError(run.id, run.status);
       const blocker = resourceResumeBlocker(await occupancy(request.resource), {
@@ -206,7 +208,8 @@ export function createInMemoryResourceStartStore(
         throw new Error(`Run '${id}' is ${run?.status ?? 'missing'}, not pending`);
       const blocker = resourceStartBlocker(
         { ...(await occupancy(resource)), capacity: installed.get(resource) ?? capacity },
-        launch
+        launch,
+        DIRECT_START_HOST_ID
       );
       if (blocker) return blocker;
       requests.set(id, {
@@ -307,9 +310,11 @@ export function createInMemoryResourceStartStore(
     listPendingStartBindings: async ({
       hostId,
       limit = 100,
+      receiptIds,
     }): ReturnType<IResourceStartStore['listPendingStartBindings']> =>
       structuredClone(
         [...receipts.values()]
+          .filter(receipt => !receiptIds || receiptIds.includes(receipt.id))
           .flatMap(receipt => receipt.bindings)
           .filter(
             item =>

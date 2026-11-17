@@ -20,7 +20,6 @@ export { execFileAsync, mkdirAsync, resolveBashPath } from './exec';
 // Worktree operations
 export {
   getWorktreeBase,
-  isProjectScopedWorktreeBase,
   worktreeExists,
   listWorktrees,
   findWorktreeByBranch,
@@ -55,10 +54,8 @@ export {
   localBranchExists,
   countCommitsAhead,
   countCommitsMissingFromRemotes,
-  checkout,
   hasUncommittedChanges,
   hasUncommittedChangesStrict,
-  commitAllChanges,
   isBranchMerged,
   isPatchEquivalent,
   isAncestorOf,
@@ -66,9 +63,6 @@ export {
   getLastCommitDate,
 } from './branch';
 
-// Forge detection
-export { detectForge } from './forge';
-export type { ForgeType, ForgeInfo } from './forge';
 export { GITHUB_COM_HOST, parseGitHubHost, readGitHubHost, resolveGitHubHost } from './github-host';
 export type { GitHubHost } from './github-host';
 
@@ -76,7 +70,6 @@ export type { GitHubHost } from './github-host';
 export {
   findRepoRoot,
   getDefaultRemote,
-  getRemoteUrl,
   listChildRepos,
   syncWorkspace,
   fetchWithRetry,

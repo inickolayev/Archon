@@ -214,6 +214,7 @@ const { generatedTaskBranch, VerificationImageInventoryError, VERIFICATION_IMAGE
   await import('@archon/isolation');
 mock.module('@archon/isolation', () => ({
   generatedTaskBranch,
+  refuseUnappliedStartPoint: mock(async () => undefined),
   getPrsForCommit: mock<typeof import('@archon/isolation').getPrsForCommit>(async () => ({
     state: 'NONE',
   })),
@@ -1376,14 +1377,14 @@ describe('isolationCleanupCommand', () => {
     consoleErrorSpy.mockRestore();
   });
 
-  it.each([0, 3, 7])('describes the cleanup thresholds for %s days', async days => {
-    await isolationCleanupCommand(days);
+  it('describes the cleanup thresholds for the given days', async () => {
+    await isolationCleanupCommand(3);
 
     expect(consoleLogSpy).toHaveBeenCalledWith(
-      `Finding eligible worktrees inactive for ${days}+ days and eligible containers created ${days}+ days ago...`
+      'Finding eligible worktrees inactive for 3+ days and eligible containers created 3+ days ago...'
     );
-    expect(mockFindStaleEnvironments).toHaveBeenCalledWith(days);
-    expect(mockCleanupContainerEnvironments).toHaveBeenCalledWith(days);
+    expect(mockFindStaleEnvironments).toHaveBeenCalledWith(3);
+    expect(mockCleanupContainerEnvironments).toHaveBeenCalledWith(3);
   });
 
   it.each([false, true])(

@@ -86,11 +86,10 @@ export type {
 // DAG node types
 export {
   triggerRuleSchema,
-  TRIGGER_RULES,
   dagNodeBaseSchema,
   nodeContextSchema,
   isNodeContextResume,
-  isTriggerRule,
+  isNodeContextSame,
 } from './dag-node-base';
 export {
   nodeMcpSchema,
@@ -149,6 +148,7 @@ export {
   isWorkflowNode,
   isComposeFanOutNode,
   isIncludeDirective,
+  startsSequentialSession,
 } from './node-guards';
 export {
   collectLoopBodyNodeIds,
@@ -159,7 +159,6 @@ export {
   ignoredFieldsForNode,
   isOutputFormatEnforced,
   BASH_NODE_AI_FIELDS,
-  SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
@@ -220,6 +219,7 @@ export type {
   WorkflowInputSpec,
   WorkflowBase,
   WorkflowDefinition,
+  WorkflowResultContract,
 } from './workflow';
 
 // Workflow run state
@@ -279,6 +279,7 @@ export {
 export type {
   WorkflowRunStatus,
   WorkflowRunOutcome,
+  RunCompletedOutcome,
   WorkflowStepStatus,
   NodeState,
   SkipCause,

@@ -138,6 +138,7 @@ export function mockWorkflowRun(id = 'mock-run-id'): WorkflowRun {
     codebase_id: null,
     status: 'running',
     outcome: null,
+    completed_outcome: null,
     user_message: 'mock message',
     metadata: {},
     active_phase_started_at: null,
@@ -152,6 +153,13 @@ export function mockWorkflowRun(id = 'mock-run-id'): WorkflowRun {
     item_id: null,
     adopted_from_run_id: null,
   };
+}
+
+/** A store method these tests never reach. */
+function notUsed(): Mock<() => Promise<never>> {
+  return mock(async () => {
+    throw new Error('Not used by this test');
+  });
 }
 
 export function createMockStore(): MockWorkflowStore {
@@ -280,21 +288,22 @@ export function createMockStore(): MockWorkflowStore {
     deleteWorkflowNodeSessions: mock<IWorkflowStore['deleteWorkflowNodeSessions']>(() => {
       throw new Error('Unexpected deleteWorkflowNodeSessions');
     }),
-    findOpenWorkRuns: mock<IWorkflowStore['findOpenWorkRuns']>(async () => {
-      throw new Error('Not used by this test');
-    }),
-    listItemRuns: mock<IWorkflowStore['listItemRuns']>(async () => {
-      throw new Error('Not used by this test');
-    }),
-    getItem: mock<IWorkflowStore['getItem']>(async () => {
-      throw new Error('Not used by this test');
-    }),
-    findAdoptingRuns: mock<IWorkflowStore['findAdoptingRuns']>(async () => {
-      throw new Error('Not used by this test');
-    }),
-    deleteOldWorkflowRuns: mock<IWorkflowStore['deleteOldWorkflowRuns']>(async () => {
-      throw new Error('Not used by this test');
-    }),
+    findOpenWorkRuns: notUsed(),
+    getItemRuns: notUsed(),
+    getItem: notUsed(),
+    listItemRulings: notUsed(),
+    recordItemRuling: notUsed(),
+    withdrawItemRuling: notUsed(),
+    listItemLinks: notUsed(),
+    recordItemLink: notUsed(),
+    endItemLink: notUsed(),
+    listOpenItemAsks: notUsed(),
+    listItemAsks: notUsed(),
+    getItemAsk: notUsed(),
+    answerItemAsk: notUsed(),
+    withdrawItemAsk: notUsed(),
+    findAdoptingRuns: notUsed(),
+    deleteOldWorkflowRuns: notUsed(),
     listWorkflowEvents: mock<IWorkflowStore['listWorkflowEvents']>(async runId => runEvents(runId)),
     listEventsForRuns: mock<IWorkflowStore['listEventsForRuns']>(
       async (ids, types) => new Map(ids.map(id => [id, runEvents(id, types)]))
@@ -319,9 +328,6 @@ export function createMockStore(): MockWorkflowStore {
     getRunAncestry: mock<IWorkflowStore['getRunAncestry']>(async _runId => []),
     getActiveWorkflowRunByPath: mock<IWorkflowStore['getActiveWorkflowRunByPath']>(
       async (_workingPath, _self) => null
-    ),
-    findResumableRun: mock<IWorkflowStore['findResumableRun']>(
-      async (_workflowName, _workingPath) => null
     ),
     resumeWorkflowRun: mock<IWorkflowStore['resumeWorkflowRun']>(async _id => mockWorkflowRun()),
     recoverCancelledFanOutRun: mock<IWorkflowStore['recoverCancelledFanOutRun']>(async _id =>
@@ -417,15 +423,6 @@ export function runUsageWrites(
           'total_tokens_in' in metadata ||
           'total_tokens_out' in metadata)
     );
-}
-
-/** Authored-outcome writes, excluding lifecycle/metadata/root updates. */
-export function authoredOutcomeWrites(
-  store: ReturnType<typeof createMockStore>
-): Array<'succeeded' | 'failed'> {
-  return (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
-    .map((call: unknown[]) => (call[1] as { outcome?: 'succeeded' | 'failed' }).outcome)
-    .filter((outcome): outcome is 'succeeded' | 'failed' => outcome !== undefined);
 }
 
 export function withProviderCapabilities(
@@ -624,13 +621,28 @@ afterEach(() => {
   ownedGroupSpy = undefined;
 });
 
-/** The `docker` calls that dispatch node work, leaving out the checkout observation's probe. */
-export function nodeDockerCalls(
-  calls: Parameters<typeof git.execFileAsync>[]
-): Parameters<typeof git.execFileAsync>[] {
-  return calls.filter(
-    ([command, args]) => command === 'docker' && args.at(-1) !== CONTAINER_MARKER_PROBE
-  );
+type ExecCall = Parameters<typeof git.execFileAsync>;
+
+/**
+ * Whether a call is engine housekeeping around a node, not its work: the checkout
+ * observation's container probe, or node scratch release's `git -C <repo> worktree`
+ * (on the host, or in the container through `docker exec`).
+ */
+export function isEngineHousekeepingCall([command, args]: ExecCall): boolean {
+  if (command === 'docker' && args.at(-1) === CONTAINER_MARKER_PROBE) return true;
+  const gitArgs =
+    command === 'git' ? args : command === 'docker' ? args.slice(args.indexOf('git') + 1) : [];
+  return gitArgs[0] === '-C' && gitArgs[2] === 'worktree';
+}
+
+/** The subprocess calls that dispatch node work, leaving out engine housekeeping. */
+export function nodeExecCalls(calls: ExecCall[]): ExecCall[] {
+  return calls.filter(call => !isEngineHousekeepingCall(call));
+}
+
+/** The `docker` calls that dispatch node work, leaving out engine housekeeping. */
+export function nodeDockerCalls(calls: ExecCall[]): ExecCall[] {
+  return nodeExecCalls(calls).filter(([command]) => command === 'docker');
 }
 
 /**

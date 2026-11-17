@@ -11,6 +11,7 @@ function makeTestWorkflowRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun 
     codebase_id: null,
     status: 'paused',
     outcome: null,
+    completed_outcome: null,
     user_message: 'test',
     metadata: {},
     active_phase_started_at: null,
@@ -56,6 +57,7 @@ mock.module('../utils/stdout', () => ({ writeStdout }));
 mock.module('../triggers/native-schedule', () => ({
   installMacosNativeSchedule: install,
   removeMacosNativeSchedule: remove,
+  inspectMacosNativeSchedule: mock(async () => undefined),
 }));
 import { workflowContinuationCommand, workflowWakeScheduleCommand } from './workflow-continuations';
 
@@ -277,15 +279,6 @@ test('watch continues after a failed pass and returns failure on shutdown', asyn
   } finally {
     timer.mockRestore();
   }
-});
-
-test('schedule management uses no persistence or engine capability', async () => {
-  expect(await workflowWakeScheduleCommand(['schedule', 'remove'], { json: true })).toBe(0);
-  expect(remove).toHaveBeenCalledTimes(1);
-  expect(scan).not.toHaveBeenCalled();
-  expect(getRun).not.toHaveBeenCalled();
-  expect(signal).not.toHaveBeenCalled();
-  expect(resume).not.toHaveBeenCalled();
 });
 
 test.each(['occurrence', 'deadline', 'both'])(

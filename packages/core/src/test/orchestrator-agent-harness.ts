@@ -26,7 +26,7 @@ import {
   mockDeactivateSession,
   mockDeleteCodebase,
   mockDetachConversationProject,
-  mockFindResumableRunByParentConversation,
+  mockListResumableRunsByParentConversation,
   mockFindWorkflowRunsByIdPrefix,
   mockGetActiveSession,
   mockGetCodebase,
@@ -249,7 +249,7 @@ mock.module('@archon/workflows/router', () => ({
   suggestWorkflowNames: mock<typeof import('@archon/workflows/router').suggestWorkflowNames>(
     () => []
   ),
-  findWorkflow: mock((name: string, workflows: WorkflowDefinition[]) =>
+  resolveWorkflowName: mock((name: string, workflows: WorkflowDefinition[]) =>
     workflows.find(w => w.name === name)
   ),
 }));
@@ -498,7 +498,7 @@ mock.module('../db/workflows', () => ({
   getPausedWorkflowRun: mockGetPausedWorkflowRun,
   getWorkflowRun: mockGetWorkflowRunDb,
   getWorkflowRunForAttention: mockGetWorkflowRunDb,
-  findResumableRunByParentConversation: mockFindResumableRunByParentConversation,
+  listResumableRunsByParentConversation: mockListResumableRunsByParentConversation,
   updateWorkflowRun: mockUpdateWorkflowRun,
   resolveApprovalGate: mockResolveApprovalGate,
   resolveAndCancelApprovalGate: mockResolveAndCancelApprovalGate,
@@ -571,6 +571,7 @@ const { generatedTaskBranch, VerificationImageInventoryError, VERIFICATION_IMAGE
   await import('@archon/isolation');
 mock.module('@archon/isolation', () => ({
   generatedTaskBranch,
+  refuseUnappliedStartPoint: mock(async () => undefined),
   getPrsForCommit: mock<typeof import('@archon/isolation').getPrsForCommit>(async () => ({
     state: 'NONE',
   })),
@@ -706,7 +707,7 @@ export function resetDispatchMocks(): void {
   mockFailPreparedRun.mockResolvedValue({ failed: true });
   mockExecuteWorkflow.mockClear();
   mockDispatchBackgroundWorkflow.mockClear();
-  mockFindResumableRunByParentConversation.mockClear();
+  mockListResumableRunsByParentConversation.mockClear();
   mockHydrateResumableRun.mockClear();
   mockInspectResumableRun.mockReset();
   mockInspectResumableRun.mockImplementation(() =>

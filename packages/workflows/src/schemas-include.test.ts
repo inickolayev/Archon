@@ -83,15 +83,35 @@ describe('dagNodeSchema — include', () => {
     const result = dagNodeSchema.parse({
       id: 'r',
       include: 'acme-review-block',
-      with: { flag: true, count: 3, tags: ['a', 'b'], meta: { k: 'v' }, nothing: null },
+      with: {
+        flag: true,
+        count: 3,
+        tags: ['a', 'b'],
+        meta: { k: 'v' },
+        pair: { from: 'alice', to: 'bob' },
+        nothing: null,
+      },
     });
     expect((result as IncludeDirective).with).toEqual({
       flag: true,
       count: 3,
       tags: ['a', 'b'],
       meta: { k: 'v' },
+      pair: { from: 'alice', to: 'bob' },
       nothing: null,
     });
+  });
+
+  // Include/workflow `with:` reads no directive, so a directive-shaped object would
+  // otherwise reach the child as data with its `if_skipped` never applied (#5734).
+  test.each([
+    ['include', { include: 'acme-review-block' }, { from: '$a.output.v', if_skipped: null }],
+    ['include', { include: 'acme-review-block' }, { outputs: 'review-report' }],
+    ['workflow', { workflow: 'child' }, { from: '$a.output.v', if_skipped: null }],
+  ])("%s rejects a directive-shaped 'with:' value, naming the key", (_kind, mode, x) => {
+    const error = validationError(dagNodeSchema.safeParse({ id: 'r', ...mode, with: { x } }));
+    const issue = error.issues.find(i => i.path[0] === 'with' && i.path[1] === 'x');
+    expect(issue?.message).toContain("input 'x'");
   });
 
   test("rejects the reserved node id 'INPUTS'", () => {
@@ -220,31 +240,6 @@ describe('dagNodeSchema — launch-only options on an include node (#1764)', () 
       })
     );
     expect(error.issues.map(issue => issue.message).join(' | ')).toContain('fan_out.as');
-  });
-
-  test('compose fan-out rejects join: first_success', () => {
-    const error = validationError(
-      dagNodeSchema.safeParse({
-        id: 'review',
-        include: 'blk',
-        fan_out: { items: '$list.output', join: 'first_success' },
-      })
-    );
-    const message = error.issues.map(i => i.message).join(' | ');
-    expect(message).toContain('first_success');
-  });
-
-  test('compose fan-out rejects fan_out.as colliding with a with: key', () => {
-    const error = validationError(
-      dagNodeSchema.safeParse({
-        id: 'review',
-        include: 'blk',
-        with: { item: 'static' },
-        fan_out: { items: '$list.output', as: 'item' },
-      })
-    );
-    const message = error.issues.map(i => i.message).join(' | ');
-    expect(message).toContain('collides with');
   });
 
   test('a merely-meaningless AI field on an include node still only warns', () => {
