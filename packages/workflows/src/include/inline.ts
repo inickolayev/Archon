@@ -183,7 +183,7 @@ function inlineInclude(
     );
   }
   const fromOwnPack = isSamePack(includerPack, child.pack);
-  const passed = includeInputs(includeNode, child, fromOwnPack);
+  const passed = includeInputs(includeNode, child);
   let scope = inlineScope(includeNode, child, commandContents, includeId, includes, passed, []);
   let namespaced = child.nodes.map(cn => inlineChildNode(scope, cn));
 
@@ -240,10 +240,14 @@ function inlineInclude(
  */
 function includeInputs(
   includeNode: IncludeDirective,
-  child: ResolvedWorkflow,
-  fromOwnPack: boolean
+  child: ResolvedWorkflow
 ): Record<string, JsonValue> {
-  if (!fromOwnPack || child.inputs === undefined || includeNode.with === undefined) {
+  // ChessWin fork: the split below applies to an includer from ANOTHER pack too. Such a
+  // block "reads only what its includer passes" (assertPackSettingReadsPassed), so passing
+  // a setting through `with:` is the one way it can be satisfied; refusing the pass whenever
+  // the block also declares inputs of its own left no way at all (archon-deliver reads `ci`,
+  // declares `work`, and could not be included from outside the SDLC pack).
+  if (child.inputs === undefined || includeNode.with === undefined) {
     return resolveIncludeInputs(includeNode, child);
   }
   const declared = child.inputs;

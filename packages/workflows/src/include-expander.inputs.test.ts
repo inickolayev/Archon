@@ -783,6 +783,26 @@ describe('expandWorkflowIncludes — a block included from its own pack reads it
     expect(errorOf(result, 'host')).toContain('references missing input $INPUTS.tone');
   });
 
+  // ChessWin fork: a block that declares inputs of its own still accepts a passed setting
+  // from a host in another pack — otherwise it could not be included from outside at all.
+  test('a host in another pack can pass a setting to a block that declares other inputs', () => {
+    const block = reader('block', 'p', { inputs: { topic: { default: 'x' } } });
+    const result = expandWorkflowIncludes(
+      mapOf(
+        block,
+        wf('host', [{ id: 'blk', include: 'block', with: { tone: 'loud' } }], {
+          pack: packOf('q'),
+        }),
+        wf('silent', [{ id: 'blk', include: 'block' }], { pack: packOf('q') })
+      )
+    );
+    expect(errorOf(result, 'host')).toBeUndefined();
+    expect(inlinePrompt(nodeById(result.workflows.get('host')!, 'blk__speak'))).toBe(
+      'tone is loud'
+    );
+    expect(errorOf(result, 'silent')).toContain('references missing input $INPUTS.tone');
+  });
+
   test('a forwarded setting must be passed where the chain changes pack', () => {
     const middle = wf('middle', [{ id: 'inner', include: 'block' }], { pack: packOf('p') });
     const result = expandWorkflowIncludes(
