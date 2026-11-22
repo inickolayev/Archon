@@ -135,6 +135,7 @@ export {
   inputEnvKey,
   bindingDirectiveSchema,
   isBindingDirective,
+  isBindingDirectiveShape,
   isTypedOutputsDirective,
 } from './node-bindings';
 export {
@@ -272,6 +273,8 @@ export {
   continuationInheritsEstate,
   EXECUTION_OWNER_METADATA_KEY,
   readExecutionOwner,
+  START_EXECUTOR_METADATA_KEY,
+  readStartExecutor,
   RUN_DISPATCH_METADATA_KEY,
   runDispatchMetadataSchema,
   readRunDispatchMetadata,
@@ -306,6 +309,7 @@ export type {
   ContinuationMode,
   ContinuationMetadata,
   ExecutionOwnerRecord,
+  StartExecutorRecord,
   RunDispatchMetadata,
 } from './workflow-run';
 
@@ -347,8 +351,18 @@ export {
   pauseCauseOfApproval,
   pauseCauseOfWait,
   readPauseCause,
+  isOperatorPaused,
   type PauseCause,
 } from './pause-cause';
+export {
+  OPERATOR_PAUSE_METADATA_KEY,
+  operatorPause,
+  describeOperatorPause,
+  operatorPauseSchema,
+  readOperatorPauseRecord,
+  type OperatorPause,
+  type OperatorPauseRecord,
+} from './operator-pause';
 export type { WorkflowRunOrigin } from './workflow-run';
 
 export * from './workflow-event';

@@ -300,7 +300,11 @@ export const workItemCommentSchema = z.object({
   url: z.url(),
   body: z.string(),
 });
-/** How far a pull request's head is behind its repository's default branch, and whether it merges. */
+/**
+ * How far a pull request's head is behind the pull request's own base branch, and whether it
+ * merges into it. A caller that needs the default branch reads it with `checks.commit` at
+ * `{kind:'default_branch'}`.
+ */
 export const prMergeStateRequestSchema = requestBase.extend({
   op: z.literal('pr.merge-state'),
   ref: prRefSchema,
@@ -308,9 +312,9 @@ export const prMergeStateRequestSchema = requestBase.extend({
 export const prMergeStateSchema = z.object({
   ref: prRefSchema,
   head_revision: gitObjectIdSchema,
-  default_branch: text,
-  default_revision: gitObjectIdSchema,
-  /** Commits of the default branch at `default_revision` that the head at `head_revision` lacks. */
+  base_branch: text,
+  base_revision: gitObjectIdSchema,
+  /** Commits of `base_branch` at `base_revision` that the head at `head_revision` lacks. */
   behind: z.number().int().nonnegative(),
   mergeable: z.enum(['clean', 'conflict', 'unknown']),
   /** The commit the pull request landed as; null until it is merged. */
@@ -391,6 +395,42 @@ export const repoFileSchema = z.object({
   revision: gitObjectIdSchema,
   text: z.string(),
 });
+/** The image types `attachment.put` stores. SVG is left out: it can carry script. */
+export const attachmentContentTypeSchema = z.enum([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+]);
+/** The most decoded bytes one `attachment.put` stores. */
+export const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+/**
+ * An image stored with the forge so a comment or review can embed it, such as a
+ * screenshot a stage took. It is presentation: anyone who can read `repo` can
+ * read the file, and nothing prunes it. The forge names the file by its content,
+ * so no caller-supplied name reaches it; what the bytes show is the caller's
+ * responsibility.
+ */
+export const attachmentPutRequestSchema = requestBase.extend({
+  op: z.literal('attachment.put'),
+  repo: repoRefSchema,
+  contentType: attachmentContentTypeSchema,
+  // A pattern rather than `z.base64()`: its JSON Schema `contentEncoding` keyword is
+  // one the script API type generator cannot state.
+  content: z
+    .string()
+    .regex(
+      /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/,
+      'content must be base64'
+    )
+    .refine(
+      value => {
+        const bytes = Buffer.byteLength(value, 'base64');
+        return bytes > 0 && bytes <= ATTACHMENT_MAX_BYTES;
+      },
+      `content must decode to between 1 byte and ${String(ATTACHMENT_MAX_BYTES)} bytes`
+    ),
+});
 /** Replace an issue's body. */
 export const workItemEditBodyRequestSchema = requestBase.extend({
   op: z.literal('workitem.edit-body'),
@@ -445,6 +485,7 @@ export const mutationRequestSchemas = [
   prThreadResolveRequestSchema,
   prReviewSubmitRequestSchema,
   workItemEditBodyRequestSchema,
+  attachmentPutRequestSchema,
 ] as const;
 export const mutationRequestSchema = z.discriminatedUnion('op', mutationRequestSchemas);
 export type ForgeMutationRequest = z.infer<typeof mutationRequestSchema>;
@@ -692,6 +733,20 @@ export const mutationResultSchemas = [
   z.object({
     op: workItemEditBodyRequestSchema.shape.op,
     value: appliedSchema.extend({ workitem: workItemRecordSchema, bodyDigest: text }),
+  }),
+  // `digest` is the sha256 hex of the stored bytes; `changed: false` means the forge
+  // already held them. `url` renders as the image in a comment on `target`.
+  z.object({
+    op: attachmentPutRequestSchema.shape.op,
+    value: appliedSchema.extend({
+      target: repoRefSchema,
+      attachment: z.object({
+        url: z.url(),
+        digest: text,
+        bytes: z.number().int().positive(),
+        contentType: attachmentContentTypeSchema,
+      }),
+    }),
   }),
 ] as const;
 

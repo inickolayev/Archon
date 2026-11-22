@@ -1,4 +1,5 @@
 import type {
+  HeldPreparation,
   PendingStartBindingInspection,
   QueuedResourceStartInspection,
 } from '@archon/workflows/resource-start-store';
@@ -10,6 +11,7 @@ import {
   type PreparedRunAiConfiguration,
   WorkflowCredentialPreflightError,
 } from '@archon/workflows/run-preflight';
+import { assertRunForgeAccess, ForgeRequirementError } from '@archon/workflows/run-forge-access';
 import {
   requireTerminalStatusWrite,
   TerminalStatusWriteError,
@@ -37,7 +39,6 @@ import {
   withCapturedSource,
 } from '@archon/workflows/run-source';
 import { canonicalValueText, type JsonValue } from '@archon/workflows/output-ref';
-import { resolveWorkflowName } from '@archon/workflows/router';
 import {
   readWorkflowRunConfigMetadata,
   WORKFLOW_RUN_CONFIG_METADATA_KEY,
@@ -53,29 +54,30 @@ import {
   type ResourceStartDisposition,
   type ResourceStartRunMetadata,
 } from '@archon/workflows/schemas/resource-start';
-import {
-  findWorkflowLoadError,
-  type ResolvedWorkflow,
-  type WorkflowExecutionResult,
-} from '@archon/workflows/schemas/workflow';
+import type { ResolvedWorkflow, WorkflowExecutionResult } from '@archon/workflows/schemas/workflow';
 import {
   SUBRUN_METADATA_KEYS,
   WORKFLOW_SOURCE_METADATA_KEY,
 } from '@archon/workflows/schemas/workflow-run';
-import {
-  assertWorkflowRequirementsMet,
-  resolveInvocationInputs,
-} from '@archon/workflows/utils/workflow-requirements';
+import { assertWorkflowRequirementsMet } from '@archon/workflows/utils/workflow-requirements';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
-import { WorkflowInputContractError } from '@archon/workflows/workflow-inputs';
-import { loadWorkflowRunConfigFile, unsealWorkflowRunConfig } from '../config/run-config';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
+import { projectKeyForCodebase } from '@archon/paths/archon-paths';
+import {
+  itemRunConfig,
+  loadWorkflowRunConfigFile,
+  unsealWorkflowRunConfig,
+} from '../config/run-config';
 import type { Codebase } from '../schemas/codebase';
 import type { WorkflowHost } from './host-store';
 import { registerRepository } from '../handlers/clone';
 import { resolveCodebaseForPath } from '../services/codebase-checkout-resolver';
 import { startRunLiveOwner, type RunLiveOwner } from '../services/run-live-owner';
+import { handOffAdmitted, type StartedExecutor } from './start-executor';
 import { createCodebaseChildResolver } from './child-isolation-resolver';
-import { executionLane, handoffIsolation } from './resource-start-lanes';
+import { assertLaneStartable, executionLane, handoffIsolation } from './resource-start-lanes';
+import { resolveBindingInputs, selectStartedWorkflow } from './binding-workflow';
+import { refuseInPlaceLanding, resolveRunLanding } from './item-landing';
 
 const log = createLogger('resource-start-host');
 
@@ -103,7 +105,7 @@ async function findOrRegisterCodebase(host: WorkflowHost, cwd: string): Promise<
 
 async function selectBindingWorkflow(
   host: WorkflowHost,
-  workflowName: string,
+  launch: ResourceStartBindingIntent['launch'],
   cwd: string,
   roots: Parameters<typeof discoverWorkflowsWithConfig>[3]
 ): Promise<ResolvedWorkflow> {
@@ -113,17 +115,9 @@ async function selectBindingWorkflow(
     host.deps.providers,
     roots
   );
-  const workflow = resolveWorkflowName(
-    workflowName,
-    discovered.workflows.map(entry => entry.workflow)
-  );
-  if (workflow) return workflow;
-  const loadError = findWorkflowLoadError(discovered.errors, workflowName);
-  throw new Error(
-    loadError
-      ? `Workflow '${workflowName}' failed to load: ${loadError.error}`
-      : `Workflow '${workflowName}' not found.`
-  );
+  const started = selectStartedWorkflow(launch, discovered);
+  if ('workflow' in started) return started.workflow;
+  throw new Error(`The binding starts nothing: ${started.refused}.`);
 }
 
 async function assertBindingRequirements(
@@ -135,52 +129,6 @@ async function assertBindingRequirements(
   assertWorkflowRequirementsMet(workflow, {
     githubConnected: Boolean(await host.deps.getUserGithubToken?.(intent.runAsUserId)),
   });
-}
-
-function quotedList(names: readonly string[]): string {
-  return names.map(name => `'${name}'`).join(', ');
-}
-
-/**
- * The binding's authored and event inputs, checked against the workflow's declared inputs
- * and its pack's settings. Exported for its tests.
- */
-export function resolveBindingInputs(
-  intent: Pick<ResourceStartBindingIntent, 'eventInputs'> & {
-    launch: Pick<ResourceStartBindingIntent['launch'], 'inputs'>;
-  },
-  workflow: Pick<ResolvedWorkflow, 'name' | 'inputs' | 'pack'>
-): Record<string, JsonValue> {
-  // The declared-input contract passes inputs through to a workflow without `inputs:`, which
-  // operator-written literals rely on. Event inputs carry untrusted source content, so
-  // they reach only a workflow that declares them.
-  // A pack setting is declared, by the pack, and checked against its type below.
-  const settings = workflow.pack?.settings ?? {};
-  const eventInputNames = Object.keys(intent.eventInputs ?? {}).filter(
-    name => !Object.hasOwn(settings, name)
-  );
-  if (workflow.inputs === undefined && eventInputNames.length > 0) {
-    throw new Error(
-      `Workflow '${workflow.name}' declares no inputs; a trigger cannot pass event-mapped ` +
-        `input${eventInputNames.length === 1 ? '' : 's'} ` +
-        quotedList(eventInputNames.sort()) +
-        ". Declare them under 'inputs:' in the workflow."
-    );
-  }
-  try {
-    // The same contract `--input` meets: the workflow's own inputs, or its pack's settings
-    // checked against their declared types.
-    return resolveInvocationInputs(workflow, { ...intent.launch.inputs, ...intent.eventInputs });
-  } catch (error) {
-    if (error instanceof WorkflowInputContractError && error.missingRequired.length > 0) {
-      throw new Error(
-        `Workflow '${workflow.name}' requires input${error.missingRequired.length === 1 ? '' : 's'} ` +
-          quotedList(error.missingRequired) +
-          '.'
-      );
-    }
-    throw error;
-  }
 }
 
 /** Reconcile the requested isolation with the workflow's pin and the project kind. */
@@ -207,8 +155,8 @@ function resolveBindingIsolation(
     : { kind: 'in-place' };
 }
 
-// The row is created with only the authored inputs. The run fixes its pack settings and
-// declared defaults on the row when it starts (resolveRunDispatch), and a resume reads that.
+// The row holds the authored inputs and those naming the judged repository. The run fixes
+// its settings and defaults on the row at start (resolveRunDispatch); a resume reads that.
 function authoredInputsMetadata(inputs: Record<string, JsonValue>): Record<string, JsonValue> {
   if (Object.keys(inputs).length === 0) return {};
   return {
@@ -242,16 +190,19 @@ function bindingRunMetadata(
   };
 }
 
+type PreparationResult = ResourceStartDisposition | HeldPreparation;
+
 /**
  * Freeze one binding's workflow source, inputs and run configuration, then commit it to
- * admission. The capture is kept only when admission keeps a promise to run it.
+ * admission. The capture is kept only when admission keeps a promise to run it: a start
+ * the install hold turned back is prepared again, from a fresh capture, after the lift.
  */
 async function prepareBinding(
   host: WorkflowHost,
   intent: ResourceStartBindingIntent,
   identity: BindingIdentity,
-  runConfig: Awaited<ReturnType<typeof loadWorkflowRunConfigFile>> | undefined
-): Promise<ResourceStartDisposition> {
+  runConfig: WorkflowRunConfigInput | undefined
+): Promise<PreparationResult> {
   const cwd = await canonicalizeProjectPath(intent.launch.cwd);
   const sourceRoot = resolve(intent.launch.discoveryCwd ?? cwd);
 
@@ -259,15 +210,10 @@ async function prepareBinding(
     let source = await prepareWorkflowSource(host.deps, { sourceRoot });
     owner.hold(source);
 
-    const workflow = await selectBindingWorkflow(
-      host,
-      intent.launch.workflowName,
-      cwd,
-      source.roots
-    );
+    const workflow = await selectBindingWorkflow(host, intent.launch, cwd, source.roots);
     await recordSelectedWorkflow(source.anchor.root, workflow.name);
     await assertBindingRequirements(host, intent, workflow);
-    const inputs = resolveBindingInputs(intent, workflow);
+    const bindingInputs = resolveBindingInputs(intent, workflow);
 
     const codebase = await findOrRegisterCodebase(host, cwd);
     let isolation: PreparedWorkflowLaunch['execution']['isolation'];
@@ -278,12 +224,10 @@ async function prepareBinding(
       handoff = { ...intent.checkoutFrom, lane: chosen.lane };
     } else {
       isolation = resolveBindingIsolation(intent.launch.isolation, workflow, codebase);
+      await assertLaneStartable(isolation, codebase);
     }
 
-    source = await finalizeWorkflowSource(host.deps, source, {
-      cwd,
-      codebaseId: codebase.id,
-    });
+    source = await finalizeWorkflowSource(host.deps, source, { cwd, codebaseId: codebase.id });
     owner.hold(source);
     const origin: ResourceStartRunMetadata = {
       receiptId: identity.receiptId,
@@ -294,6 +238,9 @@ async function prepareBinding(
       userId: intent.runAsUserId,
       runConfig,
     });
+    // Before admission, so a binding its forge cannot serve never takes a slot.
+    const site = { cwd, settingsCwd: cwd, codebaseId: codebase.id, supplied: bindingInputs };
+    const inputs = await assertRunForgeAccess(host.deps, workflow, preparedAi, site);
     const launch: PreparedWorkflowLaunch = {
       version: 2,
       run: {
@@ -322,36 +269,69 @@ async function prepareBinding(
       ...(workflow.resource === undefined ? {} : { resource: workflow.resource }),
     });
     if (!disposition) throw new Error('Preparation ownership changed before durable acceptance.');
-    if (disposition.status !== 'skipped') owner.adopt();
+    if (disposition.status === 'admitted' || disposition.status === 'queued') owner.adopt();
     return disposition;
   });
+}
+
+/**
+ * The run config of the item a binding start is on (see `itemRunConfig`). The item is the
+ * one admission's `namedItem` writes the run onto: the binding's key, else the receipt's,
+ * in the project of the launch cwd. Undefined for a start on no item or an item not
+ * written yet.
+ */
+async function bindingItemRunConfig(
+  host: WorkflowHost,
+  intent: ResourceStartBindingIntent,
+  receiptId: string
+): Promise<WorkflowRunConfigInput | undefined> {
+  const itemKey = intent.itemKey ?? (await host.deps.store.getStartReceipt(receiptId))?.itemKey;
+  if (!itemKey) return undefined;
+  // No registered project means no item yet: admission registers it and writes the item new.
+  const { codebase } = await resolveCodebaseForPath(intent.launch.cwd, host.records.codebases);
+  if (!codebase) return undefined;
+  const found = await host.deps.store.getItemRuns(
+    projectKeyForCodebase(codebase, codebase.default_cwd),
+    itemKey
+  );
+  return found ? itemRunConfig(itemKey, found.runs) : undefined;
 }
 
 async function prepareClaimedBinding(
   host: WorkflowHost,
   intent: ResourceStartBindingIntent,
   identity: BindingIdentity
-): Promise<ResourceStartDisposition> {
+): Promise<PreparationResult> {
   let stage: PreparationStage = 'run_as_user';
   try {
     if (!(await host.records.users.getUserById(intent.runAsUserId))) {
       throw new Error('The configured run-as user no longer exists.');
     }
     stage = 'run_configuration';
-    const runConfig = intent.launch.configSource
-      ? await loadWorkflowRunConfigFile(intent.launch.configSource)
-      : undefined;
+    // The item's own config wins over `configSource`: a binding file's config is written
+    // once for the install (`pack bindings --config`), a default for an item's first run,
+    // not a change to this item's config.
+    const runConfig =
+      (await bindingItemRunConfig(host, intent, identity.receiptId)) ??
+      (intent.launch.configSource
+        ? await loadWorkflowRunConfigFile(intent.launch.configSource)
+        : undefined);
     stage = 'launch_preparation';
     return await prepareBinding(host, intent, identity, runConfig);
   } catch (error) {
     // Unknown failures are not an implicit retry policy; the receipt stays inspectable.
     // Configuration and provider errors can contain secret values, so persist the
-    // failed boundary, not the exception text. The original cause reaches the caller.
+    // failed boundary, not the exception text. A forge refusal is the exception: it holds
+    // only remote names, typed reasons and text written to be shown. The original cause
+    // reaches the caller.
     try {
       await host.deps.store.failStartBindingPreparation({
         ...identity,
         retryable: false,
         error: `${stage}_failed`,
+        ...(error instanceof ForgeRequirementError
+          ? { forgeRefusal: { pack: error.packKey, failures: error.failures } }
+          : {}),
       });
     } catch (statusError) {
       throw new AggregateError(
@@ -366,11 +346,8 @@ async function prepareClaimedBinding(
 export interface ResourceStartHost extends WorkflowHost {
   /** The configured host identity. A host only prepares and admits work bound to it. */
   hostId: string;
-  /**
-   * Start one admitted request. The CLI hands it to a detached process; the server
-   * calls `startAdmittedResourceStart` in-process without awaiting the run.
-   */
-  startAdmitted: (requestId: string) => Promise<void>;
+  /** Start one admitted request: the CLI detaches it, the server runs it in-process unawaited. */
+  startAdmitted: (requestId: string) => Promise<StartedExecutor | null>;
 }
 
 /**
@@ -401,8 +378,10 @@ function receiptIdOfLaunch(launch: PreparedWorkflowLaunch | undefined): string |
 }
 
 /**
- * Prepare a page of this host's pending bindings, or all of `receiptIds` page by page (a
- * page is read again until it brings nothing untried), and start each one admitted now.
+ * Prepare every pending binding of this host, or of `receiptIds` only, and start each one
+ * admitted now. Each read lists from the oldest binding, one page further than the last,
+ * until a read is not cut by its limit; a binding is tried once per call, so one that
+ * stays pending (a retryable failure, another process's claim) cannot stall the pass.
  * Failures are collected, not thrown; a failed binding is not retried here.
  */
 async function preparePendingBindings(
@@ -414,16 +393,26 @@ async function preparePendingBindings(
   const tried = new Set<string>();
   const key = (binding: PendingStartBindingInspection) =>
     'document' in binding ? binding.document : `${binding.receiptId}\n${binding.bindingId}`;
-  for (let offset = 0; offset < (receiptIds?.length ?? 1); ) {
-    const page = receiptIds?.slice(offset, offset + PAGE);
-    const query = { hostId: host.hostId, receiptIds: page, limit: PAGE };
-    const listed = await host.deps.store.listPendingStartBindings(query);
-    const fresh = listed.filter(binding => !tried.has(key(binding)));
-    for (const binding of fresh) {
-      tried.add(key(binding));
-      await preparePendingBinding(host, failures, binding);
+  // Receipt ids go to the store in chunks, so one query never binds more than a page of them.
+  const chunks = receiptIds
+    ? Array.from({ length: Math.ceil(receiptIds.length / PAGE) }, (_, index) =>
+        receiptIds.slice(index * PAGE, (index + 1) * PAGE)
+      )
+    : [undefined];
+  for (const chunk of chunks) {
+    for (let limit = PAGE; ; limit += PAGE) {
+      const listed = await host.deps.store.listPendingStartBindings({
+        hostId: host.hostId,
+        receiptIds: chunk,
+        limit,
+      });
+      for (const binding of listed.filter(entry => !tried.has(key(entry)))) {
+        tried.add(key(binding));
+        await preparePendingBinding(host, failures, binding);
+      }
+      // The limit counts bindings, not the damaged receipts reported beside them.
+      if (listed.filter(entry => !('document' in entry)).length < limit) break;
     }
-    if (!page || listed.length < PAGE || fresh.length === 0) offset += PAGE;
   }
 }
 
@@ -437,7 +426,7 @@ async function preparePendingBinding(
   const { receiptId, bindingId } = binding;
   const identity = { receiptId, bindingId, ownerId: randomUUID() };
   if (!(await host.deps.store.claimStartBindingPreparation(identity))) return;
-  let disposition: ResourceStartDisposition;
+  let disposition: PreparationResult;
   try {
     disposition = await prepareClaimedBinding(host, binding.intent, identity);
   } catch (error) {
@@ -454,10 +443,21 @@ async function startAdmittedRequest(
   receiptId: string | undefined
 ): Promise<void> {
   try {
-    await host.startAdmitted(requestId);
+    await handOffAdmitted(host, requestId);
   } catch (error) {
     failures.push({ receiptId, error });
   }
+}
+
+/**
+ * Whether the install hold is set. A host pass then prepares and drains nothing: its
+ * bindings stay pending and its requests queued until the lift.
+ */
+async function heldPass(host: ResourceStartHost): Promise<boolean> {
+  const hold = await host.deps.store.getInstallHold();
+  // Debug, not info: a server takes a pass every few seconds for as long as the hold lasts.
+  if (hold) log.debug({ hostId: host.hostId, setAt: hold.setAt }, 'resource_start.held');
+  return hold !== null;
 }
 
 /**
@@ -468,23 +468,26 @@ export async function startReceiptBindings(
   host: ResourceStartHost,
   receiptIds: ReadonlySet<string>
 ): Promise<void> {
+  if (await heldPass(host)) return;
   const failures: ResourceStartDrainFailure[] = [];
   await preparePendingBindings(host, failures, [...receiptIds]);
   if (failures.length > 0) throw new ResourceStartDrainError(failures);
 }
 
 /**
- * One host pass: prepare a page of this host's pending receipt bindings, then admit its
- * queued requests while their slots have capacity, handing each admitted one to the host.
- * A damaged receipt is reported after the pass. Safe to run concurrently with other hosts
- * and processes: the store claims preparation and admission atomically.
+ * One host pass: admit this host's queued requests while their slots have capacity, then
+ * prepare all its pending receipt bindings, handing each admitted start to the host.
+ * Queued requests go first because a new start yields to an older runnable request of its
+ * host (`resourceStartBlocker`): after an install hold, a held `overlap: skip` binding
+ * would otherwise be dropped behind requests the hold left undrained. A damaged receipt is
+ * reported after the pass. Safe to run concurrently with other hosts and processes: the
+ * store claims preparation and admission atomically.
  */
 export async function drainResourceStartHost(host: ResourceStartHost): Promise<void> {
+  if (await heldPass(host)) return;
   const failures: ResourceStartDrainFailure[] = [];
   const start = (requestId: string, receiptId?: string): Promise<void> =>
     startAdmittedRequest(host, failures, requestId, receiptId);
-
-  await preparePendingBindings(host, failures);
 
   const queued = await host.deps.store.listQueuedResourceStartsForHost(host.hostId);
   const drain = async (resource: string): Promise<void> => {
@@ -516,6 +519,8 @@ export async function drainResourceStartHost(host: ResourceStartHost): Promise<v
     }
   };
   for (const resource of queuedDrainResources(queued, failures)) await drain(resource);
+
+  await preparePendingBindings(host, failures);
 
   if (failures.length > 0) {
     throw new ResourceStartDrainError(failures);
@@ -568,9 +573,8 @@ export interface StartAdmittedResourceStartInput {
 }
 
 /**
- * Start one admitted pending run through the engine port. The engine's pending claim
- * is the execution fence: if another starter already claimed the run, or its request
- * was withdrawn from the slot, the engine refuses before any node runs.
+ * Start one admitted pending run through the engine port. It is read again under its owner
+ * lock, which cancel holds for a pending run; the engine's pending claim fences execution.
  *
  * Owned preparation errors fail only a still-pending run. Submission belongs to the
  * engine: a rejection there does not establish that execution never started.
@@ -579,13 +583,14 @@ export async function startAdmittedResourceStart(
   input: StartAdmittedResourceStartInput
 ): Promise<WorkflowExecutionResult> {
   const { host } = input;
-  const { launch, run } = await loadAdmittedResourceStart(input);
-  const liveOwner = await startRunLiveOwner(run.id, {
+  const runId = (await loadAdmittedResourceStart(input)).run.id;
+  const liveOwner = await startRunLiveOwner(runId, {
     detachedProcessPid: input.detachedProcessPid,
   });
   let ownedExecutionClaim: string | null | undefined;
   let releaseGuard: (() => void) | undefined;
   try {
+    const { launch, run } = await loadAdmittedResourceStart(input);
     releaseGuard = input.guardOwnedRun?.({
       runId: run.id,
       liveOwner,
@@ -614,7 +619,7 @@ export async function startAdmittedResourceStart(
   } finally {
     releaseGuard?.();
     await liveOwner.close().catch((error: unknown) => {
-      log.error({ err: error as Error, runId: run.id }, 'resource_start.live_owner_close_failed');
+      log.error({ err: error as Error, runId }, 'resource_start.live_owner_close_failed');
     });
   }
 }
@@ -652,7 +657,7 @@ async function prepareAdmittedResourceSubmission(
     }
   );
   await assertRunCredentials(deps, preparedAiConfiguration, { cwd: launch.execution.cwd });
-  const lane = launch.execution.isolation;
+  const { lane, baseOverride } = await landingLane(host, codebase, run, launch.execution.isolation);
   const execution = await executionLane(host, {
     run,
     lane,
@@ -684,7 +689,9 @@ async function prepareAdmittedResourceSubmission(
       baseBranch,
       ownedWorktree: execution.ownedWorktree,
       ...(execution.cutFromCommit !== undefined ? { cutFromCommit: execution.cutFromCommit } : {}),
-      ...(lane.kind === 'worktree' && lane.baseOverride ? { baseOverride: lane.baseOverride } : {}),
+      resolvedBaseBranch: execution.resolvedBaseBranch,
+      // A hand-off lane too: it keeps the handed-on checkout and proposes against the base.
+      ...(baseOverride ? { baseOverride } : {}),
       resolveChildIsolation: createCodebaseChildResolver(
         host.records.isolation,
         codebase,
@@ -699,6 +706,33 @@ async function prepareAdmittedResourceSubmission(
       ...runConfig,
     },
   };
+}
+
+/**
+ * The prepared lane with the base the run takes. The item's landing branch outranks the
+ * trigger file's static `baseOverride`, which is the same for every item the file starts.
+ * Read now, not at preparation, so a queued start takes the branch the item records when
+ * it runs, and the persisted launch keeps its shape. A missing branch, or an in-place start
+ * on an item that has one, refuses it here.
+ */
+async function landingLane(
+  host: WorkflowHost,
+  codebase: Codebase,
+  run: { item_id: string | null },
+  prepared: PreparedWorkflowLaunch['execution']['isolation']
+): Promise<{ lane: PreparedWorkflowLaunch['execution']['isolation']; baseOverride?: string }> {
+  let landing: string | undefined;
+  if (run.item_id) {
+    const item = await host.deps.store.getItem(run.item_id);
+    if (!item) throw new Error(`The run's item '${run.item_id}' is missing from the store.`);
+    const resolved = await resolveRunLanding(host.deps.store, codebase, item);
+    // A hand-off lane is a worktree lane, so only a true in-place start reaches this.
+    if (resolved && prepared.kind === 'in-place') refuseInPlaceLanding(item, resolved);
+    landing = resolved?.branch;
+  }
+  if (prepared.kind !== 'worktree') return { lane: prepared };
+  const baseOverride = landing ?? prepared.baseOverride;
+  return baseOverride ? { lane: { ...prepared, baseOverride }, baseOverride } : { lane: prepared };
 }
 
 async function loadAdmittedResourceStart(input: StartAdmittedResourceStartInput) {

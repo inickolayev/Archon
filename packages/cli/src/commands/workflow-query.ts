@@ -14,6 +14,8 @@ import {
 import { readItem, readItemOfRun } from '@archon/workflows/item-read';
 import { itemReadLines } from './workflow-item-text';
 import type { DashboardWorkflowRun } from '@archon/workflows/schemas/workflow-run-listing';
+import { describeInstallHold } from '@archon/workflows/schemas/resource-start';
+import { heldStartLine, readHeldStarts } from './workflow-held-starts';
 import { resolveDryRunEnvironment } from './workflow-dry-run';
 import { createCliWorkflowHost } from '../utils/workflow-host';
 import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
@@ -31,6 +33,7 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
+import { operatorPause } from '@archon/workflows/schemas/operator-pause';
 import {
   loadWorkflows,
   projectWorkflowDescription,
@@ -348,6 +351,7 @@ export async function workflowStatusCommand(
   }
 
   const scopeFallback = !opts.all && !codebase;
+  const { hold, heldStarts } = await readHeldStarts(host, codebase?.id);
 
   if (opts.json) {
     if (!opts.verbose) {
@@ -358,6 +362,8 @@ export async function workflowStatusCommand(
           notice: notices.get(run.id) ?? null,
         })),
         scopeFallback,
+        hold,
+        heldStarts,
       });
       return;
     }
@@ -366,12 +372,23 @@ export async function workflowStatusCommand(
     await writeJsonLine({
       runs: runsOutput.map(run => ({ ...run, notice: notices.get(run.id) ?? null })),
       scopeFallback,
+      hold,
+      heldStarts,
     });
     return;
   }
 
   if (scopeFallback) {
     console.log('(not a registered project — showing all runs)');
+  }
+
+  if (hold) {
+    console.log(
+      `New runs are held on this install (${describeInstallHold(hold)}). Running runs continue; lift with: archon hold lift`
+    );
+    console.log(`\nHeld starts (${String(heldStarts.length)}):`);
+    if (heldStarts.length === 0) console.log('  none');
+    for (const start of heldStarts) console.log(heldStartLine(start));
   }
 
   if (runs.length === 0) {
@@ -737,12 +754,21 @@ async function listRecentRuns(
     const activeNodes =
       run.active_nodes.length > 0 ? ` · active node(s): ${run.active_nodes.join(', ')}` : '';
     console.log(
-      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${activeNodes}${authoredOutcome(run)}  (${formatAge(run.started_at)})`
+      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${activeNodes}${operatorPauseMark(run)}${authoredOutcome(run)}  (${formatAge(run.started_at)})`
     );
   }
   printModelThroughput(report?.throughput);
   console.log('');
   return 0;
+}
+
+function operatorPauseMark(run: Pick<WorkflowRun, 'status' | 'metadata'>): string {
+  const state = operatorPause(run)?.state;
+  return state === 'paused'
+    ? ' · paused by an operator'
+    : state === 'requested'
+      ? ' · pause requested'
+      : '';
 }
 
 function authoredOutcome(

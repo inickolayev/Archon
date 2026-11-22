@@ -463,6 +463,7 @@ function renderTimelineEntry(
           fanOutOutcome={entry.node.fanOutOutcome}
           output={entry.node.output}
           error={entry.node.error}
+          failureKind={entry.node.failureKind}
           showDetail={entry.showDetail}
           waiting={entry.waiting}
           source={nodeSource}

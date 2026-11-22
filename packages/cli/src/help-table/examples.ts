@@ -45,6 +45,7 @@ export const orderedExamples: ExampleHelp[] = [
     owner: { command: 'workflow', subcommand: 'artifacts' },
   },
   { text: 'archon project list --json', owner: { command: 'project', subcommand: 'list' } },
+  { text: 'archon project add --json', owner: { command: 'project', subcommand: 'add' } },
   {
     text: 'archon project config <id|name> --json',
     owner: { command: 'project', subcommand: 'config' },
@@ -61,6 +62,7 @@ export const orderedExamples: ExampleHelp[] = [
     text: 'archon workflow wait <run-id> --json',
     owner: { command: 'workflow', subcommand: 'wait' },
   },
+  { text: 'archon workflow pause <run-id>', owner: { command: 'workflow', subcommand: 'pause' } },
   { text: 'archon workflow resume <run-id>', owner: { command: 'workflow', subcommand: 'resume' } },
   { text: 'archon workflow cancel <run-id>', owner: { command: 'workflow', subcommand: 'cancel' } },
   {

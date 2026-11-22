@@ -29,13 +29,14 @@ const forgeOperationDescriptions = {
   'pr.reviews': 'Read submitted reviews and root review comments',
   'pr.threads': 'Read every review thread with its comments, creation times and resolution',
   'pr.merge-state':
-    'Read how far a pull request is behind the default branch and whether it merges',
+    'Read how far a pull request is behind its base branch and whether it merges into it',
   'pr.files': 'Read every file a pull request changes, with its patch',
   'repo.file': "Read one file's text at a commit",
   'pr.thread.reply': 'Reply on one review thread and verify the reply',
   'pr.thread.resolve': 'Resolve one review thread and verify the result',
   'pr.review.submit':
     'Submit a comment review with inline findings at one commit (presentation, not a gate)',
+  'attachment.put': 'Store an image in the repository and return a link a comment can embed',
   'comment.upsert': 'Write the one marked comment on a pull request',
 } satisfies Record<ForgeRequest['op'], string>;
 
@@ -85,12 +86,12 @@ export const forgeHelp: HelpGroup = {
       subcommand: 'check',
       spec: 'forge check',
       description:
-        'Check before a run spends that a plugin serves a host, supports the named\noperations and has a credential; runs no forge operation. Exits 1 with the reason',
+        'Check before a run spends that a plugin serves a host, supports the named\noperations and has a credential; for a remote or repo whose plugin serves\npr.view, one pr.view by head proves the forge accepts the credential, so it\nneeds pull-request read on the repository. Exits 1 with the reason',
       scopedFlags: [
         {
           spec: '--data <json>',
           description:
-            'JSON object with host and operations, for example\n{"host":"github.com","operations":["pr.view","pr.merge"]}',
+            'JSON object with host, remote or repo, and operations, for example\n{"host":"github.com","operations":["pr.view","pr.merge"]}',
         },
       ],
     },

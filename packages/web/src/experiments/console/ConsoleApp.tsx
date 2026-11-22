@@ -17,7 +17,7 @@ import { LinkTelegramPage } from './routes/LinkTelegramPage';
 import { invalidate } from './store/cache';
 import { K } from './store/keys';
 import { useKeymap, type Binding } from './lib/keymap';
-import { useDashboardSSE } from './lib/sse';
+import { useAttentionStreamSSE, useDashboardSSE } from './lib/sse';
 import { useRunAttentionAlerts } from './lib/attention-alerts';
 import { SHORTCUTS } from './lib/shortcuts';
 import './theme.css';
@@ -33,6 +33,7 @@ export function ConsoleApp(): ReactElement {
   const { pathname } = useLocation();
   const [railOpen, setRailOpen] = useState(false);
   useDashboardSSE(useRunAttentionAlerts());
+  useAttentionStreamSSE();
   useEffect(() => {
     setRailOpen(false);
   }, [pathname]);
