@@ -8,6 +8,8 @@
 #     job, the push-only ones included, on the same tree.
 #   - To run every job on a branch before it merges, dispatch this workflow on it:
 #     `gh workflow run test.yml --ref <branch>`. The results appear on the branch's pull request.
+#     This fork has no Windows jobs (ADR 0008), so the `windows-full-suite` input below is
+#     accepted and selects nothing; it stays so upstream's decision script keeps its shape.
 name: Test Suite
 
 on:
@@ -21,6 +23,10 @@ on:
         description: 'Also run the workflow fixtures (bun run validate --only workflow-fixtures)'
         type: boolean
         default: false
+      windows-full-suite:
+        description: 'Also run the whole suite on Windows, as a push to main does'
+        type: boolean
+        default: false
   push:
     branches: [main, dev]
   # Draft pull requests skip the suite: their branches are pushed many times while the
@@ -30,7 +36,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 
 env:
-  BUN_VERSION: '1.4.2'
+  BUN_VERSION: '1.4.5'
 
 # A pull request's newer push replaces its older run. A push to dev or main is the complete
 # verification of that merge (the pull request ran only the Linux jobs), so each pushed
@@ -55,6 +61,7 @@ jobs:
       run-pack-tests: ${{ steps.decision.outputs.run-pack-tests }}
       run-pack-fixtures: ${{ steps.decision.outputs.run-pack-fixtures }}
       run-full-matrix: ${{ steps.decision.outputs.run-full-matrix }}
+      run-windows-full-suite: ${{ steps.decision.outputs.run-windows-full-suite }}
       run-docker-build: ${{ steps.decision.outputs.run-docker-build }}
       run-serve-binary: ${{ steps.decision.outputs.run-serve-binary }}
     steps:
@@ -93,6 +100,8 @@ jobs:
           echo "run-pack-fixtures=$run_pack_fixtures" >> "$GITHUB_OUTPUT"
           run_full_matrix=$(bun scripts/should-run-test-suite.ts --full-matrix)
           echo "run-full-matrix=$run_full_matrix" >> "$GITHUB_OUTPUT"
+          run_windows_full_suite=$(bun scripts/should-run-test-suite.ts --windows-full-suite)
+          echo "run-windows-full-suite=$run_windows_full_suite" >> "$GITHUB_OUTPUT"
           run_docker_build=$(bun scripts/should-run-test-suite.ts --docker-build)
           echo "run-docker-build=$run_docker_build" >> "$GITHUB_OUTPUT"
           run_serve_binary=$(bun scripts/should-run-test-suite.ts --serve-binary)
@@ -523,6 +532,13 @@ jobs:
         run: |
           docker run --rm --platform linux/arm64 --network none --entrypoint bun archon-ci:slack-arm64 \
             -e 'import { inspectChatPlugin } from "./packages/cli/src/commands/inspect-chat-plugin"; const descriptor = await inspectChatPlugin("/opt/archon/image-plugins/archon-chat-slack"); if (descriptor.id !== "slack") process.exit(1);'
+
+      # The CLI imports the archon-cli skill files from outside packages/ (bundled-skill.ts);
+      # the import throws when the image lacks them, as it did while .dockerignore excluded .claude/.
+      - name: Smoke test — image carries the files the CLI imports
+        run: |
+          docker run --rm --entrypoint bun archon-ci:test \
+            -e 'await import("./packages/cli/src/bundled-skill")'
 
       - name: Smoke test — container starts and serves /api/health
         run: |

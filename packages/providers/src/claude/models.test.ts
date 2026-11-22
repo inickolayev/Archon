@@ -13,11 +13,17 @@ interface QueryCall {
 const calls: QueryCall[] = [];
 let supportedModels: () => Promise<ModelInfo[]> = async () => [];
 
+const unmocked = (name: string) => () => {
+  throw new Error(`${name} is not mocked`);
+};
 mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: (params: QueryCall) => {
     calls.push(params);
     return { supportedModels: () => supportedModels() };
   },
+  archiveSession: unmocked('archiveSession'),
+  unarchiveSession: unmocked('unarchiveSession'),
+  matchDeniedModels: unmocked('matchDeniedModels'),
 }));
 
 import { listClaudeModels } from './models';

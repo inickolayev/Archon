@@ -24,6 +24,7 @@ function needs(
         'run-tests': runTests,
         'run-workspace-tests': runWorkspaceTests,
         'run-full-matrix': runPushOnly,
+        'run-windows-full-suite': runPushOnly,
         'run-docker-build': runPushOnly,
         'run-serve-binary': runPushOnly,
       },
@@ -35,7 +36,12 @@ function needs(
 /** Every gated job skipped, as on a prose-only pull request or a push a pull request run proved. */
 const decisionSkips = Object.fromEntries([...GATED.keys()].map(job => [job, 'skipped']));
 const ALWAYS = ['static'];
-const PUSH_ONLY_OUTPUTS = ['run-full-matrix', 'run-docker-build', 'run-serve-binary'];
+const PUSH_ONLY_OUTPUTS = [
+  'run-full-matrix',
+  'run-windows-full-suite',
+  'run-docker-build',
+  'run-serve-binary',
+];
 const alwaysSuccess = Object.fromEntries(ALWAYS.map(job => [job, 'success']));
 const allSuccess = {
   ...Object.fromEntries([...GATED.keys()].map(job => [job, 'success'])),
@@ -84,6 +90,15 @@ describe('Test Suite aggregate outcome', () => {
       ...Object.fromEntries(pushOnly.map(job => [job, 'skipped'])),
     };
     expect(testSuiteFailures(needs('true', results, 'true', 'false'), GATED)).toEqual([]);
+  });
+
+  // ChessWin fork: Windows is out of scope (ADR 0008 in chesswin-factory). The decision is still
+  // published, so upstream's script keeps its shape, but no job here is gated on it.
+  test('no job is gated on the whole-Windows-suite decision in this fork', () => {
+    const fullSuite = [...GATED].flatMap(([job, output]) =>
+      output === 'run-windows-full-suite' ? [job] : []
+    );
+    expect(fullSuite).toEqual([]);
   });
 
   test('fails the workspace shards skipped when their decision said to run them', () => {
@@ -197,6 +212,7 @@ describe('CI wiring', () => {
     'pack-tests',
     'pack-fixtures',
     'full-matrix',
+    'windows-full-suite',
     'docker-build',
     'serve-binary',
   ])('publishes the %s decision from the deciding step', mode => {

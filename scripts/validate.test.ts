@@ -84,7 +84,13 @@ describe('validate check selection', () => {
         (job.steps ?? []).flatMap(step => stepChecks(job, step.run ?? ''))
       )
     );
-    expect(VALIDATE_CHECKS.map(check => check.id).filter(id => !selected.has(id))).toEqual([]);
+    // `windows-tests` is upstream's Windows set; this fork runs no Windows job (ADR 0008).
+    const notInThisFork = new Set(['windows-tests']);
+    expect(
+      VALIDATE_CHECKS.map(check => check.id).filter(
+        id => !selected.has(id) && !notInThisFork.has(id)
+      )
+    ).toEqual([]);
   });
 
   test('on each OS the test legs run every part of every workspace shard', () => {
@@ -137,6 +143,16 @@ describe('validate check selection', () => {
         runsScripts: true,
       });
     }
+  });
+
+  // Upstream runs its Windows set in a `windows-set` job; this fork has none (ADR 0008).
+  test('no job runs the Windows set in this fork', () => {
+    const { jobs } = readWorkflow();
+    expect(jobs['windows-set']).toBeUndefined();
+    const runners = Object.values(jobs).filter(job =>
+      (job.steps ?? []).some(step => stepChecks(job, step.run ?? '').includes('windows-tests'))
+    );
+    expect(runners).toEqual([]);
   });
 
   test.each([

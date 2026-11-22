@@ -8,10 +8,15 @@ import {
 } from '@archon/core/workflows/sql-host';
 import { createWorkflowStore } from '@archon/core/workflows/store-adapter';
 import * as codebaseDb from '@archon/core/db/codebases';
+import { registeredProjectKeyForPath } from '@archon/core/services/codebase-checkout-resolver';
+import { readPackGraph } from '@archon/core/workflows/pack-graph';
+import { getTriggersPath, launchProjectKey } from '@archon/core/workflows/run-ended';
+import { providerRegistry } from '@archon/providers';
 import type { WebAdapter } from '../adapters/web';
 import { dagNodeSseEventSchema } from '../adapters/web/workflow-event.schemas';
 import { isApiGateEnabled } from '../auth';
 import type { AttentionRouter } from '../services/attention-router';
+import type { ItemTracker } from '@archon/adapters/item-tracker/item-tracker';
 import type { WebPushDestination } from '../services/web-push';
 import { createOrchestratorDispatch, type TelegramAdapterSource } from './api-message-dispatch';
 import { requireWebUser, resolveAuthContext } from './api-request-auth';
@@ -26,6 +31,7 @@ import { registerHealthRoutes } from './api.health';
 import { registerItemRoutes } from './api.items';
 import { registerMessageRoutes } from './api.messages';
 import { registerMetricViewsRoute, registerMetricsRoute } from './api.metrics';
+import { registerPackGraphRoute } from './api.packs';
 import { registerProviderKeyRoutes } from './api.provider-keys';
 import { registerProviderRoutes } from './api.providers';
 import { registerAttentionStreamRoute, registerRunAttentionRoutes } from './api.run-attention';
@@ -51,7 +57,11 @@ export function registerApiRoutes(
   webAdapter: WebAdapter,
   lockManager: ConversationLockManager,
   activePlatforms?: readonly string[],
-  attention?: { webPush: WebPushDestination; router: AttentionRouter },
+  attention?: {
+    webPush: WebPushDestination;
+    router: AttentionRouter;
+    tracker?: Pick<ItemTracker, 'health'>;
+  },
   registration: Pick<CloneOptions, 'githubAppAuth'> = {},
   commit?: AppCommit,
   /**
@@ -135,6 +145,21 @@ export function registerApiRoutes(
   registerMetricViewsRoute(app, {
     codebaseCwd: async id => (await codebaseDb.getCodebase(id))?.default_cwd ?? null,
     loadConfig,
+  });
+  registerPackGraphRoute(app, {
+    codebaseCwd: async id => (await codebaseDb.getCodebase(id))?.default_cwd ?? null,
+    readPackGraph: (cwd, pack, workflowSource) =>
+      readPackGraph(
+        cwd,
+        pack,
+        {
+          loadConfig,
+          providers: providerRegistry,
+          triggersDirectory: getTriggersPath,
+          projectKeyOf: launchProjectKey(path => registeredProjectKeyForPath(path, codebaseDb)),
+        },
+        workflowSource === undefined ? {} : { workflowSource }
+      ),
   });
   registerWorkflowDefinitionRoutes(app);
   registerArtifactRoutes(app);

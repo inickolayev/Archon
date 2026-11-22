@@ -6,8 +6,10 @@ import { removeTempTree } from '@archon/paths/test-utils';
 import { discoverPlugins } from './discovery';
 import { dispatchForge } from './dispatch';
 import {
+  ATTACHMENT_MAX_BYTES,
   contentDigest,
   forgeAuditResponse,
+  forgeRequestSchema,
   mutationTarget,
   type ForgeRequest,
   type ForgeResponse,
@@ -492,6 +494,30 @@ test('a plugin without review submission refuses it by name without running', as
   });
 });
 
+test('an attachment is an image of the allowed types, from 1 byte up to the size limit', () => {
+  const put = (contentType: string, bytes: number) =>
+    forgeRequestSchema.safeParse({
+      operationId: 'attach-1',
+      op: 'attachment.put',
+      repo: ref.repo,
+      contentType,
+      content: Buffer.alloc(bytes, 1).toString('base64'),
+    }).success;
+  expect(put('image/png', ATTACHMENT_MAX_BYTES)).toBe(true);
+  expect(put('image/png', ATTACHMENT_MAX_BYTES + 1)).toBe(false);
+  expect(put('image/png', 0)).toBe(false);
+  expect(put('image/svg+xml', 1)).toBe(false);
+  expect(
+    forgeRequestSchema.safeParse({
+      operationId: 'attach-1',
+      op: 'attachment.put',
+      repo: ref.repo,
+      contentType: 'image/png',
+      content: 'not base64!',
+    }).success
+  ).toBe(false);
+});
+
 test('draft conversion accepts unchanged evidence and rejects a non-open read-back', async () => {
   expect((await dispatch(draft, 'unchanged')).response).toMatchObject({
     ok: true,
@@ -656,6 +682,18 @@ describe('review threads and issue bodies', () => {
       });
     }
   );
+
+  test('a plugin answering merge state in the pre-base shape is told which field is missing', async () => {
+    const { response } = await dispatch(
+      { operationId: 'merge-state-1', op: 'pr.merge-state', ref },
+      'old-shape'
+    );
+    expect(response).toMatchObject({ ok: false, error: { kind: 'invalid_response' } });
+    const message = response.ok ? '' : response.error.message;
+    expect(message).toContain('pr.merge-state');
+    expect(message).toContain('result.value.base_branch');
+    expect(message).toContain('result.value.base_revision');
+  });
 });
 
 describe('temporary failures at the dispatch boundary', () => {

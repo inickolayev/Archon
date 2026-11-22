@@ -4,6 +4,8 @@
  */
 import type { WorkflowHost } from '@archon/core/workflows/host-store';
 import { isContinueSubcommand, rejectRunFlagsOnContinue } from '../dispatch-guards';
+import type { ItemTarget } from '../commands/item-target';
+import type { WorkflowLinkRequest } from '../commands/workflow-link';
 import { writeJsonLine } from '../utils/stdout';
 import { type CliRouteContext, fail } from './context';
 import { loadRoute, usesDatabaseStore } from './route-loader';
@@ -15,7 +17,7 @@ export type WorkflowRoute = CliRouteContext & { commands: WorkflowCommands; host
 
 /** `workflow wake|signal`, routed before the project gate. */
 export async function runWorkflowContinuation(
-  { positionals, values }: CliRouteContext,
+  { positionals, values, forgeTrustedEnv }: CliRouteContext,
   subcommand: 'wake' | 'signal'
 ): Promise<number> {
   // `workflow wake schedule` installs an OS timer and never opens the store or a provider.
@@ -27,7 +29,7 @@ export async function runWorkflowContinuation(
   if (wakeSchedule) return await workflowWakeScheduleCommand(positionals.slice(2), values);
   const { createCliWorkflowHost } = await import('../utils/workflow-host');
   return await workflowContinuationCommand(
-    await createCliWorkflowHost(true),
+    await createCliWorkflowHost({ forgeTrustedEnv }),
     subcommand,
     positionals.slice(2),
     values
@@ -108,7 +110,9 @@ export async function prepareWorkflowRoute(ctx: CliRouteContext): Promise<Workfl
   // execute a workflow initialize it first. A misconfigured App fails here,
   // before any run row exists; query commands stay usable without it.
   const executesWorkflow = subcommand === 'run' || isContinueSubcommand(subcommand);
-  const host = await createCliWorkflowHost(executesWorkflow);
+  const host = await createCliWorkflowHost(
+    executesWorkflow ? { forgeTrustedEnv: ctx.forgeTrustedEnv } : undefined
+  );
   return { ...ctx, commands, host };
 }
 
@@ -307,6 +311,18 @@ export async function runWorkflowResume(route: WorkflowRoute): Promise<number> {
     route.effectiveCwd,
     route.values.detach as boolean | undefined
   );
+}
+
+export async function runWorkflowPause(route: WorkflowRoute): Promise<number> {
+  const pauseRunId = route.positionals[2];
+  if (!pauseRunId) {
+    return await fail(route.json, 'Usage: archon workflow pause <run-id> [--as <name>]');
+  }
+  return await route.commands.workflowPauseCommand(route.host, pauseRunId, {
+    json: route.json,
+    cwd: route.effectiveCwd,
+    as: route.values.as as string | undefined,
+  });
 }
 
 export async function runWorkflowAbandon(route: WorkflowRoute): Promise<number> {
@@ -622,21 +638,97 @@ export async function runWorkflowRule(route: WorkflowRoute): Promise<number> {
   return await commands.workflowRuleCommand(route.host, effectiveCwd, request, json);
 }
 
+export async function runWorkflowItems(route: WorkflowRoute): Promise<number> {
+  const { positionals, values, json, commands, effectiveCwd } = route;
+  if (positionals[2] !== undefined) return await fail(json, commands.WORKFLOW_ITEMS_USAGE);
+  const rawLimit = values.limit as string | undefined;
+  const limit = rawLimit === undefined ? undefined : Number(rawLimit);
+  const since = values.since as string | undefined;
+  const until = values.until as string | undefined;
+  const after = values.after as string | undefined;
+  return await commands.workflowItemsCommand(
+    route.host,
+    effectiveCwd,
+    {
+      ...(since === undefined ? {} : { since }),
+      ...(until === undefined ? {} : { until }),
+      ...(after === undefined ? {} : { after }),
+      ...(limit === undefined ? {} : { limit }),
+    },
+    json
+  );
+}
+
+export async function runWorkflowMerged(route: WorkflowRoute): Promise<number> {
+  const { positionals, values, json, commands, effectiveCwd } = route;
+  const target = itemTarget(values);
+  const change = values.change as string | undefined;
+  const at = values.at as string | undefined;
+  const commit = values.commit as string | undefined;
+  if (
+    target === undefined ||
+    change === undefined ||
+    at === undefined ||
+    positionals[2] !== undefined
+  )
+    return await fail(json, commands.WORKFLOW_MERGED_USAGE);
+  return await commands.workflowMergedCommand(
+    route.host,
+    effectiveCwd,
+    { ...target, change, at, ...(commit === undefined ? {} : { commit }) },
+    json
+  );
+}
+
+/** Exactly one of `--item <key>` and `--item-of <run-id>`, or undefined. */
+function itemTarget(values: WorkflowRoute['values']): ItemTarget | undefined {
+  const item = values.item as string | undefined;
+  const itemOf = values['item-of'] as string | undefined;
+  if (item !== undefined && itemOf === undefined) return { item };
+  if (itemOf !== undefined && item === undefined) return { itemOf };
+  return undefined;
+}
+
+export async function runWorkflowLanding(route: WorkflowRoute): Promise<number> {
+  const { positionals, values, json, commands, effectiveCwd } = route;
+  const target = itemTarget(values);
+  const branch = values.branch as string | undefined;
+  if (target === undefined || branch === undefined || positionals[2] !== undefined)
+    return await fail(json, commands.WORKFLOW_LANDING_USAGE);
+  return await commands.workflowLandingCommand(
+    route.host,
+    effectiveCwd,
+    { ...target, branch },
+    json
+  );
+}
+
+/**
+ * Exactly one form, or undefined: a link from `--item` to `--to`, a link from or to the
+ * `--item-of` run's item (`--to` or `--from`), or the id of a link to end.
+ */
+function linkRequest(values: WorkflowRoute['values']): WorkflowLinkRequest | undefined {
+  const text = (name: string) => values[name] as string | undefined;
+  const [item, itemOf, kind, to, from] = [
+    text('item'),
+    text('item-of'),
+    text('kind'),
+    text('to'),
+    text('from'),
+  ];
+  const [end, as] = [text('end'), text('as')];
+  const named = [item, itemOf, kind, to, from].filter(value => value !== undefined).length;
+  if (end !== undefined) return named === 0 ? { end, as } : undefined;
+  if (named !== 3 || kind === undefined) return undefined;
+  if (item !== undefined && to !== undefined) return { item, kind, to, as };
+  if (itemOf !== undefined && to !== undefined) return { itemOf, kind, to, as };
+  if (itemOf !== undefined && from !== undefined) return { itemOf, kind, from, as };
+  return undefined;
+}
+
 export async function runWorkflowLink(route: WorkflowRoute): Promise<number> {
   const { positionals, values, json, commands, effectiveCwd } = route;
-  const item = values.item as string | undefined;
-  const kind = values.kind as string | undefined;
-  const to = values.to as string | undefined;
-  const end = values.end as string | undefined;
-  const as = values.as as string | undefined;
-  if (positionals[2] !== undefined) return await fail(json, commands.WORKFLOW_LINK_USAGE);
-  // Exactly one of the two forms: a link to record, or the id of one to end.
-  const request =
-    end !== undefined && item === undefined && kind === undefined && to === undefined
-      ? { end, as }
-      : end === undefined && item !== undefined && kind !== undefined && to !== undefined
-        ? { item, kind, to, as }
-        : undefined;
+  const request = positionals[2] === undefined ? linkRequest(values) : undefined;
   if (request === undefined) return await fail(json, commands.WORKFLOW_LINK_USAGE);
   return await commands.workflowLinkCommand(route.host, effectiveCwd, request, json);
 }
@@ -695,6 +787,6 @@ export async function runUnknownWorkflowSubcommand({
       : `Unknown workflow subcommand: ${subcommand}`;
   return await fail(
     json,
-    `${problem}\nAvailable: list, run, test, types, status, get, artifacts, logs, wait, runs, resume, cancel, abandon, end-turn, approve, reject, respond, answer, attention, rule, link, cleanup, reset-sessions, event, notice, wake, signal`
+    `${problem}\nAvailable: list, run, test, types, status, get, artifacts, logs, wait, runs, pause, resume, cancel, abandon, end-turn, approve, reject, respond, answer, attention, rule, link, items, merged, landing, cleanup, reset-sessions, event, notice, wake, signal`
   );
 }

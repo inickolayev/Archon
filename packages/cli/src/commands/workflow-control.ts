@@ -184,9 +184,10 @@ export async function workflowAbandonCommand(
 }
 
 /**
- * Cancel a running run through the shared `cancelWorkflow` op.
+ * Cancel a pending or running run through the shared `cancelWorkflow` op.
  *
- * Ordering is the contract: prove the live exact-run owner, terminate its process
+ * A pending run no process is starting is recorded `cancelled` before it starts. For a
+ * running run, ordering is the contract: prove the live exact-run owner, terminate its process
  * tree, then record `cancelled`. An unreachable owner never falls back to a DB-only
  * transition — the refusal points at `abandon` for an orphan the operator has verified.
  */
@@ -209,6 +210,52 @@ export async function workflowCancelCommand(
 
   const resolvedId = await resolveRunIdArg(host, runId, cwd);
   printCancelResult(resolvedId, await cancelOneRun(host, resolvedId));
+  return 0;
+}
+
+/**
+ * Ask the executor that owns a running run to pause it before its next node
+ * (`pauseWorkflow`). Returns at once; the run reads `pause requested` until it pauses.
+ */
+export async function workflowPauseCommand(
+  host: WorkflowHost,
+  runId: string,
+  opts: { json?: boolean; cwd?: string; as?: string }
+): Promise<number> {
+  const pause = async () => {
+    const resolvedId = await resolveRunIdArg(host, runId, opts.cwd);
+    return host.operations.pauseWorkflow(resolvedId, cliActor(opts.as), 'cli');
+  };
+  if (opts.json) {
+    try {
+      const { run, requested, alreadyRequested } = await pause();
+      await writeJsonLine({
+        ok: true,
+        runId: run.id,
+        action: 'pause',
+        state: 'requested',
+        alreadyRequested,
+        requestedAt: requested.at,
+      });
+      return 0;
+    } catch (error) {
+      await printJsonWriteError(runId, 'pause', error);
+      return 1;
+    }
+  }
+  const { run, requested, alreadyRequested } = await pause();
+  console.log(
+    alreadyRequested
+      ? `A pause of run ${run.id} (${run.workflow_name}) was already requested at ${requested.at}.`
+      : `Pause requested for run ${run.id} (${run.workflow_name}).`
+  );
+  console.log(
+    'It pauses before its next node starts, once the nodes running now finish; ' +
+      'if no node is left, it completes instead. A paused run keeps its checkout, results, resource slot and item.'
+  );
+  console.log(
+    `Once \`archon workflow status\` shows it paused, resume it: archon workflow resume ${run.id}`
+  );
   return 0;
 }
 

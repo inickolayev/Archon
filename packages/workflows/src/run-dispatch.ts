@@ -367,7 +367,8 @@ async function resolveBaseBranch(
   config: WorkflowConfig,
   recordedDispatch: RunDispatchMetadata | undefined
 ): Promise<string> {
-  // The per-dispatch override takes priority, then what this run
+  // The per-dispatch override (`--base`, else the item's landing branch, which callers
+  // resolve before they call) takes priority, then what this run
   // recorded at its start, then an already resolved checkout base, repo config, the codebase default,
   // then git auto-detection.
   // The override must outrank config so `--base` reports the same branch the
@@ -387,9 +388,9 @@ async function resolveBaseBranch(
   try {
     const repoPath = toRepoPath(cwd);
     const remote = config.remote?.trim() || (await getDefaultRemote(repoPath));
-    // No remote to detect from is the normal state of a local repository. Like a folder
-    // project, $BASE_BRANCH stays unresolved; a worktree run refuses earlier, when it
-    // cannot choose a remote to cut from.
+    // No remote to detect from is the normal state of a local repository. A CLI or trigger
+    // worktree run already has its base from creation (`resolvedBaseBranch` above);
+    // otherwise, like a folder project, $BASE_BRANCH stays unresolved.
     if (!remote) return '';
     return await getDefaultBranch(repoPath, remote);
   } catch (error) {
