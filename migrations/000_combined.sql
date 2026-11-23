@@ -457,6 +457,21 @@ CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
 ALTER TABLE remote_agent_user_ai_prefs
   ADD COLUMN IF NOT EXISTS default_model VARCHAR(255);
 
+-- Personal access tokens for non-browser clients (CLI agents, MCP). Only the
+-- SHA-256 of the token is stored; token_prefix is the display-only head.
+-- NULL expires_at = never expires; revoked_at set = revoked.
+CREATE TABLE IF NOT EXISTS remote_agent_api_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+  name VARCHAR(255) NOT NULL,
+  token_hash VARCHAR(64) NOT NULL UNIQUE,
+  token_prefix VARCHAR(32) NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  last_used_at TIMESTAMP WITH TIME ZONE,
+  expires_at TIMESTAMP WITH TIME ZONE,
+  revoked_at TIMESTAMP WITH TIME ZONE
+);
+
 -- ============================================================================
 -- Web auth (opt-in): role on the canonical user + Better Auth tables
 -- ============================================================================
@@ -962,6 +977,10 @@ ALTER TABLE remote_agent_workflow_node_sessions ADD COLUMN IF NOT EXISTS model T
 --
 -- Guarded by packages/core/src/db/migration-statement-order.test.ts and
 -- exercised against real PostgreSQL upgrades by scripts/check-schema-upgrades.ts.
+
+-- Personal access tokens
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user
+  ON remote_agent_api_tokens(user_id);
 
 -- Item rulings
 CREATE INDEX IF NOT EXISTS idx_item_rulings_item_id

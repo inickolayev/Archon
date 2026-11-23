@@ -19,8 +19,9 @@ import type { AttentionRouter } from '../services/attention-router';
 import type { ItemTracker } from '@archon/adapters/item-tracker/item-tracker';
 import type { WebPushDestination } from '../services/web-push';
 import { createOrchestratorDispatch, type TelegramAdapterSource } from './api-message-dispatch';
-import { requireWebUser, resolveAuthContext } from './api-request-auth';
+import { hasRejectedApiToken, requireWebUser, resolveAuthContext } from './api-request-auth';
 import { registerAccountRoutes } from './api.account';
+import { registerApiTokenRoutes } from './api.api-tokens';
 import { registerArtifactRoutes } from './api.artifacts';
 import { registerAuthRoutes } from './api.auth';
 import { registerCodebaseEnvironmentRoute, registerCodebaseRoutes } from './api.codebases';
@@ -29,6 +30,7 @@ import { registerConversationRoutes } from './api.conversations';
 import { registerConversationProcessingRoute } from './api.conversation-processing';
 import { registerHealthRoutes } from './api.health';
 import { registerItemRoutes } from './api.items';
+import { registerMcpRoute } from './api.mcp';
 import { registerMessageRoutes } from './api.messages';
 import { registerMetricViewsRoute, registerMetricsRoute } from './api.metrics';
 import { registerPackGraphRoute } from './api.packs';
@@ -104,9 +106,14 @@ export function registerApiRoutes(
   // client can forge it and walk straight through this gate.
   const PUBLIC_API_GATE_PREFIXES = ['/api/auth/', '/api/health'];
   app.use('/api/*', async (c, next) => {
-    if (!isApiGateEnabled()) return next();
     const path = c.req.path;
     if (PUBLIC_API_GATE_PREFIXES.some(p => path === p || path.startsWith(p))) return next();
+    // A presented API token that does not resolve is refused even where the gate is off:
+    // the client believes it is authenticated and must learn that it is not.
+    if (await hasRejectedApiToken(c)) {
+      return c.json({ error: 'Invalid or expired API token' }, 401);
+    }
+    if (!isApiGateEnabled()) return next();
     if (await resolveAuthContext(c)) return next();
     // Soft resolution reads an identity-backend outage as "signed out"; the strict
     // path tells the two apart so an outage is a 503, not a 401.
@@ -116,6 +123,7 @@ export function registerApiRoutes(
 
   registerAuthRoutes(app);
   registerAccountRoutes(app, getTelegramAdapter);
+  registerApiTokenRoutes(app);
   registerProviderKeyRoutes(app);
   registerUserAiPrefsRoutes(app);
   registerConversationRoutes(app, { webAdapter, dispatchToOrchestrator });
@@ -167,5 +175,6 @@ export function registerApiRoutes(
   registerProviderRoutes(app);
   registerCodebaseEnvironmentRoute(app);
   registerWebPushRoutes(app, attention);
+  registerMcpRoute(app);
   registerHealthRoutes(app, { lockManager, activePlatforms, attention, commit });
 }

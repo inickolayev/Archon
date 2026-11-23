@@ -43,6 +43,9 @@ mock.module('./console/skills', () => ({
   addProjectByUrl: addUrl,
   addProjectByPath: addPath,
   getMetrics: mock(),
+  listApiTokens: mock(),
+  createApiToken: mock(),
+  revokeApiToken: mock(),
   getMetricViews: mock(),
   answerAttentionItem: mock(),
 }));

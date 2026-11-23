@@ -22,5 +22,6 @@ export * from './providers';
 export * from './github';
 export * from './providerKeys';
 export * from './account';
+export * from './apiTokens';
 
 export { HttpError } from '../lib/http';

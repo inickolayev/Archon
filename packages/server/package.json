@@ -24,6 +24,7 @@
     "@archon/providers": "workspace:*",
     "@archon/workflows": "workspace:*",
     "@hono/zod-openapi": "^1.4.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "better-auth": "~1.6.22",
     "dotenv": "^17.2.3",
     "hono": "^4.12.16",
@@ -160,6 +161,15 @@
     ],
     [
       "src/routes/api.auth.test.ts"
+    ],
+    [
+      "src/routes/api.api-tokens.test.ts"
+    ],
+    [
+      "src/routes/api.mcp.test.ts"
+    ],
+    [
+      "src/mcp/archon-mcp-server.test.ts"
     ],
     [
       "src/routes/api.conversation-ownership.test.ts"
