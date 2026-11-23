@@ -11,6 +11,6 @@ import { registerRunTools } from './run-tools';
 export function createArchonMcpServer(call: ApiCall, deps: ChatToolDeps = {}): McpServer {
   const server = new McpServer({ name: 'archon', version: '1.0.0' });
   registerChatTools(server, call, deps);
-  registerRunTools(server, call);
+  registerRunTools(server, call, deps);
   return server;
 }
