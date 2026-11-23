@@ -4,7 +4,13 @@ import type { ApiCall } from './api-client';
 import { apiFailure, asArray, asRecord, jsonResult, pick, respond } from './tool-kit';
 
 const DEFAULT_WAIT_SECONDS = 120;
-const MAX_WAIT_SECONDS = 600;
+/**
+ * The whole wait happens inside one HTTP response that writes nothing until it ends
+ * (JSON mode), and Bun.serve closes a connection idle for `idleTimeout` seconds —
+ * 255 at most (server index.ts). Staying under it keeps the tool from losing the
+ * connection mid-wait; a longer turn answers `running` and is read with get_messages.
+ */
+const MAX_WAIT_SECONDS = 240;
 const POLL_INTERVAL_MS = 1500;
 const MESSAGE_FETCH_LIMIT = 500;
 

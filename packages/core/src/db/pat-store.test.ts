@@ -81,3 +81,12 @@ test('revoke is owner-scoped and takes effect immediately', async () => {
   expect(await listApiTokens('u4')).toEqual([]);
   expect(await revokeApiToken('u4', record.id)).toBe(false);
 });
+
+test('revoking a malformed id is a plain "no such token", not a database error', async () => {
+  await seedUser('u9');
+  const { record } = await createApiToken({ userId: 'u9', name: 'x', expiresInDays: null });
+  expect(record.id).toMatch(/^[0-9a-f]{32}$/);
+  expect(await revokeApiToken('u9', 'not-a-token-id')).toBe(false);
+  expect(await revokeApiToken('u9', "1' OR '1'='1")).toBe(false);
+  expect(await revokeApiToken('u9', record.id)).toBe(true);
+});

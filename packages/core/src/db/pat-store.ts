@@ -25,6 +25,8 @@ const DISPLAY_PREFIX_LENGTH = 12;
 /** `last_used_at` is refreshed at most this often, to keep reads from becoming writes. */
 const LAST_USED_REFRESH_MS = 60_000;
 const DAY_MS = 86_400_000;
+const TOKEN_ID_PATTERN =
+  /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
 export interface ApiTokenRecord {
   id: string;
@@ -161,6 +163,9 @@ export async function listApiTokens(userId: string): Promise<ApiTokenRecord[]> {
 
 /** Revoke one of `userId`'s tokens. Returns false when it does not exist or is not theirs. */
 export async function revokeApiToken(userId: string, tokenId: string): Promise<boolean> {
+  // Ids are UUIDs on PostgreSQL and 32 hex characters on SQLite. Anything else names
+  // no token — and PostgreSQL would refuse to cast it to uuid, turning a typo into a 503.
+  if (!TOKEN_ID_PATTERN.test(tokenId)) return false;
   const result = await pool.query(
     `UPDATE remote_agent_api_tokens SET revoked_at = $1
      WHERE id = $2 AND user_id = $3 AND revoked_at IS NULL`,

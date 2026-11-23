@@ -76,7 +76,7 @@ A request that presents an `arc_pat_` token is judged on that token alone: an un
 
 These routes need a browser session. With a token they answer `403`, so a leaked token cannot mint or extend tokens.
 
-`POST /api/mcp` is an [MCP](https://modelcontextprotocol.io) server (Streamable HTTP, stateless) authenticated by the same gate. Its tools call the REST routes above in-process with your credentials, so they can do exactly what the token's owner can: `list_projects`, `list_conversations`, `create_conversation`, `send_message` (waits up to `waitSeconds`, default 120, maximum 600, for the assistant's turn; otherwise answers `running` and you read the reply with `get_messages`), `get_messages`, `list_workflows`, `run_workflow`, `list_runs`, `get_run`, `approve_run`, `reject_run` and `cancel_run`. `GET` and `DELETE` on `/api/mcp` answer `405`.
+`POST /api/mcp` is an [MCP](https://modelcontextprotocol.io) server (Streamable HTTP, stateless) authenticated by the same gate. Its tools call the REST routes above in-process with your credentials, so they can do exactly what the token's owner can: `list_projects`, `list_conversations`, `create_conversation`, `send_message` (waits up to `waitSeconds`, default 120, maximum 240, for the assistant's turn; otherwise answers `running` and you read the reply with `get_messages`), `get_messages`, `list_workflows`, `run_workflow`, `list_runs`, `get_run`, `approve_run`, `reject_run` and `cancel_run`. `GET` and `DELETE` on `/api/mcp` answer `405`.
 
 Claude Code:
 

@@ -40,7 +40,21 @@ type TokenIdentity =
  * falling back to a session or the proxy header, so a stale token never silently
  * becomes a different identity.
  */
-async function resolveTokenIdentity(c: Context): Promise<TokenIdentity> {
+/**
+ * One verification per request: the /api/* gate and the route behind it both ask,
+ * and each ask would otherwise be another lookup (and possibly a last_used write).
+ */
+const tokenIdentityByRequest = new WeakMap<Request, Promise<TokenIdentity>>();
+
+function resolveTokenIdentity(c: Context): Promise<TokenIdentity> {
+  const cached = tokenIdentityByRequest.get(c.req.raw);
+  if (cached) return cached;
+  const resolved = verifyTokenIdentity(c);
+  tokenIdentityByRequest.set(c.req.raw, resolved);
+  return resolved;
+}
+
+async function verifyTokenIdentity(c: Context): Promise<TokenIdentity> {
   const token = presentedApiToken(c);
   if (token === undefined) return { kind: 'absent' };
   try {

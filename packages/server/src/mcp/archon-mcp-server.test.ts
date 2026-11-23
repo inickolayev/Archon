@@ -119,7 +119,7 @@ describe('Archon MCP tools', () => {
     );
     const result = await client.callTool({
       name: 'send_message',
-      arguments: { conversationId: 'web-1', message: 'hi', waitSeconds: 300 },
+      arguments: { conversationId: 'web-1', message: 'hi', waitSeconds: 200 },
     });
     expect(JSON.parse(textOf(result))).toEqual({ status: 'running', conversationId: 'web-1' });
   });
