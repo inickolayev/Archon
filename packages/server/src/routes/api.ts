@@ -30,6 +30,7 @@ import { registerConversationRoutes } from './api.conversations';
 import { registerConversationProcessingRoute } from './api.conversation-processing';
 import { registerHealthRoutes } from './api.health';
 import { registerItemRoutes } from './api.items';
+import { registerMcpRoute } from './api.mcp';
 import { registerMessageRoutes } from './api.messages';
 import { registerMetricViewsRoute, registerMetricsRoute } from './api.metrics';
 import { registerPackGraphRoute } from './api.packs';
@@ -174,5 +175,6 @@ export function registerApiRoutes(
   registerProviderRoutes(app);
   registerCodebaseEnvironmentRoute(app);
   registerWebPushRoutes(app, attention);
+  registerMcpRoute(app);
   registerHealthRoutes(app, { lockManager, activePlatforms, attention, commit });
 }
