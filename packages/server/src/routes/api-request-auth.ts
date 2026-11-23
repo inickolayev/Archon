@@ -6,6 +6,7 @@ import {
   type ConversationVisibility,
 } from '@archon/core/db/conversation-visibility';
 import * as userDb from '@archon/core/db/users';
+import { looksLikeApiToken, verifyApiToken } from '@archon/core/db/pat-store';
 import * as workflowDb from '@archon/core/db/workflows';
 import { getAuth, isWebAuthEnabled, isConversationOwnershipEnforced } from '../auth';
 // Imported from the pure config module rather than the barrel: route tests mock
@@ -16,6 +17,50 @@ import { apiError, getLog } from './api-route-kit';
 interface WebUserContext {
   userId: User['id'];
   role: User['role'];
+  /** True when the request authenticated with a personal access token rather than a session or proxy header. */
+  viaToken?: true;
+}
+
+/** The personal access token in `Authorization: Bearer arc_pat_…`, if the request carries one. */
+export function presentedApiToken(c: Context): string | undefined {
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(c.req.header('authorization') ?? '');
+  const value = match?.[1];
+  return value !== undefined && looksLikeApiToken(value) ? value : undefined;
+}
+
+type TokenIdentity =
+  | { kind: 'absent' }
+  | { kind: 'valid'; context: WebUserContext }
+  | { kind: 'invalid' }
+  | { kind: 'unavailable' };
+
+/**
+ * A presented personal access token is the only credential considered: when it is
+ * present but unknown, revoked, or expired the request is refused rather than
+ * falling back to a session or the proxy header, so a stale token never silently
+ * becomes a different identity.
+ */
+async function resolveTokenIdentity(c: Context): Promise<TokenIdentity> {
+  const token = presentedApiToken(c);
+  if (token === undefined) return { kind: 'absent' };
+  try {
+    const verified = await verifyApiToken(token);
+    if (verified === null) return { kind: 'invalid' };
+    const user = await userDb.getUserById(verified.userId);
+    if (user === null) return { kind: 'invalid' };
+    return { kind: 'valid', context: { userId: user.id, role: user.role, viaToken: true } };
+  } catch (err) {
+    getLog().error({ err: err as Error, path: c.req.path }, 'web.api_token_resolve_failed');
+    return { kind: 'unavailable' };
+  }
+}
+
+/**
+ * Whether the request presented a personal access token that does not resolve.
+ * The API gate uses it to answer 401 even when the gate is otherwise off.
+ */
+export async function hasRejectedApiToken(c: Context): Promise<boolean> {
+  return (await resolveTokenIdentity(c)).kind === 'invalid';
 }
 
 /**
@@ -24,6 +69,10 @@ interface WebUserContext {
  * the API gate maps it to 401 when authentication is required.
  */
 export async function resolveAuthContext(c: Context): Promise<WebUserContext | undefined> {
+  const token = await resolveTokenIdentity(c);
+  if (token.kind === 'valid') return token.context;
+  if (token.kind !== 'absent') return undefined;
+
   const auth = getAuth();
   if (auth) {
     try {
@@ -80,6 +129,13 @@ export async function requireWebUser(
   c: Context,
   failMessage = 'Web authentication required'
 ): Promise<WebUserContext | { error: Response }> {
+  const token = await resolveTokenIdentity(c);
+  if (token.kind === 'valid') return token.context;
+  if (token.kind === 'invalid') return { error: apiError(c, 401, 'Invalid or expired API token') };
+  if (token.kind === 'unavailable') {
+    return { error: apiError(c, 503, 'Could not verify API token — backend unavailable') };
+  }
+
   const auth = getAuth();
   if (auth) {
     let session: Awaited<ReturnType<typeof auth.api.getSession>> | undefined;
@@ -112,6 +168,43 @@ export async function requireWebUser(
     return { userId: user.id, role: user.role };
   } catch (err) {
     getLog().error({ err: err as Error, headerPresent: true }, 'web.user_resolve_failed');
+    return { error: apiError(c, 503, 'Could not verify web identity — backend unavailable') };
+  }
+}
+
+/**
+ * Token management is for a signed-in browser session only: a personal access
+ * token (or the proxy header) cannot mint, list, or revoke tokens, so a leaked
+ * token cannot extend or multiply itself. A request carrying a token is 403, not
+ * 401, because the credential is valid but not allowed here.
+ */
+export async function requireSessionUser(
+  c: Context
+): Promise<WebUserContext | { error: Response }> {
+  if (presentedApiToken(c) !== undefined) {
+    return { error: apiError(c, 403, 'API tokens are managed from a signed-in browser session') };
+  }
+  const auth = getAuth();
+  if (!auth) {
+    return { error: apiError(c, 403, 'API tokens require web authentication to be enabled') };
+  }
+  let session: Awaited<ReturnType<typeof auth.api.getSession>> | undefined;
+  try {
+    session = await auth.api.getSession({ headers: c.req.raw.headers });
+  } catch (err) {
+    getLog().error({ err: err as Error }, 'web.session_resolve_failed');
+    return { error: apiError(c, 503, 'Could not verify session — backend unavailable') };
+  }
+  if (!session?.user) return { error: apiError(c, 401, 'Authentication required') };
+  try {
+    const user = await userDb.findOrCreateUserByPlatformIdentity(
+      'web',
+      session.user.id,
+      session.user.name ?? session.user.email ?? undefined
+    );
+    return { userId: user.id, role: user.role };
+  } catch (err) {
+    getLog().error({ err: err as Error }, 'web.user_resolve_failed');
     return { error: apiError(c, 503, 'Could not verify web identity — backend unavailable') };
   }
 }

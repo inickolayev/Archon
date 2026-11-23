@@ -162,6 +162,9 @@
       "src/routes/api.auth.test.ts"
     ],
     [
+      "src/routes/api.api-tokens.test.ts"
+    ],
+    [
       "src/routes/api.conversation-ownership.test.ts"
     ],
     [
