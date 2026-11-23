@@ -471,7 +471,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_api_tokens (
   expires_at TIMESTAMP WITH TIME ZONE,
   revoked_at TIMESTAMP WITH TIME ZONE
 );
-CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON remote_agent_api_tokens(user_id);
 
 -- ============================================================================
 -- Web auth (opt-in): role on the canonical user + Better Auth tables
@@ -978,6 +977,10 @@ ALTER TABLE remote_agent_workflow_node_sessions ADD COLUMN IF NOT EXISTS model T
 --
 -- Guarded by packages/core/src/db/migration-statement-order.test.ts and
 -- exercised against real PostgreSQL upgrades by scripts/check-schema-upgrades.ts.
+
+-- Personal access tokens
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user
+  ON remote_agent_api_tokens(user_id);
 
 -- Item rulings
 CREATE INDEX IF NOT EXISTS idx_item_rulings_item_id
