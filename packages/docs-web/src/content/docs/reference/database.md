@@ -299,6 +299,11 @@ The tables defined in `migrations/000_combined.sql` are prefixed with `remote_ag
   - `tiers` / `aliases` are JSON-as-TEXT; folded into model resolution as the highest-precedence layer. `default_model` pins the user's direct-chat model (written atomically with `default_provider`; applied only when the effective chat provider matches — workflows still resolve the `large` tier). Resolution follows the **acting user**: workflow runs use the run starter; chat turns use the message **sender** (the conversation creator's row is only a fallback when no sender identity resolves)
   - Editable via the console "Just me" scope, `archon ai … --scope user`, or `/api/auth/me/ai-prefs*`
 
+- **`remote_agent_api_tokens`** - Personal access tokens for non-browser clients (REST with `Authorization: Bearer arc_pat_…`, the MCP endpoint `/api/mcp`)
+  - Only the SHA-256 of a token is stored (`token_hash`, unique); `token_prefix` is a display-only head so a user can tell tokens apart. The plaintext is returned once at creation and never again
+  - `expires_at` NULL = never expires; `revoked_at` set = revoked. Cascades on user deletion; `last_used_at` is refreshed at most once a minute
+  - Minted, listed and revoked only from a signed-in browser session (`/api/me/tokens*`) — a token cannot manage tokens
+
 - **`remote_agent_web_push_subscriptions`** - Browsers opted in to run-attention Web Push
   - One row per browser endpoint (`UNIQUE(endpoint)`), owned by the user who enabled it and cascaded on user deletion; only that owner can delete it
   - Stores the endpoint and its encryption keys; every row on the install receives notices, and the attention router removes rows the push service reports as expired (404/410)
