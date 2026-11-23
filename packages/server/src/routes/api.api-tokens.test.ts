@@ -28,11 +28,26 @@ const noopLogger = () => ({
 });
 
 let gateEnabled = true;
-type Session = { user: { id: string; name: string } } | null;
-let session: Session = null;
-let authInstance: { api: { getSession: (args: unknown) => Promise<Session> } } | null = null;
+type FakeSession = { user: { id: string; name: string } } | null;
+let session: FakeSession = null;
+let authInstance: { api: { getSession: (args: unknown) => Promise<FakeSession> } } | null = null;
+
+const real0 = { ...(await import('../auth')) };
+const real1 = { ...(await import('@archon/core/db/users')) };
+const real2 = { ...(await import('@archon/core/db/pat-store')) };
+const real3 = { ...(await import('@archon/core')) };
+const real4 = { ...(await import('@archon/paths')) };
+const real5 = { ...(await import('@archon/git')) };
+const real6 = { ...(await import('@archon/core/db/conversations')) };
+const real7 = { ...(await import('@archon/core/db/codebases')) };
+const real8 = { ...(await import('@archon/core/db/isolation-environments')) };
+const real9 = { ...(await import('@archon/core/db/workflows')) };
+const real10 = { ...(await import('@archon/core/db/workflow-events')) };
+const real11 = { ...(await import('@archon/core/db/messages')) };
+const real12 = { ...(await import('@archon/core/utils/commands')) };
 
 mock.module('../auth', () => ({
+  ...real0,
   getAuth: () => authInstance,
   isWebAuthEnabled: () => authInstance !== null,
   getSignupMode: () => 'disabled',
@@ -41,6 +56,7 @@ mock.module('../auth', () => ({
 }));
 
 mock.module('@archon/core/db/users', () => ({
+  ...real1,
   findOrCreateUserByPlatformIdentity: mock(async (_platform: string, platformUserId: string) => ({
     id: `user-from-${platformUserId}`,
     role: 'admin' as const,
@@ -61,6 +77,7 @@ let stored: Stored[] = [];
 const created: { userId: string; name: string; expiresInDays: number | null }[] = [];
 
 mock.module('@archon/core/db/pat-store', () => ({
+  ...real2,
   looksLikeApiToken: (v: string) => v.startsWith('arc_pat_'),
   verifyApiToken: mock(async (token: string) => {
     const row = stored.find(s => s.token === token);
@@ -109,6 +126,7 @@ mock.module('@archon/core/db/pat-store', () => ({
 const mockGetPrefs = mock(async (_userId: string) => ({}));
 
 mock.module('@archon/core', () => ({
+  ...real3,
   handleMessage: mock(async () => {}),
   getDatabaseType: () => 'postgresql',
   loadConfig: mock(async () => ({})),
@@ -145,6 +163,7 @@ mock.module('@archon/core', () => ({
 }));
 
 mock.module('@archon/paths', () => ({
+  ...real4,
   canonicalizeProjectPath: async (path: string) => path,
   createLogger: noopLogger,
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
@@ -159,12 +178,14 @@ mock.module('@archon/paths', () => ({
 mockAllWorkflowModules();
 
 mock.module('@archon/git', () => ({
+  ...real5,
   removeWorktree: mock(async () => {}),
   toRepoPath: (p: string) => p,
   toWorktreePath: (p: string) => p,
 }));
 
 mock.module('@archon/core/db/conversations', () => ({
+  ...real6,
   listConversations: mock(async () => []),
   findConversationByPlatformId: mock(async () => null),
   getOrCreateConversation: mock(async () => ({ id: 'c', platform_conversation_id: 'web-x' })),
@@ -174,17 +195,20 @@ mock.module('@archon/core/db/conversations', () => ({
 }));
 
 mock.module('@archon/core/db/codebases', () => ({
+  ...real7,
   listCodebases: mock(async () => []),
   getCodebase: mock(async () => null),
   deleteCodebase: mock(async () => {}),
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({
+  ...real8,
   listByCodebase: mock(async () => []),
   updateStatus: mock(async () => {}),
 }));
 
 mock.module('@archon/core/db/workflows', () => ({
+  ...real9,
   pauseWorkflowRunForOperator: mock(async () => ({ paused: false })),
   requestOperatorPause: mock(async () => undefined),
   getRunIdsByIsolationEnvId: mock(async (): Promise<string[]> => []),
@@ -197,16 +221,19 @@ mock.module('@archon/core/db/workflows', () => ({
 }));
 
 mock.module('@archon/core/db/workflow-events', () => ({
+  ...real10,
   listWorkflowEvents: mock(async () => []),
   createWorkflowEvent: mock(async () => {}),
 }));
 
 mock.module('@archon/core/db/messages', () => ({
+  ...real11,
   addMessage: mock(async () => ({ id: 'm' })),
   listMessages: mock(async () => []),
 }));
 
 mock.module('@archon/core/utils/commands', () => ({
+  ...real12,
   findCommandFiles: mock(async () => []),
 }));
 

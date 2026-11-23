@@ -10,8 +10,8 @@ import { requestJson } from '../lib/http';
 export type ApiToken = components['schemas']['ApiToken'];
 export type CreatedApiToken = components['schemas']['CreateApiTokenResponse'];
 
-/** `null` mints a token that never expires. */
-export type ApiTokenExpiryDays = 30 | 90 | 365 | null;
+/** Days until expiry; `null` mints a token that never expires. */
+export type ApiTokenExpiryDays = components['schemas']['CreateApiTokenBody']['expiresInDays'];
 
 export async function listApiTokens(): Promise<ApiToken[]> {
   return (await requestJson('/api/me/tokens', 'get')).tokens;

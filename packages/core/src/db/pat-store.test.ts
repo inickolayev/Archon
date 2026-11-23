@@ -3,7 +3,10 @@ import { afterAll, expect, mock, test } from 'bun:test';
 import { SqliteAdapter, sqliteDialect } from './adapters/sqlite';
 
 const db = new SqliteAdapter(':memory:');
+const real0 = { ...(await import('./connection')) };
+
 mock.module('./connection', () => ({
+  ...real0,
   pool: db,
   getDatabase: () => db,
   getDialect: () => sqliteDialect,
