@@ -428,6 +428,20 @@ export class SqliteAdapter implements IDatabase {
         UNIQUE(user_id, provider)
       );
 
+      -- Personal access tokens (CLI agents, MCP): only the SHA-256 is stored.
+      CREATE TABLE IF NOT EXISTS remote_agent_api_tokens (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        token_prefix TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        last_used_at TEXT,
+        expires_at TEXT,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON remote_agent_api_tokens(user_id);
+
       -- User AI preferences (Phase 3): personal model tiers, @custom aliases,
       -- and default assistant. NON-encrypted — model names are not secrets
       -- (mirrors codebase_env_vars, not the provider-key store). One row per
