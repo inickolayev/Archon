@@ -96,6 +96,17 @@ const OURS: Record<string, string[]> = {
     'packages/web/src/experiments/console/builder/model/authoring-shape.ts',
     'packages/web/src/experiments/console/builder/model/authoring-shape.test.ts',
   ],
+  // chesswin-factory ADR 0011 §6, issue #32: a run belongs to nobody, so it calls whoever asked.
+  'a run calls its Telegram watchers to its gates and its end': [
+    'packages/core/src/services/run-watchers.ts',
+    'packages/core/src/services/run-watchers.test.ts',
+    'packages/core/src/handlers/commands/workflow-watch.ts',
+    'packages/core/src/handlers/commands/workflow-watch.test.ts',
+    'packages/server/src/adapters/telegram-attention.ts',
+    'packages/server/src/adapters/telegram-attention.test.ts',
+    'packages/server/src/adapters/telegram-attention-text.ts',
+    'packages/server/src/adapters/telegram-attention-text.test.ts',
+  ],
 };
 
 /**
@@ -146,6 +157,12 @@ const OURS_INSIDE_THEIRS: Record<string, [string, string][]> = {
   // version silently points every run in this repository at their branch instead of ours.
   'worktrees are cut from this fork, not from upstream': [
     ['.archon/config.yaml', 'baseBranch: chesswin'],
+  ],
+  // Without these the files above survive and nothing calls them: the bundled bot is no
+  // destination of the attention router, and `/workflow watch` answers with the usage text.
+  'a run calls its Telegram watchers to its gates and its end (wiring)': [
+    ['packages/server/src/index.ts', 'createTelegramAttentionDestination('],
+    ['packages/core/src/handlers/commands/workflow.ts', "case 'watch':"],
   ],
 };
 

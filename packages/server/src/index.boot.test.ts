@@ -320,6 +320,23 @@ mock.module('./services/attention-router', () => ({
   },
 }));
 mock.module('./services/web-push', () => ({ WebPushDestination: class {} }));
+// ChessWin fork (chesswin-factory #32): the bundled bot's attention destination reads the
+// database; boot only needs it to exist.
+class MockTelegramAttentionDestination {
+  readonly id = 'telegram';
+  async activate(): Promise<void> {}
+  async state(): Promise<'plugin_down'> {
+    return 'plugin_down';
+  }
+  async deliver(): Promise<Record<string, never>> {
+    return {};
+  }
+}
+mock.module('./adapters/telegram-attention', () => ({
+  TelegramAttentionDestination: MockTelegramAttentionDestination,
+  telegramOperatorChats: (): string[] => [],
+  createTelegramAttentionDestination: () => new MockTelegramAttentionDestination(),
+}));
 const workflowHost = {} as import('@archon/core/workflows/host-store').WorkflowHost;
 mock.module('@archon/core/workflows/sql-host', () => ({
   createSqlWorkflowHost: () => workflowHost,

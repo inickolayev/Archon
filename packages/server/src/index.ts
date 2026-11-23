@@ -57,6 +57,10 @@ import { PgNotifyListener } from './adapters/web/pg-notify-listener';
 import { AttentionRouter } from './services/attention-router';
 import { hostItemTrackerForge, ItemTracker } from '@archon/adapters/item-tracker/item-tracker';
 import { WebPushDestination } from './services/web-push';
+import {
+  createTelegramAttentionDestination,
+  type TelegramNoticeSender,
+} from './adapters/telegram-attention';
 import { loadWebhookSourcePlugins } from './services/webhook-source-plugins';
 import { createServerResourceStartHost } from './services/resource-start-hosting';
 import { createSqlWorkflowHost } from '@archon/core/workflows/sql-host';
@@ -213,7 +217,20 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     installedChatIds: new Set(chatPlugins.map(plugin => plugin.descriptor.id)),
   };
   if (!opts.skipPlatformAdapters) warnRetiredAdapters(adapterContext.installedChatIds);
-  const chat = await startChatHosting(chatPlugins, config, lockManager, registry);
+  // Telegram is declared here, above where it starts: the API routes and the attention
+  // router need a LIVE reference to it. They are set up before the HTTP listener starts and
+  // Telegram starts after it, so a value captured now would always be null (same reason
+  // `activePlatforms` is a live array).
+  let telegram: TelegramAdapter | null = null;
+  // ChessWin fork (chesswin-factory #32): the bundled bot hears pauses and ends like a chat
+  // plugin does — when this server runs it at all.
+  const bundledTelegram =
+    !opts.skipPlatformAdapters &&
+    Boolean(process.env.TELEGRAM_BOT_TOKEN) &&
+    !adapterContext.installedChatIds.has('telegram')
+      ? (): TelegramAdapter | null => telegram
+      : undefined;
+  const chat = await startChatHosting(chatPlugins, config, lockManager, registry, bundledTelegram);
   const tracker = config.itemTracker
     ? new ItemTracker(config.itemTracker, hostItemTrackerForge())
     : undefined;
@@ -233,11 +250,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const app = new OpenAPIHono({ defaultHook: validationErrorHook });
   const port = opts.port ?? (await getPort());
   const resourceStarts = await createResourceStarts();
-  // Telegram is declared here, above where it starts, because the API routes need a
-  // LIVE reference to it: they are registered before the HTTP listener starts and
-  // Telegram starts after it, so a value captured at registration would always be
-  // null (same reason `activePlatforms` is a live array).
-  let telegram: TelegramAdapter | null = null;
   registerServerRoutes(app, {
     webAdapter: web.adapter,
     lockManager,
@@ -495,7 +507,8 @@ async function startChatHosting(
   chatPlugins: readonly InstalledChatPlugin[],
   config: MergedConfig,
   lockManager: ConversationLockManager,
-  registry: PlatformRegistry
+  registry: PlatformRegistry,
+  bundledTelegram?: () => TelegramNoticeSender | null
 ): Promise<ChatHosting> {
   const inlinePlatforms = new Set(
     chatPlugins
@@ -508,12 +521,25 @@ async function startChatHosting(
     lockManager,
     registry.workflowPlatforms,
     registry.activePlatforms,
-    { routes: config.attentionNotices, inlinePlatforms }
+    {
+      // ChessWin fork (#32): the bundled bot owns the `telegram` routes when it runs.
+      routes: bundledTelegram
+        ? config.attentionNotices.filter(route => route.platform !== 'telegram')
+        : config.attentionNotices,
+      inlinePlatforms,
+    }
   );
   // Each route's activation baseline commits before the router's first scan.
   await Promise.all(host.attentionDestinations.map(destination => destination.activate()));
   const webPush = new WebPushDestination(inlinePlatforms);
-  const router = new AttentionRouter([webPush, ...host.attentionDestinations], inlinePlatforms);
+  const telegramAttention = bundledTelegram
+    ? createTelegramAttentionDestination(config.attentionNotices, bundledTelegram, inlinePlatforms)
+    : undefined;
+  await telegramAttention?.activate();
+  const router = new AttentionRouter(
+    [webPush, ...host.attentionDestinations, ...(telegramAttention ? [telegramAttention] : [])],
+    inlinePlatforms
+  );
   for (const plugin of chatPlugins) {
     getLog().info(
       { plugin: plugin.descriptor.id },

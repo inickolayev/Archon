@@ -24,6 +24,8 @@ import {
   resumeWorkflowRun,
 } from './workflow-runs';
 import { approveWorkflowRun, rejectWorkflowRun, respondToWorkflowRun } from './workflow-gates';
+// ChessWin fork (chesswin-factory #32): a chat asks a run to call it.
+import { watchWorkflowRun } from './workflow-watch';
 
 export async function handleWorkflowCommand(
   operations: WorkflowOperations,
@@ -57,6 +59,10 @@ export async function handleWorkflowCommand(
       return rejectWorkflowRun(input);
     case 'respond':
       return respondToWorkflowRun(input);
+    case 'watch':
+      return watchWorkflowRun(input, true);
+    case 'unwatch':
+      return watchWorkflowRun(input, false);
     case 'run':
       return runWorkflow(input);
     default:
@@ -176,6 +182,8 @@ function workflowUsage(input: WorkflowCommand): CommandResult {
       `  ${cmd('abandon <id>')} - Abandon a running, failed, or paused run`,
       `  ${cmd('approve <id> [comment]')} - Approve a paused gate`,
       `  ${cmd('reject <id> [reason]')} - Reject a paused gate`,
+      `  ${cmd('watch <id>')} - Telegram: get this run's gates, questions and end here`,
+      `  ${cmd('unwatch <id>')} - Telegram: stop watching a run`,
       `  ${cmd('reset-sessions <name> [<node-id>]')} - Clear persisted AI session memory for this conversation`,
       `  ${cmd('run <name> [args]')} - Run a workflow directly`,
     ].join('\n'),
