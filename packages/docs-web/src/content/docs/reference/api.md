@@ -60,6 +60,45 @@ The GitHub connection routes require a resolved Web identity. The device login r
 
 These routes require a resolved Web identity.
 
+### API tokens and the MCP endpoint
+
+A personal API token lets a non-browser client (Claude Code, Codex, a script) act as you. Tokens exist only on installs with Web authentication (Better Auth); anywhere the gate runs, `Authorization: Bearer arc_pat_...` authenticates as the token's owner with exactly that user's access.
+
+Create a token in the console under **Settings, API tokens**: give it a name, pick an expiry (30 days, 90 days, 1 year, or none) and copy the value. It is shown once and only its SHA-256 is stored; the list shows the name, the first characters, when it was created and last used, and when it expires. **Revoke** takes effect on the next request. To rotate a token, create a new one, update the client, then revoke the old one.
+
+A request that presents an `arc_pat_` token is judged on that token alone: an unknown, revoked or expired token gets `401` and never falls back to a session or the `X-Archon-User` header. Other bearer values are ignored, as before.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/me/tokens` | The signed-in user's active tokens (no secrets) |
+| POST | `/api/me/tokens` | Create a token from `{ "name": "...", "expiresInDays": 90 }` (`null` for no expiry); the response is the only time the full token appears |
+| DELETE | `/api/me/tokens/{id}` | Revoke one of your tokens |
+
+These routes need a browser session. With a token they answer `403`, so a leaked token cannot mint or extend tokens.
+
+`POST /api/mcp` is an [MCP](https://modelcontextprotocol.io) server (Streamable HTTP, stateless) authenticated by the same gate. Its tools call the REST routes above in-process with your credentials, so they can do exactly what the token's owner can: `list_projects`, `list_conversations`, `create_conversation`, `send_message` (waits up to `waitSeconds`, default 120, maximum 600, for the assistant's turn; otherwise answers `running` and you read the reply with `get_messages`), `get_messages`, `list_workflows`, `run_workflow`, `list_runs`, `get_run`, `approve_run`, `reject_run` and `cancel_run`. `GET` and `DELETE` on `/api/mcp` answer `405`.
+
+Claude Code:
+
+```bash
+claude mcp add --transport http archon https://your-archon.example.com/api/mcp \
+  --header "Authorization: Bearer $ARCHON_TOKEN"
+```
+
+Codex, in `~/.codex/config.toml` (export `ARCHON_TOKEN` in the environment Codex runs in):
+
+```toml
+[mcp_servers.archon]
+url = "https://your-archon.example.com/api/mcp"
+bearer_token_env_var = "ARCHON_TOKEN"
+```
+
+Plain REST works the same way:
+
+```bash
+curl -H "Authorization: Bearer $ARCHON_TOKEN" https://your-archon.example.com/api/workflows
+```
+
 ---
 
 ## Health
