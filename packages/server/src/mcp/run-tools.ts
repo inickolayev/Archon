@@ -4,8 +4,13 @@ import type { ApiCall } from './api-client';
 import type { ChatToolDeps } from './chat-tools';
 import { apiFailure, asArray, asRecord, jsonResult, pick, respond } from './tool-kit';
 
-/** How many times run_workflow looks for the run it started, and the pause between looks. */
-const RUN_LOOKUP_ATTEMPTS = 10;
+/**
+ * How many times run_workflow looks for the run it started, and the pause between looks.
+ * The run row appears only after dispatch and isolation setup: on the factory stand a
+ * run of a zero-AI workflow appeared 17 s after its start was accepted. A minute keeps
+ * well under Bun's 255 s idle timeout for the one HTTP response this tool call is.
+ */
+const RUN_LOOKUP_ATTEMPTS = 60;
 const RUN_LOOKUP_INTERVAL_MS = 1000;
 /** Newest runs of the workflow examined per look; the started one is among the newest. */
 const RUN_LOOKUP_CANDIDATES = 5;
