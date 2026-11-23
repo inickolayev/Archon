@@ -40,6 +40,7 @@ export const K = {
   providers: 'providers' as const,
   updateCheck: 'update-check' as const,
   githubConnection: 'github-connection' as const,
+  apiTokens: 'api-tokens' as const,
   providerConnections: 'provider-connections' as const,
   userAiPrefs: 'user-ai-prefs' as const,
   /** The signed-in account (Profile) and who-wrote-what (authorship labels). */
