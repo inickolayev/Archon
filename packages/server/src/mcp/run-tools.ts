@@ -1,7 +1,14 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ApiCall } from './api-client';
+import type { ChatToolDeps } from './chat-tools';
 import { apiFailure, asArray, asRecord, jsonResult, pick, respond } from './tool-kit';
+
+/** How many times run_workflow looks for the run it started, and the pause between looks. */
+const RUN_LOOKUP_ATTEMPTS = 10;
+const RUN_LOOKUP_INTERVAL_MS = 1000;
+/** Newest runs of the workflow examined per look; the started one is among the newest. */
+const RUN_LOOKUP_CANDIDATES = 5;
 
 const runFields = [
   'id',
@@ -22,7 +29,49 @@ function toRun(row: unknown): Record<string, unknown> {
   return pick(row, runFields);
 }
 
-export function registerRunTools(server: McpServer, call: ApiCall): void {
+/**
+ * The id of the run that `POST /api/workflows/{name}/run` just started in
+ * `conversationId`. That route answers before the run exists and returns no id,
+ * and the runs list carries no conversation platform ids, so this reads the
+ * newest runs of the workflow and matches the detail's `parent_platform_id`
+ * (web runs work in a child conversation) or `conversation_platform_id`.
+ * Undefined when nothing matched in time — the run may still start; list_runs finds it.
+ */
+async function findStartedRun(
+  call: ApiCall,
+  workflowName: string,
+  conversationId: string,
+  sleep: (ms: number) => Promise<void>
+): Promise<string | undefined> {
+  const examined = new Set<string>();
+  for (let attempt = 0; attempt < RUN_LOOKUP_ATTEMPTS; attempt++) {
+    if (attempt > 0) await sleep(RUN_LOOKUP_INTERVAL_MS);
+    const listed = await call('GET', '/api/workflows/runs', { query: { limit: 20 } });
+    if (!listed.ok) return undefined;
+    const candidates = asArray(asRecord(listed.data).runs)
+      .map(asRecord)
+      .filter(run => run.workflow_name === workflowName && typeof run.id === 'string')
+      .map(run => run.id as string)
+      .filter(id => !examined.has(id))
+      .slice(0, RUN_LOOKUP_CANDIDATES);
+    for (const id of candidates) {
+      examined.add(id);
+      const detail = await call('GET', runPath(id));
+      const run = asRecord(asRecord(detail.data).run);
+      if (
+        run.parent_platform_id === conversationId ||
+        run.conversation_platform_id === conversationId
+      ) {
+        return id;
+      }
+    }
+  }
+  return undefined;
+}
+
+export function registerRunTools(server: McpServer, call: ApiCall, deps: ChatToolDeps = {}): void {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+
   server.registerTool(
     'list_workflows',
     {
@@ -50,8 +99,8 @@ export function registerRunTools(server: McpServer, call: ApiCall): void {
       description:
         'Start a workflow run. It runs in a conversation: pass conversationId, or codebaseId ' +
         'to start in a fresh conversation of that project. `message` is the task text; ' +
-        '`inputs` fills the workflow’s declared inputs. Returns at once; follow the run with ' +
-        'list_runs / get_run.',
+        '`inputs` fills the workflow’s declared inputs. Returns once the run exists, with its ' +
+        '`runId` for get_run / approve_run / reject_run / cancel_run.',
       inputSchema: {
         name: z.string().min(1).describe('Workflow name from list_workflows'),
         message: z.string().describe('What to do; may be empty if inputs carry everything'),
@@ -76,7 +125,15 @@ export function registerRunTools(server: McpServer, call: ApiCall): void {
       const result = await call('POST', `/api/workflows/${encodeURIComponent(name)}/run`, {
         body: { conversationId: target, message, ...(inputs === undefined ? {} : { inputs }) },
       });
-      return respond(result, data => ({ conversationId: target, ...asRecord(data) }));
+      if (!result.ok) return apiFailure(result);
+      const runId = await findStartedRun(call, name, target, sleep);
+      return jsonResult({
+        conversationId: target,
+        ...asRecord(result.data),
+        ...(runId === undefined
+          ? { runId: null, note: 'Run id not found yet; look it up with list_runs.' }
+          : { runId }),
+      });
     }
   );
 

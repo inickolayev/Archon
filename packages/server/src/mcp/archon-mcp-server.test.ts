@@ -124,19 +124,38 @@ describe('Archon MCP tools', () => {
     expect(JSON.parse(textOf(result))).toEqual({ status: 'running', conversationId: 'web-1' });
   });
 
-  test('run_workflow starts a conversation when none is given and passes inputs', async () => {
-    const { client, calls } = await connect((_method, path) => {
+  test('run_workflow starts a conversation when none is given, passes inputs and returns the run id', async () => {
+    const { client, calls } = await connect((method, path) => {
       if (path === '/api/conversations') return ok({ conversationId: 'web-9', id: 'u' });
-      return ok({ accepted: true, status: 'started' });
+      if (path === '/api/workflows/runs') {
+        return ok({
+          runs: [
+            { id: 'r-other', workflow_name: 'other' },
+            { id: 'r-old', workflow_name: 'sdlc' },
+            { id: 'r-new', workflow_name: 'sdlc' },
+          ],
+        });
+      }
+      if (path === '/api/workflows/runs/r-old') return ok({ run: { parent_platform_id: 'web-1' } });
+      if (path === '/api/workflows/runs/r-new') return ok({ run: { parent_platform_id: 'web-9' } });
+      return method === 'POST' ? ok({ accepted: true, status: 'started' }) : fail(404, 'nope');
     });
     const result = await client.callTool({
       name: 'run_workflow',
       arguments: { name: 'sdlc', message: 'do #5', codebaseId: 'cb', inputs: { issue: '5' } },
     });
-    expect(JSON.parse(textOf(result)).conversationId).toBe('web-9');
+    expect(JSON.parse(textOf(result))).toEqual({
+      conversationId: 'web-9',
+      accepted: true,
+      status: 'started',
+      runId: 'r-new',
+    });
     expect(calls.map(c => `${c.method} ${c.path}`)).toEqual([
       'POST /api/conversations',
       'POST /api/workflows/sdlc/run',
+      'GET /api/workflows/runs',
+      'GET /api/workflows/runs/r-old',
+      'GET /api/workflows/runs/r-new',
     ]);
     expect(calls[0]?.body).toEqual({ codebaseId: 'cb' });
     expect(calls[1]?.body).toEqual({
@@ -144,6 +163,18 @@ describe('Archon MCP tools', () => {
       message: 'do #5',
       inputs: { issue: '5' },
     });
+  });
+
+  test('run_workflow still answers when the started run cannot be found yet', async () => {
+    const { client } = await connect((method, path) => {
+      if (path === '/api/workflows/runs') return ok({ runs: [] });
+      return method === 'POST' ? ok({ accepted: true, status: 'started' }) : fail(404, 'nope');
+    });
+    const result = await client.callTool({
+      name: 'run_workflow',
+      arguments: { name: 'sdlc', message: 'go', conversationId: 'web-2' },
+    });
+    expect(JSON.parse(textOf(result))).toMatchObject({ conversationId: 'web-2', runId: null });
   });
 
   test('gate tools post the route bodies', async () => {
