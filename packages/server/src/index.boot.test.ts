@@ -334,7 +334,6 @@ class MockTelegramAttentionDestination {
 }
 mock.module('./adapters/telegram-attention', () => ({
   TelegramAttentionDestination: MockTelegramAttentionDestination,
-  telegramOperatorChats: (): string[] => [],
   createTelegramAttentionDestination: () => new MockTelegramAttentionDestination(),
 }));
 const workflowHost = {} as import('@archon/core/workflows/host-store').WorkflowHost;

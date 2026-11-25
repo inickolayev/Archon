@@ -184,6 +184,8 @@ function workflowUsage(input: WorkflowCommand): CommandResult {
       `  ${cmd('reject <id> [reason]')} - Reject a paused gate`,
       `  ${cmd('watch <id>')} - Telegram: get this run's gates, questions and end here`,
       `  ${cmd('unwatch <id>')} - Telegram: stop watching a run`,
+      `  ${cmd('watch all')} - Telegram: get the gates of every run nobody started`,
+      `  ${cmd('unwatch all')} - Telegram: stop that`,
       `  ${cmd('reset-sessions <name> [<node-id>]')} - Clear persisted AI session memory for this conversation`,
       `  ${cmd('run <name> [args]')} - Run a workflow directly`,
     ].join('\n'),

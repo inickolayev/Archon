@@ -3,11 +3,7 @@ import type { AttentionNoticeRecord } from '@archon/core/db/workflow-events';
 import type { AttentionNotice } from '@archon/core/services/attention-notices';
 import { TELEGRAM_ATTENTION_DESTINATION, watchRecord } from '@archon/core/services/run-watchers';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
-import {
-  TelegramAttentionDestination,
-  telegramOperatorChats,
-  type TelegramAttentionDeps,
-} from './telegram-attention';
+import { TelegramAttentionDestination, type TelegramAttentionDeps } from './telegram-attention';
 
 const RUN_ID = 'run-1';
 
@@ -51,7 +47,10 @@ interface Harness {
 
 function harness(
   options: {
-    operators?: string[];
+    /** Chats watching every run nobody started. */
+    allRuns?: string[];
+    /** A user's linked Telegram chat, by user id. */
+    authors?: Record<string, string>;
     ledger?: AttentionNoticeRecord[];
     chats?: Record<string, string>;
     failFor?: string[];
@@ -62,7 +61,8 @@ function harness(
 ): Harness {
   const sent: Harness['sent'] = [];
   const deps: TelegramAttentionDeps = {
-    operators: options.operators ?? ['100'],
+    allRunsWatchers: async () => options.allRuns ?? ['100'],
+    authorChatOf: async userId => options.authors?.[userId],
     sender: () =>
       options.telegramUp === false
         ? null
@@ -86,15 +86,27 @@ describe('TelegramAttentionDestination', () => {
     expect(await harness({ telegramUp: false }).destination.state()).toBe('plugin_down');
   });
 
-  test('a gate of a run started anywhere reaches the operator chat with its answer', async () => {
+  test('a gate of a run nobody started reaches the chats watching all such runs', async () => {
     const { sent, destination } = harness();
     await destination.deliver(gateNotice());
     expect(sent.map(m => m.chat)).toEqual(['100']);
     expect(sent[0]?.text).toContain(`/workflow approve ${RUN_ID}`);
   });
 
+  test('a run someone started calls them in their linked Telegram, not the all-runs chats', async () => {
+    const { sent, destination } = harness({ authors: { 'u-dmitry': '265' } });
+    await destination.deliver(gateNotice({ user_id: 'u-dmitry' }));
+    expect(sent.map(m => m.chat)).toEqual(['265']);
+  });
+
+  test('an author with no Telegram linked is not called, and nobody is called in their place', async () => {
+    const { sent, destination } = harness();
+    await destination.deliver(gateNotice({ user_id: 'u-console-only' }));
+    expect(sent).toEqual([]);
+  });
+
   test('the Telegram chat that started a background run is called to its gate', async () => {
-    const { sent, destination } = harness({ operators: [], chats: { 'parent-conv': '200' } });
+    const { sent, destination } = harness({ allRuns: [], chats: { 'parent-conv': '200' } });
     await destination.deliver(gateNotice({ parent_conversation_id: 'parent-conv' }));
     expect(sent.map(m => m.chat)).toEqual(['200']);
   });
@@ -128,20 +140,8 @@ describe('TelegramAttentionDestination', () => {
   });
 
   test('nobody to tell is not a failure', async () => {
-    const { sent, destination } = harness({ operators: [] });
+    const { sent, destination } = harness({ allRuns: [] });
     await destination.deliver(gateNotice());
     expect(sent).toEqual([]);
-  });
-});
-
-describe('telegramOperatorChats', () => {
-  test('takes the telegram routes of attentionNotices, and only them', () => {
-    expect(
-      telegramOperatorChats([
-        { platform: 'telegram', destination: '100' },
-        { platform: 'slack', destination: 'C1' },
-        { platform: 'telegram', destination: '-200' },
-      ])
-    ).toEqual(['100', '-200']);
   });
 });

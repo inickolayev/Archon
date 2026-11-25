@@ -6,10 +6,11 @@
  * bundled adapter (media, buttons, several chats per project), not a plugin. This destination
  * gives it the same feed — every run, whoever started it: the CLI, the nightly timer, the
  * console or a chat — and sends each notice to the chats that should hear it
- * (`telegramRecipients`): the operator chats routed in `attentionNotices`, the chat that
- * started the run, and the chats watching it.
+ * (`telegramRecipients`): the run's author in the Telegram linked to their account, the chat
+ * that started the run, the chats watching it, and — for a run nobody started — the chats
+ * watching all such runs. No chat is configured: a person is found through their account.
  */
-import type { AttentionNoticeRoute } from '@archon/core/config';
+import { listIdentitiesForUser } from '@archon/core/db/account-links';
 import { getDatabase } from '@archon/core/db/connection';
 import { getConversationById } from '@archon/core/db/conversations';
 import {
@@ -18,6 +19,7 @@ import {
   type AttentionNoticeRecord,
 } from '@archon/core/db/workflow-events';
 import { parseTelegramConversationId } from '@archon/core';
+import { listAllRunsWatchers } from '@archon/core/services/all-runs-watchers';
 import type { AttentionNotice } from '@archon/core/services/attention-notices';
 import {
   TELEGRAM_ATTENTION_DESTINATION,
@@ -39,8 +41,10 @@ export interface TelegramNoticeSender {
 }
 
 export interface TelegramAttentionDeps {
-  /** Chats every pause is routed to. */
-  readonly operators: readonly string[];
+  /** Chats watching every run nobody started (`/workflow watch all`). */
+  readonly allRunsWatchers: () => Promise<readonly string[]>;
+  /** The private chat of a user's linked Telegram account; its id is their Telegram user id. */
+  readonly authorChatOf: (userId: string) => Promise<string | undefined>;
   /** The running bot, or null before it starts and on a machine without one. */
   readonly sender: () => TelegramNoticeSender | null;
   readonly ledger: (runId: string) => Promise<readonly AttentionNoticeRecord[]>;
@@ -72,14 +76,18 @@ export class TelegramAttentionDestination implements PushDestination {
     const { run } = notice;
     // Rendered first: a run that moved since selection throws, and nobody gets a stale notice.
     const text = telegramNoticeText(notice);
-    const [records, starterChat, ownChat] = await Promise.all([
+    const [records, starterChat, ownChat, authorChat, allRunsWatchers] = await Promise.all([
       this.deps.ledger(run.id),
       run.parent_conversation_id ? this.deps.chatOf(run.parent_conversation_id) : undefined,
       run.conversation_id ? this.deps.chatOf(run.conversation_id) : undefined,
+      run.user_id ? this.deps.authorChatOf(run.user_id) : undefined,
+      run.user_id ? [] : this.deps.allRunsWatchers(),
     ]);
     const recipients = telegramRecipients({
       kind: notice.kind,
-      operators: this.deps.operators,
+      authored: run.user_id !== null,
+      authorChat,
+      allRunsWatchers,
       starterChat,
       ownChat,
       watchers: runWatchers(records, run.id),
@@ -113,9 +121,9 @@ function isFinalTelegramFailure(err: unknown): boolean {
   );
 }
 
-/** The operator chats: the `attentionNotices` routes whose platform is `telegram`. */
-export function telegramOperatorChats(routes: readonly AttentionNoticeRoute[]): string[] {
-  return routes.filter(route => route.platform === 'telegram').map(route => route.destination);
+async function telegramChatOfUser(userId: string): Promise<string | undefined> {
+  const identities = await listIdentitiesForUser(userId);
+  return identities.find(identity => identity.platform === 'telegram')?.platformUserId;
 }
 
 async function telegramChatOf(conversationId: string): Promise<string | undefined> {
@@ -133,12 +141,12 @@ async function telegramChatOf(conversationId: string): Promise<string | undefine
 
 /** The destination wired to the database and a live bot getter. */
 export function createTelegramAttentionDestination(
-  routes: readonly AttentionNoticeRoute[],
   sender: () => TelegramNoticeSender | null,
   inlinePlatforms: ReadonlySet<string>
 ): TelegramAttentionDestination {
   return new TelegramAttentionDestination({
-    operators: telegramOperatorChats(routes),
+    allRunsWatchers: () => listAllRunsWatchers(),
+    authorChatOf: telegramChatOfUser,
     sender,
     ledger: runId => listAttentionNotices([runId]),
     chatOf: telegramChatOf,

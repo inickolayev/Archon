@@ -515,6 +515,17 @@ async function startChatHosting(
       .filter(plugin => plugin.descriptor.capabilities.runEvents)
       .map(plugin => plugin.descriptor.id)
   );
+  // ChessWin fork (#32): with the bundled bot, Telegram is called by account and by
+  // `/workflow watch`, never by a configured chat; a `telegram` route is ignored, not handed to
+  // a chat host that has no such plugin.
+  const ignoredTelegramRoutes = bundledTelegram
+    ? config.attentionNotices.filter(route => route.platform === 'telegram')
+    : [];
+  if (ignoredTelegramRoutes.length > 0)
+    getLog().warn(
+      { count: ignoredTelegramRoutes.length },
+      'telegram.attention_routes_ignored: a run calls its author and the chats that watch it'
+    );
   const host = createChatHost(
     chatPlugins,
     config.streaming,
@@ -522,7 +533,6 @@ async function startChatHosting(
     registry.workflowPlatforms,
     registry.activePlatforms,
     {
-      // ChessWin fork (#32): the bundled bot owns the `telegram` routes when it runs.
       routes: bundledTelegram
         ? config.attentionNotices.filter(route => route.platform !== 'telegram')
         : config.attentionNotices,
@@ -533,7 +543,7 @@ async function startChatHosting(
   await Promise.all(host.attentionDestinations.map(destination => destination.activate()));
   const webPush = new WebPushDestination(inlinePlatforms);
   const telegramAttention = bundledTelegram
-    ? createTelegramAttentionDestination(config.attentionNotices, bundledTelegram, inlinePlatforms)
+    ? createTelegramAttentionDestination(bundledTelegram, inlinePlatforms)
     : undefined;
   await telegramAttention?.activate();
   const router = new AttentionRouter(
