@@ -67,10 +67,17 @@ describe('telegramRecipients', () => {
     pauseTold: false,
   };
 
-  test('a pause goes to its author, the chat that started the run and its watchers', () => {
+  test('a pause goes to its author and its watchers', () => {
+    expect(telegramRecipients({ ...base, kind: 'gate', watchers: new Set(['3']) })).toEqual([
+      '1',
+      '3',
+    ]);
+  });
+
+  test('a run started from a chat calls that chat and its watchers', () => {
     expect(
       telegramRecipients({ ...base, kind: 'gate', starterChat: '2', watchers: new Set(['3']) })
-    ).toEqual(['1', '2', '3']);
+    ).toEqual(['2', '3']);
   });
 
   test('a run nobody started calls the chats that watch every such run', () => {
@@ -81,6 +88,14 @@ describe('telegramRecipients', () => {
 
   test('a run with an author never calls the all-runs watchers, even without Telegram linked', () => {
     expect(telegramRecipients({ ...base, authorChat: undefined, kind: 'gate' })).toEqual([]);
+  });
+
+  test('an author who started the run from a Telegram chat is called there, not twice', () => {
+    expect(telegramRecipients({ ...base, kind: 'gate', starterChat: '-200' })).toEqual(['-200']);
+  });
+
+  test('an author whose run talks in a Telegram chat was told there; no private call', () => {
+    expect(telegramRecipients({ ...base, kind: 'gate', ownChat: '-200' })).toEqual([]);
   });
 
   test('one chat hears a notice once, whatever roles it holds', () => {
@@ -118,7 +133,7 @@ describe('telegramRecipients', () => {
   test('a run that paused ended elsewhere: the chat that started it hears the end', () => {
     expect(
       telegramRecipients({ ...base, kind: 'terminal', pauseTold: true, starterChat: '2' })
-    ).toEqual(['1', '2']);
+    ).toEqual(['2']);
   });
 
   test('a run that never paused brought its result card to the chat that started it', () => {

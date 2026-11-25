@@ -77,7 +77,7 @@ export interface RecipientInput {
    * all-runs watchers.
    */
   authored: boolean;
-  /** The author's own Telegram chat, when their account has Telegram linked. */
+  /** The author's private Telegram chat, when their account has Telegram linked. */
   authorChat?: string;
   /** Chats that watch every run nobody started (`/workflow watch all`). */
   allRunsWatchers: readonly string[];
@@ -94,10 +94,15 @@ export interface RecipientInput {
   pauseTold: boolean;
 }
 
-/** Who a run calls on its own: its author, or — nobody started it — the all-runs watchers. */
+/**
+ * Who a run calls on its own: its author, or — nobody started it — the all-runs watchers. An
+ * author whose run was started from, or talks in, a Telegram chat is in that chat already, so
+ * their private chat is not called as well.
+ */
 function runCallers(input: RecipientInput): readonly string[] {
   if (!input.authored) return input.allRunsWatchers;
-  return input.authorChat ? [input.authorChat] : [];
+  const inTelegramAlready = input.starterChat !== undefined || input.ownChat !== undefined;
+  return input.authorChat && !inTelegramAlready ? [input.authorChat] : [];
 }
 
 /** The chats one notice goes to, each once, in a stable order. */
