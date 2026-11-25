@@ -43,6 +43,7 @@ import { readSubrunMetadata } from '@archon/workflows/schemas/run-metadata';
 import { DETACHED_LAUNCH_METADATA_KEY } from '@archon/workflows/store';
 import { loadWorkflows } from './workflow-list';
 import { resolveLaunchRunConfig } from './workflow-run-config';
+import { workflowSourceAdmits } from './workflow-source-global';
 import { assertInheritedWorkflowCodebase, type WorkflowRunOptions } from './workflow-shared';
 import {
   assertNoWorktreeOptionsForFolder,
@@ -185,7 +186,7 @@ export async function selectRunWorkflow(request: OwnedRunRequest): Promise<RunSe
   if (
     !isContinuation &&
     options.discoveryCwd !== undefined &&
-    workflowEntry?.source !== 'project'
+    !workflowSourceAdmits(workflowEntry?.source)
   ) {
     throw workflowNotInSourceError(workflowName, options.discoveryCwd, workflowEntry?.source);
   }

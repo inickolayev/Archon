@@ -107,6 +107,11 @@ const OURS: Record<string, string[]> = {
     'packages/server/src/adapters/telegram-attention-text.ts',
     'packages/server/src/adapters/telegram-attention-text.test.ts',
   ],
+  'the Factory runs its global pack under a pinned --workflow-source': [
+    'packages/cli/src/commands/workflow-source-global.ts',
+    'packages/cli/src/commands/workflow-source-global.test.ts',
+    'packages/cli/src/commands/workflow-source-global.integration.spec.ts',
+  ],
 };
 
 /**
@@ -163,6 +168,11 @@ const OURS_INSIDE_THEIRS: Record<string, [string, string][]> = {
   'a run calls its Telegram watchers to its gates and its end (wiring)': [
     ['packages/server/src/index.ts', 'createTelegramAttentionDestination('],
     ['packages/core/src/handlers/commands/workflow.ts', "case 'watch':"],
+  ],
+  // Without this the file above survives and admission ignores it: every `bin/factory run`
+  // of the Factory's pack is refused again (chesswin-factory#40).
+  'the Factory runs its global pack under a pinned --workflow-source (wiring)': [
+    ['packages/cli/src/commands/workflow-run-admission.ts', 'workflowSourceAdmits('],
   ],
 };
 
