@@ -44,6 +44,7 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
 - \`${cmd('approve <id>')}\` — Approve a paused gate
 - \`${cmd('reject <id>')}\` — Reject a paused gate
 - \`${cmd('watch <id>')}\` — Telegram: get this run's gates, questions and end here (\`unwatch <id>\` stops)
+- \`${cmd('watch all')}\` — Telegram: get the gates of every run nobody started — the CLI, the nightly timer (\`unwatch all\` stops)
 - \`${cmd('reset-sessions <name> [<node-id>]')}\` — Clear persisted AI session memory for this conversation
 
 **Projects**

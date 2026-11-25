@@ -100,6 +100,9 @@ const OURS: Record<string, string[]> = {
   'a run calls its Telegram watchers to its gates and its end': [
     'packages/core/src/services/run-watchers.ts',
     'packages/core/src/services/run-watchers.test.ts',
+    'packages/core/src/services/all-runs-watchers.ts',
+    'packages/core/src/services/all-runs-watchers.test.ts',
+    'packages/core/src/services/all-runs-watchers.integration.test.ts',
     'packages/core/src/handlers/commands/workflow-watch.ts',
     'packages/core/src/handlers/commands/workflow-watch.test.ts',
     'packages/server/src/adapters/telegram-attention.ts',

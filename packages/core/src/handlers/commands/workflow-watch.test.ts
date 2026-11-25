@@ -25,11 +25,17 @@ function command(platform: string, platformId: string, args: string[]): Workflow
 function deps(status: WorkflowRun['status'] = 'running'): {
   deps: WatchDeps;
   recorded: { runId: string; data: AttentionNoticeData }[];
+  allRuns: { chatId: string; watching: boolean }[];
 } {
   const recorded: { runId: string; data: AttentionNoticeData }[] = [];
+  const allRuns: { chatId: string; watching: boolean }[] = [];
   return {
     recorded,
+    allRuns,
     deps: {
+      watchAll: async (chatId, watching) => {
+        allRuns.push({ chatId, watching });
+      },
       resolveRunId: async arg => {
         if (!RUN_ID.startsWith(arg))
           throw new Error(`Workflow run not found in this project: ${arg}`);
@@ -45,6 +51,30 @@ function deps(status: WorkflowRun['status'] = 'running'): {
 }
 
 describe('watchWorkflowRun', () => {
+  test('`watch all`: the chat is called by every run nobody started', async () => {
+    const { deps: d, allRuns, recorded } = deps();
+    const result = await watchWorkflowRun(command('telegram', '352', ['watch', 'all']), true, d);
+    expect(result.success).toBe(true);
+    expect(allRuns).toEqual([{ chatId: '352', watching: true }]);
+    expect(recorded).toEqual([]);
+    expect(result.message).toContain('nobody started');
+    expect(result.message).toContain('/workflow unwatch all');
+  });
+
+  test('`unwatch all` stops it', async () => {
+    const { deps: d, allRuns } = deps();
+    const result = await watchWorkflowRun(command('telegram', '352', ['unwatch', 'all']), false, d);
+    expect(result.success).toBe(true);
+    expect(allRuns).toEqual([{ chatId: '352', watching: false }]);
+  });
+
+  test('`watch all` is refused outside Telegram', async () => {
+    const { deps: d, allRuns } = deps();
+    const result = await watchWorkflowRun(command('web', 'w-1', ['watch', 'all']), true, d);
+    expect(result.success).toBe(false);
+    expect(allRuns).toEqual([]);
+  });
+
   test('a Telegram chat watches a run by its short id', async () => {
     const { deps: d, recorded } = deps();
     const result = await watchWorkflowRun(
@@ -94,7 +124,7 @@ describe('watchWorkflowRun', () => {
   test('without an id it says how to use it; an unknown id says so', async () => {
     const { deps: d } = deps();
     const usage = await watchWorkflowRun(command('telegram', '42', ['watch']), true, d);
-    expect(usage.message).toContain('/workflow watch <id>');
+    expect(usage.message).toContain('/workflow watch <id|all>');
     const unknown = await watchWorkflowRun(command('telegram', '42', ['watch', 'ffff']), true, d);
     expect(unknown.success).toBe(false);
     expect(unknown.message).toContain('not found');

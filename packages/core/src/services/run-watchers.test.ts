@@ -58,16 +58,29 @@ describe('pauseWasTold', () => {
 });
 
 describe('telegramRecipients', () => {
+  // A run someone started, whose account has Telegram linked as chat 1.
   const base = {
-    operators: ['1'],
+    authored: true,
+    authorChat: '1',
+    allRunsWatchers: ['9'],
     watchers: new Set<string>(),
     pauseTold: false,
   };
 
-  test('a pause goes to the operators, the chat that started the run and its watchers', () => {
+  test('a pause goes to its author, the chat that started the run and its watchers', () => {
     expect(
       telegramRecipients({ ...base, kind: 'gate', starterChat: '2', watchers: new Set(['3']) })
     ).toEqual(['1', '2', '3']);
+  });
+
+  test('a run nobody started calls the chats that watch every such run', () => {
+    expect(
+      telegramRecipients({ ...base, authored: false, authorChat: undefined, kind: 'gate' })
+    ).toEqual(['9']);
+  });
+
+  test('a run with an author never calls the all-runs watchers, even without Telegram linked', () => {
+    expect(telegramRecipients({ ...base, authorChat: undefined, kind: 'gate' })).toEqual([]);
   });
 
   test('one chat hears a notice once, whatever roles it holds', () => {
@@ -82,13 +95,24 @@ describe('telegramRecipients', () => {
     ).toEqual(['3']);
   });
 
-  test('the end goes to watchers, and to operators only when they were told of a pause', () => {
+  test('the end goes to watchers, and to the author only when they were told of a pause', () => {
     const watchers = new Set(['3']);
     expect(telegramRecipients({ ...base, kind: 'terminal', watchers })).toEqual(['3']);
     expect(telegramRecipients({ ...base, kind: 'terminal', watchers, pauseTold: true })).toEqual([
       '1',
       '3',
     ]);
+  });
+
+  test('the all-runs watchers hear an end only after they were called to a pause', () => {
+    const authorless = {
+      ...base,
+      authored: false,
+      authorChat: undefined,
+      kind: 'terminal' as const,
+    };
+    expect(telegramRecipients(authorless)).toEqual([]);
+    expect(telegramRecipients({ ...authorless, pauseTold: true })).toEqual(['9']);
   });
 
   test('a run that paused ended elsewhere: the chat that started it hears the end', () => {
@@ -108,7 +132,9 @@ describe('telegramRecipients', () => {
     ).toEqual(['3']);
   });
 
-  test('nobody configured and nobody watching: nobody to tell', () => {
-    expect(telegramRecipients({ ...base, operators: [], kind: 'gate' })).toEqual([]);
+  test('nobody to call and nobody watching: nobody to tell', () => {
+    expect(
+      telegramRecipients({ ...base, authored: false, allRunsWatchers: [], kind: 'gate' })
+    ).toEqual([]);
   });
 });
